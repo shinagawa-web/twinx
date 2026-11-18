@@ -22,7 +22,6 @@ jobs:
     env:
       BRANCH: ${{ github.ref_name }}
       TWINX_REPO: ${{ github.workspace }}
-      JUDGE: ${{ runner.temp }}/harness
       # twinx is built with coverage instrumentation so the judge can see which lines
       # the cases run. Counter relocation keeps the profile current while twinx runs,
       # because the harness kills it rather than letting it exit.
@@ -34,7 +33,7 @@ jobs:
           fetch-depth: 0
 
       - name: Keep main's harness, so the branch is judged by main's rules
-        run: cp -r harness "$JUDGE"
+        run: cp -r harness "$RUNNER_TEMP/harness"
 
       - name: Merge the branch into main without committing
         id: merge
@@ -69,26 +68,25 @@ jobs:
         id: compare
         if: steps.merge.outcome == 'success'
         continue-on-error: true
-        env:
-          LLVM_PROFILE_FILE: ${{ runner.temp }}/profiles/twinx-%p-%c.profraw
         run: |
-          mkdir -p "${{ runner.temp }}/profiles"
-          python3 "$JUDGE/compare.py" --out results.json
+          mkdir -p "$RUNNER_TEMP/profiles"
+          export LLVM_PROFILE_FILE="$RUNNER_TEMP/profiles/twinx-%p-%c.profraw"
+          python3 "$RUNNER_TEMP/harness/compare.py" --out results.json
 
       - name: Measure what the cases ran
         id: coverage
         if: steps.merge.outcome == 'success'
         continue-on-error: true
         run: |
-          profiles="${{ runner.temp }}/profiles"
+          profiles="$RUNNER_TEMP/profiles"
           if ls "$profiles"/*.profraw >/dev/null 2>&1 && [ -x target/release/twinx ]; then
             bin=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin
             "$bin/llvm-profdata" merge -sparse "$profiles"/*.profraw -o "$profiles/merged.profdata"
             "$bin/llvm-cov" export target/release/twinx -instr-profile="$profiles/merged.profdata" \
               -format=lcov --ignore-filename-regex='/.cargo/registry|/rustc/' > cases.lcov
-            python3 "$JUDGE/coverage.py" --base "${{ steps.merge.outputs.base }}" --lcov cases.lcov --out coverage.json
+            python3 "$RUNNER_TEMP/harness/coverage.py" --base "${{ steps.merge.outputs.base }}" --lcov cases.lcov --out coverage.json
           else
-            python3 "$JUDGE/coverage.py" --base "${{ steps.merge.outputs.base }}" --out coverage.json
+            python3 "$RUNNER_TEMP/harness/coverage.py" --base "${{ steps.merge.outputs.base }}" --out coverage.json
           fi
 
       - name: Judge
@@ -96,7 +94,7 @@ jobs:
         if: steps.merge.outcome == 'success' && hashFiles('results.json') != ''
         continue-on-error: true
         run: >
-          python3 "$JUDGE/judge.py"
+          python3 "$RUNNER_TEMP/harness/judge.py"
           --branch "$BRANCH"
           --base "${{ steps.merge.outputs.base }}"
           --head "${{ steps.merge.outputs.head }}"
@@ -112,7 +110,9 @@ jobs:
           git add status/passing.txt
           after=$(python3 -c 'import json; print(json.load(open("verdict.json"))["cases_passing_after"])')
           git commit -q -m "Merge $BRANCH ($after cases pass)"
-          git push origin HEAD:main
+          # A human may have pushed to main while this ran; take their commits in and retry.
+          for i in 1 2 3; do git push origin HEAD:main && break; git pull -q --no-rebase --no-edit origin main; done
+          git fetch -q origin main && git merge-base --is-ancestor HEAD origin/main
           git push origin --delete "$BRANCH"
 
       - name: Record the failed attempt
