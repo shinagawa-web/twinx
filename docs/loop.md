@@ -1,6 +1,6 @@
 # One run of the loop
 
-A scheduled Claude Code session runs this once an hour. Each run does up to three iterations and then ends.
+A scheduled Claude Code session runs this once an hour (routine `trig_01YX3pTLi2c3KYXT33CabyPp`, model `claude-opus-5-5`, from 2026-11-18T10:34:00Z). Each run does up to three iterations and then ends.
 
 ## Each iteration
 
