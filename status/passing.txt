@@ -1,0 +1,4 @@
+cases/stage1/proxy-pass
+cases/stage1/return-and-add-header
+cases/stage1/static-file
+cases/stage1/try-files
