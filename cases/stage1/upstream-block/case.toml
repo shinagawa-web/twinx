@@ -1,0 +1,29 @@
+description = "proxy_pass to a named upstream block, with proxy_set_header and the redirect for a location without its trailing slash"
+config = """
+upstream app {
+    server {{backend}};
+}
+server {
+    listen {{port}};
+    location /app/ {
+        proxy_pass http://app;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Original-URI $request_uri;
+    }
+    location /svc/ {
+        proxy_pass http://app/;
+    }
+}
+"""
+
+[[requests]]
+raw = "GET /app/page?q=1&r=2 HTTP/1.1\r\nHost: example.test\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /svc/a/b HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /svc HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /app?x=1 HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
