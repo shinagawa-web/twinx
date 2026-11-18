@@ -30,3 +30,4 @@ Kinds:
 | 2026-11-18 | Before start | approval | Five local commits were waiting to be pushed, and the next step was the GitHub Actions judge | Pushed, and went on to the judge |
 | 2026-11-18 | Before start | approval | The agent proposed writing the Fixer and Finder rules and the cloud setup script next | Went ahead |
 | 2026-11-18 | Before start | question | The step "create a new environment in claude.ai/code" did not say where or how | The agent spelled out the screens from the documentation; the plan did not change |
+| 2026-11-18 | Before start | approval | The cloud environment, the GitHub App and a first session had to be set up by hand | Set them up; the harness ran in the cloud and nginx answered all four cases |
