@@ -1,6 +1,6 @@
 # One run of the loop
 
-A scheduled Claude Code session runs this once an hour with model `claude-opus-5-5`. The first run is routine `trig_012ER29uuypTqhUEnHtyZfrF` at 2026-11-18T23:30:00Z, and the hourly runs are routine `trig_01YX3pTLi2c3KYXT33CabyPp` from 2026-11-19T00:30:00Z. Each run does up to three iterations and then ends.
+A scheduled Claude Code session runs this once an hour with model `claude-opus-5-5`. The first run is routine `trig_012ER29uuypTqhUEnHtyZfrF` at 2026-11-18T23:30:00Z, and the hourly runs are routine `trig_01YX3pTLi2c3KYXT33CabyPp` (cron `30 * * * *`) from 2026-11-19T00:30:00Z. Each run does up to three iterations and then ends.
 
 ## Each iteration
 
