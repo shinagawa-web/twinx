@@ -41,3 +41,5 @@ Kinds:
 | 2026-11-19 | Stage 1 | approval | The agent proposed designing the stage 1 security checks first, in a separate repository | Went ahead; naming the repository next |
 | 2026-11-19 | Stage 1 | correction | The agent recommended naming the security check repository gauntlet, since it tests nginx as well as twinx | Too broad a name across shinagawa-web; named it twinx-gauntlet, still testing both nginx and twinx |
 | 2026-11-19 | Stage 1 | approval | The agent offered to review the first run before designing the security checks | Reviewed it first |
+| 2026-11-19 | Stage 1 | correction | In the first run the same session worked as the Fixer and then as the Finder, so the Finder wrote cases knowing the code it had just written (its first five drafts all passed at once) | Run the Fixer and the Finder as separate scheduled runs; the Finder does not see the Rust code |
+| 2026-11-19 | Stage 1 | decision | nginx 1.30.7 fixes CVEs, including one around alias and try_files, and the reference is pinned to 1.30.6 | Keep 1.30.6: following every nginx release would never end |
