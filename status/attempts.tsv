@@ -1,0 +1,2 @@
+date	branch	head	problems
+2026-11-18T09:24:35Z	claude/fix-stage1-smoke-test-nonexistent	9855a18e5623e9d926ac0bfe0414441d573dda82	cases/stage1/smoke-test-nonexistent does not exist
