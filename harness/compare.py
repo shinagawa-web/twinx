@@ -292,7 +292,7 @@ def main():
     results = []
     try:
         for case_dir in cases:
-            result = run_case(case_dir, Path(args.twinx))
+            result = run_case(case_dir, Path(args.twinx).resolve())
             results.append(result)
             print(("PASS " if result["passed"] else "FAIL ") + result["case"])
             for problem in result.get("problems", []):
