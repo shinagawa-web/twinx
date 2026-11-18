@@ -1,0 +1,12 @@
+[package]
+name = "twinx"
+version = "0.1.0"
+edition = "2021"
+description = "An HTTP server that behaves like nginx"
+publish = false
+
+[dependencies]
+regex = "1"
+
+[profile.release]
+debug = false
