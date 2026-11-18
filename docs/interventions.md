@@ -34,3 +34,4 @@ Kinds:
 | 2026-11-18 | Before start | decision | The scheduled run needed a model, and changing it mid-experiment would make the results incomparable | Opus 5.5 (claude-opus-5-5) for the whole experiment |
 | 2026-11-18 | Before start | approval | The agent proposed registering the hourly scheduled run | Registered as routine trig_01YX3pTLi2c3KYXT33CabyPp; the first run fires at 2026-11-18T10:34:00Z, which is when the experiment starts |
 | 2026-11-18 | Before start | correction | The routine kept the account connectors (Claude Docs, Claude Code Remote), which the loop does not need and which could change its conditions | Removed them from the routine |
+| 2026-11-18 | Before start | decision | The first run was set for 19:34 JST, too late in the day to review its results | Start at 2026-11-19 08:30 JST (2026-11-18T23:30:00Z) with a one-off run, then hourly from 09:30 JST |
