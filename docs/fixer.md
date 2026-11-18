@@ -18,8 +18,9 @@ Among the open failing cases (see `docs/loop.md`), take the one in the lowest st
 1. Read the case (`case.toml`, `files/`) and run it to see what nginx answers and what twinx answers.
 2. Implement the nginx behavior behind the difference, as nginx documents and does it, for any configuration and any request, not only the ones in the case. Never recognize the harness: no special handling of case names, paths under /tmp/twinx-cases, port 18080 or the echo backend.
 3. Crates from crates.io may be used. Prefer ones whose behavior you can make match nginx byte for byte.
-4. Add Rust unit tests in `src/` or `tests/` for the parts you write.
-5. Before pushing, build, run `cargo test` and run every case (`scripts/run.sh python3 harness/compare.py --out results/all.json`). No case listed in `status/passing.txt` may fail.
+4. Implement only what the cases need. The judge builds twinx with coverage instrumentation, runs every case, and rejects the branch when the cases run less than 99% of the executable lines it adds. Rust unit tests do not count toward this. A feature no case exercises waits until the Finder writes a case for it.
+5. Add Rust unit tests in `src/` or `tests/` for the parts you write.
+6. Before pushing, build, run `cargo test` and run every case (`scripts/run.sh python3 harness/compare.py --out results/all.json`). No case listed in `status/passing.txt` may fail.
 
 ## What to push
 

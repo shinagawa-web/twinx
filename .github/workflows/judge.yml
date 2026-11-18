@@ -21,11 +21,20 @@ jobs:
     timeout-minutes: 30
     env:
       BRANCH: ${{ github.ref_name }}
+      TWINX_REPO: ${{ github.workspace }}
+      JUDGE: ${{ runner.temp }}/harness
+      # twinx is built with coverage instrumentation so the judge can see which lines
+      # the cases run. Counter relocation keeps the profile current while twinx runs,
+      # because the harness kills it rather than letting it exit.
+      RUSTFLAGS: -C instrument-coverage -C llvm-args=-runtime-counter-relocation
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+
+      - name: Keep main's harness, so the branch is judged by main's rules
+        run: cp -r harness "$JUDGE"
 
       - name: Merge the branch into main without committing
         id: merge
@@ -39,6 +48,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         if: steps.merge.outcome == 'success' && hashFiles('Cargo.toml') != ''
+
+      - name: Install the LLVM coverage tools
+        if: steps.merge.outcome == 'success' && hashFiles('Cargo.toml') != ''
+        run: rustup component add llvm-tools-preview
 
       - name: Build
         id: build
@@ -56,20 +69,41 @@ jobs:
         id: compare
         if: steps.merge.outcome == 'success'
         continue-on-error: true
-        run: python3 harness/compare.py --out results.json
+        env:
+          LLVM_PROFILE_FILE: ${{ runner.temp }}/profiles/twinx-%p-%c.profraw
+        run: |
+          mkdir -p "${{ runner.temp }}/profiles"
+          python3 "$JUDGE/compare.py" --out results.json
+
+      - name: Measure what the cases ran
+        id: coverage
+        if: steps.merge.outcome == 'success'
+        continue-on-error: true
+        run: |
+          profiles="${{ runner.temp }}/profiles"
+          if ls "$profiles"/*.profraw >/dev/null 2>&1 && [ -x target/release/twinx ]; then
+            bin=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin
+            "$bin/llvm-profdata" merge -sparse "$profiles"/*.profraw -o "$profiles/merged.profdata"
+            "$bin/llvm-cov" export target/release/twinx -instr-profile="$profiles/merged.profdata" \
+              -format=lcov --ignore-filename-regex='/.cargo/registry|/rustc/' > cases.lcov
+            python3 "$JUDGE/coverage.py" --base "${{ steps.merge.outputs.base }}" --lcov cases.lcov --out coverage.json
+          else
+            python3 "$JUDGE/coverage.py" --base "${{ steps.merge.outputs.base }}" --out coverage.json
+          fi
 
       - name: Judge
         id: judge
         if: steps.merge.outcome == 'success' && hashFiles('results.json') != ''
         continue-on-error: true
         run: >
-          python3 harness/judge.py
+          python3 "$JUDGE/judge.py"
           --branch "$BRANCH"
           --base "${{ steps.merge.outputs.base }}"
           --head "${{ steps.merge.outputs.head }}"
           --build "${{ steps.build.outcome }}"
           --test "${{ steps.test.outcome }}"
           --results results.json
+          --coverage coverage.json
           --verdict verdict.json
 
       - name: Merge into main
@@ -113,5 +147,6 @@ jobs:
           name: judge-${{ github.run_id }}
           path: |
             results.json
+            coverage.json
             verdict.json
           if-no-files-found: ignore

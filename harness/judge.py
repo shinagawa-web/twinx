@@ -16,15 +16,21 @@ Exit status 0 means merge. The verdict is also written as JSON.
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+# The repository the scripts work on. The judge runs copies of these scripts taken from
+# main before the branch is merged, so a branch cannot change how it is judged.
+REPO = Path(os.environ.get("TWINX_REPO") or Path(__file__).resolve().parent.parent).resolve()
 PASSING = REPO / "status" / "passing.txt"
 
-FIXER_MAY_TOUCH = ("src/", "tests/", "benches/", "Cargo.toml", "Cargo.lock")
+# Share of the executable lines a Fixer branch adds that the cases must run.
+COVERAGE_THRESHOLD = 99.0
+
+FIXER_MAY_TOUCH =("src/", "tests/", "benches/", "Cargo.toml", "Cargo.lock")
 FINDER_MAY_ADD = ("cases/",)
 
 
@@ -66,6 +72,7 @@ def main():
     parser.add_argument("--build", required=True, choices=["success", "failure", "skipped"])
     parser.add_argument("--test", required=True, choices=["success", "failure", "skipped"])
     parser.add_argument("--results", required=True, help="JSON written by compare.py")
+    parser.add_argument("--coverage", help="JSON written by coverage.py")
     parser.add_argument("--verdict", required=True, help="where to write the verdict JSON")
     args = parser.parse_args()
 
@@ -93,6 +100,17 @@ def main():
         elif target not in passing_now:
             problems.append(f"{target} still does not pass")
 
+    coverage = json.loads(Path(args.coverage).read_text()) if args.coverage and Path(args.coverage).exists() else None
+    if role == "fix":
+        if coverage is None:
+            problems.append("no coverage was measured")
+        elif coverage["percent"] is not None and coverage["percent"] < COVERAGE_THRESHOLD:
+            missed = "; ".join(f"{path}:{','.join(lines)}" for path, lines in coverage["missed"].items())
+            problems.append(
+                f"the cases run {coverage['percent']}% of the {coverage['added_executable_lines']} lines "
+                f"this branch adds, below {COVERAGE_THRESHOLD}%; not run by any case: {missed}"
+            )
+
     verdict = {
         "branch": args.branch,
         "role": role,
@@ -105,6 +123,7 @@ def main():
         "cases_passing_before": len(passing_before),
         "cases_passing_after": len(passing_now),
         "newly_passing": [c for c in passing_now if c not in passing_before],
+        "coverage": coverage,
     }
     Path(args.verdict).write_text(json.dumps(verdict, indent=2))
     if not problems:

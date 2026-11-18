@@ -39,7 +39,7 @@ Claude Code works in two roles and only ever pushes a branch. It never decides w
 - The Fixer picks one failing case, changes the Rust code until that case passes, and pushes `claude/fix-<stage>-<case>`.
 - The Finder writes new cases for the current stage and pushes `claude/find-<name>`.
 
-The judge is a GitHub Actions workflow (`.github/workflows/judge.yml`, `harness/judge.py`). For every push to a `claude/` branch it merges the branch into main without committing, then builds, runs `cargo test` and runs every case against nginx and twinx.
+The judge is a GitHub Actions workflow (`.github/workflows/judge.yml`, `harness/judge.py`). For every push to a `claude/` branch it keeps a copy of main's `harness/`, merges the branch into main without committing, then builds twinx with coverage instrumentation, runs `cargo test` and runs every case against nginx and twinx, all with main's copy of the harness.
 
 ```
 push to claude/...
@@ -49,6 +49,7 @@ push to claude/...
   ├─ build and cargo test pass?
   ├─ every case that passed on main still passes?
   ├─ (Fixer) the case it names now passes?
+  ├─ (Fixer) the cases run at least 99% of the lines it adds?
   │
   ├─ yes → merge into main, update status/passing.txt, delete the branch
   └─ no  → append the reason to status/attempts.tsv on main

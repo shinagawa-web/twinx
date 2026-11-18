@@ -43,8 +43,10 @@ IGNORED_HEADERS = {"date", "server"}
 SERVER_NAMES = re.compile(rb"nginx/1\.30\.6|twinx/[0-9][0-9A-Za-z.+-]*")
 SERVER_PLACEHOLDER = b"<server>"
 
-REPO = Path(__file__).resolve().parent.parent
-MIME_TYPES = REPO / "harness" / "mime.types"
+# The repository the scripts work on. The judge runs copies of these scripts taken from
+# main before the branch is merged, so a branch cannot change how it is judged.
+REPO = Path(os.environ.get("TWINX_REPO") or Path(__file__).resolve().parent.parent).resolve()
+MIME_TYPES = Path(__file__).resolve().parent / "mime.types"
 
 WRAPPER = """worker_processes 1;
 pid /tmp/twinx-case.pid;
