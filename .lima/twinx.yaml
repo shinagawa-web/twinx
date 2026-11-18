@@ -1,0 +1,35 @@
+vmType: vz
+os: Linux
+arch: aarch64
+cpus: 4
+memory: 8GiB
+disk: 50GiB
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+mounts: []
+containerd:
+  system: false
+  user: false
+provision:
+  - mode: system
+    script: |
+      set -eux
+      printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/80-timeouts
+      apt-get update
+      apt-get install -y ca-certificates curl python3 build-essential pkg-config perl
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io
+      systemctl enable --now docker
+      LIMA_USER=$(getent passwd | awk -F: '$6 ~ /\.guest$/ {print $1; exit}')
+      usermod -aG docker "$LIMA_USER"
+  - mode: user
+    script: |
+      set -eux
+      if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy,rustfmt
+      fi
