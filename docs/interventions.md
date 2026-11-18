@@ -25,3 +25,4 @@ Kinds:
 | 2026-11-18 | Before start | question | How the loop would move off the Mac | All state lives in git, and only scripts/run.sh knows whether it is on the Mac or on Linux |
 | 2026-11-18 | Before start | question | Whether Claude Code on the web could run the loop | It can: its sessions are Ubuntu VMs with Docker and Rust. Decided to prepare for running the loop there, with scheduled tasks, and to move the pass/fail judge to GitHub Actions so it stays outside Claude |
 | 2026-11-18 | Before start | correction | The log held only three decisions and missed the rest of the conversation, such as the execution environment | Log every human input as it happens, until the human starts working through GitHub issues |
+| 2026-11-18 | Before start | decision | Logging interventions was a rule only the current session knew | Wrote it into CLAUDE.md so that other sessions follow it |
