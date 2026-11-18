@@ -1,0 +1,117 @@
+name: judge
+
+# Every push to a claude/ branch is judged on main with the branch merged in.
+# A branch that passes is merged into main; one that fails is recorded in
+# status/attempts.tsv. Runs are serialized so each one judges the latest main.
+
+on:
+  push:
+    branches: ["claude/**"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: judge-main
+  cancel-in-progress: false
+
+jobs:
+  judge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge the branch into main without committing
+        id: merge
+        continue-on-error: true
+        run: |
+          git config user.name "twinx-judge"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "head=$(git rev-parse "origin/$BRANCH")" >> "$GITHUB_OUTPUT"
+          git merge --no-ff --no-commit "origin/$BRANCH"
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.merge.outcome == 'success' && hashFiles('Cargo.toml') != ''
+
+      - name: Build
+        id: build
+        if: steps.merge.outcome == 'success' && hashFiles('Cargo.toml') != ''
+        continue-on-error: true
+        run: cargo build --release
+
+      - name: Test
+        id: test
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: cargo test --release
+
+      - name: Compare with nginx
+        id: compare
+        if: steps.merge.outcome == 'success'
+        continue-on-error: true
+        run: python3 harness/compare.py --out results.json
+
+      - name: Judge
+        id: judge
+        if: steps.merge.outcome == 'success' && hashFiles('results.json') != ''
+        continue-on-error: true
+        run: >
+          python3 harness/judge.py
+          --branch "$BRANCH"
+          --base "${{ steps.merge.outputs.base }}"
+          --head "${{ steps.merge.outputs.head }}"
+          --build "${{ steps.build.outcome }}"
+          --test "${{ steps.test.outcome }}"
+          --results results.json
+          --verdict verdict.json
+
+      - name: Merge into main
+        if: steps.judge.outcome == 'success'
+        run: |
+          git add status/passing.txt
+          after=$(python3 -c 'import json; print(json.load(open("verdict.json"))["cases_passing_after"])')
+          git commit -q -m "Merge $BRANCH ($after cases pass)"
+          git push origin HEAD:main
+          git push origin --delete "$BRANCH"
+
+      - name: Record the failed attempt
+        if: steps.judge.outcome != 'success'
+        run: |
+          if [ -f verdict.json ]; then
+            problems=$(python3 -c 'import json; print("; ".join(json.load(open("verdict.json"))["problems"]))')
+          elif [ "${{ steps.merge.outcome }}" != success ]; then
+            problems="the branch does not merge cleanly into main"
+          else
+            problems="the comparison harness did not produce results (outcome: ${{ steps.compare.outcome }})"
+          fi
+          git merge --abort 2>/dev/null || git reset -q --hard HEAD
+          mkdir -p status
+          [ -f status/attempts.tsv ] || printf 'date\tbranch\thead\tproblems\n' > status/attempts.tsv
+          printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BRANCH" \
+            "${{ steps.merge.outputs.head }}" "$problems" >> status/attempts.tsv
+          git add status/attempts.tsv
+          git commit -q -m "Record a failed attempt from $BRANCH"
+          for i in 1 2 3; do git push origin HEAD:main && break; git pull -q --rebase origin main; done
+          echo "::error::$problems"
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          [ -f verdict.json ] && { echo '```json'; cat verdict.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: judge-${{ github.run_id }}
+          path: |
+            results.json
+            verdict.json
+          if-no-files-found: ignore

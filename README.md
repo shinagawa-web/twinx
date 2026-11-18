@@ -6,7 +6,7 @@ An experiment to find out how far an agent loop can take an HTTP server that beh
 
 | Question | Records that answer it |
 |---|---|
-| How much can be automated? | The number of issues closed automatically, and the number that stopped and waited for a human |
+| How much can be automated? | The number of cases made to pass automatically, and the number that got stuck and waited for a human |
 | Where does a human have to step in? | The intervention log (`docs/interventions.md`) |
 | What quality do we get, in how much time and at what cost? | The differential test pass rate over elapsed time, the number of nginx-tests passed, and the time and tokens spent per iteration |
 
@@ -32,25 +32,35 @@ Time spent, pass rate and the number of interventions are recorded separately fo
 
 ## The automated loop
 
-A shell script (the driver) runs the loop and calls Claude Code with `claude -p` once per iteration. Whether an issue is fixed is never decided from Claude Code's own report. The driver reruns the differential tests and decides.
+The work queue is the set of cases that fail on main: each failing case holds the configuration, the requests and what nginx answered. There are no separate issue files.
+
+Claude Code works in two roles and only ever pushes a branch. It never decides whether its own change is good:
+
+- The Fixer picks one failing case, changes the Rust code until that case passes, and pushes `claude/fix-<stage>-<case>`.
+- The Finder writes new cases for the current stage and pushes `claude/find-<name>`.
+
+The judge is a GitHub Actions workflow (`.github/workflows/judge.yml`, `harness/judge.py`). For every push to a `claude/` branch it merges the branch into main without committing, then builds, runs `cargo test` and runs every case against nginx and twinx.
 
 ```
-driver
-  ├─ take one issue from issues/open/
-  ├─ create a fresh worktree
-  ├─ the Fixer (claude -p) fixes that issue and exits
-  ├─ the driver runs every differential test and cargo test
-  │     ├─ the issue is fixed and nothing else broke → merge into main, move the issue to issues/fixed/
-  │     └─ otherwise → discard the change, increment the failure count
-  ├─ after 3 failures on the same issue, move it to issues/stuck/
-  └─ next iteration
+push to claude/...
+  ├─ the branch touched only what its role may touch?
+  │     Fixer: src/, tests/, benches/, Cargo.toml, Cargo.lock
+  │     Finder: new files under cases/
+  ├─ build and cargo test pass?
+  ├─ every case that passed on main still passes?
+  ├─ (Fixer) the case it names now passes?
+  │
+  ├─ yes → merge into main, update status/passing.txt, delete the branch
+  └─ no  → append the reason to status/attempts.tsv on main
 ```
 
-The Finder writes test cases (pairs of a configuration and a request), runs them against both nginx and twinx, and writes an issue file into `issues/open/` when the two differ. Only writing the test cases uses Claude Code. Running and comparing them is done by scripts.
+A case with three failed attempts in `status/attempts.tsv` is stuck and waits for a human.
+
+`scripts/run.sh` is the one way to run a command: in place on Linux, inside the Lima VM on macOS.
 
 ## Where a human steps in
 
-- Issues that land in `issues/stuck/`
+- Stuck cases
 - Whether to move on to the next stage
 - Changes to the judging rules, such as adding a header that is excluded from comparison
 

@@ -12,4 +12,4 @@ Where and how often a human steps in is one of the results of this experiment, s
 
 ## Language
 
-Everything in the repository is written in English: documents, code comments, issue files and commit messages.
+Everything in the repository is written in English: documents, code comments, test cases and commit messages.
