@@ -1,0 +1,22 @@
+description = "Serve files from root: index, a nested file, a missing file and a directory without a trailing slash"
+config = """
+server {
+    listen {{port}};
+    root {{root}};
+}
+"""
+
+[[requests]]
+raw = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /docs/readme.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /missing.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /docs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "HEAD /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
