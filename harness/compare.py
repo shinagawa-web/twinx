@@ -14,6 +14,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import shutil
 import socket
 import socketserver
@@ -36,6 +37,11 @@ REQUEST_TIMEOUT = 5.0
 
 # Headers whose values legitimately differ between the two servers.
 IGNORED_HEADERS = {"date", "server"}
+
+# Each server names itself in the pages it generates ("<hr><center>nginx/1.30.6</center>").
+# twinx names itself, not nginx, so both names are replaced before comparing.
+SERVER_NAMES = re.compile(rb"nginx/1\.30\.6|twinx/[0-9][0-9A-Za-z.+-]*")
+SERVER_PLACEHOLDER = b"<server>"
 
 REPO = Path(__file__).resolve().parent.parent
 MIME_TYPES = REPO / "harness" / "mime.types"
@@ -126,12 +132,19 @@ def parse(response):
     if not sep:
         return {"status": response.decode("latin-1"), "headers": [], "body": ""}
     lines = head.decode("latin-1").split("\r\n")
+    normalized = SERVER_NAMES.sub(SERVER_PLACEHOLDER, body)
     headers = []
     for line in lines[1:]:
         name, _, value = line.partition(":")
-        if name.strip().lower() not in IGNORED_HEADERS:
-            headers.append([name.strip().lower(), value.strip()])
-    return {"status": lines[0], "headers": sorted(headers), "body": body.decode("latin-1")}
+        name, value = name.strip().lower(), value.strip()
+        if name in IGNORED_HEADERS:
+            continue
+        # Replacing the server name changes the body length, so a Content-Length
+        # that described the original body is recounted for the replaced one.
+        if name == "content-length" and normalized != body and value == str(len(body)):
+            value = str(len(normalized))
+        headers.append([name, value])
+    return {"status": lines[0], "headers": sorted(headers), "body": normalized.decode("latin-1")}
 
 
 def diff(expected, actual):
