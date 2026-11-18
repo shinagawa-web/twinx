@@ -33,3 +33,4 @@ Kinds:
 | 2026-11-18 | Before start | approval | The cloud environment, the GitHub App and a first session had to be set up by hand | Set them up; the harness ran in the cloud and nginx answered all four cases |
 | 2026-11-18 | Before start | decision | The scheduled run needed a model, and changing it mid-experiment would make the results incomparable | Opus 5.5 (claude-opus-5-5) for the whole experiment |
 | 2026-11-18 | Before start | approval | The agent proposed registering the hourly scheduled run | Registered as routine trig_01YX3pTLi2c3KYXT33CabyPp; the first run fires at 2026-11-18T10:34:00Z, which is when the experiment starts |
+| 2026-11-18 | Before start | correction | The routine kept the account connectors (Claude Docs, Claude Code Remote), which the loop does not need and which could change its conditions | Removed them from the routine |
