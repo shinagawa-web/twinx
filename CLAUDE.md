@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-The experiment and its loop are described in README.md.
+The experiment and its loop are described in README.md. A scheduled run of the loop follows docs/loop.md.
 
 ## Log every human intervention
 

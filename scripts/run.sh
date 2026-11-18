@@ -12,6 +12,14 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 
 if [ "$(uname -s)" = Linux ]; then
+  # A cloud session keeps Docker installed but not necessarily running.
+  if ! docker info >/dev/null 2>&1; then
+    sudo_cmd=""
+    [ "$(id -u)" -eq 0 ] || sudo_cmd="sudo -n"
+    $sudo_cmd sh -c 'nohup dockerd >/tmp/dockerd.log 2>&1 &' || true
+    for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+    docker info >/dev/null 2>&1 || { echo "run.sh: Docker is not available (see /tmp/dockerd.log)" >&2; exit 2; }
+  fi
   cd "$root"
   mkdir -p results
   exec "$@"

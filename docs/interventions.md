@@ -28,3 +28,4 @@ Kinds:
 | 2026-11-18 | Before start | decision | Logging interventions was a rule only the current session knew | Wrote it into CLAUDE.md so that other sessions follow it |
 | 2026-11-18 | Before start | decision | nginx names itself as nginx/1.30.6 in the pages it generates, so twinx would have to claim to be nginx to pass | Option A of two: twinx names itself, and the harness replaces both names, and recounts Content-Length, before comparing |
 | 2026-11-18 | Before start | approval | Five local commits were waiting to be pushed, and the next step was the GitHub Actions judge | Pushed, and went on to the judge |
+| 2026-11-18 | Before start | approval | The agent proposed writing the Fixer and Finder rules and the cloud setup script next | Went ahead |
