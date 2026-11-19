@@ -1,0 +1,23 @@
+description = "index with several files: the first one that exists wins, falling back to the next, and a directory with none of them is forbidden"
+config = """
+server {
+    listen {{port}};
+    root {{root}};
+    index home.html index.html;
+}
+"""
+
+[[requests]]
+raw = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /sub/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /sub/?page=2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /noindex/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /noindex/file.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"

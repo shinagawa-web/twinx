@@ -1,0 +1,26 @@
+description = "try_files serves existing files and hands everything else to a named location that proxies to the application"
+config = """
+server {
+    listen {{port}};
+    root {{root}};
+    location / {
+        try_files $uri $uri/index.html @app;
+    }
+    location @app {
+        proxy_pass http://{{backend}};
+        proxy_set_header X-Fallback yes;
+    }
+}
+"""
+
+[[requests]]
+raw = "GET /about.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /docs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /dashboard?tab=2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 7\r\nConnection: close\r\n\r\nuser=me"
