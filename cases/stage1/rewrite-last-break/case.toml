@@ -1,0 +1,32 @@
+description = "rewrite ... last searches the locations again with the new URI, rewrite ... break serves it in the current location, and a server-level rewrite runs before a location is chosen"
+covers = ["rewrite.last", "rewrite.break", "rewrite.captures", "rewrite.server-level"]
+config = """
+server {
+    listen {{port}};
+    root {{root}};
+    rewrite ^/legacy/(.*)$ /old/$1 last;
+    location /old/ {
+        rewrite ^/old/(.*)$ /new/$1 last;
+        return 500 "old should not answer\\n";
+    }
+    location /new/ {
+        add_header X-Location new;
+    }
+    location /v1/ {
+        rewrite ^/v1/(\\w+)\\.txt$ /new/v2.txt break;
+        add_header X-Location v1;
+    }
+}
+"""
+
+[[requests]]
+raw = "GET /old/page.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /legacy/page.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /v1/anything.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /old/missing.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"

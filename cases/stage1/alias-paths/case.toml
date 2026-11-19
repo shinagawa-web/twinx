@@ -1,0 +1,37 @@
+description = "alias replaces the location prefix with a path, including the classic trailing-slash mismatch and captures in a regular expression location, next to root set in a location"
+covers = ["alias.prefix", "alias.trailing-slash", "alias.regex-captures", "root.location"]
+config = """
+server {
+    listen {{port}};
+    location /files/ {
+        alias {{root}}/data/;
+    }
+    location /loose {
+        alias {{root}}/data;
+    }
+    location ~ ^/images/(.+\\.png)$ {
+        alias {{root}}/data/img/$1;
+    }
+    location /site/ {
+        root {{root}}/www;
+    }
+}
+"""
+
+[[requests]]
+raw = "GET /files/file.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /loose/file.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /loosefile.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /images/logo.png HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /site/hello.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /files/missing.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
