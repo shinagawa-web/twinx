@@ -1,6 +1,6 @@
 # One run of the loop
 
-Both scheduled runs are paused since 2026-11-19T00:07Z, until the design is ready for unattended runs.
+Both schedules are paused since 2026-11-19T00:07Z, until the design is ready for unattended runs. While they are paused, a run starts only when a human starts it by hand, so a run that has started goes ahead.
 
 Two scheduled Claude Code sessions run the loop, both with model `claude-opus-5-5`. Each session has one role and never takes the other, so the Finder writes cases without knowing how twinx is written.
 
@@ -17,10 +17,10 @@ Every change reaches main through a pull request that the `judge` check passes. 
 
 ```
 gh api repos/shinagawa-web/twinx/pulls -f title="<what it does>" -f head=<branch> -f base=main -f body="<why>"
-gh api graphql -f query='mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){clientMutationId}}' -f id=<node_id from the response>
+gh api -X PUT repos/shinagawa-web/twinx/pulls/<number>/ccr/auto_merge -f merge_method=SQUASH
 ```
 
-If GraphQL is refused, leave auto-merge off and merge through REST once the check passes: `gh api -X PUT repos/shinagawa-web/twinx/pulls/<number>/merge -f merge_method=squash`.
+If auto-merge is refused, leave it off and merge through REST once the check passes: `gh api -X PUT repos/shinagawa-web/twinx/pulls/<number>/merge -f merge_method=squash`.
 
 Then wait: every 30 seconds, for up to 20 minutes, read the pull request (`gh api repos/shinagawa-web/twinx/pulls/<number>`). It is done when `merged` is true. When the judge fails it comments the reasons on the pull request (`gh api repos/shinagawa-web/twinx/issues/<number>/comments`); read them, then close the pull request (`gh api -X PATCH repos/shinagawa-web/twinx/pulls/<number> -f state=closed`). When main moved and the branch is behind, update it (`gh api -X PUT repos/shinagawa-web/twinx/pulls/<number>/update-branch`) and keep waiting.
 
