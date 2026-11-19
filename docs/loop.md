@@ -40,7 +40,8 @@ One iteration:
 
 1. `git fetch --prune origin` and start from a fresh `origin/main`.
 2. If there are three or more open failing cases, stop: the Fixer has enough work.
-3. Add cases as `docs/finder.md` says, open the pull request and wait for it as above.
+3. If the judge's checklist line says no item is left, stop: the stage is done, and a human decides when to move on.
+4. Add cases as `docs/finder.md` says, open the pull request and wait for it as above.
 
 ## What you never do
 

@@ -1,4 +1,5 @@
 description = "try_files serves existing files and hands everything else to a named location that proxies to the application"
+covers = ["try-files.file", "try-files.named", "location.named"]
 config = """
 server {
     listen {{port}};

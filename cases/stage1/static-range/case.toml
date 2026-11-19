@@ -1,4 +1,5 @@
 description = "Byte ranges on a static file: a start and end, a suffix, an open end, and a range past the end of the file"
+covers = ["static.range"]
 config = """
 server {
     listen {{port}};

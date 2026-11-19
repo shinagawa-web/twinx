@@ -1,4 +1,5 @@
 description = "return with a status and a URL, and add_header on success and error responses"
+covers = ["return.redirect", "return.code", "return.text", "add-header.always", "add-header.errors"]
 config = """
 server {
     listen {{port}};

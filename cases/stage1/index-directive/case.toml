@@ -1,4 +1,5 @@
 description = "index with several files: the first one that exists wins, falling back to the next, and a directory with none of them is forbidden"
+covers = ["index.several", "index.missing-first", "index.none-forbidden", "root.server"]
 config = """
 server {
     listen {{port}};

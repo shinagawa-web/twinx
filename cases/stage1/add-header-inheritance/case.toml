@@ -1,4 +1,5 @@
 description = "add_header is inherited from the server level only by locations that declare no add_header of their own, and is not added to errors without always"
+covers = ["add-header.inheritance", "add-header.errors", "return.text", "return.code"]
 config = """
 server {
     listen {{port}};
