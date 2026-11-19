@@ -370,6 +370,28 @@ pub struct Return {
     pub text: Option<Template>,
 }
 
+/// How a matching `rewrite` goes on: `last` searches the locations again
+/// with the new URI, `break` keeps serving it in the current location.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RewriteFlag {
+    Last,
+    Break,
+}
+
+#[derive(Debug)]
+pub struct Rewrite {
+    pub regex: Regex,
+    pub replacement: Template,
+    pub flag: RewriteFlag,
+}
+
+/// A directive of the rewrite module, run in configuration order.
+#[derive(Debug, Clone)]
+pub enum RewriteOp {
+    Rewrite(Arc<Rewrite>),
+    Return(Return),
+}
+
 #[derive(Debug)]
 pub struct UpstreamServer {
     pub addrs: Vec<SocketAddr>,
@@ -442,7 +464,8 @@ pub struct LocConf {
     pub alias: Option<Template>,
     pub index: Vec<Template>,
     pub try_files: Option<Vec<Template>>,
-    pub ret: Option<Return>,
+    /// The rewrite module's directives of this level, which are not inherited.
+    pub rewrites: Vec<RewriteOp>,
     pub proxy: Option<Arc<ProxyPass>>,
     pub add_headers: Vec<AddHeader>,
     pub proxy_set_headers: Vec<(String, Template)>,
@@ -466,7 +489,7 @@ impl Default for LocConf {
             alias: None,
             index: vec![Template::literal("index.html")],
             try_files: None,
-            ret: None,
+            rewrites: Vec::new(),
             proxy: None,
             add_headers: Vec::new(),
             proxy_set_headers: Vec::new(),
@@ -523,7 +546,8 @@ pub struct Server {
     pub listens: Vec<Listen>,
     pub names: Vec<String>,
     pub conf: Arc<LocConf>,
-    pub ret: Option<Return>,
+    /// The rewrite module's directives at server level, run before a location is chosen.
+    pub rewrites: Vec<RewriteOp>,
     pub locations: Vec<Arc<Location>>,
     pub named: HashMap<String, Arc<Location>>,
 }
@@ -608,6 +632,7 @@ fn check(d: &Directive, ctx: Ctx) -> Result<(), String> {
         "index" => (HSL, 1, 999, false),
         "try_files" => (&[Server, Location], 2, 999, false),
         "return" => (&[Server, Location], 1, 2, false),
+        "rewrite" => (&[Server, Location], 2, 3, false),
         "add_header" => (HSL, 2, 3, false),
         "proxy_pass" => (&[Location], 1, 1, false),
         "proxy_set_header" => (HSL, 2, 2, false),
@@ -757,7 +782,7 @@ fn apply_level(
 ) -> Result<LocConf, String> {
     let mut conf = parent.clone();
     conf.try_files = None;
-    conf.ret = None;
+    conf.rewrites = Vec::new();
     conf.proxy = None;
     conf.auto_redirect = false;
     if let Some((name, _)) = location {
@@ -834,13 +859,8 @@ fn apply_level(
                 }
                 conf.try_files = Some(list);
             }
-            "return" => {
-                if conf.ret.is_none() {
-                    conf.ret = Some(parse_return(d)?);
-                } else {
-                    parse_return(d)?;
-                }
-            }
+            "return" => conf.rewrites.push(RewriteOp::Return(parse_return(d)?)),
+            "rewrite" => conf.rewrites.push(RewriteOp::Rewrite(Arc::new(parse_rewrite(d)?))),
             "add_header" => {
                 if !own_add_headers {
                     conf.add_headers.clear();
@@ -926,6 +946,18 @@ fn parse_return(d: &Directive) -> Result<Return, String> {
         .filter(|c| *c <= 999)
         .ok_or_else(|| d.err(format!("invalid return code \"{first}\"")))?;
     Ok(Return { code, text: Some(template(d, &d.args[1])?) })
+}
+
+fn parse_rewrite(d: &Directive) -> Result<Rewrite, String> {
+    let regex = Regex::new(&d.args[0]).map_err(|e| d.err(format!("pcre2_compile() failed: {e} in \"{}\"", d.args[0])))?;
+    let flag = match d.args.get(2).map(String::as_str) {
+        Some("last") => RewriteFlag::Last,
+        Some("break") => RewriteFlag::Break,
+        other => {
+            return Err(d.err(format!("rewrite flag \"{}\" is not supported by twinx yet", other.unwrap_or(""))))
+        }
+    };
+    Ok(Rewrite { regex, replacement: template(d, &d.args[1])?, flag })
 }
 
 fn parse_proxy_pass(d: &Directive, cx: &Ctxt) -> Result<ProxyPass, String> {
@@ -1035,13 +1067,12 @@ fn build_server(d: &Directive, http_conf: &LocConf, cx: &Ctxt) -> Result<Server,
     if listens.is_empty() {
         listens.push(Listen { addr: None, port: 80, default_server: false });
     }
-    let ret = conf.ret.clone();
     let mut server_conf = conf;
-    server_conf.ret = None;
+    let rewrites = std::mem::take(&mut server_conf.rewrites);
     let server_conf = Arc::new(server_conf);
     let mut named = HashMap::new();
     let locations = build_locations(block, &server_conf, cx, None, &mut named)?;
-    Ok(Server { listens, names, conf: server_conf, ret, locations, named })
+    Ok(Server { listens, names, conf: server_conf, rewrites, locations, named })
 }
 
 fn build_locations(
@@ -1190,7 +1221,7 @@ mod tests {
         let a = &s.locations[0];
         assert_eq!(a.conf.add_headers[0].name, "B");
         assert_eq!(a.children[0].conf.add_headers[0].name, "B");
-        assert_eq!(s.locations[1].conf.ret, Some(Return { code: 301, text: Some(Template::literal("/y")) }));
+        assert_eq!(ret(&s.locations[1].conf), &Return { code: 301, text: Some(Template::literal("/y")) });
         assert!(s.named.contains_key("@fallback"));
     }
 
@@ -1216,9 +1247,43 @@ mod tests {
     fn parses_return_forms() {
         let c = conf("server { location /a { return 404; } location /b { return https://x/; } location /c { return 200 \"ok\"; } }").unwrap();
         let l = &c.servers[0].locations;
-        assert_eq!(l[0].conf.ret.as_ref().unwrap().code, 404);
-        assert_eq!(l[1].conf.ret.as_ref().unwrap().code, 302);
-        assert_eq!(l[2].conf.ret.as_ref().unwrap().text.as_ref().unwrap().raw, "ok");
+        assert_eq!(ret(&l[0].conf).code, 404);
+        assert_eq!(ret(&l[1].conf).code, 302);
+        assert_eq!(ret(&l[2].conf).text.as_ref().unwrap().raw, "ok");
         assert!(conf("server { return abc; }").is_err());
+    }
+
+    fn ret(conf: &LocConf) -> &Return {
+        match &conf.rewrites[0] {
+            RewriteOp::Return(r) => r,
+            other => panic!("not a return: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rewrites_in_order_without_inheriting_them() {
+        let c = conf(
+            "server { rewrite ^/a/(.*)$ /b/$1 last;
+             location /b/ { rewrite ^/b/(\\w+)$ /c/$1 break; return 403; location /b/x/ {} } }",
+        )
+        .unwrap();
+        let s = &c.servers[0];
+        assert_eq!(s.rewrites.len(), 1);
+        assert!(s.conf.rewrites.is_empty());
+        let b = &s.locations[0];
+        let RewriteOp::Rewrite(rw) = &b.conf.rewrites[0] else { panic!() };
+        assert_eq!(rw.flag, RewriteFlag::Break);
+        assert_eq!(rw.replacement.raw, "/c/$1");
+        assert!(rw.regex.is_match("/b/abc"));
+        assert!(matches!(b.conf.rewrites[1], RewriteOp::Return(Return { code: 403, .. })));
+        assert!(b.children[0].conf.rewrites.is_empty());
+    }
+
+    #[test]
+    fn refuses_rewrites_twinx_does_not_implement() {
+        assert!(conf("server { rewrite ^ /x redirect; }").unwrap_err().contains("rewrite flag \"redirect\" is not supported"));
+        assert!(conf("server { rewrite ^ /x; }").unwrap_err().contains("rewrite flag \"\""));
+        assert!(conf("server { rewrite ( /x last; }").unwrap_err().contains("pcre2_compile() failed"));
+        assert!(conf("location / { rewrite ^ /x last; }").unwrap_err().contains("not allowed here"));
     }
 }
