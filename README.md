@@ -34,35 +34,42 @@ Time spent, pass rate and the number of interventions are recorded separately fo
 
 The work queue is the set of cases that fail on main: each failing case holds the configuration, the requests and what nginx answered. There are no separate issue files.
 
-Claude Code works in two roles and only ever pushes a branch. It never decides whether its own change is good:
+Claude Code works in two roles. Neither decides whether its own change is good; the judge does:
 
-- The Fixer picks one failing case, changes the Rust code until that case passes, and pushes `claude/fix-<stage>-<case>`.
-- The Finder writes new cases for the current stage and pushes `claude/find-<name>`.
+- The Fixer picks one failing case, changes the Rust code until that case passes, and opens a pull request from `claude/fix-<stage>-<case>`.
+- The Finder writes new cases for the current stage and opens a pull request from `claude/find-<name>`.
 
-The judge is a GitHub Actions workflow (`.github/workflows/judge.yml`, `harness/judge.py`). For every push to a `claude/` branch it keeps a copy of main's `harness/`, merges the branch into main without committing, then builds twinx with coverage instrumentation, runs `cargo test` and runs every case against nginx and twinx, all with main's copy of the harness.
+Both turn on auto-merge when they open the pull request. main's ruleset accepts a merge only through a pull request whose `judge` check passed on a branch that is up to date with main, with no exceptions, the owner included. Whoever presses merge, the judge decides.
+
+The judge is a GitHub Actions workflow (`.github/workflows/judge.yml`, `harness/judge.py`). It runs on `pull_request_target`, so the workflow and the harness always come from main, never from the pull request. The job that runs the pull request's code can only read the repository. For every pull request it runs every case against main as it is, merges the pull request into main without committing, builds twinx with coverage instrumentation, runs `cargo test`, runs every case again, and comments the verdict on the pull request.
 
 ```
-push to claude/...
-  ├─ the branch touched only what its role may touch?
+pull request into main
+  ├─ it touched only what its role may touch?
   │     Fixer: src/, tests/, benches/, Cargo.toml, Cargo.lock
   │     Finder: new files under cases/
+  │     anything else: a human, no limit
   ├─ build and cargo test pass?
-  ├─ every case that passed on main still passes?
+  ├─ every case that passes on main still passes?
   ├─ (Fixer) the case it names now passes?
   ├─ (Fixer) the cases run at least 99% of the lines it adds?
   │
-  ├─ yes → merge into main, update status/passing.txt, delete the branch
-  └─ no  → append the reason to status/attempts.tsv on main
+  ├─ yes → judge passes, auto-merge merges it
+  └─ no  → judge fails with the reasons in a comment; the pull request stays open
 ```
 
-A case with three failed attempts in `status/attempts.tsv` is stuck and waits for a human.
+Cases that fail on main are allowed: they are the Fixer's work queue. A green `judge` on main means main did not get worse, not that every case passes.
+
+A case is stuck after three pull requests for it were closed without being merged, and waits for a human.
 
 `scripts/run.sh` is the one way to run a command: in place on Linux, inside the Lima VM on macOS.
 
 ## Where a human steps in
 
+Only through what the judge enforces: the harness, the judging rules, the cases and these documents, changed by pull requests that pass the same `judge` check.
+
 - Stuck cases
-- Whether to move on to the next stage
+- Whether to move on to the next stage (`status/stage.txt`)
 - Changes to the judging rules, such as adding a header that is excluded from comparison
 
 Every intervention adds one row to `docs/interventions.md`. Decisions made before the experiment starts are recorded there too, as human decisions.

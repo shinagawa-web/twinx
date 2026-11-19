@@ -1,8 +1,0 @@
-cases/stage1/location-precedence
-cases/stage1/proxy-pass
-cases/stage1/return-and-add-header
-cases/stage1/server-name-selection
-cases/stage1/static-file
-cases/stage1/try-files
-cases/stage1/upstream-block
-cases/stage1/upstream-unreachable

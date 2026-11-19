@@ -1,26 +1,37 @@
 name: judge
 
-# Every push to a claude/ branch is judged on main with the branch merged in.
-# A branch that passes is merged into main; one that fails is recorded in
-# status/attempts.tsv. Runs are serialized so each one judges the latest main.
+# The required check for every pull request into main. main's ruleset only
+# accepts a merge when this check passes on a branch that is up to date with
+# main, so whoever merges, the judge decides.
+#
+# pull_request_target runs this file as it is on main, never the copy in the
+# pull request, so a pull request cannot change how it is judged. The job
+# that runs the pull request's code gets read-only access and no secrets;
+# only the job that comments on the pull request may write, and it never
+# runs that code.
 
 on:
-  push:
-    branches: ["claude/**"]
-
-permissions:
-  contents: write
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
 
 concurrency:
-  group: judge-main
-  cancel-in-progress: false
+  group: judge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   judge:
+    name: judge
+    # Pull requests from forks are not judged, so they can never be merged.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
+    permissions:
+      contents: read
     env:
-      BRANCH: ${{ github.ref_name }}
+      BRANCH: ${{ github.event.pull_request.head.ref }}
+      PR_HEAD: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
       TWINX_REPO: ${{ github.workspace }}
       # twinx is built with coverage instrumentation so the judge can see which lines
       # the cases run. Counter relocation keeps the profile current while twinx runs,
@@ -31,26 +42,43 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Keep main's harness, so the branch is judged by main's rules
-        run: cp -r harness "$RUNNER_TEMP/harness"
+      - name: Keep main's harness, so the pull request is judged by main's rules
+        id: base
+        run: |
+          cp -r harness "$RUNNER_TEMP/harness"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Merge the branch into main without committing
+      - name: Install the LLVM coverage tools
+        run: rustup component add llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      # What passes on main right now. Cached per main commit, so it is computed once.
+      - name: Restore main's results
+        id: baseline-cache
+        uses: actions/cache@v4
+        with:
+          path: baseline.json
+          key: baseline-${{ steps.base.outputs.sha }}
+
+      - name: Run every case against main
+        if: steps.baseline-cache.outputs.cache-hit != 'true'
+        run: |
+          if [ -f Cargo.toml ]; then cargo build --release || true; fi
+          python3 "$RUNNER_TEMP/harness/compare.py" --out baseline.json || true
+          [ -f baseline.json ]
+
+      - name: Merge the pull request into main without committing
         id: merge
         continue-on-error: true
         run: |
           git config user.name "twinx-judge"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "head=$(git rev-parse "origin/$BRANCH")" >> "$GITHUB_OUTPUT"
-          git merge --no-ff --no-commit "origin/$BRANCH"
-
-      - uses: Swatinem/rust-cache@v2
-        if: steps.merge.outcome == 'success' && hashFiles('Cargo.toml') != ''
-
-      - name: Install the LLVM coverage tools
-        if: steps.merge.outcome == 'success' && hashFiles('Cargo.toml') != ''
-        run: rustup component add llvm-tools-preview
+          git fetch -q origin "pull/$PR_NUMBER/head"
+          [ "$(git rev-parse FETCH_HEAD)" = "$PR_HEAD" ]
+          git merge -q --no-ff --no-commit FETCH_HEAD
 
       - name: Build
         id: build
@@ -64,8 +92,7 @@ jobs:
         continue-on-error: true
         run: cargo test --release
 
-      - name: Compare with nginx
-        id: compare
+      - name: Run every case against the merged tree
         if: steps.merge.outcome == 'success'
         continue-on-error: true
         run: |
@@ -74,79 +101,65 @@ jobs:
           python3 "$RUNNER_TEMP/harness/compare.py" --out results.json
 
       - name: Measure what the cases ran
-        id: coverage
         if: steps.merge.outcome == 'success'
         continue-on-error: true
         run: |
           profiles="$RUNNER_TEMP/profiles"
+          base="${{ steps.base.outputs.sha }}"
           if ls "$profiles"/*.profraw >/dev/null 2>&1 && [ -x target/release/twinx ]; then
             bin=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin
             "$bin/llvm-profdata" merge -sparse "$profiles"/*.profraw -o "$profiles/merged.profdata"
             "$bin/llvm-cov" export target/release/twinx -instr-profile="$profiles/merged.profdata" \
               -format=lcov --ignore-filename-regex='/.cargo/registry|/rustc/' > cases.lcov
-            python3 "$RUNNER_TEMP/harness/coverage.py" --base "${{ steps.merge.outputs.base }}" --lcov cases.lcov --out coverage.json
+            python3 "$RUNNER_TEMP/harness/coverage.py" --base "$base" --lcov cases.lcov --out coverage.json
           else
-            python3 "$RUNNER_TEMP/harness/coverage.py" --base "${{ steps.merge.outputs.base }}" --out coverage.json
+            python3 "$RUNNER_TEMP/harness/coverage.py" --base "$base" --out coverage.json
           fi
 
       - name: Judge
-        id: judge
-        if: steps.merge.outcome == 'success' && hashFiles('results.json') != ''
-        continue-on-error: true
-        run: >
-          python3 "$RUNNER_TEMP/harness/judge.py"
-          --branch "$BRANCH"
-          --base "${{ steps.merge.outputs.base }}"
-          --head "${{ steps.merge.outputs.head }}"
-          --build "${{ steps.build.outcome }}"
-          --test "${{ steps.test.outcome }}"
-          --results results.json
-          --coverage coverage.json
-          --verdict verdict.json
-
-      - name: Merge into main
-        if: steps.judge.outcome == 'success'
         run: |
-          git add status/passing.txt
-          after=$(python3 -c 'import json; print(json.load(open("verdict.json"))["cases_passing_after"])')
-          git commit -q -m "Merge $BRANCH ($after cases pass)"
-          # A human may have pushed to main while this ran; take their commits in and retry.
-          for i in 1 2 3; do git push origin HEAD:main && break; git pull -q --no-rebase --no-edit origin main; done
-          git fetch -q origin main && git merge-base --is-ancestor HEAD origin/main
-          git push origin --delete "$BRANCH"
-
-      - name: Record the failed attempt
-        if: steps.judge.outcome != 'success'
-        run: |
-          if [ -f verdict.json ]; then
-            problems=$(python3 -c 'import json; print("; ".join(json.load(open("verdict.json"))["problems"]))')
-          elif [ "${{ steps.merge.outcome }}" != success ]; then
-            problems="the branch does not merge cleanly into main"
-          else
-            problems="the comparison harness did not produce results (outcome: ${{ steps.compare.outcome }})"
+          if [ "${{ steps.merge.outcome }}" != success ]; then
+            printf '## judge: fail\n\nThe pull request does not merge cleanly into main. Update the branch.\n' > comment.md
+            echo '{"passed": false, "problems": ["does not merge cleanly into main"]}' > verdict.json
+            exit 1
           fi
-          git merge --abort 2>/dev/null || git reset -q --hard HEAD
-          mkdir -p status
-          [ -f status/attempts.tsv ] || printf 'date\tbranch\thead\tproblems\n' > status/attempts.tsv
-          printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BRANCH" \
-            "${{ steps.merge.outputs.head }}" "$problems" >> status/attempts.tsv
-          git add status/attempts.tsv
-          git commit -q -m "Record a failed attempt from $BRANCH"
-          for i in 1 2 3; do git push origin HEAD:main && break; git pull -q --rebase origin main; done
-          echo "::error::$problems"
-          exit 1
+          python3 "$RUNNER_TEMP/harness/judge.py" \
+            --branch "$BRANCH" --base "${{ steps.base.outputs.sha }}" --head "$PR_HEAD" \
+            --build "${{ steps.build.outcome }}" --test "${{ steps.test.outcome }}" \
+            --baseline baseline.json --results results.json --coverage coverage.json \
+            --verdict verdict.json --comment comment.md
 
       - name: Summary
         if: always()
-        run: |
-          [ -f verdict.json ] && { echo '```json'; cat verdict.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+        run: '[ -f comment.md ] && cat comment.md >> "$GITHUB_STEP_SUMMARY" || true'
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: judge-${{ github.run_id }}
+          name: judge-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
           path: |
+            baseline.json
             results.json
             coverage.json
             verdict.json
+            comment.md
           if-no-files-found: ignore
+
+  comment:
+    needs: judge
+    if: always() && needs.judge.result != 'skipped'
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: judge-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+        continue-on-error: true
+      - name: Comment the verdict on the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          [ -f comment.md ] || printf '## judge: fail\n\nThe judge did not finish; see the workflow run.\n' > comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md

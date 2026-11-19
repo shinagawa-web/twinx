@@ -22,7 +22,7 @@ Placeholders in `config`: `{{port}}` (listen port), `{{root}}` (document root), 
 
 ## How to add cases
 
-1. Read the existing cases and `status/passing.txt` so you do not repeat one.
+1. Read the existing cases so you do not repeat one.
 2. Write up to five new cases.
 3. Run them (`scripts/run.sh python3 harness/compare.py cases/stage<N>/<name> --out results/<name>.json`) and check in the results that nginx started and answered as the case intends. A case whose configuration nginx refuses is only useful when the refusal is the behavior being checked.
-4. Push them on one branch, `claude/find-<short-name>`, adding files under `cases/` only. Existing cases may not be changed; the judge rejects that.
+4. Open one pull request for them from the branch `claude/find-<short-name>`, adding files under `cases/` only. Existing cases may not be changed; the judge rejects that.
