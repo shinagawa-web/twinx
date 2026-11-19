@@ -2,7 +2,8 @@
 """Run test cases against nginx and twinx and compare the responses.
 
 Each case is a directory holding a case.toml and, optionally, a files/
-directory that becomes the document root. Both servers read the same
+directory that becomes the document root. A case can set the mode of paths
+under files/ with a `modes` table ("secret.txt" = "000"). Both servers read the same
 rendered configuration, listen on the same port (one after the other, so
 absolute redirects carry the same port) and serve the same files.
 
@@ -176,9 +177,17 @@ def diff(expected, actual):
     return problems
 
 
+def make_writable(path):
+    """Give the owner full access again, so a case that took it away can be removed."""
+    for child in [path, *path.rglob("*")] if path.is_dir() else []:
+        if not child.is_symlink():
+            child.chmod(0o700 if child.is_dir() else 0o600)
+
+
 def prepare(case_dir, case):
     work = WORK_ROOT / case_dir.name
     if work.exists():
+        make_writable(work)
         shutil.rmtree(work)
     root = work / "root"
     root.mkdir(parents=True)
@@ -193,6 +202,12 @@ def prepare(case_dir, case):
     for path in [work, *work.rglob("*")]:
         path.chmod(0o755 if path.is_dir() else 0o644)
         os.utime(path, (FIXED_MTIME, FIXED_MTIME))
+    # Deepest first, so a directory that loses access is changed after what is in it.
+    for name, mode in sorted(case.get("modes", {}).items(), key=lambda m: -m[0].count("/")):
+        path = (root / name).resolve()
+        if root.resolve() not in path.parents:
+            raise ValueError(f"modes: {name} is not under files/")
+        path.chmod(int(mode, 8))
     return work
 
 
@@ -278,6 +293,10 @@ def run_case(case_dir, binary, sandbox=None):
     requests = [r["raw"].encode("latin-1") for r in case.get("requests", [])]
     work = prepare(case_dir, case)
     nginx, nginx_error = run_nginx(work, requests)
+    # nginx's workers read the files as another user, so a case that sets modes runs
+    # twinx as another user too: in the sandbox, whether or not --sandbox was given.
+    if case.get("modes") and sandbox is None:
+        sandbox = ""
     twinx, twinx_error = run_twinx(binary, work, requests, sandbox)
     result = {"case": str(case_dir.relative_to(REPO)), "description": case.get("description", "")}
     if nginx is None:

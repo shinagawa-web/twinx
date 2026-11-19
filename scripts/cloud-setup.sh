@@ -10,5 +10,7 @@ if ! docker info >/dev/null 2>&1; then
   for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
 fi
 docker pull nginx@sha256:42c68eab6f7e22611786a9fe1d1c019e275c50185bd54b8f75dc2b9184322703
+# The image harness/compare.py runs twinx in for cases that set file modes (SANDBOX_IMAGE).
+docker pull rust@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37
 cargo --version
 python3 --version

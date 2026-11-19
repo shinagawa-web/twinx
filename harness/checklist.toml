@@ -89,3 +89,4 @@
 "static.head" = "HEAD on a static file"
 "static.conditional-get" = "If-Modified-Since and If-None-Match on a static file"
 "static.range" = "Range requests on a static file"
+"static.unreadable" = "a file or directory the server may not read answers 403"
