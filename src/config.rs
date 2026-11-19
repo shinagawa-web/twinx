@@ -371,17 +371,25 @@ pub struct Return {
 }
 
 /// How a matching `rewrite` goes on: `last` searches the locations again
-/// with the new URI, `break` keeps serving it in the current location.
+/// with the new URI, `break` keeps serving it in the current location,
+/// `redirect` and `permanent` answer 302 and 301 with it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RewriteFlag {
     Last,
     Break,
+    Redirect,
+    Permanent,
 }
 
 #[derive(Debug)]
 pub struct Rewrite {
     pub regex: Regex,
+    /// The URI part of the replacement, before its first "?".
     pub replacement: Template,
+    /// The arguments after the first "?" of the replacement, if it has one.
+    /// They replace the request's, which are appended after "&" unless the
+    /// replacement ends in "?".
+    pub args: Option<Template>,
     pub flag: RewriteFlag,
 }
 
@@ -953,11 +961,17 @@ fn parse_rewrite(d: &Directive) -> Result<Rewrite, String> {
     let flag = match d.args.get(2).map(String::as_str) {
         Some("last") => RewriteFlag::Last,
         Some("break") => RewriteFlag::Break,
+        Some("redirect") => RewriteFlag::Redirect,
+        Some("permanent") => RewriteFlag::Permanent,
         other => {
             return Err(d.err(format!("rewrite flag \"{}\" is not supported by twinx yet", other.unwrap_or(""))))
         }
     };
-    Ok(Rewrite { regex, replacement: template(d, &d.args[1])?, flag })
+    let (uri, args) = match d.args[1].split_once('?') {
+        Some((uri, args)) => (uri, Some(template(d, args)?)),
+        None => (d.args[1].as_str(), None),
+    };
+    Ok(Rewrite { regex, replacement: template(d, uri)?, args, flag })
 }
 
 fn parse_proxy_pass(d: &Directive, cx: &Ctxt) -> Result<ProxyPass, String> {
@@ -1280,8 +1294,20 @@ mod tests {
     }
 
     #[test]
+    fn splits_the_arguments_off_rewrite_replacements() {
+        let c = conf("server { rewrite ^/a /b?x=$1&y=2 redirect; rewrite ^/c /d? permanent; rewrite ^/e /f last; }").unwrap();
+        let rw: Vec<&Rewrite> = c.servers[0].rewrites.iter().map(|op| match op {
+            RewriteOp::Rewrite(rw) => rw.as_ref(),
+            RewriteOp::Return(_) => panic!(),
+        }).collect();
+        assert_eq!((rw[0].replacement.raw.as_str(), rw[0].args.as_ref().unwrap().raw.as_str(), rw[0].flag), ("/b", "x=$1&y=2", RewriteFlag::Redirect));
+        assert_eq!((rw[1].replacement.raw.as_str(), rw[1].args.as_ref().unwrap().raw.as_str(), rw[1].flag), ("/d", "", RewriteFlag::Permanent));
+        assert_eq!((rw[2].replacement.raw.as_str(), rw[2].args.is_none()), ("/f", true));
+    }
+
+    #[test]
     fn refuses_rewrites_twinx_does_not_implement() {
-        assert!(conf("server { rewrite ^ /x redirect; }").unwrap_err().contains("rewrite flag \"redirect\" is not supported"));
+        assert!(conf("server { rewrite ^ /x other; }").unwrap_err().contains("rewrite flag \"other\" is not supported"));
         assert!(conf("server { rewrite ^ /x; }").unwrap_err().contains("rewrite flag \"\""));
         assert!(conf("server { rewrite ( /x last; }").unwrap_err().contains("pcre2_compile() failed"));
         assert!(conf("location / { rewrite ^ /x last; }").unwrap_err().contains("not allowed here"));
