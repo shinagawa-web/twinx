@@ -21,6 +21,8 @@ pub struct Response {
     pub close: bool,
     /// The range filter may answer a Range request from this response.
     pub allow_ranges: bool,
+    /// Made by the special response handler, so error_page may replace it.
+    pub special: bool,
 }
 
 impl Response {
@@ -37,6 +39,7 @@ impl Response {
             chunked: false,
             close: false,
             allow_ranges: false,
+            special: false,
         }
     }
 }
@@ -140,6 +143,7 @@ pub fn special(status: u16, server_tokens: bool) -> Response {
     // 494-497 are sent as 400 on the wire.
     let wire = if (494..=497).contains(&status) { 400 } else { status };
     let mut resp = Response::new(wire);
+    resp.special = true;
     match page(status, server_tokens) {
         Some(body) => {
             resp.content_type = Some("text/html".to_string());

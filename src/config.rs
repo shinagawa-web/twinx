@@ -466,6 +466,15 @@ pub struct ProxyPass {
     pub uri: Option<String>,
 }
 
+/// One status of an error_page directive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ErrorPage {
+    pub status: u16,
+    /// None keeps the error's status, Some(0) ("=") takes the target's own.
+    pub overwrite: Option<u16>,
+    pub uri: Template,
+}
+
 #[derive(Debug, Clone)]
 pub struct LocConf {
     pub root: Template,
@@ -476,6 +485,8 @@ pub struct LocConf {
     pub rewrites: Vec<RewriteOp>,
     pub proxy: Option<Arc<ProxyPass>>,
     pub add_headers: Vec<AddHeader>,
+    /// Inherited only by levels with no error_page of their own.
+    pub error_pages: Vec<ErrorPage>,
     pub proxy_set_headers: Vec<(String, Template)>,
     pub proxy_http_version: String,
     pub default_type: String,
@@ -500,6 +511,7 @@ impl Default for LocConf {
             rewrites: Vec::new(),
             proxy: None,
             add_headers: Vec::new(),
+            error_pages: Vec::new(),
             proxy_set_headers: Vec::new(),
             proxy_http_version: "1.1".to_string(),
             default_type: "text/plain".to_string(),
@@ -642,6 +654,7 @@ fn check(d: &Directive, ctx: Ctx) -> Result<(), String> {
         "return" => (&[Server, Location], 1, 2, false),
         "rewrite" => (&[Server, Location], 2, 3, false),
         "add_header" => (HSL, 2, 3, false),
+        "error_page" => (HSL, 2, 999, false),
         "proxy_pass" => (&[Location], 1, 1, false),
         "proxy_set_header" => (HSL, 2, 2, false),
         _ => return Err(d.err(format!("unknown directive \"{}\"", d.name))),
@@ -799,6 +812,7 @@ fn apply_level(
     let mut own_add_headers = false;
     let mut own_proxy_headers = false;
     let mut own_index = false;
+    let mut error_pages = Vec::new();
     let mut seen: Vec<&str> = Vec::new();
     for d in block {
         check(d, ctx)?;
@@ -885,6 +899,7 @@ fn apply_level(
                     always,
                 });
             }
+            "error_page" => error_pages.extend(parse_error_page(d)?),
             "proxy_set_header" => {
                 if !own_proxy_headers {
                     conf.proxy_set_headers.clear();
@@ -931,6 +946,7 @@ fn apply_level(
             _ => {}
         }
     }
+    if !error_pages.is_empty() { conf.error_pages = error_pages; }
     Ok(conf)
 }
 
@@ -972,6 +988,30 @@ fn parse_rewrite(d: &Directive) -> Result<Rewrite, String> {
         None => (d.args[1].as_str(), None),
     };
     Ok(Rewrite { regex, replacement: template(d, uri)?, args, flag })
+}
+
+/// ngx_atoi: a non-empty run of decimal digits.
+fn atoi(s: &str) -> Option<u16> {
+    s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse().ok()).flatten()
+}
+
+/// ngx_http_core_error_page: "error_page code ... [=[response]] uri".
+fn parse_error_page(d: &Directive) -> Result<Vec<ErrorPage>, String> {
+    let n = d.args.len();
+    let (codes, overwrite) = match d.args[n - 2].strip_prefix('=') {
+        Some("") => (&d.args[..n - 2], Some(0)),
+        Some(o) => (&d.args[..n - 2], Some(atoi(o).ok_or_else(|| d.err(format!("invalid value \"{}\"", d.args[n - 2])))?)),
+        None => (&d.args[..n - 1], None),
+    };
+    let uri = template(d, &d.args[n - 1])?;
+    let mut pages = Vec::new();
+    // "=" in place of the first status is refused as an invalid status.
+    for code in if codes.is_empty() { &d.args[..1] } else { codes } {
+        let status = atoi(code).filter(|s| *s != 499).ok_or_else(|| d.err(format!("invalid value \"{code}\"")))?;
+        if !(300..=599).contains(&status) { return Err(d.err(format!("value \"{code}\" must be between 300 and 599"))); }
+        pages.push(ErrorPage { status, overwrite, uri: uri.clone() });
+    }
+    Ok(pages)
 }
 
 fn parse_proxy_pass(d: &Directive, cx: &Ctxt) -> Result<ProxyPass, String> {
@@ -1207,6 +1247,36 @@ mod tests {
     fn conf(http: &str) -> Result<Config, String> {
         let text = format!("events {{}}\nhttp {{\n{http}\n}}\n");
         build(&parse(&text)?)
+    }
+
+    #[test]
+    fn parses_and_inherits_error_pages() {
+        let c = conf(
+            "error_page 404 /404.html; server { listen 1; error_page 500 502 =200 /50x.html;
+             error_page 403 = @x; error_page 410 =301 http://e.test/;
+             location /a/ { } location /b/ { error_page 404 /b.html; } }",
+        )
+        .unwrap();
+        let s = &c.servers[0];
+        let pages: Vec<(u16, Option<u16>, &str)> =
+            s.conf.error_pages.iter().map(|p| (p.status, p.overwrite, p.uri.raw.as_str())).collect();
+        assert_eq!(
+            pages,
+            vec![
+                (500, Some(200), "/50x.html"),
+                (502, Some(200), "/50x.html"),
+                (403, Some(0), "@x"),
+                (410, Some(301), "http://e.test/")
+            ]
+        );
+        assert_eq!(s.locations[0].conf.error_pages.len(), 4);
+        assert_eq!(s.locations[1].conf.error_pages.len(), 1);
+        let err = |d: &str| conf(&format!("server {{ listen 1; {d} }}")).unwrap_err();
+        assert!(err("error_page 404 =x /a;").contains("invalid value \"=x\""));
+        assert!(err("error_page =200 /a;").contains("invalid value \"=200\""));
+        assert!(err("error_page 499 /a;").contains("invalid value \"499\""));
+        assert!(err("error_page 4o4 /a;").contains("invalid value \"4o4\""));
+        assert!(err("error_page 200 /a;").contains("value \"200\" must be between 300 and 599"));
     }
 
     #[test]
