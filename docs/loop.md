@@ -1,5 +1,7 @@
 # One run of the loop
 
+Both scheduled runs are paused since 2026-11-19T00:07Z, until the design is ready for unattended runs.
+
 Two scheduled Claude Code sessions run the loop, both with model `claude-opus-5-5`. Each session has one role and never takes the other, so the Finder writes cases without knowing how twinx is written.
 
 | Role | Routine | Schedule | Rules |
