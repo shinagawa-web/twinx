@@ -1,0 +1,31 @@
+description = "return with a URL alone answers 302 with that Location, including one built from $scheme and $host, and add_header with variables records where the redirect came from"
+covers = ["return.url-only", "add-header.variables", "return.variables"]
+config = """
+server {
+    listen {{port}};
+    server_name example.test;
+    add_header X-Redirected-From "$host$request_uri";
+    location = /old {
+        return https://www.example.test/new;
+    }
+    location /legacy/ {
+        return $scheme://$host/current$request_uri;
+    }
+    location /plain {
+        add_header X-Method "$request_method $uri";
+        return 200 "plain\\n";
+    }
+}
+"""
+
+[[requests]]
+raw = "GET /old HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /legacy/page?id=7 HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "HEAD /old HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /plain?x=1 HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"

@@ -1,0 +1,53 @@
+description = "An upstream with several servers takes them in turn, skips a server marked down, and uses a backup server only when the primary cannot be reached"
+covers = ["upstream.round-robin", "upstream.down", "upstream.backup", "listen.address"]
+config = """
+upstream turns {
+    server 127.0.0.1:18081;
+    server 127.0.0.1:18082;
+}
+upstream skip_down {
+    server 127.0.0.1:18081 down;
+    server 127.0.0.1:18082;
+}
+upstream primary_up {
+    server 127.0.0.1:18081;
+    server 127.0.0.1:18082 backup;
+}
+upstream primary_gone {
+    server 127.0.0.1:18089;
+    server 127.0.0.1:18082 backup;
+}
+server {
+    listen 127.0.0.1:18081;
+    return 200 "one\\n";
+}
+server {
+    listen 127.0.0.1:18082;
+    return 200 "two\\n";
+}
+server {
+    listen {{port}};
+    location /turns { proxy_pass http://turns; }
+    location /down { proxy_pass http://skip_down; }
+    location /backup-unused { proxy_pass http://primary_up; }
+    location /backup-used { proxy_pass http://primary_gone; }
+}
+"""
+
+[[requests]]
+raw = "GET /turns HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /turns HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /turns HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /down HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /backup-unused HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /backup-used HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"

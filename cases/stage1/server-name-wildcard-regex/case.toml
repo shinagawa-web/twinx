@@ -1,0 +1,52 @@
+description = "server_name precedence: exact name, then the longest leading wildcard, then the longest trailing wildcard, then the first regular expression in order, with a named capture used in the answer"
+covers = ["server-name.trailing-wildcard", "server-name.regex", "server-name.leading-wildcard", "server-name.exact"]
+config = """
+server {
+    listen {{port}} default_server;
+    server_name _;
+    return 200 "default\\n";
+}
+server {
+    listen {{port}};
+    server_name ~^www\\.;
+    return 200 "regex www\\n";
+}
+server {
+    listen {{port}};
+    server_name ~^(?<sub>[a-z0-9-]+)\\.regex\\.test$;
+    return 200 "regex sub=$sub\\n";
+}
+server {
+    listen {{port}};
+    server_name www.example.*;
+    return 200 "trailing\\n";
+}
+server {
+    listen {{port}};
+    server_name *.example.test;
+    return 200 "leading\\n";
+}
+server {
+    listen {{port}};
+    server_name www.example.test;
+    return 200 "exact\\n";
+}
+"""
+
+[[requests]]
+raw = "GET / HTTP/1.1\r\nHost: www.example.org\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET / HTTP/1.1\r\nHost: shop.example.test\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET / HTTP/1.1\r\nHost: www.example.test\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET / HTTP/1.1\r\nHost: api-2.regex.test\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET / HTTP/1.1\r\nHost: www.other.test\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET / HTTP/1.1\r\nHost: unknown.test\r\nConnection: close\r\n\r\n"
