@@ -1,5 +1,5 @@
 //! Answering one request: server rewrite phase, location choice, the
-//! location rewrite phase (`return`), `try_files`, then the content
+//! location rewrite phase (`rewrite`, `return`), `try_files`, then the content
 //! handlers (proxy, index, static), and the header filters (`add_header`,
 //! ranges, absolute `Location`).
 
@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{LocConf, Location, Modifier, Return, Server};
+use crate::config::{LocConf, Location, Modifier, Return, RewriteFlag, RewriteOp, Server};
 use crate::http::Request;
 use crate::location::{self, Captures, Found};
 use crate::response::{self, Response};
@@ -149,6 +149,9 @@ impl Ctx<'_> {
 const MAX_REDIRECTS: usize = 10;
 
 enum Next {
+    /// Run the server rewrite phase, then find a location (a new request or an internal redirect).
+    Server,
+    /// Find a location again (after `rewrite ... last`).
     Find,
     Named(Arc<Location>),
 }
@@ -174,14 +177,19 @@ pub fn handle(server: &Server, req: &Request, body: &[u8], local: SocketAddr, re
 }
 
 fn run(cx: &mut Ctx) -> Response {
-    if let Some(ret) = cx.server.ret.clone() {
-        return do_return(cx, &ret);
-    }
-    let mut next = Next::Find;
+    let server = cx.server;
+    let mut next = Next::Server;
     for _ in 0..=MAX_REDIRECTS {
-        match std::mem::replace(&mut next, Next::Find) {
+        let step = std::mem::replace(&mut next, Next::Server);
+        if let Next::Server = step {
+            cx.conf = server.conf.clone();
+            if let Err(resp) = rewrite_phase(cx, &server.rewrites) {
+                return resp;
+            }
+        }
+        match step {
             Next::Named(loc) => cx.set_location(loc, Vec::new()),
-            Next::Find => match location::find(&cx.server.locations, &cx.uri) {
+            Next::Server | Next::Find => match location::find(&cx.server.locations, &cx.uri) {
                 Found::Location(loc, captures) => cx.set_location(loc, captures),
                 Found::AutoRedirect(loc) => {
                     cx.set_location(loc.clone(), Vec::new());
@@ -201,8 +209,14 @@ fn run(cx: &mut Ctx) -> Response {
                 }
             },
         }
-        if let Some(ret) = cx.conf.ret.clone() {
-            return do_return(cx, &ret);
+        let conf = cx.conf.clone();
+        match rewrite_phase(cx, &conf.rewrites) {
+            Err(resp) => return resp,
+            Ok(true) => {
+                next = Next::Find;
+                continue;
+            }
+            Ok(false) => {}
         }
         if let Some(list) = cx.conf.try_files.clone() {
             match try_files(cx, &list) {
@@ -237,6 +251,25 @@ fn run(cx: &mut Ctx) -> Response {
     }
     // "rewrite or internal redirection cycle"
     special(cx, 500)
+}
+
+/// Runs the rewrite module's directives in order, as ngx_http_rewrite_handler
+/// does. A `return` answers the request; a matching `rewrite` changes the URI
+/// and its captures become $1..$9. Returns true when a location has to be
+/// found again for the new URI (`last`).
+fn rewrite_phase(cx: &mut Ctx, ops: &[RewriteOp]) -> Result<bool, Response> {
+    for op in ops {
+        let rw = match op {
+            RewriteOp::Return(ret) => return Err(do_return(cx, ret)),
+            RewriteOp::Rewrite(rw) => rw,
+        };
+        let Some(caps) = rw.regex.captures(&cx.uri) else { continue };
+        cx.captures = caps.iter().map(|m| m.map(|m| m.as_str().to_string())).collect();
+        cx.uri = cx.eval(&rw.replacement);
+        cx.internal = true;
+        return Ok(rw.flag == RewriteFlag::Last);
+    }
+    Ok(false)
 }
 
 fn special(cx: &Ctx, code: u16) -> Response {
@@ -506,6 +539,32 @@ mod tests {
         assert!(!etag_listed(etag, "\"other\""));
         assert!(!etag_listed(etag, "\"6955b900-c\"x"));
         assert!(!etag_listed(None, "*"));
+    }
+
+    fn answer(server_block: &str, raw: &str) -> (u16, String) {
+        let text = format!("events {{}} http {{ server {{ {server_block} }} }}");
+        let tree = crate::config::parse_text(&text, "t", std::path::Path::new("/")).unwrap();
+        let c = crate::config::build(&tree).unwrap();
+        let req = crate::http::parse_head(raw.as_bytes(), true).unwrap();
+        let resp = handle(&c.servers[0], &req, b"", "127.0.0.1:80".parse().unwrap(), "127.0.0.1:5000".parse().unwrap());
+        (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
+    }
+
+    #[test]
+    fn runs_rewrites_and_returns_in_order() {
+        let conf = "rewrite ^/s/(.*)$ /a/$1 last;
+            location /a/ { rewrite ^/a/(\\w+)$ /b/$1 last; return 200 \"a $uri\"; }
+            location /b/ { rewrite ^/b/(.+)$ /c/$1 break; return 200 \"b $uri $1\"; }
+            location /c/ { return 200 \"c $uri\"; }
+            location /loop/ { rewrite ^ /loop/x last; }";
+        let get = |uri: &str| answer(conf, &format!("GET {uri} HTTP/1.1\r\nHost: h\r\n\r\n"));
+        // break also stops the return after it: /c/x is served from the root.
+        assert_eq!(get("/a/x").0, 404);
+        assert_eq!(get("/s/x").0, 404);
+        assert_eq!(get("/b/").1, "b /b/ ");
+        assert_eq!(get("/a/x/y"), (200, "a /a/x/y".into()));
+        assert_eq!(get("/c/x"), (200, "c /c/x".into()));
+        assert_eq!(get("/loop/").0, 500);
     }
 
     #[test]
