@@ -59,6 +59,8 @@
 "error-page.named" = "error_page to a named location"
 "error-page.change-code" = "error_page changing the code with =code"
 "error-page.external" = "error_page to an external URL (a redirect)"
+"error-page.several" = "several error_page directives in one level"
+"error-page.target-fails" = "an error_page whose own target fails too"
 
 "add-header.inheritance" = "add_header is inherited only by levels that declare none of their own"
 "add-header.always" = "add_header ... always also applies to errors"
