@@ -12,6 +12,7 @@ Among the open failing cases (see `docs/loop.md`), take the one in the lowest st
 - It reads nginx's configuration language and behaves as nginx 1.30.6 does with that configuration. The harness wraps every case in the same top-level configuration (`harness/compare.py`, `WRAPPER`), so the directives there must be accepted.
 - When nginx refuses a configuration, twinx refuses it too and exits without listening. A directive twinx does not implement yet is refused the same way, naming the directive.
 - In the pages it generates, twinx names itself `twinx/<version in Cargo.toml>`, never nginx.
+- The judge runs twinx in a container as an unprivileged user, with the case directory read-only and only `/tmp` writable. `harness/compare.py --sandbox` runs it the same way.
 
 ## How to fix
 

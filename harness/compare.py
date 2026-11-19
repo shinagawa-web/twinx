@@ -6,6 +6,11 @@ directory that becomes the document root. Both servers read the same
 rendered configuration, listen on the same port (one after the other, so
 absolute redirects carry the same port) and serve the same files.
 
+With --sandbox, twinx runs in a container as an unprivileged user, with the
+case directory read-only and only /tmp writable, so it can reach nothing
+of the machine running the harness: the judge uses this, because twinx is
+the pull request's code.
+
 Exit status: 0 when every request matches, 1 when any differs, 2 when the
 harness itself cannot run (no Docker, no cases).
 """
@@ -28,6 +33,10 @@ from pathlib import Path
 NGINX_IMAGE = "nginx@sha256:42c68eab6f7e22611786a9fe1d1c019e275c50185bd54b8f75dc2b9184322703"
 NGINX_VERSION = "1.30.6"
 CONTAINER_NAME = "twinx-reference-nginx"
+# The image the judge builds, tests and runs twinx in (rust:1.100-slim-bookworm).
+SANDBOX_IMAGE = "rust@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37"
+SANDBOX_NAME = "twinx-under-test"
+SANDBOX_USER = "65534:65534"
 PORT = 18080
 BACKEND_PORT = 19090
 WORK_ROOT = Path("/tmp/twinx-cases")
@@ -212,9 +221,11 @@ def run_nginx(work, requests):
         subprocess.run(["docker", "rm", "-f", CONTAINER_NAME], capture_output=True)
 
 
-def run_twinx(binary, work, requests):
+def run_twinx(binary, work, requests, sandbox=None):
     if not binary.is_file():
         return None, f"twinx binary not found at {binary}"
+    if sandbox is not None:
+        return run_twinx_sandboxed(binary, work, requests, sandbox)
     log = open(work / "twinx.log", "wb")
     process = subprocess.Popen([str(binary), "-c", str(work / "nginx.conf")],
                                cwd=work, stdout=log, stderr=subprocess.STDOUT)
@@ -229,12 +240,45 @@ def run_twinx(binary, work, requests):
         log.close()
 
 
-def run_case(case_dir, binary):
+def run_twinx_sandboxed(binary, work, requests, profiles):
+    """Run twinx in a container that can write nothing but its own /tmp (and the
+    coverage profiles, when the judge measures them)."""
+    subprocess.run(["docker", "rm", "-f", SANDBOX_NAME], capture_output=True)
+    command = [
+        "docker", "run", "-d", "--name", SANDBOX_NAME, "--network", "host",
+        "--user", SANDBOX_USER, "--read-only", "--tmpfs", "/tmp:rw,exec,size=64m",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--pids-limit", "256", "--memory", "1g",
+        "-v", f"{binary}:/usr/local/bin/twinx:ro", "-v", f"{work}:{work}:ro", "-w", str(work),
+    ]
+    if profiles:
+        # twinx is pid 1 in every container, so the profile is named after the case instead.
+        command += ["-v", f"{profiles}:/profiles", "-e", f"LLVM_PROFILE_FILE=/profiles/twinx-{work.name}-%c.profraw"]
+    command += [SANDBOX_IMAGE, "twinx", "-c", str(work / "nginx.conf")]
+    started = subprocess.run(command, capture_output=True, text=True)
+    if started.returncode != 0:
+        raise RuntimeError(f"docker run failed: {started.stderr.strip()}")
+
+    def alive():
+        state = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", SANDBOX_NAME],
+                               capture_output=True, text=True)
+        return state.stdout.strip() == "true"
+
+    try:
+        if not wait_for_port(PORT, STARTUP_TIMEOUT, alive):
+            logs = subprocess.run(["docker", "logs", SANDBOX_NAME], capture_output=True, text=True)
+            return None, (logs.stdout + logs.stderr).strip()[-2000:]
+        return [send_raw(raw) for raw in requests], None
+    finally:
+        subprocess.run(["docker", "rm", "-f", SANDBOX_NAME], capture_output=True)
+
+
+def run_case(case_dir, binary, sandbox=None):
     case = tomllib.loads((case_dir / "case.toml").read_text())
     requests = [r["raw"].encode("latin-1") for r in case.get("requests", [])]
     work = prepare(case_dir, case)
     nginx, nginx_error = run_nginx(work, requests)
-    twinx, twinx_error = run_twinx(binary, work, requests)
+    twinx, twinx_error = run_twinx(binary, work, requests, sandbox)
     result = {"case": str(case_dir.relative_to(REPO)), "description": case.get("description", "")}
     if nginx is None:
         # A configuration nginx refuses must be refused by twinx too.
@@ -278,6 +322,9 @@ def main():
     parser.add_argument("paths", nargs="*", default=["cases"], help="case directories or parents of them")
     parser.add_argument("--twinx", default=str(REPO / "target" / "release" / "twinx"))
     parser.add_argument("--out", help="write the full results as JSON to this file")
+    parser.add_argument("--sandbox", action="store_true",
+                        help=f"run twinx in a container ({SANDBOX_IMAGE}) that can write only its own /tmp")
+    parser.add_argument("--profiles", help="with --sandbox, a directory twinx writes coverage profiles to")
     args = parser.parse_args()
 
     if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
@@ -294,7 +341,8 @@ def main():
     results = []
     try:
         for case_dir in cases:
-            result = run_case(case_dir, Path(args.twinx).resolve())
+            sandbox = (str(Path(args.profiles).resolve()) if args.profiles else "") if args.sandbox else None
+            result = run_case(case_dir, Path(args.twinx).resolve(), sandbox)
             results.append(result)
             print(("PASS " if result["passed"] else "FAIL ") + result["case"])
             for problem in result.get("problems", []):
