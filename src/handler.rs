@@ -255,8 +255,8 @@ fn run(cx: &mut Ctx) -> Response {
 
 /// Runs the rewrite module's directives in order, as ngx_http_rewrite_handler
 /// does. A `return` answers the request; a matching `rewrite` changes the URI
-/// and its captures become $1..$9. Returns true when a location has to be
-/// found again for the new URI (`last`).
+/// and its captures become $1..$9, and `redirect` or `permanent` answer with
+/// it. Returns true when a location has to be found again for the new URI (`last`).
 fn rewrite_phase(cx: &mut Ctx, ops: &[RewriteOp]) -> Result<bool, Response> {
     for op in ops {
         let rw = match op {
@@ -266,8 +266,23 @@ fn rewrite_phase(cx: &mut Ctx, ops: &[RewriteOp]) -> Result<bool, Response> {
         let Some(caps) = rw.regex.captures(&cx.uri) else { continue };
         cx.captures = caps.iter().map(|m| m.map(|m| m.as_str().to_string())).collect();
         cx.uri = cx.eval(&rw.replacement);
+        if let Some(args) = &rw.args {
+            let new = cx.eval(args);
+            cx.args = match (new.is_empty(), cx.args.is_empty()) {
+                (false, false) => format!("{new}&{}", cx.args),
+                _ => new,
+            };
+        }
         cx.internal = true;
-        return Ok(rw.flag == RewriteFlag::Last);
+        let code = match rw.flag {
+            RewriteFlag::Last => return Ok(true),
+            RewriteFlag::Break => return Ok(false),
+            RewriteFlag::Redirect => 302,
+            RewriteFlag::Permanent => 301,
+        };
+        let mut resp = special(cx, code);
+        resp.location = Some(if cx.args.is_empty() { cx.uri.clone() } else { format!("{}?{}", cx.uri, cx.args) });
+        return Err(resp);
     }
     Ok(false)
 }
@@ -565,6 +580,36 @@ mod tests {
         assert_eq!(get("/a/x/y"), (200, "a /a/x/y".into()));
         assert_eq!(get("/c/x"), (200, "c /c/x".into()));
         assert_eq!(get("/loop/").0, 500);
+    }
+
+    #[test]
+    fn redirects_with_rewrite_and_keeps_or_drops_arguments() {
+        let conf = "location /t/ { rewrite ^/t/(.*)$ /m/$1 redirect; }
+            location /p/ { rewrite ^/p/(.*)$ /m/$1? permanent; }
+            location /a/ { rewrite ^/a/(.*)$ /m/?i=$1 redirect; }
+            location /l/ { rewrite ^/l/(.*)$ /m/?i=$1 last; }
+            location /m/ { return 200 \"$uri $args\"; }";
+        let get = |uri: &str| {
+            let text = format!("events {{}} http {{ server {{ {conf} }} }}");
+            let tree = crate::config::parse_text(&text, "t", std::path::Path::new("/")).unwrap();
+            let c = crate::config::build(&tree).unwrap();
+            let req = crate::http::parse_head(format!("GET {uri} HTTP/1.1\r\nHost: h\r\n\r\n").as_bytes(), true).unwrap();
+            let mut cx = Ctx {
+                req: &req, body: b"", server: &c.servers[0],
+                local: "127.0.0.1:80".parse().unwrap(), remote: "127.0.0.1:5000".parse().unwrap(),
+                uri: req.uri.clone(), args: req.args.clone(), conf: c.servers[0].conf.clone(),
+                location: None, captures: Vec::new(), internal: false, proxy_host: None,
+            };
+            let resp = run(&mut cx);
+            (resp.status, resp.location.unwrap_or_default(), String::from_utf8_lossy(&resp.body).into_owned())
+        };
+        assert_eq!(get("/t/a/b?x=1").0, 302);
+        assert_eq!(get("/t/a/b?x=1").1, "/m/a/b?x=1");
+        assert_eq!(get("/p/a?x=1").0, 301);
+        assert_eq!(get("/p/a?x=1").1, "/m/a");
+        assert_eq!(get("/a/z?x=1").1, "/m/?i=z&x=1");
+        assert_eq!(get("/a/z").1, "/m/?i=z");
+        assert_eq!(get("/l/z?x=1").2, "/m/ i=z&x=1");
     }
 
     #[test]
