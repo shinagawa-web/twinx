@@ -1,1 +1,2 @@
 date	branch	head	problems
+2026-11-19T00:27:33Z	claude/identity-check	ebca11ff91762c69b26b49605419c2f7c8aa330d	claude/identity-check is neither claude/fix-<stage>-<case> nor claude/find-<name>
