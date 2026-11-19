@@ -1,4 +1,5 @@
 description = "try_files falls back to an application shell for paths that do not exist, and to a status code at the end"
+covers = ["try-files.file", "try-files.dir", "try-files.code", "try-files.uri-fallback"]
 config = """
 server {
     listen {{port}};

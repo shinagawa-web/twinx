@@ -1,4 +1,5 @@
 description = "Serve files from root: index, a nested file, a missing file and a directory without a trailing slash"
+covers = ["static.mime-type", "static.missing", "static.dir-redirect", "static.head", "root.server"]
 config = """
 server {
     listen {{port}};

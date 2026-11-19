@@ -1,4 +1,5 @@
 description = "Location precedence: exact match, ^~ prefix, regular expressions in order, then the longest prefix"
+covers = ["location.exact", "location.no-regex-prefix", "location.regex-order", "location.prefix-longest", "return.text"]
 config = """
 server {
     listen {{port}};

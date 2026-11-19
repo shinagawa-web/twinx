@@ -1,4 +1,5 @@
 description = "proxy_pass to an upstream that refuses connections answers 502, and add_header always still applies"
+covers = ["upstream.unreachable", "add-header.always", "add-header.errors"]
 config = """
 server {
     listen {{port}};

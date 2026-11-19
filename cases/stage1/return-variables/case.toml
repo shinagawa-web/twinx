@@ -1,4 +1,5 @@
 description = "return with variables: an HTTPS redirect built from $host and $request_uri, a body built from request variables, and a relative redirect"
+covers = ["return.variables", "return.redirect", "server-name.exact"]
 config = """
 server {
     listen {{port}};

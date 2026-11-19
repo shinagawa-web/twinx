@@ -1,4 +1,5 @@
 description = "Conditional GET on a static file: If-Modified-Since and If-None-Match that match, and ones that do not"
+covers = ["static.conditional-get", "root.server"]
 config = """
 server {
     listen {{port}};

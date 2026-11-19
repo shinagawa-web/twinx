@@ -1,4 +1,5 @@
 description = "proxy_pass to a named upstream block, with proxy_set_header and the redirect for a location without its trailing slash"
+covers = ["upstream.named", "proxy-pass.no-uri", "proxy-pass.uri", "proxy-pass.slash-redirect", "proxy-set-header.variables"]
 config = """
 upstream app {
     server {{backend}};

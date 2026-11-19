@@ -14,9 +14,10 @@ Every pull request must build, pass cargo test and keep every case that
 passes on main passing. A Fixer pull request may only touch twinx's code,
 must make the case it names pass, and the cases must run at least 99% of
 the executable lines it adds. A Finder pull request may only add files
-under cases/. Cases that fail on main are allowed: they are the Fixer's
-work queue, so a green check means main did not get worse, not that every
-case passes.
+under cases/. Every case must name, in `covers`, the items of
+harness/checklist.toml it shows. Cases that fail on main are allowed:
+they are the Fixer's work queue, so a green check means main did not get
+worse, not that every case passes.
 
 Exit status 0 means the pull request passes. The verdict is written as
 JSON and as Markdown for the pull request comment.
@@ -28,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 # The repository the scripts work on. The judge runs copies of these scripts taken from
@@ -39,6 +41,9 @@ COVERAGE_THRESHOLD = 99.0
 
 FIXER_MAY_TOUCH = ("src/", "tests/", "benches/", "Cargo.toml", "Cargo.lock")
 FINDER_MAY_ADD = ("cases/",)
+
+# What each stage has to cover, read from main's copy of the harness.
+CHECKLIST = Path(__file__).resolve().parent / "checklist.toml"
 
 
 def changed_files(base, head):
@@ -79,6 +84,27 @@ def passing(results_file):
     return sorted(r["case"] for r in json.loads(Path(results_file).read_text())["results"] if r["passed"])
 
 
+def checklist(results):
+    """Check every case's `covers` against the checklist and list the items of the
+    current stage that no passing case covers yet."""
+    stage = int((REPO / "status" / "stage.txt").read_text().strip())
+    stages = tomllib.loads(CHECKLIST.read_text())
+    known = {item for name, items in stages.items() if int(name.removeprefix("stage")) <= stage for item in items}
+    current = list(stages.get(f"stage{stage}", {}))
+    problems, covered = [], set()
+    for result in results:
+        covers = tomllib.loads((REPO / result["case"] / "case.toml").read_text()).get("covers", [])
+        if not covers:
+            problems.append(f"{result['case']} lists no checklist item in covers")
+        for item in covers:
+            if item not in known:
+                problems.append(f"{result['case']} covers {item}, which is not in the checklist up to stage {stage}")
+        if result["passed"]:
+            covered.update(covers)
+    missing = [item for item in current if item not in covered]
+    return problems, {"stage": stage, "items": len(current), "covered": len(current) - len(missing), "missing": missing}
+
+
 def markdown(verdict):
     lines = [f"## judge: {'pass' if verdict['passed'] else 'fail'}", ""]
     if verdict["problems"]:
@@ -92,6 +118,11 @@ def markdown(verdict):
         lines.append("- Newly passing: " + ", ".join(f"`{c}`" for c in verdict["newly_passing"]))
     # The Finder cannot build twinx, so it reads which cases fail from this line.
     lines.append("- Failing: " + (", ".join(f"`{c}`" for c in verdict["failing"]) or "none"))
+    stage = verdict.get("checklist")
+    if stage:
+        # The Finder reads which items still need a case from this line.
+        lines.append(f"- Stage {stage['stage']} checklist: {stage['covered']} of {stage['items']} items have a passing case; "
+                     "not yet: " + (", ".join(f"`{i}`" for i in stage["missing"]) or "none"))
     coverage = verdict.get("coverage")
     if coverage and coverage.get("percent") is not None:
         lines.append(f"- Added executable lines run by the cases: {coverage['covered_by_cases']} of "
@@ -136,6 +167,8 @@ def main():
     regressed = [c for c in passing_before if c in known and c not in passing_now]
     if regressed:
         problems.append(f"cases that pass on main no longer pass: {regressed}")
+    checklist_problems, stage = checklist(results)
+    problems += checklist_problems
     if role == "fix":
         if target not in known:
             problems.append(f"{target} does not exist")
@@ -166,6 +199,7 @@ def main():
         "cases_passing_after": len(passing_now),
         "newly_passing": [c for c in passing_now if c not in passing_before],
         "failing": sorted(known - set(passing_now)),
+        "checklist": stage,
         "coverage": coverage,
     }
     Path(args.verdict).write_text(json.dumps(verdict, indent=2))

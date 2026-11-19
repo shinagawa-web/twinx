@@ -1,4 +1,5 @@
 description = "Choose the server by Host: exact name, leading wildcard, then the default_server for unknown hosts"
+covers = ["server-name.exact", "server-name.leading-wildcard", "server-name.no-match", "server-name.no-host", "listen.port", "listen.default-server"]
 config = """
 server {
     listen {{port}};

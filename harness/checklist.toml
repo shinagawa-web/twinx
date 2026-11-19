@@ -1,0 +1,91 @@
+# What each stage has to cover. A stage is done when every item has at least one
+# case that passes on main. A case says which items it shows with `covers` in its
+# case.toml, and the judge lists the items that have no passing case yet.
+#
+# Items come from nginx's documentation for the directives in the stage's scope
+# (README.md). The judge reads this file from main, so only a human changes it.
+
+[stage1]
+"listen.port" = "listen with a port only"
+"listen.address" = "listen with an address and a port"
+"listen.default-server" = "listen ... default_server picks the server for unknown hosts"
+
+"server-name.exact" = "server_name with an exact name"
+"server-name.leading-wildcard" = "server_name with a leading *. wildcard"
+"server-name.trailing-wildcard" = "server_name with a trailing .* wildcard"
+"server-name.regex" = "server_name with a regular expression"
+"server-name.no-match" = "a Host that no server_name matches goes to the default server"
+"server-name.no-host" = "a request without a Host header"
+
+"location.prefix-longest" = "the longest matching prefix location wins"
+"location.exact" = "location = matches only the exact URI and wins"
+"location.no-regex-prefix" = "location ^~ stops the regular expression search"
+"location.regex-order" = "location ~ and ~* are tried in the order they appear"
+"location.named" = "named locations (@name) reached from another directive"
+"location.nested" = "locations nested in a location"
+
+"root.server" = "root in a server"
+"root.location" = "root in a location"
+
+"alias.prefix" = "alias in a prefix location"
+"alias.trailing-slash" = "alias with and without a trailing slash on the location and the path"
+"alias.regex-captures" = "alias in a regular expression location with captures"
+
+"index.several" = "index with several files, the first one that exists wins"
+"index.missing-first" = "index falls back when the first file is missing"
+"index.none-forbidden" = "a directory with none of the index files answers 403"
+
+"try-files.file" = "try_files serving an existing file"
+"try-files.dir" = "try_files with $uri/"
+"try-files.code" = "try_files ending in =code"
+"try-files.named" = "try_files ending in a named location"
+"try-files.uri-fallback" = "try_files ending in a URI"
+
+"return.text" = "return with a code and a text"
+"return.code" = "return with a code alone (the generated page)"
+"return.redirect" = "return with a redirect code (301, 302, 303, 307, 308) and a URL"
+"return.url-only" = "return with a URL alone"
+"return.variables" = "return with variables in the URL or the text"
+
+"rewrite.last" = "rewrite ... last"
+"rewrite.break" = "rewrite ... break"
+"rewrite.redirect" = "rewrite ... redirect"
+"rewrite.permanent" = "rewrite ... permanent"
+"rewrite.captures" = "rewrite with captures in the replacement"
+"rewrite.server-level" = "rewrite in a server, before a location is chosen"
+"rewrite.query-string" = "rewrite keeping or dropping the query string (a trailing ?)"
+
+"error-page.uri" = "error_page to a URI"
+"error-page.named" = "error_page to a named location"
+"error-page.change-code" = "error_page changing the code with =code"
+"error-page.external" = "error_page to an external URL (a redirect)"
+
+"add-header.inheritance" = "add_header is inherited only by levels that declare none of their own"
+"add-header.always" = "add_header ... always also applies to errors"
+"add-header.errors" = "add_header without always is not added to errors"
+"add-header.variables" = "add_header with variables in the value"
+
+"default-type.unknown-extension" = "default_type for a file whose extension has no MIME type"
+"default-type.levels" = "default_type set in a server and in a location"
+
+"proxy-pass.no-uri" = "proxy_pass without a URI part passes the request URI unchanged"
+"proxy-pass.uri" = "proxy_pass with a URI part replaces the location prefix"
+"proxy-pass.request-headers" = "the request line and headers proxy_pass sends upstream"
+"proxy-pass.slash-redirect" = "a prefix location ending in / that proxies redirects the URI without the slash"
+
+"proxy-set-header.host" = "proxy_set_header overriding Host"
+"proxy-set-header.empty-removes" = "proxy_set_header with an empty value removes the header"
+"proxy-set-header.variables" = "proxy_set_header with variables in the value"
+
+"upstream.named" = "proxy_pass to a named upstream block"
+"upstream.round-robin" = "an upstream with several servers takes them in turn"
+"upstream.down" = "an upstream server marked down"
+"upstream.backup" = "an upstream backup server"
+"upstream.unreachable" = "every upstream server unreachable answers 502"
+
+"static.mime-type" = "the Content-Type of a static file from its extension"
+"static.missing" = "a missing file answers 404"
+"static.dir-redirect" = "a directory without a trailing slash redirects with 301"
+"static.head" = "HEAD on a static file"
+"static.conditional-get" = "If-Modified-Since and If-None-Match on a static file"
+"static.range" = "Range requests on a static file"

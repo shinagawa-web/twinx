@@ -1,4 +1,5 @@
 description = "Forward requests to an upstream with proxy_pass, with and without a URI part"
+covers = ["proxy-pass.no-uri", "proxy-pass.uri", "proxy-pass.request-headers"]
 config = """
 server {
     listen {{port}};

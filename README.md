@@ -20,11 +20,11 @@ If the official nginx test suite (nginx-tests) can be pointed at the twinx binar
 
 ## Stages
 
-Time spent, pass rate and the number of interventions are recorded separately for each stage. Every differential test from earlier stages keeps running in later stages.
+A stage is done when every item of its checklist (`harness/checklist.toml`, from nginx's documentation for the directives in its scope) has a case that passes on main. Time spent, pass rate and the number of interventions are recorded separately for each stage. Every differential test from earlier stages keeps running in later stages.
 
 | Stage | Scope |
 |---|---|
-| 1 | Static file serving and reverse proxying over HTTP/1.1: server and location selection, root, index, try_files, return, add_header, proxy_pass, upstream |
+| 1 | Static file serving and reverse proxying over HTTP/1.1: server and location selection, root, alias, index, try_files, return, rewrite, error_page, add_header, default_type, proxy_pass, upstream |
 | 2 | gzip |
 | 3 | TLS |
 | 4 | HTTP/2 |
