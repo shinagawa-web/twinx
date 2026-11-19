@@ -70,6 +70,7 @@
 "error-page.uri" = "error_page to a URI"
 "error-page.named" = "error_page to a named location"
 "error-page.change-code" = "error_page changing the code with =code"
+"error-page.target-code" = "error_page with = alone, answering with the code the target answers with"
 "error-page.external" = "error_page to an external URL (a redirect)"
 "error-page.several" = "several error_page directives in one level"
 "error-page.target-fails" = "an error_page whose own target fails too"
