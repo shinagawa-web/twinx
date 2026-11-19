@@ -13,22 +13,18 @@ The very first run (`trig_012ER29uuypTqhUEnHtyZfrF`, 2026-11-18T23:30:00Z) was a
 
 ## Pull requests
 
-Every change reaches main through a pull request that the `judge` check passes. Open it through the REST API (`gh pr` subcommands that use GraphQL do not work in a cloud session) and turn on auto-merge in the same step, so it merges as soon as the judge passes:
+Every change reaches main through a pull request that the `judge` check passes. Use whichever GitHub tools the session has; which ones work has changed from one run to the next.
 
-```
-gh api repos/shinagawa-web/twinx/pulls -f title="<what it does>" -f head=<branch> -f base=main -f body="<why>"
-gh api -X PUT repos/shinagawa-web/twinx/pulls/<number>/ccr/auto_merge -f merge_method=SQUASH
-```
-
-If auto-merge is refused, leave it off and merge through REST once the check passes: `gh api -X PUT repos/shinagawa-web/twinx/pulls/<number>/merge -f merge_method=squash`.
-
-Then wait: every 30 seconds, for up to 20 minutes, read the pull request (`gh api repos/shinagawa-web/twinx/pulls/<number>`). It is done when `merged` is true. When the judge fails it comments the reasons on the pull request (`gh api repos/shinagawa-web/twinx/issues/<number>/comments`); read them, then close the pull request (`gh api -X PATCH repos/shinagawa-web/twinx/pulls/<number> -f state=closed`). When main moved and the branch is behind, update it (`gh api -X PUT repos/shinagawa-web/twinx/pulls/<number>/update-branch`) and keep waiting.
+- Open the pull request against main with squash auto-merge turned on, so it merges as soon as the judge passes. If auto-merge cannot be turned on, merge it with squash yourself once the check passes.
+- Wait, for up to 20 minutes, until it is merged.
+- When the judge fails, it comments the reasons on the pull request. Read them, then close the pull request.
+- When main moved and the branch is behind, update the branch and keep waiting.
 
 ## Open failing cases
 
 The cases that fail on main are listed in the judge's comment on the most recently merged pull request (the "Failing:" line). A Fixer can also find them by building twinx and running every case.
 
-An open failing case is one under `cases/stage<N>/`, for every stage up to the one in `status/stage.txt`, that fails on main, is not stuck, and has no open pull request yet. A case is stuck when three pull requests from its branch (`claude/fix-<stage>-<case>`) were closed without being merged (`gh api "repos/shinagawa-web/twinx/pulls?state=closed&head=shinagawa-web:claude/fix-<stage>-<case>"`, counting those with `merged_at` null).
+An open failing case is one under `cases/stage<N>/`, for every stage up to the one in `status/stage.txt`, that fails on main, is not stuck, and has no open pull request yet. A case is stuck when three pull requests from its branch (`claude/fix-<stage>-<case>`) were closed without being merged.
 
 ## A Fixer run
 
