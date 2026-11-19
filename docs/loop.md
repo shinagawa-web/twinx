@@ -1,6 +1,6 @@
 # One run of the loop
 
-Both schedules are paused since 2026-11-19T00:07Z, until the design is ready for unattended runs. While they are paused, a run starts only when a human starts it by hand, so a run that has started goes ahead.
+Both schedules run again since 2026-11-19T23:16Z, after a pause from 2026-11-19T00:07Z while the design was made ready for unattended runs. A human may also start a run by hand; a run that has started goes ahead.
 
 Two scheduled Claude Code sessions run the loop, both with model `claude-opus-5-5`. Each session has one role and never takes the other, so the Finder writes cases without knowing how twinx is written.
 
