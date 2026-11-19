@@ -9,7 +9,7 @@ Write cases from what nginx does, not from what twinx does. Do not read twinx's 
 A directory `cases/stage<N>/<name>/` with:
 
 - `case.toml`: a `description`, `covers` (the checklist items the case shows), a `config` (what goes inside the `http` block) and one or more `[[requests]]` with a `raw` HTTP request. See the existing cases for the format.
-- `files/` (optional): the document root, used through `{{root}}`.
+- `files/` (optional): the document root, used through `{{root}}`. Git keeps no file modes, so a case that needs one sets it in a `modes` table in `case.toml` (`"secret.txt" = "600"`). nginx reads the files as another user than their owner.
 
 Placeholders in `config`: `{{port}}` (listen port), `{{root}}` (document root), `{{dir}}` (the case's working directory) and `{{backend}}` (an upstream that answers with the exact request it received).
 
