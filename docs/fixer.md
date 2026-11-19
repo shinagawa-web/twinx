@@ -4,7 +4,7 @@ Make one failing case pass by changing twinx, without breaking any case that pas
 
 ## Pick the case
 
-Among the open failing cases (see `docs/loop.md`), take the one in the lowest stage, and within a stage the first by directory name.
+Among the open failing cases (see `docs/loop.md`), take the one in the lowest stage; within a stage, the one with the fewest closed pull requests from its branch, and among those the first by directory name.
 
 ## What twinx is
 
