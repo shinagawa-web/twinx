@@ -1,7 +1,7 @@
 //! Answering one request: server rewrite phase, location choice, the
 //! location rewrite phase (`return`), `try_files`, then the content
 //! handlers (proxy, index, static), and the header filters (`add_header`,
-//! absolute `Location`).
+//! ranges, absolute `Location`).
 
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -399,7 +399,7 @@ fn static_content(cx: &Ctx) -> Content {
     resp.content_length = Some(size);
     resp.last_modified = Some(mtime);
     resp.headers.push(("ETag".into(), format!("\"{:x}-{:x}\"", mtime, size)));
-    resp.headers.push(("Accept-Ranges".into(), "bytes".into()));
+    resp.allow_ranges = true;
     resp.body = body;
     Content::Done(resp)
 }
@@ -448,7 +448,6 @@ fn not_modified(cx: &Ctx, resp: &mut Response) {
     resp.content_type = None;
     resp.content_length = None;
     resp.body.clear();
-    resp.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("accept-ranges"));
 }
 
 fn finalize(cx: &Ctx, mut resp: Response) -> Response {
@@ -467,6 +466,7 @@ fn finalize(cx: &Ctx, mut resp: Response) -> Response {
         }
         resp.headers.push((h.name.clone(), value));
     }
+    let mut resp = crate::range::filter(cx, resp);
     if let Some(loc) = &resp.location {
         if loc.starts_with('/') && cx.conf.absolute_redirect {
             let host = if cx.conf.server_name_in_redirect {
