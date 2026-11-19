@@ -39,7 +39,7 @@ Claude Code works in two roles. Neither decides whether its own change is good; 
 - The Fixer picks one failing case, changes the Rust code until that case passes, and opens a pull request from `claude/fix-<stage>-<case>`.
 - The Finder writes new cases for the current stage and opens a pull request from `claude/find-<name>`.
 
-Both turn on auto-merge when they open the pull request. main's ruleset accepts a merge only through a pull request whose `judge` check passed on a branch that is up to date with main, with no exceptions, the owner included. Whoever presses merge, the judge decides.
+Both turn on auto-merge when they open the pull request. main's ruleset (`main requires judge`) accepts a merge only through a pull request whose `judge` check passed on a branch that is up to date with main, with no exceptions, the owner included. Whoever presses merge, the judge decides.
 
 The judge is a GitHub Actions workflow (`.github/workflows/judge.yml`, `harness/judge.py`). It runs on `pull_request_target`, so the workflow and the harness always come from main, never from the pull request. The job that runs the pull request's code can only read the repository. For every pull request it runs every case against main as it is, merges the pull request into main without committing, builds twinx with coverage instrumentation, runs `cargo test`, runs every case again, and comments the verdict on the pull request.
 
