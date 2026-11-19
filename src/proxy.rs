@@ -86,7 +86,7 @@ pub fn upstream_headers(cx: &Ctx) -> Vec<(String, String)> {
 pub fn forward(cx: &mut Ctx, pass: &ProxyPass) -> Response {
     cx.proxy_host = Some(pass.host.clone());
     let uri = upstream_uri(cx, pass);
-    let mut request = format!("{} {} HTTP/{}\r\n", cx.req.method, uri, cx.conf.proxy_http_version);
+    let mut request = format!("{} {} HTTP/{}\r\n", cx.method, uri, cx.conf.proxy_http_version);
     for (name, value) in upstream_headers(cx) {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -169,7 +169,7 @@ fn read_response(stream: &mut TcpStream, cx: &Ctx, pass: &ProxyPass) -> Result<R
             _ => resp.headers.push((name.trim().to_string(), value)),
         }
     }
-    let no_body = cx.req.method == "HEAD" || code == 204 || code == 304 || code < 200;
+    let no_body = cx.method == "HEAD" || code == 204 || code == 304 || code < 200;
     let mut body = buf[head_end..].to_vec();
     if no_body {
         resp.content_length = length.map(|l| l as u64);
@@ -253,6 +253,7 @@ mod tests {
         };
         let mut cx = Ctx {
             req: &req,
+            method: req.method.clone(),
             body: b"",
             server: &server,
             local: "127.0.0.1:80".parse().unwrap(),

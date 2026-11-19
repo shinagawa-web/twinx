@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{LocConf, Location, Modifier, Return, Server};
+use crate::config::{ErrorPage, LocConf, Location, Modifier, Return, Server};
 use crate::http::Request;
 use crate::location::{self, Captures, Found};
 use crate::response::{self, Response};
@@ -18,6 +18,8 @@ use crate::time;
 /// The state of a request while it moves through the phases.
 pub struct Ctx<'a> {
     pub req: &'a Request,
+    /// The request method, which an error_page redirect turns into GET.
+    pub method: String,
     pub body: &'a [u8],
     pub server: &'a Server,
     pub local: SocketAddr,
@@ -42,7 +44,7 @@ impl Vars for Ctx<'_> {
             "is_args" => if self.args.is_empty() { String::new() } else { "?".into() },
             "request_uri" => req.unparsed_uri.clone(),
             "request" => req.request_line.clone(),
-            "request_method" => req.method.clone(),
+            "request_method" => self.method.clone(),
             "host" => self.host_name(),
             "hostname" => hostname(),
             "scheme" => "http".into(),
@@ -157,6 +159,7 @@ enum Next {
 pub fn handle(server: &Server, req: &Request, body: &[u8], local: SocketAddr, remote: SocketAddr) -> Response {
     let mut cx = Ctx {
         req,
+        method: req.method.clone(),
         body,
         server,
         local,
@@ -169,18 +172,27 @@ pub fn handle(server: &Server, req: &Request, body: &[u8], local: SocketAddr, re
         internal: false,
         proxy_host: None,
     };
-    let resp = run(&mut cx);
+    // r->uri_changes: the request and the internal redirects it may make.
+    let mut changes = MAX_REDIRECTS + 1;
+    let resp = run(&mut cx, Next::Find, false, &mut changes);
+    let resp = error_page(&mut cx, resp, &mut changes);
     finalize(&cx, resp)
 }
 
-fn run(cx: &mut Ctx) -> Response {
-    if let Some(ret) = cx.server.ret.clone() {
-        return do_return(cx, &ret);
-    }
-    let mut next = Next::Find;
-    for _ in 0..=MAX_REDIRECTS {
+/// Runs the phases from server or location selection (`next`) until a
+/// response, counting each internal redirect, `redirected` included.
+fn run(cx: &mut Ctx, mut next: Next, redirected: bool, changes: &mut usize) -> Response {
+    let mut first = !redirected;
+    loop {
+        if !first {
+            *changes -= 1;
+            // "rewrite or internal redirection cycle"
+            if *changes == 0 { return special(cx, 500); }
+        }
+        first = false;
         match std::mem::replace(&mut next, Next::Find) {
             Next::Named(loc) => cx.set_location(loc, Vec::new()),
+            Next::Find if cx.server.ret.is_some() => return do_return(cx, &cx.server.ret.clone().unwrap()),
             Next::Find => match location::find(&cx.server.locations, &cx.uri) {
                 Found::Location(loc, captures) => cx.set_location(loc, captures),
                 Found::AutoRedirect(loc) => {
@@ -235,8 +247,44 @@ fn run(cx: &mut Ctx) -> Response {
             }
         }
     }
-    // "rewrite or internal redirection cycle"
-    special(cx, 500)
+}
+
+/// The error_page step of the special response handler, with
+/// recursive_error_pages off: the first special response of a request is
+/// replaced by what the error_page for its status, if any, leads to.
+fn error_page(cx: &mut Ctx, resp: Response, changes: &mut usize) -> Response {
+    let status = resp.status;
+    let found = (resp.special && *changes > 0).then(|| cx.conf.error_pages.iter().find(|p| p.status == status));
+    let Some(Some(page)) = found.map(|p| p.cloned()) else { return resp };
+    let ErrorPage { overwrite, uri, .. } = page;
+    let uri = cx.eval(&uri);
+    let mut out = if uri.starts_with('/') {
+        let (path, args) = uri.split_once('?').unwrap_or((&uri, ""));
+        cx.uri = path.to_string();
+        cx.args = args.to_string();
+        if cx.method != "HEAD" { cx.method = "GET".into(); }
+        cx.internal = true;
+        run(cx, Next::Find, true, changes)
+    } else if uri.starts_with('@') {
+        let Some(loc) = cx.server.named.get(&uri).cloned() else { return special(cx, 500) };
+        cx.internal = true;
+        run(cx, Next::Named(loc), true, changes)
+    } else {
+        // An external redirect: 302 unless another redirect code was given.
+        let code = overwrite.filter(|c| matches!(c, 301 | 302 | 303 | 307 | 308)).unwrap_or(302);
+        let mut out = special(cx, code);
+        out.location = Some(uri);
+        return out;
+    };
+    // r->err_status: the error's status, or the one given after "=", replaces
+    // the status the target answered with, unless the target failed itself.
+    let err_status = match overwrite { None => Some(status), Some(0) => None, given => given };
+    if let (Some(s), false) = (err_status, out.special) {
+        out.status = s;
+        out.status_line = None;
+    }
+    out.close |= resp.close;
+    out
 }
 
 fn special(cx: &Ctx, code: u16) -> Response {
@@ -326,7 +374,7 @@ fn method_allowed(m: &str) -> bool {
 
 fn static_content(cx: &Ctx) -> Content {
     let uri = cx.uri.clone();
-    let method = cx.req.method.as_str();
+    let method = cx.method.as_str();
     if uri.ends_with('/') {
         if !method_allowed(method) {
             return Content::Done(special(cx, 405));
@@ -454,6 +502,8 @@ fn finalize(cx: &Ctx, mut resp: Response) -> Response {
     if resp.status == 444 {
         return resp;
     }
+    // The header filter sends Last-Modified only with these statuses.
+    if !matches!(resp.status, 200 | 206 | 304) { resp.last_modified = None; }
     not_modified(cx, &mut resp);
     let applies = add_header_applies(resp.status);
     for h in &cx.conf.add_headers {
@@ -506,6 +556,46 @@ mod tests {
         assert!(!etag_listed(etag, "\"other\""));
         assert!(!etag_listed(etag, "\"6955b900-c\"x"));
         assert!(!etag_listed(None, "*"));
+    }
+
+    fn answer(server_block: &str, raw: &str) -> Response {
+        let text = format!("events {{}} http {{ server {{ listen 1; {server_block} }} }}");
+        let tree = crate::config::parse_text(&text, "t", std::path::Path::new("/")).unwrap();
+        let c = crate::config::build(&tree).unwrap();
+        let req = crate::http::parse_head(raw.as_bytes(), true).unwrap();
+        let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        handle(&c.servers[0], &req, b"", addr, addr)
+    }
+
+    #[test]
+    fn sends_error_pages() {
+        let conf = r#"
+            location /a/ { error_page 403 @n; return 403; }
+            location /b/ { error_page 403 =200 @n; return 403; }
+            location /c/ { error_page 403 = /m/; return 403; }
+            location /m/ { return 200 "$request_method $uri $args"; }
+            location /d/ { error_page 403 /d/again?x=1; return 403; }
+            location /e/ { error_page 403 =301 http://e.test/; return 403; }
+            location /f/ { error_page 403 @missing; return 403; }
+            location /g/ { error_page 404 /m/; return 403; }
+            location @n { return 410 "named"; }
+        "#;
+        let get = |uri: &str, method: &str| {
+            answer(conf, &format!("{method} {uri} HTTP/1.1\r\nHost: h\r\n\r\n"))
+        };
+        let a = get("/a/", "GET");
+        assert_eq!((a.status, a.body.as_slice()), (403, &b"named"[..]));
+        assert_eq!(get("/b/", "GET").status, 200);
+        let c = get("/c/?q", "POST");
+        assert_eq!((c.status, c.body.as_slice()), (200, &b"GET /m/ "[..]));
+        assert_eq!(get("/c/", "HEAD").body, b"HEAD /m/ ");
+        // The page itself fails: no second error_page, the plain 403.
+        let d = get("/d/", "GET");
+        assert!(d.special && d.status == 403);
+        let e = get("/e/", "GET");
+        assert_eq!((e.status, e.location.as_deref()), (301, Some("http://e.test/")));
+        assert_eq!(get("/f/", "GET").status, 500);
+        assert_eq!(get("/g/", "GET").status, 403);
     }
 
     #[test]
