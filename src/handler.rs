@@ -13,6 +13,7 @@ use crate::http::Request;
 use crate::location::{self, Captures, Found};
 use crate::response::{self, Response};
 use crate::template::{Template, Vars};
+use crate::time;
 
 /// The state of a request while it moves through the phases.
 pub struct Ctx<'a> {
@@ -422,10 +423,39 @@ fn add_header_applies(status: u16) -> bool {
     matches!(status, 200 | 201 | 204 | 206 | 301 | 302 | 303 | 304 | 307 | 308)
 }
 
+/// ngx_http_test_if_match with weak comparison: true when `list` is "*" or
+/// names `etag` among its comma-separated entity tags, "W/" prefixes ignored.
+fn etag_listed(etag: Option<&str>, list: &str) -> bool {
+    let Some(etag) = etag else { return false };
+    let listed = |t: &str| t.strip_prefix("W/").unwrap_or(t) == etag;
+    list == "*" || list.split(',').map(|t| t.trim_matches([' ', '\t'])).any(listed)
+}
+
+/// The not_modified filter: a 200 with Last-Modified becomes 304 Not
+/// Modified when If-Modified-Since (equal to Last-Modified, the default
+/// "if_modified_since exact") and If-None-Match, whichever were sent, allow it.
+fn not_modified(cx: &Ctx, resp: &mut Response) {
+    let (200, Some(last_modified)) = (resp.status, resp.last_modified) else { return };
+    let since = cx.req.header("if-modified-since");
+    let none_match = cx.req.header("if-none-match");
+    let etag = resp.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("etag")).map(|(_, v)| v.as_str());
+    let modified = since.is_some_and(|v| time::parse_http_date(v) != Some(last_modified));
+    let changed = none_match.is_some_and(|v| !etag_listed(etag, v));
+    if (since.is_none() && none_match.is_none()) || modified || changed {
+        return;
+    }
+    resp.status = 304;
+    resp.content_type = None;
+    resp.content_length = None;
+    resp.body.clear();
+    resp.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("accept-ranges"));
+}
+
 fn finalize(cx: &Ctx, mut resp: Response) -> Response {
     if resp.status == 444 {
         return resp;
     }
+    not_modified(cx, &mut resp);
     let applies = add_header_applies(resp.status);
     for h in &cx.conf.add_headers {
         if !(applies || h.always) {
@@ -465,6 +495,17 @@ mod tests {
         assert_eq!(escape_uri("/a b/%?#x"), "/a%20b/%25%3F%23x");
         assert_eq!(escape_uri("/caf\u{e9}"), "/caf%C3%A9");
         assert_eq!(escape_uri("/a=b&c"), "/a=b&c");
+    }
+
+    #[test]
+    fn matches_entity_tags_weakly() {
+        let etag = Some("\"6955b900-c\"");
+        assert!(etag_listed(etag, "\"6955b900-c\""));
+        assert!(etag_listed(etag, "\"a\", W/\"6955b900-c\"\t"));
+        assert!(etag_listed(etag, "*"));
+        assert!(!etag_listed(etag, "\"other\""));
+        assert!(!etag_listed(etag, "\"6955b900-c\"x"));
+        assert!(!etag_listed(None, "*"));
     }
 
     #[test]
