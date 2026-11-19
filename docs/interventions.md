@@ -69,3 +69,6 @@ Kinds:
 | 2026-11-19 | Stage 1 | correction | Issue #7 held the checklist, the pace so far, the harness work for each stage and the prerequisites for resuming, so it could never be closed | Narrowed to the stage 1 checklist with a closing condition; the two prerequisites became #9 and #10 |
 | 2026-11-19 | Stage 1 | question | Whether the Fixer can pick up issues | No: it only reads failing cases, and harness issues are outside the paths it may change. Harness changes stay with a human |
 | 2026-11-19 | Stage 1 | decision | The tools for pull requests differed between runs (gh REST in one, GitHub MCP in the next) | docs/loop.md says what to do with a pull request, not which commands |
+| 2026-11-19 | Stage 1 | question | How to stop the Fixer from moving branches no case runs onto lines the cases do run | The agent recommended recording region coverage next to line coverage before gating on it, because every `?` has an error region that cases rarely run |
+| 2026-11-19 | Stage 1 | approval | Recording region coverage first, as an issue | Issue #12 |
+| 2026-11-19 | Stage 1 | decision | Which issues to settle before the schedules resume | #7, #9 and #10, before resuming |

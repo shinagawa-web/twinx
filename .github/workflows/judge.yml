@@ -6,9 +6,9 @@ name: judge
 #
 # pull_request_target runs this file as it is on main, never the copy in the
 # pull request, so a pull request cannot change how it is judged. The job
-# that runs the pull request's code gets read-only access and no secrets;
-# only the job that comments on the pull request may write, and it never
-# runs that code.
+# that runs the pull request's code gets read-only access and no secrets,
+# and runs that code only in containers (harness/judge.sh); only the job that
+# comments on the pull request may write, and it never runs that code.
 
 on:
   pull_request_target:
@@ -33,10 +33,6 @@ jobs:
       PR_HEAD: ${{ github.event.pull_request.head.sha }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       TWINX_REPO: ${{ github.workspace }}
-      # twinx is built with coverage instrumentation so the judge can see which lines
-      # the cases run. Counter relocation keeps the profile current while twinx runs,
-      # because the harness kills it rather than letting it exit.
-      RUSTFLAGS: -C instrument-coverage -C llvm-args=-runtime-counter-relocation
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,105 +40,55 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # harness/judge.sh runs the pull request's code (cargo build, cargo test, twinx)
+      # only in containers that see a copy of the merged tree, never this checkout,
+      # the harness or the results. Nothing from the pull request runs on the runner.
       - name: Keep main's harness, so the pull request is judged by main's rules
         id: base
         run: |
           cp -r harness "$RUNNER_TEMP/harness"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "JUDGE_DIR=$RUNNER_TEMP/judge" >> "$GITHUB_ENV"
 
-      - name: Install the LLVM coverage tools
-        run: rustup component add llvm-tools-preview
-
-      - uses: Swatinem/rust-cache@v2
-
-      # What passes on main right now. Cached per main commit, so it is computed once.
+      # What passes on main right now. Cached per main commit, and saved before
+      # any of the pull request's code runs.
       - name: Restore main's results
         id: baseline-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          path: baseline.json
-          key: baseline-${{ steps.base.outputs.sha }}
+          path: ${{ runner.temp }}/judge/out/baseline.json
+          key: baseline-sandboxed-${{ steps.base.outputs.sha }}
 
       - name: Run every case against main
         if: steps.baseline-cache.outputs.cache-hit != 'true'
-        run: |
-          if [ -f Cargo.toml ]; then cargo build --release || true; fi
-          python3 "$RUNNER_TEMP/harness/compare.py" --out baseline.json || true
-          [ -f baseline.json ]
+        run: '"$RUNNER_TEMP/harness/judge.sh" baseline'
 
-      - name: Merge the pull request into main without committing
-        id: merge
-        continue-on-error: true
-        run: |
-          git config user.name "twinx-judge"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch -q origin "pull/$PR_NUMBER/head"
-          [ "$(git rev-parse FETCH_HEAD)" = "$PR_HEAD" ]
-          git merge -q --no-ff --no-commit FETCH_HEAD
+      - name: Save main's results
+        if: steps.baseline-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/judge/out/baseline.json
+          key: baseline-sandboxed-${{ steps.base.outputs.sha }}
 
-      - name: Build
-        id: build
-        if: steps.merge.outcome == 'success' && hashFiles('Cargo.toml') != ''
-        continue-on-error: true
-        run: cargo build --release
-
-      - name: Test
-        id: test
-        if: steps.build.outcome == 'success'
-        continue-on-error: true
-        run: cargo test --release
-
-      - name: Run every case against the merged tree
-        if: steps.merge.outcome == 'success'
-        continue-on-error: true
-        run: |
-          mkdir -p "$RUNNER_TEMP/profiles"
-          export LLVM_PROFILE_FILE="$RUNNER_TEMP/profiles/twinx-%p-%c.profraw"
-          python3 "$RUNNER_TEMP/harness/compare.py" --out results.json
-
-      - name: Measure what the cases ran
-        if: steps.merge.outcome == 'success'
-        continue-on-error: true
-        run: |
-          profiles="$RUNNER_TEMP/profiles"
-          base="${{ steps.base.outputs.sha }}"
-          if ls "$profiles"/*.profraw >/dev/null 2>&1 && [ -x target/release/twinx ]; then
-            bin=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin
-            "$bin/llvm-profdata" merge -sparse "$profiles"/*.profraw -o "$profiles/merged.profdata"
-            "$bin/llvm-cov" export target/release/twinx -instr-profile="$profiles/merged.profdata" \
-              -format=lcov --ignore-filename-regex='/.cargo/registry|/rustc/' > cases.lcov
-            python3 "$RUNNER_TEMP/harness/coverage.py" --base "$base" --lcov cases.lcov --out coverage.json
-          else
-            python3 "$RUNNER_TEMP/harness/coverage.py" --base "$base" --out coverage.json
-          fi
-
-      - name: Judge
-        run: |
-          if [ "${{ steps.merge.outcome }}" != success ]; then
-            printf '## judge: fail\n\nThe pull request does not merge cleanly into main. Update the branch.\n' > comment.md
-            echo '{"passed": false, "problems": ["does not merge cleanly into main"]}' > verdict.json
-            exit 1
-          fi
-          python3 "$RUNNER_TEMP/harness/judge.py" \
-            --branch "$BRANCH" --base "${{ steps.base.outputs.sha }}" --head "$PR_HEAD" \
-            --build "${{ steps.build.outcome }}" --test "${{ steps.test.outcome }}" \
-            --baseline baseline.json --results results.json --coverage coverage.json \
-            --verdict verdict.json --comment comment.md
+      - name: Judge the pull request
+        env:
+          BASE: ${{ steps.base.outputs.sha }}
+        run: '"$RUNNER_TEMP/harness/judge.sh" pr'
 
       - name: Summary
         if: always()
-        run: '[ -f comment.md ] && cat comment.md >> "$GITHUB_STEP_SUMMARY" || true'
+        run: '[ -f "$JUDGE_DIR/out/comment.md" ] && cat "$JUDGE_DIR/out/comment.md" >> "$GITHUB_STEP_SUMMARY" || true'
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: judge-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
           path: |
-            baseline.json
-            results.json
-            coverage.json
-            verdict.json
-            comment.md
+            ${{ runner.temp }}/judge/out/baseline.json
+            ${{ runner.temp }}/judge/out/results.json
+            ${{ runner.temp }}/judge/out/coverage.json
+            ${{ runner.temp }}/judge/out/verdict.json
+            ${{ runner.temp }}/judge/out/comment.md
           if-no-files-found: ignore
 
   comment:

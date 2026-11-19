@@ -41,7 +41,7 @@ Claude Code works in two roles. Neither decides whether its own change is good; 
 
 Both turn on auto-merge when they open the pull request. main's ruleset (`main requires judge`) accepts a merge only through a pull request whose `judge` check passed on a branch that is up to date with main, with no exceptions, the owner included. Whoever presses merge, the judge decides.
 
-The judge is a GitHub Actions workflow (`.github/workflows/judge.yml`, `harness/judge.py`). It runs on `pull_request_target`, so the workflow and the harness always come from main, never from the pull request. The job that runs the pull request's code can only read the repository. For every pull request it runs every case against main as it is, merges the pull request into main without committing, builds twinx with coverage instrumentation, runs `cargo test`, runs every case again, and comments the verdict on the pull request.
+The judge is a GitHub Actions workflow (`.github/workflows/judge.yml`, `harness/judge.py`). It runs on `pull_request_target`, so the workflow and the harness always come from main, never from the pull request. The job that runs the pull request's code can only read the repository, and it runs that code (cargo build with its build scripts, cargo test, twinx) only in containers that see a copy of the merged tree, never the harness or the results (`harness/judge.sh`). For every pull request it runs every case against main as it is, merges the pull request into main without committing, builds twinx with coverage instrumentation, runs `cargo test`, runs every case again, and comments the verdict on the pull request.
 
 ```
 pull request into main
