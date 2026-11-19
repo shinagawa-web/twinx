@@ -19,6 +19,8 @@ pub struct Response {
     pub chunked: bool,
     /// The connection must be closed after this response.
     pub close: bool,
+    /// The range filter may answer a Range request from this response.
+    pub allow_ranges: bool,
 }
 
 impl Response {
@@ -34,6 +36,7 @@ impl Response {
             body: Vec::new(),
             chunked: false,
             close: false,
+            allow_ranges: false,
         }
     }
 }

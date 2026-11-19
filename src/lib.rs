@@ -6,6 +6,7 @@ pub mod handler;
 pub mod http;
 pub mod location;
 pub mod proxy;
+pub mod range;
 pub mod response;
 pub mod server;
 pub mod template;
