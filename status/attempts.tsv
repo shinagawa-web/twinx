@@ -1,1 +1,2 @@
 date	branch	head	problems
+2026-11-19T00:01:13Z	claude/fix-stage1-smoke-coverage	c8d506c17d07d00d5d5b9af4a5c362965a2c1095	cases/stage1/smoke-coverage does not exist; the cases run 0.0% of the 5 lines this branch adds, below 99.0%; not run by any case: src/lib.rs:23-25,27,29
