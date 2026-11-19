@@ -1,0 +1,21 @@
+description = "A file or directory only its owner may read answers 403, because the server reads as another user"
+covers = ["static.unreadable"]
+config = """
+server {
+    listen {{port}};
+    root {{root}};
+}
+"""
+
+[modes]
+"secret.txt" = "600"
+"private" = "700"
+
+[[requests]]
+raw = "GET /public.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /secret.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+[[requests]]
+raw = "GET /private/inside.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
