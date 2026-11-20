@@ -102,6 +102,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("gzip_http_version", HSL, 1, 1, false),
     ("gzip_types", HSL, 1, usize::MAX, false),
     ("limit_rate", HSL | LIF, 1, 1, false),
+    ("proxy_limit_rate", HSL, 1, 1, false),
     ("limit_rate_after", HSL | LIF, 1, 1, false),
     ("if_modified_since", HSL, 1, 1, false),
 ];
@@ -294,6 +295,9 @@ pub struct Level {
     /// evaluated when the answer is sent.
     pub limit_rate: Template,
     pub limit_rate_after: Template,
+    /// proxy_limit_rate: the rate a proxied answer is read at, a size that may
+    /// have variables, evaluated once its head has come; 0 or none is no limit.
+    pub proxy_limit_rate: Template,
     /// if_modified_since: None when off; Some(true) for "before", where an
     /// If-Modified-Since time after Last-Modified holds too, not only an equal one.
     pub if_modified_since: Option<bool>,
@@ -590,6 +594,7 @@ impl Builder<'_> {
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
                 "limit_rate" => level.limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "limit_rate_after" => level.limit_rate_after = size_value(&d.args[0]).map_err(at)?,
+                "proxy_limit_rate" => level.proxy_limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "if_modified_since" => level.if_modified_since = [("off", None), ("exact", Some(false)), ("before", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"if_modified_since\" directive, it must be \"off\", \"exact\" or \"before\"", d.args[0])))?.1,
                 _ => {}
             }
@@ -1106,6 +1111,9 @@ mod tests {
         let level = &c.servers[0].level;
         assert_eq!((level.limit_rate.0.len(), level.limit_rate_after.0.len()), (1, 1));
         assert_eq!(build_text("http { limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
+        let c = build_text("http { proxy_limit_rate $upstream_http_x_rate; server { proxy_limit_rate 8k; } }").unwrap();
+        assert_eq!(c.servers[0].level.proxy_limit_rate.0.len(), 1);
+        assert_eq!(build_text("http { proxy_limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
         let c = build_text("http { if_modified_since before; server { location / { if_modified_since off; } } }").unwrap();
         assert_eq!((c.servers[0].level.if_modified_since, c.servers[0].locations[0].level.if_modified_since), (Some(true), None));
         assert!(build_text("http { if_modified_since x; }").unwrap_err().starts_with("invalid value \"x\""));
