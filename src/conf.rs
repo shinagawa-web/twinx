@@ -65,6 +65,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("rewrite", SRV | LOC, 2, 3, false),
     ("default_type", HSL, 1, 1, false),
     ("proxy_set_header", HSL, 2, 2, false),
+    ("proxy_hide_header", HSL, 1, 1, false),
     ("gzip", HSL, 1, 1, false),
     ("gzip_static", HSL, 1, 1, false),
     ("gunzip", HSL, 1, 1, false),
@@ -154,6 +155,9 @@ pub struct Level {
     pub default_type: String,
     /// proxy_set_header: the headers sent to the proxied server instead of the client's.
     pub proxy_set_header: Vec<(String, Template)>,
+    /// proxy_hide_header: the headers of the proxied server's answer not passed
+    /// to the client besides those nginx never passes, lowercased.
+    pub proxy_hide_header: Vec<String>,
     /// gzip_static: None when off, Some(true) for "always".
     pub gzip_static: Option<bool>,
     /// gzip: compress answers for clients that take gzip.
@@ -306,6 +310,7 @@ impl Builder<'_> {
         let (mut headers, mut trailers): (Option<Vec<(String, Template, bool)>>, Option<Vec<_>>) = (None, None);
         let mut pages: Option<Vec<ErrorPage>> = None;
         let mut proxy_headers: Option<Vec<(String, Template)>> = None;
+        let mut hidden: Option<Vec<String>> = None;
         for d in block {
             self.check(d, ctx)?;
             let at = |e: String| format!("{e} in {}", d.at);
@@ -339,6 +344,7 @@ impl Builder<'_> {
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
                 "default_type" => level.default_type = d.args[0].clone(),
                 "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
+                "proxy_hide_header" => hidden.get_or_insert_default().push(d.args[0].to_ascii_lowercase()),
                 "gzip_static" => level.gzip_static = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\"", d.args[0])))?.1,
                 "gunzip" => level.gunzip = flag(d).map_err(at)?,
                 "gzip" => level.gzip = flag(d).map_err(at)?,
@@ -367,6 +373,7 @@ impl Builder<'_> {
         if let Some(trailers) = trailers { level.add_trailer = trailers; }
         if let Some(pages) = pages { level.error_page = pages; }
         if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
+        if let Some(hidden) = hidden { level.proxy_hide_header = hidden; }
         Ok(())
     }
 
@@ -568,6 +575,13 @@ mod tests {
         assert!(e.servers[0].level.expires.is_some() && e.servers[0].locations[0].level.expires.is_some());
         let e = build_text("http { expires bad; }").unwrap_err();
         assert_eq!(e, "invalid value \"bad\" in t.conf:1");
+    }
+
+    #[test]
+    fn proxy_hide_header_inherits_as_a_whole() {
+        let c = build_text("http { proxy_hide_header X-A; server { location /a { proxy_hide_header X-B; proxy_hide_header x-c; } location /b { } } }").unwrap();
+        let (a, b) = (&c.servers[0].locations[0].level, &c.servers[0].locations[1].level);
+        assert_eq!((a.proxy_hide_header.clone(), b.proxy_hide_header.clone()), (vec!["x-b".to_string(), "x-c".into()], vec!["x-a".to_string()]));
     }
 
     #[test]
