@@ -72,6 +72,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             host: None,
             server_name: String::new(),
             peer,
+            local,
             started,
             pipelined,
             length: head.len(),
@@ -284,10 +285,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     out.extend_from_slice(&resp.body[..body_len]);
     let written = stream.write_all(&out).is_ok();
     let sent = Sent { status, bytes: out.len(), body: body_len };
-    for log in &level.access_log {
-        let line = log.format.log_line(r, &sent) + "\n";
-        let _ = (&*log.file).write_all(line.as_bytes());
-    }
+    level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     written && keepalive && status != 444
 }
 
@@ -482,6 +480,7 @@ mod tests {
             host: None,
             server_name: "localhost".into(),
             peer: "127.0.0.1:1".parse().unwrap(),
+            local: "127.0.0.1:8080".parse().unwrap(),
             started: Instant::now(),
             pipelined: false,
             length: 0,

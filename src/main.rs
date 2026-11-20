@@ -4,6 +4,7 @@ mod conf;
 mod expires;
 mod config;
 mod http;
+mod log;
 mod upstream;
 mod vars;
 
