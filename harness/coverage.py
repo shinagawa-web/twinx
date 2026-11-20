@@ -52,6 +52,29 @@ def line_counts(lcov):
     return counts
 
 
+def source_path(name):
+    index = name.rfind("/src/")
+    return name[index + 1:] if index >= 0 else None
+
+
+def region_counts(export):
+    """(path, line, column) -> count for every code region that starts there.
+
+    A line can hold several regions: both arms of an if, a match arm, the error
+    return of a `?`. Line coverage counts the line as run when any of them ran;
+    regions show which ones did. Recorded next to line coverage, not judged (#12).
+    """
+    counts = {}
+    for file in json.loads(Path(export).read_text())["data"][0]["files"]:
+        path = source_path(file["filename"])
+        if not path:
+            continue
+        for line, column, count, has_count, is_entry, is_gap in file["segments"]:
+            if has_count and is_entry and not is_gap:
+                counts[(path, line, column)] = count
+    return counts
+
+
 def ranges(numbers):
     numbers, out = sorted(numbers), []
     for n in numbers:
@@ -66,6 +89,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", required=True)
     parser.add_argument("--lcov", help="LCOV exported from the nginx-tests runs; missing means nothing ran")
+    parser.add_argument("--regions", help="llvm-cov export -format=text from the same runs")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -94,6 +118,14 @@ def main():
         "percent": round(100.0 * covered / executable, 2) if executable else None,
         "missed": {path: ranges(numbers) for path, numbers in sorted(missed.items())},
     }
+    if have_profiles and args.regions and Path(args.regions).exists():
+        regions = [(key, count) for key, count in region_counts(args.regions).items()
+                   if key[1] in added.get(key[0], ())]
+        unrun = sorted(key for key, count in regions if count == 0)
+        result["added_regions"] = len(regions)
+        result["regions_run"] = len(regions) - len(unrun)
+        result["regions_percent"] = round(100.0 * result["regions_run"] / len(regions), 2) if regions else None
+        result["regions_not_run"] = [f"{path}:{line}:{column}" for path, line, column in unrun]
     Path(args.out).write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))
     return 0
