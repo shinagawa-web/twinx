@@ -5,6 +5,9 @@
 #
 # Only subtests that pass on nginx 1.30.6 count: a file or subtest nginx skips
 # here (it needs root, another OS, or a tool the image lacks) is not expected.
+#
+# twinx names itself twinx, not nginx, so server_tokens.t, which checks for
+# "nginx" in the Server header and error pages, is left out.
 
 [stage1]
 files = [
@@ -27,7 +30,7 @@ files = [
   "proxy_pass_request.t", "proxy_redirect.t", "proxy_request_buffering.t",
   "proxy_request_buffering_chunked.t", "proxy_set_body.t", "proxy_upstream_cookie.t",
   "proxy_variables.t", "proxy_websocket.t", "proxy_xar.t", "range_if_range.t",
-  "rewrite.t", "rewrite_if.t", "rewrite_unescape.t", "server_tokens.t", "trailers.t",
+  "rewrite.t", "rewrite_if.t", "rewrite_unescape.t", "trailers.t",
   "upstream.t", "worker_channel.t", "worker_shutdown_timeout.t",
   "worker_shutdown_timeout_proxy_upgrade.t", "working_directory.t",
 ]
