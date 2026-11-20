@@ -86,6 +86,11 @@ def markdown(verdict):
     if coverage and coverage.get("percent") is not None:
         lines.append(f"- Added executable lines run by nginx-tests: {coverage['covered_by_cases']} of "
                      f"{coverage['added_executable_lines']} ({coverage['percent']}%)")
+    if coverage and coverage.get("regions_percent") is not None:
+        # Recorded, not judged (#12): a line counts as run when any region on it ran.
+        lines.append(f"- Added code regions run by nginx-tests (recorded, not judged): {coverage['regions_run']} of "
+                     f"{coverage['added_regions']} ({coverage['regions_percent']}%)"
+                     + (f"; not run: {', '.join(coverage['regions_not_run'][:20])}" if coverage["regions_not_run"] else ""))
     lines += ["", f"main `{verdict['base'][:7]}`, pull request head `{verdict['head'][:7]}`"]
     return "\n".join(lines) + "\n"
 

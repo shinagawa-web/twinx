@@ -96,8 +96,14 @@ pr() {
         bin=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n "s/^host: //p")/bin
         "$bin/llvm-profdata" merge -sparse /profiles/*.profraw -o /tmp/merged.profdata
         "$bin/llvm-cov" export "$0" -instr-profile=/tmp/merged.profdata -format=lcov \
+          --ignore-filename-regex="/registry/src/|/rustc/"
+        echo "=====REGIONS====="
+        "$bin/llvm-cov" export "$0" -instr-profile=/tmp/merged.profdata -format=text -skip-functions \
           --ignore-filename-regex="/registry/src/|/rustc/"' "$tree/target/release/twinx" \
-      > "$OUT/tests.lcov" && lcov=(--lcov "$OUT/tests.lcov")
+      > "$OUT/coverage.raw" \
+      && sed '/^=====REGIONS=====$/,$d' "$OUT/coverage.raw" > "$OUT/tests.lcov" \
+      && sed '1,/^=====REGIONS=====$/d' "$OUT/coverage.raw" > "$OUT/tests-regions.json" \
+      && lcov=(--lcov "$OUT/tests.lcov" --regions "$OUT/tests-regions.json")
   fi
   python3 "$HARNESS/coverage.py" --base "$BASE" "${lcov[@]}" --out "$OUT/coverage.json" || true
 
