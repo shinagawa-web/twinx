@@ -74,6 +74,8 @@ pub enum Var {
     RequestBodyFile,
     ConnectionRequests,
     ConnectionTime,
+    RequestPort,
+    IsRequestPort,
     Arg(String),
     Http(String),
     Cookie(String),
@@ -94,6 +96,7 @@ impl Var {
             ("server_addr", Var::ServerAddr), ("server_port", Var::ServerPort), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
             ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
+            ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -130,6 +133,8 @@ impl Var {
             Var::ConnectionTime => { let ms = r.connected.elapsed().as_millis(); format!("{}.{:03}", ms / 1000, ms % 1000) }
             Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
             Var::RequestUri => r.target.clone(),
+            Var::RequestPort => request_port(r).to_string(),
+            Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
             Var::Args => r.target.split_once('?').map_or("", |(_, a)| a).to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
@@ -187,6 +192,16 @@ fn set_cookie(headers: &[(String, String)], name: &str) -> Option<String> {
         let value = v.get(name.len()..).filter(|_| starts)?.trim_start_matches(' ').strip_prefix('=')?.trim_start_matches(' ');
         Some(value.split(';').next().unwrap_or_default().to_string())
     })
+}
+
+/// The port of the request: the one in an absolute URI of the request line,
+/// else the one in the Host header; empty when neither has one.
+fn request_port(r: &Request) -> &str {
+    let target = r.line.split(' ').filter(|w| !w.is_empty()).nth(1).unwrap_or_default();
+    let absolute = target.split_once("://").filter(|_| !target.starts_with('/')).map(|(_, rest)| rest.split(['/', '?']).next().unwrap_or_default());
+    let host = absolute.or_else(|| r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("host")).map(|h| h.1.as_str())).unwrap_or_default();
+    let host = host.rsplit_once(']').map_or(host, |(_, after)| after);
+    host.split_once(':').map_or("", |(_, port)| port)
 }
 
 /// The user of "Authorization: Basic <base64 of user:password>"; None when the
@@ -350,6 +365,23 @@ mod tests {
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"127.0.0.1:1234:127.0.0.1:8080|\\x7F\\x00\\x00\\x01|\\x22\\x5C\\x0A\\x01\\xC3\\xA9");
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Json), b"127.0.0.1:1234:127.0.0.1:8080|\x7F\\u0000\\u0000\\u0001|\\\"\\\\\\n\\u0001\xC3\xA9".as_slice());
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::None), b"127.0.0.1:1234:127.0.0.1:8080|\x7F\x00\x00\x01|\"\\\n\x01\xC3\xA9");
+    }
+
+    #[test]
+    fn request_port() {
+        let t = Template::parse("[$is_request_port$request_port]").unwrap();
+        let port = |line: &str, host: &str| {
+            let mut r = request();
+            r.line = line.into();
+            r.headers = vec![("Host".into(), host.into())];
+            t.render(&r, &Sent::default())
+        };
+        assert_eq!(port("GET / HTTP/1.0", "a"), "[]");
+        assert_eq!(port("GET / HTTP/1.0", "a:81"), "[:81]");
+        assert_eq!(port("GET / HTTP/1.0", "[::1]:82"), "[:82]");
+        assert_eq!(port("GET http://a:83/x HTTP/1.0", "a:9"), "[:83]");
+        assert_eq!(port("GET http://[::1] HTTP/1.0", "a:9"), "[]");
+        assert_eq!(Template::parse("[$request_port]").unwrap().render(&request(), &Sent::default()), "[]");
     }
 
     #[test]
