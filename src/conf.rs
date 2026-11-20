@@ -82,6 +82,8 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_intercept_errors", HSL, 1, 1, false),
     ("proxy_connect_timeout", HSL, 1, 1, false),
     ("proxy_read_timeout", HSL, 1, 1, false),
+    ("proxy_buffer_size", HSL, 1, 1, false),
+    ("proxy_buffering", HSL, 1, 1, false),
     ("resolver", HSL, 1, usize::MAX, false),
     ("resolver_timeout", HSL, 1, 1, false),
     ("gzip", HSL, 1, 1, false),
@@ -452,6 +454,9 @@ impl Builder<'_> {
                 "underscores_in_headers" => level.underscores_in_headers = flag(d).map_err(at)?,
                 "merge_slashes" => level.merge_slashes = flag(d).map_err(at)?,
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
+                // How the proxied answer is read changes nothing that is sent: the values are only checked.
+                "proxy_buffer_size" => { size(&d.args[0]).map_err(at)?; }
+                "proxy_buffering" => { flag(d).map_err(at)?; }
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
                 "default_type" => level.default_type = d.args[0].clone(),
@@ -800,6 +805,13 @@ mod tests {
         let p = peer(&["127.0.0.1:1".into(), "max_fails=3".into(), "fail_timeout=5s".into()]).unwrap();
         assert_eq!((p.max_fails, p.fail_timeout, p.weight, p.backup), (3, 5, 1, false));
         assert_eq!(peer(&["127.0.0.1:1".into(), "down".into()]).unwrap_err(), "invalid parameter \"down\"");
+    }
+
+    #[test]
+    fn checks_proxy_buffering() {
+        assert!(build_text("http { server { location / { proxy_buffer_size 512; proxy_buffering off; } } }").is_ok());
+        assert!(build_text("http { proxy_buffer_size 5x; }").unwrap_err().starts_with("\"5x\" is invalid"));
+        assert!(build_text("http { proxy_buffering of; }").is_err());
     }
 
     #[test]
