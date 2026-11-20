@@ -43,6 +43,12 @@ pub fn http_date(t: i64) -> String {
     DateTime::from_timestamp(t, 0).unwrap_or_default().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
+/// The time an HTTP date such as "Sun, 06 Nov 1994 08:49:37 GMT" gives.
+/// The older forms ngx_parse_http_time() also reads are not read yet.
+pub fn http_time(s: &str) -> Option<i64> {
+    DateTime::parse_from_rfc2822(s.trim()).ok().map(|t| t.timestamp())
+}
+
 /// The Expires and Cache-Control values, given the response's Last-Modified time.
 pub fn headers(e: Expires, last_modified: Option<i64>) -> Option<(String, String)> {
     let now = Utc::now().timestamp();
