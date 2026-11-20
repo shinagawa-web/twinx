@@ -34,6 +34,15 @@ pub struct Request {
     pub body_file: Option<PathBuf>,
     /// The proxied servers tried before an internal redirect ($upstream_addr).
     pub upstream_addr: Option<String>,
+    /// The named captures of the server name that matched the host.
+    pub captures: Vec<(String, String)>,
+}
+
+/// The names of the captures that are variables.
+static CAPTURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn add_captures<'a>(names: impl Iterator<Item = &'a str>) {
+    CAPTURES.lock().unwrap().extend(names.map(String::from));
 }
 
 /// What the answer to a request was, once it was sent.
@@ -82,6 +91,9 @@ pub enum Var {
     IsRequestPort,
     UpstreamAddr,
     Pid,
+    ServerName,
+    /// A named capture of the server name's regular expression.
+    Capture(String),
     Arg(String),
     Http(String),
     Cookie(String),
@@ -103,6 +115,7 @@ impl Var {
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
             ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
             ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("pid", Var::Pid),
+            ("server_name", Var::ServerName),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -112,7 +125,8 @@ impl Var {
             ("upstream_cookie_", Var::UpstreamCookie, false),
         ];
         let found = prefixed.into_iter().find_map(|(p, var, dashes)| name.strip_prefix(p).map(|n| var(if dashes { n.replace('_', "-") } else { n.to_string() })));
-        found.or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v))
+        let capture = || CAPTURES.lock().unwrap().iter().any(|c| c == name).then(|| Var::Capture(name.to_string()));
+        found.or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v)).or_else(capture)
     }
 
     /// The value, or None when the variable is "not found" (no such header, no user).
@@ -142,6 +156,8 @@ impl Var {
             Var::RequestPort => request_port(r).to_string(),
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
             Var::Pid => std::process::id().to_string(),
+            Var::ServerName => r.server_name.clone(),
+            Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
             Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
             Var::Args => r.target.split_once('?').map_or("", |(_, a)| a).to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
@@ -341,6 +357,7 @@ mod tests {
             body: b"xy".to_vec(),
             body_file: None,
             upstream_addr: None,
+            captures: Vec::new(),
         }
     }
 
