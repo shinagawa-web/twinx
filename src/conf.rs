@@ -87,6 +87,8 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_next_upstream_tries", HSL, 1, 1, false),
     ("proxy_next_upstream_timeout", HSL, 1, 1, false),
     ("proxy_intercept_errors", HSL, 1, 1, false),
+    ("proxy_pass_request_headers", HSL, 1, 1, false),
+    ("proxy_pass_request_body", HSL, 1, 1, false),
     ("proxy_connect_timeout", HSL, 1, 1, false),
     ("proxy_read_timeout", HSL, 1, 1, false),
     ("proxy_buffer_size", HSL, 1, 1, false),
@@ -275,6 +277,10 @@ pub struct Level {
     pub proxy_hide_header: Vec<String>,
     /// proxy_intercept_errors: error_page replaces the answers of proxied servers too.
     pub proxy_intercept_errors: bool,
+    /// proxy_pass_request_headers, proxy_pass_request_body: whether the
+    /// client's headers and body are passed to the proxied server.
+    pub proxy_pass_request_headers: bool,
+    pub proxy_pass_request_body: bool,
     /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
     pub proxy_next_upstream: Vec<String>,
     /// proxy_next_upstream_tries: how many servers a request may try, 0 for any.
@@ -435,7 +441,7 @@ impl Builder<'_> {
         let temp = self.path("client_body_temp");
         let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -580,6 +586,8 @@ impl Builder<'_> {
                 "proxy_connect_timeout" => level.proxy_connect_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_read_timeout" => level.proxy_read_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_intercept_errors" => level.proxy_intercept_errors = flag(d).map_err(at)?,
+                "proxy_pass_request_headers" => level.proxy_pass_request_headers = flag(d).map_err(at)?,
+                "proxy_pass_request_body" => level.proxy_pass_request_body = flag(d).map_err(at)?,
                 "proxy_next_upstream" => {
                     const VALUES: &[&str] = &["error", "timeout", "invalid_header", "http_500", "http_502", "http_503", "http_504", "http_403", "http_404", "http_429", "non_idempotent", "updating", "off"];
                     if let Some(a) = d.args.iter().find(|a| !VALUES.contains(&a.as_str())) { return Err(at(format!("invalid value \"{a}\""))); }
@@ -1145,6 +1153,8 @@ mod tests {
         let c = build_text("http { proxy_limit_rate $upstream_http_x_rate; server { proxy_limit_rate 8k; } }").unwrap();
         assert_eq!(c.servers[0].level.proxy_limit_rate.0.len(), 1);
         assert_eq!(build_text("http { proxy_limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
+        let c = build_text("http { proxy_pass_request_body off; server { proxy_pass_request_headers off; } }").unwrap();
+        assert_eq!((c.servers[0].level.proxy_pass_request_headers, c.servers[0].level.proxy_pass_request_body), (false, false));
         let c = build_text("http { proxy_next_upstream http_404; server { proxy_next_upstream error off; } server { } }").unwrap();
         assert_eq!((c.servers[0].level.proxy_next_upstream.len(), c.servers[1].level.proxy_next_upstream.as_slice()), (0, &["http_404".to_string()][..]));
         let c = build_text("http { proxy_next_upstream_tries 2; proxy_next_upstream_timeout 3800ms; server { proxy_next_upstream_timeout 2s; } }").unwrap();
