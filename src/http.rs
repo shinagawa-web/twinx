@@ -410,8 +410,22 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let rate = r.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
     let written = send(stream, &out, rate, size(&level.limit_rate_after), r.started);
     let sent = Sent { bytes: out.len(), body: body_len, ..so_far(&resp, &trailers) };
+    if written { post_action(server, r, level); }
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     (written && keepalive && status != 444).then_some(level.keepalive_timeout)
+}
+
+/// post_action: once the answer is sent, the request is redirected internally
+/// to the URI (or named location) post_action gives, and what that answers is
+/// discarded. The location it goes to does not run its own post_action.
+fn post_action(server: &Server, r: &Request, level: &Level) {
+    let Some(url) = &level.post_action else { return };
+    let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && &l.path == url);
+    // A named location answers the request as it is; a URI replaces the request's.
+    let uri = || url.split('?').next().unwrap_or_default().to_string();
+    let to = if named.is_some() { r.clone() } else { Request { uri: uri(), target: url.clone(), ..r.clone() } };
+    let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
+    answer(server, &to, Ok(()), found);
 }
 
 /// The not modified filter, as ngx_http_not_modified_filter() is: a 200
@@ -1350,6 +1364,18 @@ mod tests {
         assert_eq!(request("GET / HTTP/1.0\nIf-Match: a\nif-match: b\n\n").0, Err(400));
         assert_eq!(request("GET / HTTP/1.0\nAuthorization: a\nAuthorization: a\n\n").0, Err(400));
         assert_eq!(request("GET / HTTP/1.0\nCookie: a\nCookie: b\nVia: x\nVia: y\n\n").0, Ok(()));
+    }
+
+    #[test]
+    fn post_action_answers_in_the_background() {
+        let text = "http { server { location / { post_action @n; } location @n { return 204; } location /u { post_action /x?a; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        for target in ["/", "/u"] {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            post_action(s, &r, location(s, &r.uri).1);
+        }
+        assert_eq!(location(s, "/").1.post_action.as_deref(), Some("@n"));
     }
 
     #[test]
