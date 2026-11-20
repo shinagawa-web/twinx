@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,10 +31,47 @@ const REASONS: &[(u16, &str)] = &[
 
 /// Binds every address the servers listen on and accepts connections on each in a thread.
 /// Opens the listening sockets: the master does this, so that bind errors stop it and every worker shares them.
-pub fn bind(config: &Config) -> Result<Vec<(TcpListener, SocketAddr)>, String> {
+pub fn bind(config: &Config, open: &[(TcpListener, SocketAddr)]) -> Result<Vec<(TcpListener, SocketAddr)>, String> {
     let mut addrs: Vec<SocketAddr> = config.servers.iter().flat_map(|s| s.listen.clone()).collect();
     addrs.dedup();
-    addrs.into_iter().map(|addr| TcpListener::bind(addr).map(|l| (l, addr)).map_err(|e| format!("bind() to {addr} failed ({e})"))).collect()
+    // On a reload, a socket already open on the address is kept. accept() on
+    // it gives up after a while, so that a worker shutting down stops accepting.
+    let get = |addr| open.iter().find(|o| o.1 == addr).map_or_else(|| TcpListener::bind(addr), |o| o.0.try_clone());
+    let timeout = |l: TcpListener| socket2::SockRef::from(&l).set_read_timeout(Some(ACCEPT_WAIT)).map(|()| l);
+    addrs.into_iter().map(|addr| get(addr).and_then(timeout).map(|l| (l, addr)).map_err(|e| format!("bind() to {addr} failed ({e})"))).collect()
+}
+
+/// How long accept() waits before it looks again whether the worker is shutting down.
+const ACCEPT_WAIT: Duration = Duration::from_millis(100);
+
+/// Whether the worker is shutting down gracefully, and how many requests it is answering.
+static SHUTTING: AtomicBool = AtomicBool::new(false);
+static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+/// A request being answered, counted in BUSY while it lives.
+struct Busy;
+
+impl Busy {
+    fn new() -> Busy {
+        BUSY.fetch_add(1, Ordering::SeqCst);
+        Busy
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Shuts the worker down gracefully, as QUIT does: it stops accepting, closes
+/// each connection once its request is answered, and returns when no request
+/// is left, or once worker_shutdown_timeout has passed. Idle connections are
+/// closed when the worker exits.
+pub fn shut_down(timeout: Option<Duration>) {
+    let start = Instant::now();
+    SHUTTING.store(true, Ordering::SeqCst);
+    while BUSY.load(Ordering::SeqCst) > 0 && timeout.is_none_or(|t| start.elapsed() < t) { thread::sleep(Duration::from_millis(10)); }
 }
 
 /// Accepts connections on the listening sockets, in a worker process.
@@ -42,7 +79,8 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
     for (listener, addr) in listeners {
         let (listener, addr, config) = (listener.try_clone().map_err(|e| e.to_string())?, *addr, config.clone());
         thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
+            while !SHUTTING.load(Ordering::SeqCst) {
+                let Ok((stream, _)) = listener.accept() else { continue };
                 let config = config.clone();
                 thread::spawn(move || connection(&config, stream, addr));
             }
@@ -146,7 +184,9 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
                 buf.extend_from_slice(&chunk[..read]);
             },
         };
+        let busy = Busy::new();
         idle = exchange(&mut stream, server, &r, parsed, found, local);
+        drop(busy);
         // What of an unbuffered body was not passed on is read and dropped.
         // What came after a chunked one is the next request.
         if let Some(mut u) = r.unread.lock().unwrap().take() {
@@ -154,7 +194,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             buf = u.rest;
         }
         if !level.body_in_file_only { r.body_file.map(std::fs::remove_file); }
-        if idle.is_none() { return linger(&mut stream); }
+        if idle.is_none() || SHUTTING.load(Ordering::SeqCst) { return linger(&mut stream); }
     }
 }
 
@@ -238,6 +278,9 @@ struct Response {
     body: Vec<u8>,
     /// Whether "Vary: Accept-Encoding" is sent when gzip_vary is on.
     vary: bool,
+    /// The connection to a proxied server that switched protocols (101) for a
+    /// request with Upgrade: once the head is sent, data is passed both ways.
+    tunnel: Option<TcpStream>,
     /// Whether this is a page nginx generates for an error or a redirect
     /// (ngx_http_special_response_handler()), which keeps its own status
     /// after an error_page redirect.
@@ -529,8 +572,10 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     // chunked_transfer_encoding off leaves both unchunked.
     let unknown = resp.unknown_length && r.method != "HEAD";
     let trailing = level.add_trailer.iter().any(|t| t.2 || added) && r.method != "HEAD" && ![204, 304].contains(&status);
-    let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1") && level.chunked;
-    let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown);
+    // An upgraded connection is neither chunked nor kept alive, and has no length.
+    let upgraded = resp.tunnel.is_some();
+    let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1") && level.chunked && !upgraded;
+    let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown) && !upgraded;
     let mut out = Vec::new();
     // 444 closes the connection without an answer; 499 is the status of a client that closed it.
     let silent = [444, 499].contains(&status);
@@ -538,9 +583,9 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
         let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
         let ctype = resp.ctype.as_ref().map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
-        let connection = if keepalive { "keep-alive" } else { "close" };
+        let connection = if upgraded { "upgrade" } else if keepalive { "keep-alive" } else { "close" };
         let len = resp.body.len();
-        let length = if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else if !resp.unknown_length && status != 304 { format!("Content-Length: {len}\r\n") } else { String::new() };
+        let length = if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else if !resp.unknown_length && status != 304 && !upgraded { format!("Content-Length: {len}\r\n") } else { String::new() };
         let header = level.keepalive_header.filter(|_| keepalive).map(|t| format!("Keep-Alive: timeout={t}\r\n")).unwrap_or_default();
         let vary = if resp.vary && level.gzip_vary { "Vary: Accept-Encoding\r\n" } else { "" };
         let server = if level.server_tokens { NAME } else { "twinx" };
@@ -566,10 +611,23 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let size = |t: &Template| crate::conf::size(&t.render(r, &Sent::default())).unwrap_or(0);
     let rate = r.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
     let written = send(stream, &out, rate, size(&level.limit_rate_after), r.started);
+    if let Some(up) = resp.tunnel.take().filter(|_| written) { tunnel(stream, up); }
     let sent = Sent { bytes: out.len(), body: body_len, ..so_far(&resp, &trailers) };
     if written { post_action(server, r, level); }
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     (written && keepalive && !silent).then_some(level.keepalive_timeout)
+}
+
+/// Passes data both ways between a client and the proxied server its
+/// connection was upgraded to, until either closes it or sends nothing for
+/// proxy_read_timeout.
+fn tunnel(client: &TcpStream, up: TcpStream) {
+    let _ = client.set_read_timeout(up.read_timeout().ok().flatten());
+    let (Ok(mut from_client), Ok(mut to_up)) = (client.try_clone(), up.try_clone()) else { return };
+    let other = thread::spawn(move || { let _ = std::io::copy(&mut from_client, &mut to_up); let _ = to_up.shutdown(Shutdown::Both); });
+    let _ = std::io::copy(&mut &up, &mut &*client);
+    let _ = client.shutdown(Shutdown::Both);
+    let _ = other.join();
 }
 
 /// post_action: once the answer is sent, the request is redirected internally
@@ -901,13 +959,14 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let (mut tried, mut answer, mut addrs, mut times, mut bytes) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new(), Vec::new());
     let (mut statuses, limit, first) = (Vec::new(), level.proxy_next_upstream_tries, Instant::now());
     let (mut tries, next) = (if limit > 0 { up.tries().min(limit) } else { up.tries() }, |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
+    let upgrade = r.headers.iter().any(|h| h.0.eq_ignore_ascii_case("upgrade"));
     while let Some(i) = up.pick(&mut tried) {
         addrs.push(up.peers[i].addr.to_string());
         // A socket that cannot be bound fails the request without trying the next server.
         let socket = bind.map(|b| bound(&up.peers[i].addr, b));
         if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
         let (start, mut time, mut counted) = (Instant::now(), [None; 3], [0; 3]);
-        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body);
+        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade);
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
@@ -1045,7 +1104,7 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
 /// it took to connect and to send the response head. While it waits for the
 /// head, the client closing the connection ends the request with 499, as
 /// proxy_ignore_client_abort off does.
-fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64) -> Option<Response> {
+fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
     let start = Instant::now();
     let mut s = match socket {
         Some(socket) => socket.connect_timeout(&(*peer).into(), level.proxy_connect_timeout).ok().map(|()| TcpStream::from(socket))?,
@@ -1079,6 +1138,8 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
         let again = lower == "expires" && resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("expires"));
         if !again && !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
     }
+    // 101 to a request with Upgrade: what came after the head goes to the client first.
+    if status == 101 && upgrade { return Some(Response { body: answer[end..].to_vec(), tunnel: Some(s), ..resp }); }
     // The body's length: one Content-Length of digits, or one "Transfer-Encoding:
     // chunked" without it; any other mix makes the answer invalid. A HEAD, 204
     // or 304 answer has no body.
@@ -1393,6 +1454,38 @@ fn page(status: u16) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tunnel_passes_data_both_ways() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let (mut client, accepted) = (TcpStream::connect(addr).unwrap(), l.accept().unwrap().0);
+        let (mut server, up) = (TcpStream::connect(addr).unwrap(), l.accept().unwrap().0);
+        let t = thread::spawn(move || tunnel(&accepted, up));
+        let mut buf = [0u8; 4];
+        client.write_all(b"ping").unwrap();
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+        server.write_all(b"pong").unwrap();
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
+        // The proxied server closing ends the client's connection too.
+        drop(server);
+        assert_eq!(client.read(&mut buf).unwrap(), 0);
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn bind_keeps_open_sockets() {
+        let open = vec![(TcpListener::bind("127.0.0.1:0").unwrap(), "0.0.0.0:0".parse::<SocketAddr>().unwrap())];
+        let addr = open[0].0.local_addr().unwrap();
+        let text = format!("http {{ server {{ listen {addr}; }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        // The address is taken already, so a socket of its own could not be bound.
+        assert!(bind(&config, &[]).unwrap_err().starts_with(&format!("bind() to {addr} failed")));
+        let open = vec![(open.into_iter().next().unwrap().0, addr)];
+        assert_eq!(bind(&config, &open).unwrap()[0].0.local_addr().unwrap(), addr);
+    }
+
     fn request(head: &str) -> (Result<(), u16>, Request) {
         let mut r = Request {
             method: String::new(),
@@ -1490,7 +1583,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (mut time, mut bytes) = ([None; 3], [0; 3]);
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0, false).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
         // The body, the whole answer and the request, in bytes.
         assert_eq!(bytes, [4, 80, 18]);
@@ -1595,7 +1688,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
-        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0).unwrap().status, 200);
+        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
@@ -1614,7 +1707,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
-        let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0).unwrap();
+        let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).unwrap();
         // The body is read after the head, 4000 bytes (what came with the head too)
         // in each second of the clock: it ends in the third second.
         assert!(resp.body.is_empty() && resp.rest.is_some());
@@ -1655,10 +1748,10 @@ mod tests {
             }
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0).is_none());
+            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).is_none());
         }
     }
 
