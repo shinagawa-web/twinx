@@ -27,10 +27,14 @@ const HSL: u8 = HTTP | SRV | LOC;
 
 /// Every directive twinx knows: where it may appear, its argument counts, and
 /// whether it takes a block.
+/// The levels of error_log, from the lowest.
+const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
+
 const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("daemon", MAIN, 1, 1, false),
     ("pid", MAIN, 1, 1, false),
     ("worker_rlimit_nofile", MAIN, 1, 1, false),
+    ("working_directory", MAIN, 1, 1, false),
     ("worker_shutdown_timeout", MAIN, 1, 1, false),
     ("error_log", MAIN | HSL, 1, usize::MAX, false),
     ("log_not_found", HSL, 1, 1, false),
@@ -447,6 +451,10 @@ pub struct Config {
     pub rlimit_nofile: Option<u64>,
     /// worker_shutdown_timeout: how long a worker shutting down gracefully waits for its requests.
     pub shutdown_timeout: Option<Duration>,
+    /// working_directory: where a worker changes to when it starts, as given, not relative to the prefix.
+    pub working_directory: Option<PathBuf>,
+    /// The error_log files of the main block that take alerts.
+    pub alert_logs: Vec<Arc<File>>,
     pub servers: Vec<Server>,
 }
 
@@ -465,14 +473,18 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), location: String::new() };
-    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, servers: Vec::new() };
+    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), servers: Vec::new() };
     for d in main {
         b.check(d, MAIN)?;
         match d.name.as_str() {
             "pid" => config.pid = b.path(&d.args[0]),
             "worker_rlimit_nofile" => config.rlimit_nofile = Some(d.args[0].parse().map_err(|_| format!("invalid number in {}", d.at))?),
             "worker_shutdown_timeout" => config.shutdown_timeout = Some(millis(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?),
-            "error_log" => b.open(&d.args[0]).map(drop).map_err(|e| format!("{e} in {}", d.at))?,
+            "working_directory" => config.working_directory = Some(d.args[0].clone().into()),
+            "error_log" => {
+                let file = b.open(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
+                if d.args.get(1).is_none_or(|l| LEVELS.iter().position(|v| v == l) <= Some(6)) { config.alert_logs.push(file) }
+            }
             "events" => d.block.iter().flatten().try_for_each(|e| b.check(e, EVENTS))?,
             "http" => config.servers = b.http(d.block.as_deref().unwrap_or_default())?,
             _ => {}
@@ -651,7 +663,6 @@ impl Builder<'_> {
                 "index" => level.index = d.args.iter().map(|a| Template::parse(a)).collect::<Result<_, _>>().map_err(at)?,
                 "log_not_found" => level.log_not_found = flag(d).map_err(at)?,
                 "error_log" => {
-                    const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
                     let file = self.open(&d.args[0]).map_err(at)?;
                     level.error_log = d.args.get(1).is_none_or(|l| LEVELS.iter().position(|v| v == l) <= Some(4)).then_some(file);
                 }
@@ -1106,6 +1117,16 @@ mod tests {
         let l = &c.servers[0].locations;
         assert_eq!((l[0].level.chunked, l[1].level.chunked), (false, true));
         assert!(build_text("http { chunked_transfer_encoding x; }").is_err());
+    }
+
+    #[test]
+    fn working_directory_and_alert_logs() {
+        let c = build_text("working_directory wd; error_log a.log; error_log b.log emerg; error_log c.log alert; http { }").unwrap();
+        assert_eq!(c.working_directory, Some(PathBuf::from("wd")));
+        assert_eq!(c.alert_logs.len(), 2);
+        assert_eq!(build_text("http { }").unwrap().working_directory, None);
+        assert!(build_text("working_directory;").is_err());
+        assert!(build_text("http { working_directory wd; }").is_err());
     }
 
     #[test]

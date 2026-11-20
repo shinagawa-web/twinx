@@ -121,6 +121,13 @@ fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], s
     let limit = config.rlimit_nofile.map(|n| libc::rlimit { rlim_cur: n, rlim_max: n });
     // SAFETY: setrlimit() only reads the structure it is given.
     if let Some(l) = limit { unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &l) }; }
+    // working_directory: as in nginx 1.30, a worker that cannot change to it logs an alert and exits
+    // with the fatal code 2, and the master does not start it again.
+    if let Some((dir, Err(e))) = config.working_directory.as_ref().map(|d| (d, std::env::set_current_dir(d))) {
+        let reason = e.to_string().split(" (os error").next().unwrap_or_default().to_string();
+        alert(config, &format!("chdir(\"{}\") failed ({}: {reason})", dir.display(), e.raw_os_error().unwrap_or(0)));
+        std::process::exit(2)
+    }
     if let Err(e) = http::accept(config.clone(), listeners) { fail(&e, None) }
     // A worker ignores HUP, which only the master acts on. QUIT shuts it down
     // gracefully; TERM and INT end it at once.
@@ -144,6 +151,13 @@ fn main() {
 fn fail(msg: &str, log: Option<&Path>) -> ! {
     emerg(msg, log);
     std::process::exit(1)
+}
+
+/// Writes an alert to the error logs of the main block.
+fn alert(config: &conf::Config, msg: &str) {
+    let time = chrono::Local::now().format("%Y/%m/%d %H:%M:%S");
+    let line = format!("{time} [alert] {}#0: {msg}\n", std::process::id());
+    config.alert_logs.iter().for_each(|f| { let _ = (&**f).write_all(line.as_bytes()); });
 }
 
 /// Reports an error on standard error and in the error log.
@@ -170,6 +184,17 @@ mod tests {
         assert!(args(&strings(&["-V"])).unwrap().version);
         assert_eq!(args(&strings(&["-x"])).unwrap_err(), "invalid option: \"-x\"");
         assert_eq!(args(&strings(&["-p"])).unwrap_err(), "option \"-p\" requires an argument");
+    }
+
+    #[test]
+    fn alert_goes_to_the_main_error_logs() {
+        let dir = std::env::temp_dir().join(format!("twinx-alert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = config::parse("error_log a.log; error_log b.log emerg;", Path::new("t.conf")).unwrap();
+        alert(&conf::build(&main, &dir).unwrap(), "chdir(\"wd\") failed");
+        let a = std::fs::read_to_string(dir.join("a.log")).unwrap();
+        assert!(a.ends_with(&format!(" [alert] {}#0: chdir(\"wd\") failed\n", std::process::id())));
+        assert_eq!(std::fs::read_to_string(dir.join("b.log")).unwrap(), "");
     }
 
     #[test]
