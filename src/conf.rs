@@ -35,6 +35,8 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("server", UPS, 1, usize::MAX, false),
     ("listen", SRV, 1, usize::MAX, false),
     ("server_name", SRV, 1, usize::MAX, false),
+    ("server_names_hash_bucket_size", HTTP, 1, 1, false),
+    ("server_names_hash_max_size", HTTP, 1, 1, false),
     ("location", SRV | LOC, 1, 2, true),
     ("return", SRV | LOC, 1, 2, false),
     ("root", HTTP | SRV | LOC, 1, 1, false),
@@ -208,10 +210,22 @@ pub struct Location {
     pub auto_redirect: bool,
 }
 
+/// A server_name: an exact name, "*.name" (here ".name"), "name.*" (here
+/// "name."), or "~regex", matched against the host case-insensitively.
+#[derive(Debug)]
+pub enum ServerName {
+    Exact(String),
+    Leading(String),
+    Trailing(String),
+    Regex(regex::Regex),
+}
+
 #[derive(Debug)]
 pub struct Server {
     pub listen: Vec<SocketAddr>,
-    pub names: Vec<String>,
+    pub names: Vec<ServerName>,
+    /// The first name as written ($server_name), without the leading "." of ".name".
+    pub name: String,
     pub level: Level,
     pub locations: Vec<Location>,
 }
@@ -286,18 +300,24 @@ impl Builder<'_> {
             let upstream = Upstream::new(peers.collect::<Result<_, _>>()?);
             self.upstreams.insert(d.args[0].clone(), Arc::new(upstream));
         }
+        // Named captures of server names are variables everywhere, so they are known first.
+        let names = block.iter().filter(|d| d.name == "server").flat_map(|d| d.block.iter().flatten()).filter(|d| d.name == "server_name");
+        names.flat_map(|d| d.args.iter()).filter(|n| n.starts_with('~')).for_each(|n| drop(server_name(n)));
         self.level(block, HTTP, &mut level)?;
         let servers = block.iter().filter(|d| d.name == "server");
         servers.map(|d| self.server(d.block.as_deref().unwrap_or_default(), &level)).collect()
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), level: parent.clone(), locations: Vec::new() };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new() };
         self.level(block, SRV, &mut s.level)?;
         for d in block {
             match d.name.as_str() {
                 "listen" => s.listen.push(listen(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?),
-                "server_name" => s.names.extend(d.args.iter().map(|n| n.to_lowercase())),
+                "server_name" => {
+                    if s.names.is_empty() { s.name = d.args[0].strip_prefix('.').unwrap_or(&d.args[0]).to_string(); }
+                    for n in &d.args { s.names.extend(server_name(n).map_err(|e| format!("{e} in {}", d.at))?); }
+                }
                 _ => {}
             }
         }
@@ -504,6 +524,34 @@ fn expires(args: &[String]) -> Result<Template, String> {
 /// A time such as "1s" or "30", for directives that take one.
 fn seconds(s: &str) -> Result<Duration, String> {
     crate::expires::parse_time(s).filter(|t| *t >= 0).map(|t| Duration::from_secs(t as u64)).ok_or_else(|| "invalid value".to_string())
+}
+
+/// What a server_name argument matches: ".name" is both "name" and "*.name".
+/// The named captures of a regular expression become variables.
+fn server_name(n: &str) -> Result<Vec<ServerName>, String> {
+    let lower = n.to_lowercase();
+    if let Some(re) = n.strip_prefix('~') {
+        let re = regex::Regex::new(&format!("(?i){}", pcre(re))).map_err(|e| format!("invalid regular expression \"{re}\": {e}"))?;
+        crate::vars::add_captures(re.capture_names().flatten());
+        return Ok(vec![ServerName::Regex(re)]);
+    }
+    Ok(match (lower.strip_prefix('*'), lower.strip_suffix('*'), lower.strip_prefix('.')) {
+        (Some(suffix), _, _) => vec![ServerName::Leading(suffix.to_string())],
+        (_, Some(prefix), _) => vec![ServerName::Trailing(prefix.to_string())],
+        (_, _, Some(name)) => vec![ServerName::Exact(name.to_string()), ServerName::Leading(lower.clone())],
+        _ => vec![ServerName::Exact(lower)],
+    })
+}
+
+/// A PCRE pattern in the syntax of the regex crate: "\Q...\E" quotes text.
+fn pcre(p: &str) -> String {
+    let (mut out, mut rest) = (String::new(), p);
+    while let Some(i) = rest.find("\\Q") {
+        let (quoted, next) = rest[i + 2..].split_once("\\E").unwrap_or((&rest[i + 2..], ""));
+        out += &format!("{}{}", &rest[..i], regex::escape(quoted));
+        rest = next;
+    }
+    out + rest
 }
 
 /// "on" or "off".
