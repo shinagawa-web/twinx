@@ -3,6 +3,7 @@
 mod conf;
 mod config;
 mod http;
+mod upstream;
 mod vars;
 
 use std::fs::OpenOptions;
