@@ -626,17 +626,20 @@ fn parse(r: &mut Request, head: &[u8]) -> Result<(), u16> {
     if hosts.len() > 1 || (hosts.is_empty() && version == "HTTP/1.1") { return Err(400); }
     r.host = hosts.first().map(|h| valid_host(h).ok_or(400u16)).transpose()?;
     if method == "CONNECT" { return Err(if target.starts_with('/') || !target.contains(':') { 400 } else { 405 }); }
+    if target.bytes().any(|c| c < 0x20 || c == 0x7f) { return Err(400); }
+    // A fragment is not part of the request.
+    let target = target.split('#').next().unwrap_or_default();
     let path = match target.split_once("://") {
         Some((_, rest)) if !target.starts_with('/') => {
-            let (authority, path) = rest.find('/').map_or((rest, "/"), |i| (&rest[..i], &rest[i..]));
+            let (authority, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
             r.host = Some(valid_host(authority).ok_or(400u16)?);
-            path
+            if path.starts_with('/') { path.to_string() } else { format!("/{path}") }
         }
-        _ => target,
+        _ => target.to_string(),
     };
     if !path.starts_with('/') { return Err(400); }
-    r.target = path.to_string();
-    r.uri = decode(path.split('?').next().unwrap_or_default()).ok_or(400u16)?;
+    r.uri = decode(path.split('?').next().unwrap_or_default()).and_then(|u| dots(&u)).ok_or(400u16)?;
+    r.target = path;
     if method == "TRACE" { return Err(405); }
     Ok(())
 }
@@ -650,6 +653,23 @@ fn decode(s: &str) -> Option<String> {
         i += 1;
     }
     Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The path with its "." and ".." segments resolved, as nginx does; None when
+/// ".." would go above the root. A last "." or ".." leaves the path ending with "/".
+fn dots(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split('/').skip(1).collect();
+    let mut out = Vec::new();
+    for (i, s) in segments.iter().enumerate() {
+        let last = i + 1 == segments.len();
+        match *s {
+            "." => {}
+            ".." => drop(out.pop()?),
+            _ => { out.push(*s); continue }
+        }
+        if last { out.push(""); }
+    }
+    Some(format!("/{}", out.join("/")))
 }
 
 /// Escapes what may not appear as such in a URI, as nginx's NGX_ESCAPE_URI
@@ -868,6 +888,12 @@ mod tests {
         let (res, r) = request("GET /d%20s?a=b HTTP/1.0\n\n");
         assert_eq!((res, r.uri.as_str(), args(&r)), (Ok(()), "/d s", "?a=b"));
         assert_eq!(request("GET /%g HTTP/1.0\n\n").0, Err(400));
+        assert_eq!(request("GET /\x02 HTTP/1.0\n\n").0, Err(400));
+        let (res, r) = request("GET /a/%2e/b/..?x#f HTTP/1.0\n\n");
+        assert_eq!((res, r.uri.as_str(), args(&r)), (Ok(()), "/a/", "?x"));
+        let (res, r) = request("GET http://h:80?x#f HTTP/1.0\n\n");
+        assert_eq!((res, r.uri.as_str(), args(&r), r.host.as_deref()), (Ok(()), "/", "?x", Some("h")));
+        assert_eq!([dots("/a/./b/."), dots("/a/b/../c/.."), dots("/a//.x"), dots("/a/../..")], [Some("/a/b/".into()), Some("/a/".into()), Some("/a//.x".into()), None]);
     }
 
     #[test]
