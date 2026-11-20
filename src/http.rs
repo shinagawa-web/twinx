@@ -306,7 +306,7 @@ fn args(r: &Request) -> &str {
 /// Answers one request; when the connection stays open for the next one, how
 /// long it waits for it (keepalive_timeout).
 fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr) -> Option<Duration> {
-    let (mut resp, mut level) = answer(server, r, parsed, found);
+    let (mut resp, mut level, mut last) = answer(server, r, parsed, found);
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)) {
         let url = ep.url.render(r, &Sent::default());
         let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == url);
@@ -323,13 +323,15 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
             }
             let status = ep.status.unwrap_or(resp.status);
             let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
-            (resp, level) = answer(server, &to, Ok(()), found);
+            (resp, level, last) = answer(server, &to, Ok(()), found);
             if resp.status == 200 { resp.status = status; }
         } else {
             // A named location that does not exist is an error.
             resp = if url.starts_with('@') { special(500) } else { redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url) };
         }
     }
+    // The headers and the log see the request as the last internal redirect left it ($uri).
+    let r = &last;
     if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| level.absolute_redirect) {
         let host = if level.server_name_in_redirect { r.server_name.clone() } else { r.host.clone().unwrap_or_else(|| local.ip().to_string()) };
         let port = if level.port_in_redirect && local.port() != 80 { format!(":{}", local.port()) } else { String::new() };
@@ -428,20 +430,19 @@ fn browser(ua: &str) -> (bool, bool) {
 
 /// The answer of the location found, after the internal redirects of the
 /// index module, and the settings of the location that gave it.
-fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>) -> (Response, &'a Level) {
+fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>) -> (Response, &'a Level, Request) {
     let mut resp = respond(r, parsed, (prefix, level, auto));
-    let mut redirects = 0;
+    let (mut redirects, mut to) = (0, r.clone());
     while let Some(target) = resp.internal.take() {
         // nginx gives up after 10 internal redirects.
         redirects += 1;
-        let mut to = r.clone();
         to.uri = target.split('?').next().unwrap_or_default().to_string();
         to.target = target;
         let found = location(server, &to.uri);
         level = found.1;
         resp = if redirects > 10 { special(500) } else { respond(&to, Ok(()), found) };
     }
-    (resp, level)
+    (resp, level, to)
 }
 
 /// Serves a file under root (or alias), as nginx's static module does; a
@@ -454,11 +455,58 @@ fn file(level: &Level, r: &Request, prefix: &str) -> Response {
         Some(alias) => std::path::PathBuf::from(format!("{}{}", alias.display(), r.uri.get(prefix.len()..).unwrap_or_default())),
         None => level.root.join(r.uri.trim_start_matches('/')),
     };
-    if r.uri.ends_with('/') {
-        let internal = path.join("index.html").is_file().then(|| format!("{}index.html{}", r.uri, args(r)));
-        return if internal.is_some() { Response { internal, ..Response::default() } } else { special(if path.is_dir() { 403 } else { 404 }) };
-    }
+    if r.uri.ends_with('/') { return index(level, r, &path); }
     file_at(level, r, path)
+}
+
+/// The index module, as ngx_http_index_handler() does it: an internal redirect
+/// to the first index that exists in the directory, or to an index that starts
+/// with "/"; 403 when the directory exists but none does, 404 when it does not.
+fn index(level: &Level, r: &Request, dir: &std::path::Path) -> Response {
+    use std::io::ErrorKind::{InvalidFilename, NotADirectory, NotFound, PermissionDenied};
+    let mut dir_tested = false;
+    for name in level.index.iter().map(|t| t.render(r, &Sent::default())) {
+        if name.starts_with('/') { return Response { internal: Some(format!("{name}{}", args(r))), ..Response::default() }; }
+        let file = dir.join(&name);
+        let err = match std::fs::metadata(&file) {
+            Ok(_) => return Response { internal: Some(format!("{}{name}{}", r.uri, args(r))), ..Response::default() },
+            Err(e) => e,
+        };
+        if matches!(err.kind(), NotADirectory | InvalidFilename | PermissionDenied) { return index_error(level, r, &file, &err); }
+        if !dir_tested {
+            match std::fs::metadata(dir) {
+                Err(e) if e.kind() == NotFound => return index_error(level, r, &file, &e),
+                Err(e) if e.kind() == PermissionDenied => return index_error(level, r, dir, &e),
+                Err(_) => return special(500),
+                Ok(m) if !m.is_dir() => return special(500),
+                Ok(_) => dir_tested = true,
+            }
+        }
+        if err.kind() != NotFound { return special(500); }
+    }
+    error_log(level, r, &format!("directory index of \"{}/\" is forbidden", dir.display().to_string().trim_end_matches('/')));
+    special(403)
+}
+
+/// 403 for a path that may not be read, else 404, logged as nginx does.
+fn index_error(level: &Level, r: &Request, path: &std::path::Path, err: &std::io::Error) -> Response {
+    let reason = format!("({}: {})", err.raw_os_error().unwrap_or(0), err.to_string().split(" (os error").next().unwrap_or_default());
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        error_log(level, r, &format!("\"{}\" is forbidden {reason}", path.display()));
+        return special(403);
+    }
+    if level.log_not_found { error_log(level, r, &format!("\"{}\" is not found {reason}", path.display())); }
+    special(404)
+}
+
+/// Writes an error of the request to the error_log of its level, as nginx's
+/// lines are: the time, the level, the process, the message and the request.
+fn error_log(level: &Level, r: &Request, msg: &str) {
+    let Some(mut log) = level.error_log.as_deref() else { return };
+    let time = chrono::Local::now().format("%Y/%m/%d %H:%M:%S");
+    let host = r.host.as_ref().map(|h| format!(", host: \"{h}\"")).unwrap_or_default();
+    let line = format!("{time} [error] {}#0: {msg}, client: {}, server: {}, request: \"{}\"{host}\n", std::process::id(), r.peer.ip(), r.server_name, r.line);
+    let _ = log.write_all(line.as_bytes());
 }
 
 /// Serves the file at a path, or redirects to the directory there.
@@ -1070,12 +1118,41 @@ mod tests {
         let s = &config.servers[0];
         let status = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            let (resp, _) = answer(s, &r, Ok(()), location(s, &r.uri));
+            let (resp, _, _) = answer(s, &r, Ok(()), location(s, &r.uri));
             (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
         };
         assert_eq!(status("/a/?x"), (200, "i/a/index.html".to_string()));
         assert_eq!(status("/a/empty/").0, 403);
         assert_eq!(status("/a/none/").0, 404);
+    }
+
+    #[test]
+    fn index_directive_and_error_log() {
+        let dir = std::env::temp_dir().join(format!("twinx-indices-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("m")).unwrap();
+        std::fs::write(dir.join("m/two.html"), "2").unwrap();
+        std::fs::write(dir.join("f"), "").unwrap();
+        let text = format!("http {{ server {{ root {d}; error_log {d}/e.log; location /m/ {{ index one.html two.html; }} \
+                            location /abs/ {{ index /m/$server_name; }} location /q/ {{ log_not_found off; }} \
+                            location /c/ {{ error_log {d}/c.log crit; }} }} }}", d = dir.display());
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let answer = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            let (resp, _, last) = answer(s, &r, Ok(()), location(s, &r.uri));
+            (resp.status, last.target)
+        };
+        assert_eq!(answer("/m/?a"), (200, "/m/two.html?a".to_string()));
+        assert_eq!(answer("/abs/").1, "/m/localhost");
+        assert_eq!(answer("/f/").0, 404);
+        assert_eq!(answer("/q/").0, 404);
+        assert_eq!(answer("/c/").0, 404);
+        assert_eq!(answer("/").0, 403);
+        let log = std::fs::read_to_string(dir.join("e.log")).unwrap();
+        assert!(log.contains(&format!("[error] {}#0: \"{}/f/index.html\" is not found (20: Not a directory), client: 127.0.0.1, server: localhost", std::process::id(), dir.display())));
+        assert!(log.contains("directory index of \""));
+        assert_eq!(log.lines().count(), 2);
+        assert_eq!(std::fs::read_to_string(dir.join("c.log")).unwrap(), "");
     }
 
     #[test]
@@ -1094,7 +1171,7 @@ mod tests {
         let s = &config.servers[0];
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            let (resp, _) = answer(s, &r, Ok(()), location(s, &r.uri));
+            let (resp, _, _) = answer(s, &r, Ok(()), location(s, &r.uri));
             (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
         };
         assert_eq!(answer("/f.html"), (200, "f".to_string()));

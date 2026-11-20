@@ -27,7 +27,9 @@ const HSL: u8 = HTTP | SRV | LOC;
 const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("daemon", MAIN, 1, 1, false),
     ("pid", MAIN, 1, 1, false),
-    ("error_log", MAIN, 1, usize::MAX, false),
+    ("error_log", MAIN | HSL, 1, usize::MAX, false),
+    ("log_not_found", HSL, 1, 1, false),
+    ("index", HSL, 1, usize::MAX, false),
     ("events", MAIN, 0, 0, true),
     ("http", MAIN, 0, 0, true),
     ("server", HTTP, 0, 0, true),
@@ -141,6 +143,14 @@ pub struct Level {
     /// add_trailer: the same, sent as trailers of a chunked answer.
     pub add_trailer: Vec<(String, Template, bool)>,
     pub error_page: Vec<ErrorPage>,
+    /// index: the files looked for in a directory, in order; one that starts
+    /// with "/" is a URI redirected to whether it exists or not.
+    pub index: Vec<Template>,
+    /// error_log of http, server or location: where errors of requests are
+    /// written, when its level lets errors through.
+    pub error_log: Option<Arc<File>>,
+    /// log_not_found: whether files that are not found are logged.
+    pub log_not_found: bool,
     pub proxy: Option<Arc<Proxy>>,
     pub max_body: u64,
     /// max_headers: the header lines a request may have; one more is refused with 400.
@@ -320,7 +330,7 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
+        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -410,6 +420,13 @@ impl Builder<'_> {
                     if !number || size(d.args.last().unwrap()).is_err() { return Err(at(format!("\"{}\" directive invalid value", d.name))); }
                 }
                 "max_headers" => level.max_headers = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
+                "index" => level.index = d.args.iter().map(|a| Template::parse(a)).collect::<Result<_, _>>().map_err(at)?,
+                "log_not_found" => level.log_not_found = flag(d).map_err(at)?,
+                "error_log" => {
+                    const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
+                    let file = self.open(&d.args[0]).map_err(at)?;
+                    level.error_log = d.args.get(1).is_none_or(|l| LEVELS.iter().position(|v| v == l) <= Some(4)).then_some(file);
+                }
                 "ignore_invalid_headers" => level.ignore_invalid_headers = flag(d).map_err(at)?,
                 "underscores_in_headers" => level.underscores_in_headers = flag(d).map_err(at)?,
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
