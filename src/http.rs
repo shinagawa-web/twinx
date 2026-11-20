@@ -186,6 +186,8 @@ struct Response {
     body: Vec<u8>,
     /// Whether "Vary: Accept-Encoding" is sent when gzip_vary is on.
     vary: bool,
+    /// Every header of the proxied server's answer, for $upstream_http_*.
+    upstream: Vec<(String, String)>,
     /// The URI the index module redirects to internally, with "index.html" added.
     index: Option<String>,
     /// Whether the length is not known when the head is sent (the gzip filter
@@ -294,8 +296,14 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("expires") && !h.0.eq_ignore_ascii_case("cache-control"));
         resp.headers.extend([("Expires".to_string(), e), ("Cache-Control".to_string(), cc)]);
     }
+    // What has been sent so far, for $sent_http_* and $upstream_http_*.
+    let so_far = |resp: &Response, trailers: &[(String, String)]| {
+        let ctype = resp.ctype.iter().map(|t| ("Content-Type".to_string(), t.clone()));
+        let headers = ctype.chain(resp.headers.iter().cloned()).collect();
+        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), ..Sent::default() }
+    };
     for (name, value, _) in level.add_header.iter().filter(|h| h.2 || added) {
-        let value = value.render(r, &Sent::default());
+        let value = value.render(r, &so_far(&resp, &[]));
         // These replace what the response has, and an empty value removes it.
         if ["etag", "last-modified"].contains(&name.to_ascii_lowercase().as_str()) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case(name)); }
         if !value.is_empty() { resp.headers.push((name.clone(), value)); }
@@ -304,17 +312,19 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let status = resp.status;
     // A body of unknown length is chunked for HTTP/1.1; otherwise the connection
     // closes after it. A HEAD answer has neither.
+    // add_trailer makes it chunked too, except for a status that has no body.
     let unknown = resp.unknown_length && r.method != "HEAD";
-    let chunked = unknown && r.line.ends_with("HTTP/1.1");
+    let trailing = level.add_trailer.iter().any(|t| t.2 || added) && r.method != "HEAD" && ![204, 304].contains(&status);
+    let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1");
     let keepalive = parsed.is_ok() && keepalive(r) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown);
     let mut out = Vec::new();
     if status != 444 {
         let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
         let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
-        let ctype = resp.ctype.map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
+        let ctype = resp.ctype.as_ref().map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
         let connection = if keepalive { "keep-alive" } else { "close" };
         let len = resp.body.len();
-        let length = if !resp.unknown_length { format!("Content-Length: {len}\r\n") } else if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else { String::new() };
+        let length = if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else if !resp.unknown_length { format!("Content-Length: {len}\r\n") } else { String::new() };
         let vary = if resp.vary && level.gzip_vary { "Vary: Accept-Encoding\r\n" } else { "" };
         let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{vary}");
         resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
@@ -323,9 +333,19 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let body_len = if r.method == "HEAD" || status == 444 { 0 } else { resp.body.len() };
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
     out.extend_from_slice(&resp.body[..body_len]);
-    if chunked { out.extend_from_slice(if body_len > 0 { b"\r\n0\r\n\r\n" } else { b"0\r\n\r\n" }); }
+    // The trailers are made after the body, each seeing those before it ($sent_trailer_*).
+    let mut trailers = Vec::new();
+    for (name, value, _) in level.add_trailer.iter().filter(|t| chunked && (t.2 || added)) {
+        let value = value.render(r, &so_far(&resp, &trailers));
+        if !value.is_empty() { trailers.push((name.clone(), value)); }
+    }
+    if chunked {
+        out.extend_from_slice(if body_len > 0 { b"\r\n0\r\n" } else { b"0\r\n" });
+        trailers.iter().for_each(|(n, v)| out.extend_from_slice(format!("{n}: {v}\r\n").as_bytes()));
+        out.extend_from_slice(b"\r\n");
+    }
     let written = stream.write_all(&out).is_ok();
-    let sent = Sent { status, bytes: out.len(), body: body_len };
+    let sent = Sent { bytes: out.len(), body: body_len, ..so_far(&resp, &trailers) };
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     written && keepalive && status != 444
 }
@@ -477,6 +497,7 @@ fn fetch(peer: &SocketAddr, req: &[u8]) -> Option<Response> {
     const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
     for (name, value) in lines.filter_map(|l| l.split_once(':')) {
         let (lower, value) = (name.to_ascii_lowercase(), value.trim().to_string());
+        resp.upstream.push((name.to_string(), value.clone()));
         if lower == "content-type" { resp.ctype = Some(value); continue; }
         if !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
     }
@@ -497,6 +518,11 @@ fn parse(r: &mut Request, head: &[u8]) -> Result<(), u16> {
         let (name, value) = line.split_once(':').ok_or(400u16)?;
         r.headers.push((name.to_string(), value.trim_matches([' ', '\t']).to_string()));
     }
+    // Headers nginx takes only once: a second one is refused.
+    const UNIQUE: &[&str] = &["if-modified-since", "if-unmodified-since", "if-match", "if-none-match", "content-length",
+                              "content-range", "if-range", "transfer-encoding", "expect", "authorization"];
+    let count = |name: &str| r.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name)).count();
+    if UNIQUE.iter().any(|u| count(u) > 1) { return Err(400); }
     let hosts: Vec<&String> = r.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("host")).map(|(_, v)| v).collect();
     if hosts.len() > 1 || (hosts.is_empty() && version == "HTTP/1.1") { return Err(400); }
     r.host = hosts.first().map(|h| valid_host(h).ok_or(400u16)).transpose()?;
@@ -668,6 +694,7 @@ mod tests {
         let resp = fetch(&addr, b"GET / HTTP/1.0\r\n\r\n").unwrap();
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
+        assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
     }
 
     #[test]
@@ -806,6 +833,13 @@ mod tests {
         assert_eq!(status("/a/?x"), (200, "i/a/index.html".to_string()));
         assert_eq!(status("/a/empty/").0, 403);
         assert_eq!(status("/a/none/").0, 404);
+    }
+
+    #[test]
+    fn refuses_second_unique_headers() {
+        assert_eq!(request("GET / HTTP/1.0\nIf-Match: a\nif-match: b\n\n").0, Err(400));
+        assert_eq!(request("GET / HTTP/1.0\nAuthorization: a\nAuthorization: a\n\n").0, Err(400));
+        assert_eq!(request("GET / HTTP/1.0\nCookie: a\nCookie: b\nVia: x\nVia: y\n\n").0, Ok(()));
     }
 
     #[test]
