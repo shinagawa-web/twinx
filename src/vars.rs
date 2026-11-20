@@ -41,6 +41,25 @@ pub struct Request {
     pub client: i32,
     /// $limit_rate, which set changes; shared by the internal redirects of the request.
     pub limit_rate: std::sync::Arc<Rate>,
+    /// The variables set gives values to, and the captures of the last regular
+    /// expression matched ("1", "2", ...); shared by the internal redirects of the request.
+    pub vars: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+impl Request {
+    /// Gives a variable of set, or a capture, its value for this request.
+    pub fn set_var(&self, name: &str, value: String) {
+        let mut vars = self.vars.lock().unwrap();
+        vars.retain(|v| v.0 != name);
+        vars.push((name.to_string(), value));
+    }
+
+    /// The captures of a regular expression that matched: "$0" is the whole
+    /// match, "$1" the first group; those it does not have are empty.
+    pub fn set_captures(&self, caps: &regex::Captures) {
+        self.vars.lock().unwrap().retain(|v| !v.0.bytes().all(|c| c.is_ascii_digit()));
+        (0..caps.len()).for_each(|i| self.set_var(&i.to_string(), caps.get(i).map_or("", |m| m.as_str()).to_string()));
+    }
 }
 
 /// The limit_rate of a request, once set $limit_rate or X-Accel-Limit-Rate set
@@ -62,6 +81,19 @@ static CAPTURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new(
 
 pub fn add_captures<'a>(names: impl Iterator<Item = &'a str>) {
     CAPTURES.lock().unwrap().extend(names.map(String::from));
+}
+
+/// The names of the variables set gives values to, known before any directive uses them.
+static USER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn add_user(name: &str) {
+    USER.lock().unwrap().push(name.to_string());
+}
+
+/// Whether the name is one of the variables twinx makes itself, which set
+/// cannot change (all but $limit_rate).
+pub fn builtin(name: &str) -> bool {
+    !matches!(Var::named(name), None | Some(Var::User(_)))
 }
 
 /// What the answer to a request was, once it was sent.
@@ -125,6 +157,8 @@ pub enum Var {
     LimitRate,
     /// A named capture of the server name's regular expression.
     Capture(String),
+    /// A variable of set, or a capture of a regular expression ("$1").
+    User(String),
     Arg(String),
     Http(String),
     Cookie(String),
@@ -159,7 +193,8 @@ impl Var {
         ];
         let found = prefixed.into_iter().find_map(|(p, var, dashes)| name.strip_prefix(p).map(|n| var(if dashes { n.replace('_', "-") } else { n.to_string() })));
         let capture = || CAPTURES.lock().unwrap().iter().any(|c| c == name).then(|| Var::Capture(name.to_string()));
-        found.or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v)).or_else(capture)
+        let user = || (name.bytes().all(|c| c.is_ascii_digit()) || USER.lock().unwrap().iter().any(|u| u == name)).then(|| Var::User(name.to_string()));
+        found.or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v)).or_else(capture).or_else(user)
     }
 
     /// The value, or None when the variable is "not found" (no such header, no user).
@@ -192,6 +227,7 @@ impl Var {
             Var::ServerName => r.server_name.clone(),
             Var::LimitRate => r.limit_rate.get().unwrap_or(0).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
+            Var::User(name) => r.vars.lock().unwrap().iter().find(|v| v.0 == *name)?.1.clone(),
             Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
             Var::UpstreamTime(i) => {
                 let time = |t: &[Option<u128>; 3]| t[*i].map_or("-".to_string(), |ms| format!("{}.{:03}", ms / 1000, ms % 1000));
@@ -312,7 +348,8 @@ impl Template {
             let after = &rest[i + 1..];
             let braced = after.starts_with('{');
             let body = if braced { &after[1..] } else { after };
-            let len = body.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(body.len());
+            // "$1" is a capture, whatever follows it.
+            let len = if body.starts_with(|c: char| c.is_ascii_digit()) { 1 } else { body.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(body.len()) };
             let name = &body[..len];
             if name.is_empty() || (braced && !body[len..].starts_with('}')) { return Err(format!("invalid variable name in \"{s}\"")); }
             let var = Var::named(name).ok_or_else(|| format!("unknown \"{name}\" variable"))?;
@@ -400,6 +437,7 @@ mod tests {
             upstream_addr: None,
             captures: Vec::new(),
             limit_rate: Default::default(),
+            vars: Default::default(),
             client: -1,
         }
     }
