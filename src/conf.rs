@@ -85,6 +85,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_buffer_size", HSL, 1, 1, false),
     ("proxy_buffering", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
+    ("proxy_buffers", HSL, 2, 2, false),
     ("resolver", HSL, 1, usize::MAX, false),
     ("resolver_timeout", HSL, 1, 1, false),
     ("gzip", HSL, 1, 1, false),
@@ -463,6 +464,7 @@ impl Builder<'_> {
                 "proxy_buffer_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_buffering" => { flag(d).map_err(at)?; }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
+                "proxy_buffers" => if d.args[0].parse::<u64>().map_or(true, |n| n == 0) || size(&d.args[1]).map_or(true, |n| n == 0) { return Err(at("\"proxy_buffers\" directive invalid value".into())); }
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
                 "default_type" => level.default_type = d.args[0].clone(),
@@ -829,6 +831,14 @@ mod tests {
         let p = peer(&["127.0.0.1:1".into(), "max_fails=3".into(), "fail_timeout=5s".into()]).unwrap();
         assert_eq!((p.max_fails, p.fail_timeout, p.weight, p.backup), (3, 5, 1, false));
         assert_eq!(peer(&["127.0.0.1:1".into(), "down".into()]).unwrap_err(), "invalid parameter \"down\"");
+    }
+
+    #[test]
+    fn checks_proxy_buffers() {
+        assert!(build_text("http { server { proxy_buffers 4 128; location / { proxy_buffers 8 4k; } } }").is_ok());
+        for v in ["0 4k", "x 4k", "4 0", "4 x"] {
+            assert_eq!(build_text(&format!("http {{ proxy_buffers {v}; }}")).unwrap_err(), "\"proxy_buffers\" directive invalid value in t.conf:1");
+        }
     }
 
     #[test]

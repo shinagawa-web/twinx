@@ -767,23 +767,25 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
     // chunked" without it; any other mix makes the answer invalid. A HEAD, 204
     // or 304 answer has no body.
     let values = |name: &str| resp.upstream.iter().filter(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone()).collect::<Vec<_>>();
-    let length = match (&values("content-length")[..], &values("transfer-encoding")[..]) {
-        ([], []) => None,
-        ([l], []) => Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten()?),
-        ([], [c]) if c.eq_ignore_ascii_case("chunked") => None,
+    let (length, chunked) = match (&values("content-length")[..], &values("transfer-encoding")[..]) {
+        ([], []) => (None, false),
+        ([l], []) => (Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten()?), false),
+        ([], [c]) if c.eq_ignore_ascii_case("chunked") => (None, true),
         _ => return None,
     };
-    let length = if req.starts_with(b"HEAD ") || [204, 304].contains(&status) { Some(0) } else { length };
+    let no_body = req.starts_with(b"HEAD ") || [204, 304].contains(&status);
+    let (length, chunked) = if no_body { (Some(0), false) } else { (length, chunked) };
     // The body of an answer that redirects with X-Accel-Redirect is not read;
-    // otherwise it is read up to its length, or until the server closes the connection.
+    // otherwise it is read up to its length, up to its last chunk, or until
+    // the server closes the connection. What follows the last chunk is dropped.
     let accel = resp.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect"));
-    while !accel && length.is_none_or(|n| answer.len() - end < n) {
+    while !accel && length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1) {
         let n = s.read(&mut chunk).ok()?;
         if n == 0 { break; }
         answer.extend_from_slice(&chunk[..n]);
     }
     let body = &answer[end..];
-    resp.body = body[..length.unwrap_or(body.len()).min(body.len())].to_vec();
+    resp.body = if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() };
     Some(resp)
 }
 
@@ -803,6 +805,23 @@ fn bound(peer: &SocketAddr, (local, transparent): (SocketAddr, bool)) -> Option<
     let _ = if local.port() == 0 { set(libc::IPPROTO_IP, libc::IP_BIND_ADDRESS_NO_PORT) } else { set(libc::SOL_SOCKET, libc::SO_REUSEADDR) };
     s.bind(&local.into()).ok()?;
     Some(s)
+}
+
+/// The data of the chunks of a proxied answer read so far, and whether
+/// nothing more is to be read: the last chunk came, or a chunk is invalid.
+fn unchunk(buf: &[u8]) -> (Vec<u8>, bool) {
+    let (mut body, mut at) = (Vec::new(), 0);
+    while let Some(n) = buf[at..].iter().position(|&c| c == b'\n') {
+        let line = String::from_utf8_lossy(&buf[at..at + n]);
+        let Ok(size) = usize::from_str_radix(line.split(';').next().unwrap_or_default().trim(), 16) else { return (body, true) };
+        let (start, end) = (at + n + 1, at + n + 1 + size);
+        if size == 0 { return (body, true); }
+        let Some(after) = buf.get(end..).filter(|a| a.len() >= 2) else { break };
+        if !after.starts_with(b"\r\n") && !after.starts_with(b"\n") { return (body, true); }
+        body.extend_from_slice(&buf[start..end]);
+        at = end + if after[0] == b'\r' { 2 } else { 1 };
+    }
+    (body, false)
 }
 
 /// Waits until the proxied server sends something or the client closes the
@@ -1106,6 +1125,15 @@ mod tests {
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
         assert!(bound(&addr, ("192.0.2.1:0".parse().unwrap(), false)).is_none());
+    }
+
+    #[test]
+    fn unchunks_answers() {
+        assert_eq!(unchunk(b"3\r\nabc\r\n2;x=y\nde\n0\r\n\r\n3\r\nzzz\r\n"), (b"abcde".to_vec(), true));
+        assert_eq!(unchunk(b"3\r\nabc\r\n2\r\nd"), (b"abc".to_vec(), false));
+        assert_eq!(unchunk(b"3\r\nabc"), (Vec::new(), false));
+        assert_eq!(unchunk(b"3\r\nabcd\r\n"), (Vec::new(), true));
+        assert_eq!(unchunk(b"x\r\n"), (Vec::new(), true));
     }
 
     #[test]
