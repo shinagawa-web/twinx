@@ -473,16 +473,11 @@ fn index(level: &Level, r: &Request, dir: &std::path::Path) -> Response {
             Err(e) => e,
         };
         if matches!(err.kind(), NotADirectory | InvalidFilename | PermissionDenied) { return index_error(level, r, &file, &err); }
-        if !dir_tested {
-            match std::fs::metadata(dir) {
-                Err(e) if e.kind() == NotFound => return index_error(level, r, &file, &e),
-                Err(e) if e.kind() == PermissionDenied => return index_error(level, r, dir, &e),
-                Err(_) => return special(500),
-                Ok(m) if !m.is_dir() => return special(500),
-                Ok(_) => dir_tested = true,
-            }
-        }
-        if err.kind() != NotFound { return special(500); }
+        // A file that is not found is skipped once the directory is known to
+        // exist; a directory that does not exist is not found itself.
+        let skipped = err.kind() == NotFound && (dir_tested || dir.is_dir());
+        if !skipped { return if err.kind() == NotFound { index_error(level, r, &file, &err) } else { special(500) }; }
+        dir_tested = true;
     }
     error_log(level, r, &format!("directory index of \"{}/\" is forbidden", dir.display().to_string().trim_end_matches('/')));
     special(403)
