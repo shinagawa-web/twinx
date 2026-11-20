@@ -99,6 +99,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             captures: Vec::new(),
             limit_rate: Default::default(),
             vars: Default::default(),
+            unread: Default::default(),
             client: std::os::fd::AsRawFd::as_raw_fd(&stream),
         };
         // Header lines are read with the settings of the default server of the address.
@@ -115,6 +116,14 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
         if framing.is_ok() && expect && r.line.ends_with("HTTP/1.1") { let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n"); }
         let parsed = match framing {
             Err(status) => Err(status),
+            // With proxy_request_buffering off, what came with the head is passed
+            // with the request, and the rest of the body as it comes.
+            Ok(Some(n)) if level.proxy.is_some() && !level.proxy_request_buffering && (buf.len() as u64) < n => {
+                r.length += n as usize;
+                r.body = std::mem::take(&mut buf);
+                *r.unread.lock().unwrap() = stream.try_clone().ok().map(|c| (c, n - r.body.len() as u64));
+                Ok(())
+            }
             Ok(length) => loop {
                 match take_body(&buf, length, level.max_body) {
                     Ok(None) => {}
@@ -132,6 +141,8 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             },
         };
         idle = exchange(&mut stream, server, &r, parsed, found, local);
+        // What of an unbuffered body was not passed on is read and dropped.
+        if r.unread.lock().unwrap().take().is_some_and(|(mut c, mut n)| pass_body(&mut c, &mut n, &mut std::io::sink()).is_none()) { return; }
         if !level.body_in_file_only { r.body_file.map(std::fs::remove_file); }
         if idle.is_none() { return linger(&mut stream); }
     }
@@ -764,7 +775,8 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     if !is_set("host") { req += &format!("Host: {host}\r\n"); }
     if !is_set("connection") { req += "Connection: close\r\n"; }
-    if pass_body && framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len()); }
+    let mut unread = r.unread.lock().unwrap().take();
+    if pass_body && framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len() as u64 + unread.as_ref().map_or(0, |u| u.1)); }
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
     // proxy_pass_request_headers off passes none of the client's headers.
     let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()) && !is_set(n));
@@ -785,7 +797,7 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
         let socket = bind.map(|b| bound(&up.peers[i].addr, b));
         if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
         let (start, mut time) = (Instant::now(), [None; 3]);
-        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, &mut time, &rate);
+        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, &mut time, &rate, unread.as_mut().filter(|_| pass_body));
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         // An error, or a status proxy_next_upstream names while servers are
@@ -922,7 +934,7 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
 /// it took to connect and to send the response head. While it waits for the
 /// head, the client closing the connection ends the request with 499, as
 /// proxy_ignore_client_abort off does.
-fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, time: &mut [Option<u128>; 3], rate: &dyn Fn(&Response) -> u64) -> Option<Response> {
+fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, time: &mut [Option<u128>; 3], rate: &dyn Fn(&Response) -> u64, unread: Option<&mut (TcpStream, u64)>) -> Option<Response> {
     let start = Instant::now();
     let mut s = match socket {
         Some(socket) => socket.connect_timeout(&(*peer).into(), level.proxy_connect_timeout).ok().map(|()| TcpStream::from(socket))?,
@@ -932,6 +944,8 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
     let _ = s.set_read_timeout(Some(level.proxy_read_timeout));
     let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
     s.write_all(req).ok()?;
+    // The rest of a body that is not buffered goes on as the client sends it.
+    if let Some((c, n)) = unread { pass_body(c, n, &mut s)?; }
     let end = loop {
         if let Some(end) = head_end(&answer) { break end; }
         if client_closed(&s, client, level.proxy_read_timeout)? { return Some(Response { status: 499, ..Response::default() }); }
@@ -1025,6 +1039,18 @@ fn unchunk(buf: &[u8]) -> (Vec<u8>, bool) {
         at = end + if after[0] == b'\r' { 2 } else { 1 };
     }
     (body, false)
+}
+
+/// Reads the n bytes of a body still to come from the client and writes them
+/// as they come; None when the client closes or the writing fails.
+fn pass_body(client: &mut TcpStream, n: &mut u64, to: &mut dyn Write) -> Option<()> {
+    let mut chunk = [0u8; 4096];
+    while *n > 0 {
+        let got = client.read(&mut chunk[..(*n).min(4096) as usize]).ok().filter(|g| *g > 0)?;
+        *n -= got as u64;
+        to.write_all(&chunk[..got]).ok()?;
+    }
+    Some(())
 }
 
 /// Waits until the proxied server sends something or the client closes the
@@ -1246,6 +1272,7 @@ mod tests {
             captures: Vec::new(),
             limit_rate: Default::default(),
             vars: Default::default(),
+            unread: Default::default(),
             client: -1,
         };
         (parse(&mut r, head.as_bytes(), &Level::default()), r)
@@ -1318,7 +1345,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let mut time = [None; 3];
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut time, &|_| 0).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut time, &|_| 0, None).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
@@ -1370,7 +1397,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
-        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0).unwrap().status, 200);
+        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0, None).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
@@ -1389,7 +1416,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
-        let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &rate).unwrap();
+        let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &rate, None).unwrap();
         // The body is read after the head, 4000 bytes (what came with the head too)
         // in each second of the clock: it ends in the third second.
         assert!(resp.body.is_empty() && resp.rest.is_some());
@@ -1430,10 +1457,10 @@ mod tests {
             }
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0, None).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0).is_none());
+            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0, None).is_none());
         }
     }
 
@@ -1706,6 +1733,22 @@ mod tests {
         let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { proxy_cookie_path off; proxy_cookie_path /a /b; }"), "\"proxy_cookie_path\" directive is duplicate in t:1");
         assert_eq!(refused("http { proxy_cookie_path on; }"), "invalid parameter \"on\" in t:1");
+    }
+
+    #[test]
+    fn passes_bodies_as_they_come() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut out = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut client, _) = listener.accept().unwrap();
+        out.write_all(b"abcdef").unwrap();
+        let (mut to, mut n) = (Vec::new(), 4);
+        assert_eq!(pass_body(&mut client, &mut n, &mut to), Some(()));
+        assert_eq!((to.as_slice(), n), (&b"abcd"[..], 0));
+        // The client closing before the end fails it.
+        drop(out);
+        let mut n = 5;
+        assert_eq!(pass_body(&mut client, &mut n, &mut to), None);
+        assert_eq!((to.as_slice(), n), (&b"abcdef"[..], 3));
     }
 
     #[test]
