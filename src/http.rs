@@ -421,11 +421,9 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
 fn post_action(server: &Server, r: &Request, level: &Level) {
     let Some(url) = &level.post_action else { return };
     let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && &l.path == url);
-    let mut to = r.clone();
-    if named.is_none() {
-        to.uri = url.split('?').next().unwrap_or_default().to_string();
-        to.target = url.clone();
-    }
+    // A named location answers the request as it is; a URI replaces the request's.
+    let uri = || url.split('?').next().unwrap_or_default().to_string();
+    let to = if named.is_some() { r.clone() } else { Request { uri: uri(), target: url.clone(), ..r.clone() } };
     let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
     answer(server, &to, Ok(()), found);
 }
