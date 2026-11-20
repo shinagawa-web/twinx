@@ -32,6 +32,8 @@ pub struct Request {
     /// The body when it is kept in memory, and the file it was written to otherwise.
     pub body: Vec<u8>,
     pub body_file: Option<PathBuf>,
+    /// The proxied servers tried before an internal redirect ($upstream_addr).
+    pub upstream_addr: Option<String>,
 }
 
 /// What the answer to a request was, once it was sent.
@@ -46,6 +48,8 @@ pub struct Sent {
     pub upstream: Vec<(String, String)>,
     /// The trailers so far ($sent_trailer_*).
     pub trailers: Vec<(String, String)>,
+    /// The proxied servers tried, as $upstream_addr gives them.
+    pub upstream_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +80,7 @@ pub enum Var {
     ConnectionTime,
     RequestPort,
     IsRequestPort,
+    UpstreamAddr,
     Arg(String),
     Http(String),
     Cookie(String),
@@ -96,7 +101,7 @@ impl Var {
             ("server_addr", Var::ServerAddr), ("server_port", Var::ServerPort), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
             ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
-            ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort),
+            ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -135,6 +140,7 @@ impl Var {
             Var::RequestUri => r.target.clone(),
             Var::RequestPort => request_port(r).to_string(),
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
+            Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
             Var::Args => r.target.split_once('?').map_or("", |(_, a)| a).to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
@@ -332,6 +338,7 @@ mod tests {
             length: 39,
             body: b"xy".to_vec(),
             body_file: None,
+            upstream_addr: None,
         }
     }
 
