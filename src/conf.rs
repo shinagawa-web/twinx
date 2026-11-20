@@ -90,14 +90,16 @@ pub struct ErrorPage {
 }
 
 /// rewrite regex replacement [flag], where the replacement is a URL the
-/// client is redirected to: with 301 for "permanent", 302 otherwise. A
-/// replacement ending with "?" does not get the request's arguments.
+/// client is redirected to: with 301 for "permanent", 302 otherwise; or, with
+/// "break", the URI the location goes on with. A replacement ending with "?"
+/// does not get the request's arguments.
 #[derive(Debug, Clone)]
 pub struct Rewrite {
     pub regex: regex::Regex,
     pub url: Template,
     pub status: u16,
     pub add_args: bool,
+    pub internal: bool,
 }
 
 /// The settings of one level (http, server or location) after inheriting from the one above.
@@ -149,6 +151,8 @@ pub enum Match {
     Prefix,
     NoRegex,
     Regex(regex::Regex),
+    /// "@name": only error_page goes there, never a URI.
+    Named,
 }
 
 #[derive(Debug)]
@@ -389,7 +393,8 @@ fn location(args: &[String]) -> Result<(Match, String), String> {
         "~" | "~*" => regex(if modifier == "~*" { format!("(?i){path}") } else { path.clone() })?,
         _ => {
             let plain = [("", Match::Prefix), ("=", Match::Exact), ("^~", Match::NoRegex)].into_iter().find(|k| k.0 == modifier);
-            plain.ok_or_else(|| format!("invalid location modifier \"{modifier}\""))?.1
+            let kind = plain.ok_or_else(|| format!("invalid location modifier \"{modifier}\""))?.1;
+            if modifier.is_empty() && path.starts_with('@') { Match::Named } else { kind }
         }
     };
     Ok((kind, path.clone()))
@@ -447,7 +452,6 @@ fn error_page(args: &[String]) -> Result<ErrorPage, String> {
     };
     let codes = codes.iter().map(|c| c.parse::<u16>().ok().filter(|c| (300..=599).contains(c)).ok_or_else(|| format!("value \"{c}\" must be between 300 and 599")));
     let codes = codes.collect::<Result<Vec<u16>, String>>()?;
-    if url.starts_with('@') { return Err(format!("twinx does not support redirecting errors to \"{url}\" yet")); }
     Ok(ErrorPage { codes, status, url: Template::parse(url)? })
 }
 
@@ -457,8 +461,8 @@ fn rewrite(args: &[String]) -> Result<Rewrite, String> {
     if !["", "last", "break", "redirect", "permanent"].contains(&flag) { return Err(format!("invalid parameter \"{flag}\"")); }
     let (url, add_args) = args[1].strip_suffix('?').map_or((args[1].as_str(), true), |u| (u, false));
     let is_url = ["http://", "https://", "$scheme"].iter().any(|p| url.starts_with(p)) || ["redirect", "permanent"].contains(&flag);
-    if !is_url { return Err(format!("twinx does not support rewriting to \"{url}\" yet")); }
-    Ok(Rewrite { regex, url: Template::parse(url)?, status: if flag == "permanent" { 301 } else { 302 }, add_args })
+    if !is_url && flag != "break" { return Err(format!("twinx does not support rewriting to \"{url}\" yet")); }
+    Ok(Rewrite { regex, url: Template::parse(url)?, status: if flag == "permanent" { 301 } else { 302 }, add_args, internal: !is_url })
 }
 
 fn ret(args: &[String]) -> Result<(u16, Template), String> {
@@ -545,7 +549,10 @@ mod tests {
         assert_eq!(size("10"), Ok(10));
         assert_eq!(size("1x"), Err("\"1x\" is invalid".into()));
         assert_eq!(error_page(&["200".into(), "http://e/".into()]).unwrap_err(), "value \"200\" must be between 300 and 599");
-        assert!(error_page(&["404".into(), "@named".into()]).is_err());
+        assert!(error_page(&["404".into(), "@named".into()]).is_ok());
+        assert!(matches!(location(&["@named".into()]).unwrap().0, Match::Named));
+        let r = rewrite(&["^".into(), "/x?".into(), "break".into()]).unwrap();
+        assert_eq!((r.internal, r.add_args), (true, false));
         assert_eq!(error_page(&["404".into(), "/local".into()]).unwrap().status, None);
         assert_eq!(error_page(&["404".into(), "500".into(), "http://e/".into()]).unwrap().codes, vec![404, 500]);
     }
