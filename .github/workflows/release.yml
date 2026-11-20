@@ -1,0 +1,70 @@
+name: release
+
+# When a version tag (v*) is pushed, builds twinx from that tag the way the judge
+# does, runs nginx-tests against it and against nginx, and publishes a GitHub
+# release with the binary and the results. twinx's code runs only in containers;
+# the token that creates the release stays on the runner.
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build twinx in the judge's Rust image
+        run: |
+          image=$(python3 -c "import sys; sys.path.insert(0, 'harness'); import run_tests; print(run_tests.RUST_IMAGE)")
+          tree="$RUNNER_TEMP/tree"
+          mkdir -p "$tree" "$RUNNER_TEMP/cargo"
+          git archive HEAD | tar -x -C "$tree"
+          docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
+            -e HOME=/tmp -e CARGO_HOME=/cargo --tmpfs /tmp:rw,exec \
+            -v "$RUNNER_TEMP/cargo:/cargo" -v "$tree:$tree" -w "$tree" "$image" cargo build --release --locked
+          mkdir -p dist
+          cp "$tree/target/release/twinx" "dist/twinx-$TAG-x86_64-linux-gnu"
+
+      - name: Run nginx-tests against nginx and against this twinx
+        run: |
+          python3 harness/run_tests.py --nginx --out dist/nginx-tests-nginx.json
+          python3 harness/run_tests.py --twinx "dist/twinx-$TAG-x86_64-linux-gnu" \
+            --reference dist/nginx-tests-nginx.json --out dist/nginx-tests-twinx.json
+
+      - name: Write the release notes
+        run: |
+          python3 - <<'PY' > notes.md
+          import json, os
+          ref = json.load(open("dist/nginx-tests-nginx.json"))["files"]
+          got = json.load(open("dist/nginx-tests-twinx.json"))["files"]
+          stage = json.load(open("dist/nginx-tests-twinx.json"))["summary"]["stage"]
+          ok = lambda r: {n for n, s in r["tests"].items() if s == "ok"}
+          expected = {f: ok(r) for f, r in ref.items() if ok(r)}
+          passing = sorted(f for f, t in expected.items() if t <= ok(got[f]))
+          subtests = sum(len(t & ok(got[f])) for f, t in expected.items())
+          print(f"twinx {os.environ['TAG']}, judged by nginx-tests (harness/nginx-tests/Dockerfile) against nginx 1.30.6.")
+          print()
+          print(f"- Stages 1 to {stage}: {len(passing)} of {len(expected)} files pass, "
+                f"{subtests} of {sum(len(t) for t in expected.values())} subtests")
+          print("- Passing files: " + ", ".join(f"`{f}`" for f in passing))
+          print()
+          print("The binary is built for x86_64 Linux in rust:1.100-slim-bookworm (glibc 2.36). "
+                "The JSON files hold every subtest's result for nginx and for this binary.")
+          PY
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+          (cd dist && sha256sum * > SHA256SUMS)
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$TAG" dist/* --title "twinx $TAG" --notes-file notes.md --verify-tag
