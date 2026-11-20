@@ -56,6 +56,7 @@ pub enum Var {
     RequestUri,
     RequestBody,
     RequestBodyFile,
+    Arg(String),
     Http(String),
 }
 
@@ -70,7 +71,8 @@ impl Var {
             ("request_uri", Var::RequestUri), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
         ];
         let header = name.strip_prefix("http_").map(|h| Var::Http(h.replace('_', "-")));
-        header.or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v))
+        let arg = || name.strip_prefix("arg_").map(|a| Var::Arg(a.to_string()));
+        header.or_else(arg).or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v))
     }
 
     /// The value, or None when the variable is "not found" (no such header, no user).
@@ -93,6 +95,10 @@ impl Var {
             Var::RequestUri => r.target.clone(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
+            Var::Arg(name) => {
+                let args = r.target.split_once('?').map_or("", |(_, a)| a).split('&');
+                args.filter_map(|a| a.split_once('=')).find(|(n, _)| n.eq_ignore_ascii_case(name))?.1.to_string()
+            }
             Var::Http(name) => r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))?.1.clone(),
         })
     }
@@ -197,6 +203,9 @@ mod tests {
         assert_eq!(t.log_line(&request(), &Sent::default()), "[-][-][-]");
         let t = Template::parse("$request_uri $request_body").unwrap();
         assert_eq!(t.render(&request(), &Sent::default()), "/a?b xy");
+        let mut r = request();
+        r.target = "/a?x=1&E=2".into();
+        assert_eq!(Template::parse("[$arg_e][$arg_y]").unwrap().render(&r, &Sent::default()), "[2][]");
     }
 
     #[test]
