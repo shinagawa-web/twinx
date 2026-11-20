@@ -1,6 +1,6 @@
 # One run of the loop
 
-The schedule is paused since 2026-11-20T02:25Z, while twinx starts over on nginx-tests. A human may start a run by hand; a run that has started goes ahead.
+The schedule runs again since 2026-11-20T05:45Z, after a pause from 2026-11-20T02:25Z while twinx started over on nginx-tests. A human may also start a run by hand; a run that has started goes ahead.
 
 A scheduled Claude Code session runs the loop as the Fixer, with model `claude-opus-5-5`, following `docs/fixer.md`.
 
