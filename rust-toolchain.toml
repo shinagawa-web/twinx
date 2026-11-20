@@ -1,0 +1,5 @@
+# The Rust the judge builds with (harness/compare.py, SANDBOX_IMAGE: rust:1.100-slim-bookworm).
+# Coverage counts lines differently from one Rust to the next, so building with the
+# same one lets a coverage measurement before pushing match the judge's.
+[toolchain]
+channel = "1.100.0"
