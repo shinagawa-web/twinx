@@ -212,8 +212,12 @@ struct Response {
     /// The URI and arguments to redirect to internally: the index module's, with
     /// "index.html" added, or the last parameter of try_files.
     internal: Option<String>,
-    /// The proxied servers tried ($upstream_addr).
+    /// The proxied servers tried ($upstream_addr), and how long each took ($upstream_response_time).
     upstream_addr: Option<String>,
+    upstream_time: Option<String>,
+    /// Whether the internal redirect makes the request a GET, unless it is a
+    /// HEAD (X-Accel-Redirect).
+    as_get: bool,
     /// Whether the length is not known when the head is sent (the gzip filter
     /// compresses as it goes): the body is chunked, or the connection closed after it.
     unknown_length: bool,
@@ -238,7 +242,7 @@ fn redirect(status: u16, location: String) -> Response {
 fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -> Response {
     // set $limit_rate: a value that is not a size leaves it as it was.
     for value in level.set.iter().filter(|_| parsed.is_ok()) {
-        if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.limit_rate.store(rate, std::sync::atomic::Ordering::Relaxed); }
+        if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.limit_rate.set(rate); }
     }
     let rewrite = level.rewrite.iter().find(|rw| rw.regex.is_match(&r.uri));
     let url = rewrite.map(|rw| (rw, rw.url.render(r, &Sent::default()), args(r)));
@@ -355,7 +359,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let so_far = |resp: &Response, trailers: &[(String, String)]| {
         let ctype = resp.ctype.iter().map(|t| ("Content-Type".to_string(), t.clone()));
         let headers = ctype.chain(resp.headers.iter().cloned()).collect();
-        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), upstream_addr: resp.upstream_addr.clone(), ..Sent::default() }
+        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), upstream_addr: resp.upstream_addr.clone(), upstream_time: resp.upstream_time.clone(), ..Sent::default() }
     };
     for (name, value, _) in level.add_header.iter().filter(|h| h.2 || added) {
         let value = value.render(r, &so_far(&resp, &[]));
@@ -400,10 +404,34 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         trailers.iter().for_each(|(n, v)| out.extend_from_slice(format!("{n}: {v}\r\n").as_bytes()));
         out.extend_from_slice(b"\r\n");
     }
-    let written = stream.write_all(&out).is_ok();
+    // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
+    let size = |t: &Template| crate::conf::size(&t.render(r, &Sent::default())).unwrap_or(0);
+    let rate = r.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
+    let written = send(stream, &out, rate, size(&level.limit_rate_after), r.started);
     let sent = Sent { bytes: out.len(), body: body_len, ..so_far(&resp, &trailers) };
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     (written && keepalive && status != 444).then_some(level.keepalive_timeout)
+}
+
+/// Writes an answer, paced as ngx_http_write_filter() paces it with a rate:
+/// by the end of each second since the request started (counted in whole
+/// seconds of the clock) up to limit_rate_after bytes and limit_rate bytes for
+/// each second have gone, and after each write the time it is worth at that
+/// rate is waited. Without a rate it is written at once.
+fn send(stream: &mut TcpStream, out: &[u8], rate: u64, after: u64, started: Instant) -> bool {
+    if rate == 0 { return stream.write_all(out).is_ok(); }
+    let clock = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let start = (clock() - started.elapsed()).as_secs() as i64;
+    let (rate, mut sent) = (rate as i64, 0);
+    while sent < out.len() {
+        let limit = rate * (clock().as_secs() as i64 - start + 1) - (sent as i64 - after as i64);
+        if limit <= 0 { thread::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)); continue; }
+        let n = (limit as usize).min(out.len() - sent);
+        if stream.write_all(&out[sent..sent + n]).is_err() { return false; }
+        sent += n;
+        if sent < out.len() { thread::sleep(Duration::from_millis(n as u64 * 1000 / rate as u64)); }
+    }
+    true
 }
 
 /// Whether the location lets the connection serve another request, as
@@ -436,6 +464,7 @@ fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix,
     while let Some(target) = resp.internal.take() {
         // nginx gives up after 10 internal redirects.
         redirects += 1;
+        if resp.as_get && to.method != "HEAD" { to.method = "GET".to_string(); }
         to.uri = target.split('?').next().unwrap_or_default().to_string();
         to.target = target;
         let found = location(server, &to.uri);
@@ -603,15 +632,23 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     let mut req = (req + "\r\n").into_bytes();
     req.extend_from_slice(&body);
-    let (mut tried, mut answer, mut addrs) = (vec![false; up.peers.len()], None, Vec::new());
+    let (mut tried, mut answer, mut addrs, mut times) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new());
     while answer.is_none() && let Some(i) = up.pick(&mut tried) {
         addrs.push(up.peers[i].addr.to_string());
+        let start = Instant::now();
         answer = fetch(&up.peers[i].addr, &req, level.proxy_connect_timeout);
+        let ms = start.elapsed().as_millis();
+        times.push(format!("{}.{:03}", ms / 1000, ms % 1000));
         up.done(i, answer.is_none());
     }
-    let upstream_addr = Some(addrs.join(", "));
-    let Some(mut resp) = answer else { return Response { upstream_addr, ..special(502) } };
-    resp.upstream_addr = upstream_addr;
+    let (upstream_addr, upstream_time) = (Some(addrs.join(", ")), Some(times.join(", ")));
+    let Some(mut resp) = answer else { return Response { upstream_addr, upstream_time, ..special(502) } };
+    (resp.upstream_addr, resp.upstream_time) = (upstream_addr, upstream_time);
+    // X-Accel-Limit-Rate sets the rate the answer is sent at; X-Accel-Redirect
+    // replaces the answer with an internal redirect to its URI.
+    let accel = |name: &str| resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
+    if let Some(rate) = accel("x-accel-limit-rate").and_then(|v| v.parse().ok()) { r.limit_rate.set(rate); }
+    if let Some(uri) = accel("x-accel-redirect").filter(|u| u.starts_with('/')) { return Response { internal: Some(uri), as_get: true, ..resp }; }
     let hidden = |name: &str| level.proxy_hide_header.iter().any(|h| h.eq_ignore_ascii_case(name));
     resp.headers.retain(|h| !hidden(&h.0));
     if hidden("content-type") { resp.ctype = None; }
@@ -636,10 +673,17 @@ fn fetch(peer: &SocketAddr, req: &[u8], connect: Duration) -> Option<Response> {
     let timeout = Duration::from_secs(60);
     let mut s = TcpStream::connect_timeout(peer, connect).ok()?;
     let _ = s.set_read_timeout(Some(timeout));
-    let mut answer = Vec::new();
-    s.write_all(req).and_then(|_| s.read_to_end(&mut answer)).ok()?;
-    let end = head_end(&answer)?;
+    let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
+    s.write_all(req).ok()?;
+    let end = loop {
+        if let Some(end) = head_end(&answer) { break end; }
+        let n = s.read(&mut chunk).ok().filter(|n| *n > 0)?;
+        answer.extend_from_slice(&chunk[..n]);
+    };
     let head = String::from_utf8_lossy(&answer[..end]).into_owned();
+    // The body of an answer that redirects with X-Accel-Redirect is not read.
+    let accel = head.split('\n').any(|l| l.get(..17).is_some_and(|n| n.eq_ignore_ascii_case("x-accel-redirect:")));
+    if !accel { s.read_to_end(&mut answer).ok()?; }
     let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
     let status = lines.next()?.strip_prefix("HTTP/1.")?.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()?;
     let mut resp = Response { status, body: answer[end..].to_vec(), ..Response::default() };
@@ -913,6 +957,44 @@ mod tests {
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
         assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
+    }
+
+    #[test]
+    fn accel_headers_redirect_and_set_the_rate() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf).unwrap();
+            // The body never ends: it is not read.
+            s.write_all(b"HTTP/1.1 200 OK\r\nX-Accel-Redirect: /b?c=1\r\nX-Accel-Limit-Rate: 13000\r\n\r\nxy").unwrap();
+            thread::sleep(Duration::from_secs(5));
+        });
+        let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
+        let p = Proxy { host: "h".into(), upstream, uri: None, url: None };
+        let level = Level { proxy_connect_timeout: Duration::from_secs(1), ..Level::default() };
+        let (_, r) = request("POST /a HTTP/1.0\n\n");
+        let resp = proxy(&p, &level, &r, "");
+        assert_eq!((resp.internal.as_deref(), resp.as_get, r.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
+        assert!(resp.upstream_time.unwrap().starts_with("0."));
+    }
+
+    #[test]
+    fn sends_at_the_rate() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut s, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        assert!(send(&mut s, &[b'x'; 3000], 0, 0, started));
+        // 1000 bytes and 1000 a second: the rest goes after a second or two.
+        assert!(send(&mut s, &[b'x'; 2500], 1000, 1000, started));
+        assert!(started.elapsed() >= Duration::from_millis(1400));
+        let mut got = vec![0u8; 5500];
+        client.read_exact(&mut got).unwrap();
+        drop(client);
+        thread::sleep(Duration::from_millis(100));
+        assert!(!send(&mut s, &[b'x'; 1 << 22], 1 << 20, 0, Instant::now()));
     }
 
     #[test]

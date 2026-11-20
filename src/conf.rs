@@ -87,6 +87,8 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("gzip_vary", HSL, 1, 1, false),
     ("gzip_http_version", HSL, 1, 1, false),
     ("gzip_types", HSL, 1, usize::MAX, false),
+    ("limit_rate", HSL, 1, 1, false),
+    ("limit_rate_after", HSL, 1, 1, false),
 ];
 
 const COMBINED: &str =
@@ -211,6 +213,10 @@ pub struct Level {
     pub resolver: Option<Arc<Resolver>>,
     pub resolver_timeout: Duration,
     pub proxy_connect_timeout: Duration,
+    /// limit_rate and limit_rate_after: sizes, which may have variables,
+    /// evaluated when the answer is sent.
+    pub limit_rate: Template,
+    pub limit_rate_after: Template,
 }
 
 /// try_files: the files tried in order, each a directory when its parameter
@@ -463,6 +469,8 @@ impl Builder<'_> {
                 "gzip_vary" => level.gzip_vary = flag(d).map_err(at)?,
                 "gzip_http_version" => level.gzip_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))? == 1,
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
+                "limit_rate" => level.limit_rate = size_value(&d.args[0]).map_err(at)?,
+                "limit_rate_after" => level.limit_rate_after = size_value(&d.args[0]).map_err(at)?,
                 _ => {}
             }
         }
@@ -631,6 +639,13 @@ fn set(args: &[String]) -> Result<Template, String> {
     let name = args[0].strip_prefix('$').ok_or_else(|| format!("invalid variable name \"{}\"", args[0]))?;
     if name != "limit_rate" { return Err(format!("setting the \"{name}\" variable is not supported")); }
     Template::parse(&args[1])
+}
+
+/// A size that may have variables; one without them must be valid.
+fn size_value(s: &str) -> Result<Template, String> {
+    let t = Template::parse(s)?;
+    if t.0.iter().all(|p| matches!(p, Part::Text(_))) { size(s)?; }
+    Ok(t)
 }
 
 /// A size such as "512", "8k" or "1m".
@@ -876,6 +891,14 @@ mod tests {
         assert_eq!(build_text("http { keepalive_requests x; }").unwrap_err(), "invalid number in t.conf:1");
         assert_eq!(build_text("http { keepalive_timeout 1x; }").unwrap_err(), "\"keepalive_timeout\" directive invalid value in t.conf:1");
         assert_eq!(build_text("http { keepalive_disable opera; }").unwrap_err(), "invalid value \"opera\" in t.conf:1");
+    }
+
+    #[test]
+    fn limit_rate_values() {
+        let c = build_text("http { limit_rate 12k; server { limit_rate_after $arg_a; } }").unwrap();
+        let level = &c.servers[0].level;
+        assert_eq!((level.limit_rate.0.len(), level.limit_rate_after.0.len()), (1, 1));
+        assert_eq!(build_text("http { limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
     }
 
     #[test]
