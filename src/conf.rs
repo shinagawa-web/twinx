@@ -58,6 +58,13 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("server_name_in_redirect", HSL, 1, 1, false),
     ("port_in_redirect", HSL, 1, 1, false),
     ("rewrite", SRV | LOC, 2, 3, false),
+    ("default_type", HSL, 1, 1, false),
+    ("proxy_set_header", HSL, 2, 2, false),
+    ("gzip_static", HSL, 1, 1, false),
+    ("gunzip", HSL, 1, 1, false),
+    ("gzip_vary", HSL, 1, 1, false),
+    ("gzip_http_version", HSL, 1, 1, false),
+    ("gzip_types", HSL, 1, usize::MAX, false),
 ];
 
 const COMBINED: &str =
@@ -122,6 +129,16 @@ pub struct Level {
     pub absolute_redirect: bool,
     pub server_name_in_redirect: bool,
     pub port_in_redirect: bool,
+    /// default_type: the Content-Type of files whose extension has no type.
+    pub default_type: String,
+    /// proxy_set_header: the headers sent to the proxied server instead of the client's.
+    pub proxy_set_header: Vec<(String, Template)>,
+    /// gzip_static: None when off, Some(true) for "always".
+    pub gzip_static: Option<bool>,
+    pub gunzip: bool,
+    pub gzip_vary: bool,
+    /// gzip_http_version 1.1 (the default): HTTP/1.0 requests are not given gzip.
+    pub gzip_http_11: bool,
 }
 
 /// How a location matches the URI: "=", a prefix, "^~" (a prefix that stops
@@ -212,7 +229,7 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { max_body: 1 << 20, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true, ..Level::default() };
+        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -260,6 +277,7 @@ impl Builder<'_> {
         let mut logs: Option<Vec<Arc<AccessLog>>> = None;
         let mut headers: Option<Vec<(String, Template, bool)>> = None;
         let mut pages: Option<Vec<ErrorPage>> = None;
+        let mut proxy_headers: Option<Vec<(String, Template)>> = None;
         for d in block {
             self.check(d, ctx)?;
             let at = |e: String| format!("{e} in {}", d.at);
@@ -290,6 +308,12 @@ impl Builder<'_> {
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
+                "default_type" => level.default_type = d.args[0].clone(),
+                "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
+                "gzip_static" => level.gzip_static = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\"", d.args[0])))?.1,
+                "gunzip" => level.gunzip = flag(d).map_err(at)?,
+                "gzip_vary" => level.gzip_vary = flag(d).map_err(at)?,
+                "gzip_http_version" => level.gzip_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))? == 1,
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
                 _ => {}
             }
@@ -297,6 +321,7 @@ impl Builder<'_> {
         if let Some(logs) = logs { level.access_log = logs; }
         if let Some(headers) = headers { level.add_header = headers; }
         if let Some(pages) = pages { level.error_page = pages; }
+        if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
         Ok(())
     }
 
@@ -582,6 +607,24 @@ mod tests {
         ] {
             assert_eq!(build_text(&format!("http {{ {text} }}")).unwrap_err(), format!("{e} in t.conf:1"));
         }
+    }
+
+    #[test]
+    fn gzip_and_proxy_headers() {
+        let c = build_text(
+            "http { proxy_set_header X $uri; gzip_http_version 1.0; server { default_type a/b; gunzip on; gzip_vary on; gzip_types text/plain; \
+             location /a { gzip_static always; proxy_set_header Y 1; proxy_set_header Z ''; } location /b { gzip_static on; } } }",
+        )
+        .unwrap();
+        let s = &c.servers[0];
+        let (a, b) = (&s.locations[0].level, &s.locations[1].level);
+        assert_eq!((s.level.default_type.as_str(), s.level.gunzip, s.level.gzip_vary, s.level.gzip_http_11), ("a/b", true, true, false));
+        assert_eq!((a.gzip_static, b.gzip_static, s.level.gzip_static), (Some(true), Some(false), None));
+        let names = |l: &Level| l.proxy_set_header.iter().map(|h| h.0.clone()).collect::<Vec<_>>();
+        assert_eq!((names(a), names(b)), (vec!["Y".to_string(), "Z".to_string()], vec!["X".to_string()]));
+        let e = build_text("http { gzip_static yes; }").unwrap_err();
+        assert_eq!(e, "invalid value \"yes\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\" in t.conf:1");
+        assert_eq!(build_text("http { gzip_http_version 2; }").unwrap_err(), "invalid value \"2\" in t.conf:1");
     }
 
     #[test]
