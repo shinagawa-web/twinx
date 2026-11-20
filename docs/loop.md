@@ -53,6 +53,20 @@ Up to three iterations. Each one:
 3. If one of your open pull requests failed the judge, fix it as the judge's comment says. Otherwise:
 4. If there is no open failing file, stop. Otherwise fix one as `docs/fixer.md` says, open the pull request and wait for it as above.
 
+## At the end of a run
+
+Before you end, however the run ends (merged, blocked, nothing to do), add one comment to the issue "Fixer runs" (#44):
+
+```
+started: <when the run fired>
+ended: <now>
+tokens: input <n>, output <n>, cache written <n>, cache read <n>, model calls <n>
+pull requests: opened <#…>, merged <#…>
+passing on main: <files> of <files> files, <subtests> of <subtests> subtests
+```
+
+The tokens come from `python3 harness/usage.py`, which reads this session's own transcript. The passing counts are those of the judge's comment on the most recently merged pull request, or the run's own results when nothing merged.
+
 ## What you never do
 
 - Push to main. The ruleset refuses it anyway; every change goes through a pull request.

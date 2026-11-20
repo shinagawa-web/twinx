@@ -8,7 +8,7 @@ An experiment to find out how far an agent loop can take an HTTP server that beh
 |---|---|
 | How much can be automated? | The number of nginx-tests files made to pass automatically, and the number of blocked issues the loop opened for a human |
 | Where does a human have to step in? | The intervention log (`docs/interventions.md`) |
-| What quality do we get, in how much time and at what cost? | The nginx-tests pass rate over elapsed time, and the time and tokens spent per iteration |
+| What quality do we get, in how much time and at what cost? | The nginx-tests pass rate over elapsed time, and the time and tokens spent per iteration ("Fixer runs", #44) |
 
 ## Approach
 
@@ -73,6 +73,7 @@ Only through what the judge enforces: the harness, the judging rules, the stage 
 | Plan (label `plan`): what the human follows, such as finishing a stage | the human | the human |
 | Harness work: a change to the harness, the judging rules, the stage lists or the documents | the human | the pull request that makes the change, when it merges |
 | Blocked (label `blocked`): something the loop cannot fix within its role | the Fixer | the human, after fixing it |
+| Record (label `record`): "Fixer runs" (#44), one comment per run with its time, tokens and results | the human, once | never |
 
 The human includes the Claude Code session the human instructs; the loop is the scheduled Fixer.
 
