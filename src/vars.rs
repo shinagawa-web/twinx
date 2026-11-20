@@ -25,6 +25,9 @@ pub struct Request {
     pub local: SocketAddr,
     pub started: Instant,
     pub pipelined: bool,
+    /// When the connection was accepted, and how many requests it has had, this one included.
+    pub connected: Instant,
+    pub requests: u64,
     pub length: usize,
     /// The body when it is kept in memory, and the file it was written to otherwise.
     pub body: Vec<u8>,
@@ -69,6 +72,8 @@ pub enum Var {
     Args,
     RequestBody,
     RequestBodyFile,
+    ConnectionRequests,
+    ConnectionTime,
     Arg(String),
     Http(String),
     Cookie(String),
@@ -88,6 +93,7 @@ impl Var {
             ("remote_addr", Var::RemoteAddr), ("remote_port", Var::RemotePort), ("binary_remote_addr", Var::BinaryRemoteAddr),
             ("server_addr", Var::ServerAddr), ("server_port", Var::ServerPort), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
+            ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -120,6 +126,8 @@ impl Var {
             Var::ServerPort => r.local.port().to_string(),
             Var::RemoteUser => basic_user(r)?,
             Var::Request => r.line.clone(),
+            Var::ConnectionRequests => r.requests.to_string(),
+            Var::ConnectionTime => { let ms = r.connected.elapsed().as_millis(); format!("{}.{:03}", ms / 1000, ms % 1000) }
             Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
             Var::RequestUri => r.target.clone(),
             Var::Args => r.target.split_once('?').map_or("", |(_, a)| a).to_string(),
@@ -304,6 +312,8 @@ mod tests {
             local: "127.0.0.1:8080".parse().unwrap(),
             started: Instant::now(),
             pipelined: true,
+            connected: Instant::now(),
+            requests: 2,
             length: 39,
             body: b"xy".to_vec(),
             body_file: None,
@@ -362,6 +372,12 @@ mod tests {
             r.headers = vec![h("Authorization", auth)];
             assert_eq!(basic_user(&r).as_deref(), user, "{auth}");
         }
+    }
+
+    #[test]
+    fn connection_variables() {
+        let t = Template::parse("$connection_requests:$connection_time").unwrap();
+        assert!(t.render(&request(), &Sent::default()).starts_with("2:0."));
     }
 
     #[test]
