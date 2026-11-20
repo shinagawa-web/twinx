@@ -248,6 +248,9 @@ struct Response {
     /// The status each of them answered with ($upstream_status).
     upstream_status: Option<String>,
     upstream_time: Option<Vec<[Option<u128>; 3]>>,
+    /// For each of them, the bytes of the body and of the whole answer read,
+    /// and of the request sent ($upstream_response_length, $upstream_bytes_*).
+    upstream_bytes: Option<Vec<[u64; 3]>>,
     /// The host of the proxy_pass URL ($proxy_host).
     proxy_host: Option<String>,
     /// Whether the internal redirect makes the request a GET, unless it is a
@@ -276,8 +279,10 @@ struct Rest { s: TcpStream, answer: Vec<u8>, end: usize, length: Option<usize>, 
 /// Reads the rest of a proxied answer's body, noting how long the whole answer took.
 fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
-    resp.body = read_body(&mut rest.s, rest.answer, rest.end, rest.length, rest.chunked, rest.rate).unwrap_or_default();
+    let (body, read) = read_body(&mut rest.s, rest.answer, rest.end, rest.length, rest.chunked, rest.rate).unwrap_or_default();
+    resp.body = body;
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
+    if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
 }
 
 /// The page nginx generates for an error status.
@@ -439,7 +444,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let so_far = |resp: &Response, trailers: &[(String, String)]| {
         let ctype = resp.ctype.iter().map(|t| ("Content-Type".to_string(), t.clone()));
         let headers = ctype.chain(resp.headers.iter().cloned()).collect();
-        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), upstream_addr: resp.upstream_addr.clone(), upstream_status: resp.upstream_status.clone(), upstream_time: resp.upstream_time.clone(), proxy_host: resp.proxy_host.clone(), ..Sent::default() }
+        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), upstream_addr: resp.upstream_addr.clone(), upstream_status: resp.upstream_status.clone(), upstream_time: resp.upstream_time.clone(), upstream_bytes: resp.upstream_bytes.clone(), proxy_host: resp.proxy_host.clone(), ..Sent::default() }
     };
     // While the head is made, the last proxied server is still sending ($upstream_response_time).
     let at_head = |resp: &Response| {
@@ -815,7 +820,7 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let Some(bind) = bind.map(|(a, t)| crate::conf::local_addr(&a).map(|a| (a, t))).map_or(Some(None), |b| b.map(Some)) else { return special(500) };
     // proxy_limit_rate, which may have the answer's headers ($upstream_http_*).
     let rate = |resp: &Response| crate::conf::size(&level.proxy_limit_rate.render(r, &Sent { upstream: resp.upstream.clone(), ..Sent::default() })).unwrap_or(0);
-    let (mut tried, mut answer, mut addrs, mut times) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new());
+    let (mut tried, mut answer, mut addrs, mut times, mut bytes) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new(), Vec::new());
     let (mut statuses, limit, first) = (Vec::new(), level.proxy_next_upstream_tries, Instant::now());
     let (mut tries, next) = (if limit > 0 { up.tries().min(limit) } else { up.tries() }, |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
     while let Some(i) = up.pick(&mut tried) {
@@ -823,10 +828,11 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
         // A socket that cannot be bound fails the request without trying the next server.
         let socket = bind.map(|b| bound(&up.peers[i].addr, b));
         if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
-        let (start, mut time) = (Instant::now(), [None; 3]);
-        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, &mut time, &rate, unread.as_mut().filter(|_| pass_body), level.max_body);
+        let (start, mut time, mut counted) = (Instant::now(), [None; 3], [0; 3]);
+        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body);
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
+        bytes.push(counted);
         // An error, or a status proxy_next_upstream names while servers are
         // left to try, goes on to the next server; 403 and 404 are no failures.
         tries -= 1;
@@ -839,9 +845,9 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
         if !again || tries == 0 { break; }
         answer = None;
     }
-    let (upstream_addr, upstream_status, upstream_time, proxy_host) = (Some(addrs.join(", ")), Some(statuses.join(", ")), Some(times), Some(host));
-    let Some(mut resp) = answer else { return Response { upstream_addr, upstream_status, upstream_time, proxy_host, ..special(502) } };
-    (resp.upstream_addr, resp.upstream_status, resp.upstream_time, resp.proxy_host) = (upstream_addr, upstream_status, upstream_time, proxy_host);
+    let (upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host) = (Some(addrs.join(", ")), Some(statuses.join(", ")), Some(times), Some(bytes), Some(host));
+    let Some(mut resp) = answer else { return Response { upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host, ..special(502) } };
+    (resp.upstream_addr, resp.upstream_status, resp.upstream_time, resp.upstream_bytes, resp.proxy_host) = (upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host);
     // X-Accel-Limit-Rate sets the rate the answer is sent at; X-Accel-Redirect
     // replaces the answer with an internal redirect to its URI.
     let accel = |name: &str| resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
@@ -961,7 +967,7 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
 /// it took to connect and to send the response head. While it waits for the
 /// head, the client closing the connection ends the request with 499, as
 /// proxy_ignore_client_abort off does.
-fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, time: &mut [Option<u128>; 3], rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64) -> Option<Response> {
+fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64) -> Option<Response> {
     let start = Instant::now();
     let mut s = match socket {
         Some(socket) => socket.connect_timeout(&(*peer).into(), level.proxy_connect_timeout).ok().map(|()| TcpStream::from(socket))?,
@@ -971,13 +977,15 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
     let _ = s.set_read_timeout(Some(level.proxy_read_timeout));
     let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
     s.write_all(req).ok()?;
+    bytes[2] = req.len() as u64;
     // The rest of a body that is not buffered goes on as the client sends it.
-    if let Some(u) = unread { pass_body(u, max, &mut s)?; }
+    if let Some(u) = unread { bytes[2] += pass_body(u, max, &mut s)?; }
     let end = loop {
         if let Some(end) = head_end(&answer) { break end; }
         if client_closed(&s, client, level.proxy_read_timeout)? { return Some(Response { status: 499, ..Response::default() }); }
         let n = s.read(&mut chunk).ok().filter(|n| *n > 0)?;
         answer.extend_from_slice(&chunk[..n]);
+        bytes[1] = answer.len() as u64;
     };
     time[1] = Some(start.elapsed().as_millis());
     let head = String::from_utf8_lossy(&answer[..end]).into_owned();
@@ -1009,9 +1017,11 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
     let (length, chunked) = if no_body { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
     if rate > 0 { return Some(Response { rest: Some(Rest { s, answer, end, length, chunked, rate, started: start }), ..resp }); }
-    resp.body = read_body(&mut s, answer, end, length, chunked, 0)?;
+    let (body, read) = read_body(&mut s, answer, end, length, chunked, 0)?;
+    (resp.body, bytes[0], bytes[1]) = (body, (read - end) as u64, read as u64);
     Some(resp)
 }
+
 
 /// Reads a proxied answer's body up to its length, up to its last chunk, or
 /// until the server closes the connection; what follows the last chunk is
@@ -1019,7 +1029,8 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
 /// proxy_limit_rate: by the end of each second since the body started
 /// (counted in whole seconds of the clock) up to the rate for each second has
 /// been read, and when that much has, it waits for the time it is worth.
-fn read_body(s: &mut TcpStream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64) -> Option<Vec<u8>> {
+/// Returns the body and the bytes of the whole answer read.
+fn read_body(s: &mut TcpStream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64) -> Option<(Vec<u8>, usize)> {
     let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let (start, rate, mut chunk) = (secs(), rate as i64, [0u8; 4096]);
     while length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1) {
@@ -1030,7 +1041,7 @@ fn read_body(s: &mut TcpStream, mut answer: Vec<u8>, end: usize, length: Option<
         answer.extend_from_slice(&chunk[..n]);
     }
     let body = &answer[end..];
-    Some(if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() })
+    Some((if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() }, answer.len()))
 }
 
 /// A socket for connecting to a proxied server from a local address, set up
@@ -1082,17 +1093,19 @@ fn chunk(data: &[u8]) -> Vec<u8> {
 
 /// Reads the rest of a body from the client and writes it as it comes: the
 /// bytes of a body with a Content-Length as they are, the data of a chunked
-/// one in a chunk for each read, with the last chunk once it ends. None when
+/// one in a chunk for each read, with the last chunk once it ends, and returns
+/// how many bytes it wrote ($upstream_bytes_sent). None when
 /// the client closes, the body is invalid or the writing fails.
-fn pass_body(u: &mut Unread, max: u64, to: &mut dyn Write) -> Option<()> {
-    let mut buf = [0u8; 4096];
+fn pass_body(u: &mut Unread, max: u64, to: &mut dyn Write) -> Option<u64> {
+    let (mut buf, mut written) = ([0u8; 4096], 0);
     let Some((raw, sent)) = &mut u.chunked else {
         while u.left > 0 {
             let got = u.client.read(&mut buf[..u.left.min(4096) as usize]).ok().filter(|g| *g > 0)?;
             u.left -= got as u64;
             to.write_all(&buf[..got]).ok()?;
+            written += got as u64;
         }
-        return Some(());
+        return Some(written);
     };
     loop {
         let (data, used) = decode_chunked(raw, max).ok()?;
@@ -1100,7 +1113,8 @@ fn pass_body(u: &mut Unread, max: u64, to: &mut dyn Write) -> Option<()> {
         *sent = data.len();
         if used.is_some() { out.extend_from_slice(b"0\r\n\r\n"); }
         to.write_all(&out).ok()?;
-        if let Some(used) = used { u.rest = raw.split_off(used); u.chunked = None; return Some(()); }
+        written += out.len() as u64;
+        if let Some(used) = used { u.rest = raw.split_off(used); u.chunked = None; return Some(written); }
         let got = u.client.read(&mut buf).ok().filter(|g| *g > 0)?;
         raw.extend_from_slice(&buf[..got]);
     }
@@ -1397,9 +1411,11 @@ mod tests {
             s.write_all(b"HTTP/1.1 201 Created\r\nServer: x\r\nContent-Type: a/b\r\nX-A: 1\r\nX-Accel-B: 2\r\n\r\nbody").unwrap();
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let mut time = [None; 3];
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut time, &|_| 0, None, 0).unwrap();
+        let (mut time, mut bytes) = ([None; 3], [0; 3]);
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
+        // The body, the whole answer and the request, in bytes.
+        assert_eq!(bytes, [4, 80, 18]);
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
         assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
@@ -1450,7 +1466,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
-        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0, None, 0).unwrap().status, 200);
+        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
@@ -1469,7 +1485,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
-        let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &rate, None, 0).unwrap();
+        let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0).unwrap();
         // The body is read after the head, 4000 bytes (what came with the head too)
         // in each second of the clock: it ends in the third second.
         assert!(resp.body.is_empty() && resp.rest.is_some());
@@ -1510,10 +1526,10 @@ mod tests {
             }
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0, None, 0).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0, None, 0).is_none());
+            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0).is_none());
         }
     }
 
@@ -1818,13 +1834,13 @@ mod tests {
         let unread = |client: &TcpStream, left: u64, chunked: Option<&[u8]>| Unread { client: client.try_clone().unwrap(), left, chunked: chunked.map(|c| (c.to_vec(), 1)), rest: Vec::new() };
         out.write_all(b"abcdef").unwrap();
         let (mut to, mut u) = (Vec::new(), unread(&client, 4, None));
-        assert_eq!(pass_body(&mut u, 100, &mut to), Some(()));
+        assert_eq!(pass_body(&mut u, 100, &mut to), Some(4));
         assert_eq!((to.as_slice(), u.left), (&b"abcd"[..], 0));
         // A chunked body: the data that came after the one passed, in one chunk
         // for each read, then the last chunk; what follows it is kept.
         let (mut to, mut u) = (Vec::new(), unread(&client, 0, Some(b"3\r\nx")));
         out.write_all(b"\r\n4\r\nmany\r\n0\r\n\r\nGET").unwrap();
-        assert_eq!(pass_body(&mut u, 100, &mut to), Some(()));
+        assert_eq!(pass_body(&mut u, 100, &mut to), Some(16));
         assert_eq!((String::from_utf8_lossy(&to), u.rest.as_slice()), ("6\r\nefmany\r\n0\r\n\r\n".into(), &b"GET"[..]));
         // An invalid chunk, or the client closing before the end, fails it.
         assert_eq!(pass_body(&mut unread(&client, 0, Some(b"z\r\n")), 100, &mut to), None);
