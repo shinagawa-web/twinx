@@ -747,7 +747,9 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
             None => return special(502),
         },
     };
-    let body = r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default());
+    // proxy_pass_request_body off sends no body, and so no Content-Length.
+    let pass_body = level.proxy_pass_request_body;
+    let body = if pass_body { r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default()) } else { Vec::new() };
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &sent))).collect();
@@ -758,9 +760,10 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     if !is_set("host") { req += &format!("Host: {host}\r\n"); }
     if !is_set("connection") { req += "Connection: close\r\n"; }
-    if framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len()); }
+    if pass_body && framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len()); }
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
-    let passed = r.headers.iter().filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()) && !is_set(n));
+    // proxy_pass_request_headers off passes none of the client's headers.
+    let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()) && !is_set(n));
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     let mut req = (req + "\r\n").into_bytes();
     req.extend_from_slice(&body);
