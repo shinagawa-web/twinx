@@ -45,11 +45,17 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("client_header_buffer_size", HTTP | SRV, 1, 1, false),
     ("large_client_header_buffers", HTTP | SRV, 2, 2, false),
     ("connection_pool_size", HTTP | SRV, 1, 1, false),
+    ("max_headers", HTTP | SRV, 1, 1, false),
     ("client_body_buffer_size", HSL, 1, 1, false),
     ("client_body_in_file_only", HSL, 1, 1, false),
     ("client_body_in_single_buffer", HSL, 1, 1, false),
     ("client_max_body_size", HSL, 1, 1, false),
     ("add_header", HSL, 2, 3, false),
+    ("add_trailer", HSL, 2, 3, false),
+    ("keepalive_requests", HSL, 1, 1, false),
+    ("keepalive_timeout", HSL, 1, 2, false),
+    ("keepalive_time", HSL, 1, 1, false),
+    ("keepalive_disable", HSL, 1, usize::MAX, false),
     ("error_page", HSL, 2, usize::MAX, false),
     ("proxy_pass", LOC, 1, 1, false),
     ("expires", HSL, 1, 2, false),
@@ -60,6 +66,8 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("rewrite", SRV | LOC, 2, 3, false),
     ("default_type", HSL, 1, 1, false),
     ("proxy_set_header", HSL, 2, 2, false),
+    ("proxy_hide_header", HSL, 1, 1, false),
+    ("gzip", HSL, 1, 1, false),
     ("gzip_static", HSL, 1, 1, false),
     ("gunzip", HSL, 1, 1, false),
     ("gzip_vary", HSL, 1, 1, false),
@@ -114,9 +122,13 @@ pub struct Level {
     pub root: PathBuf,
     /// add_header: name, value, and whether it is added whatever the status ("always").
     pub add_header: Vec<(String, Template, bool)>,
+    /// add_trailer: the same, sent as trailers of a chunked answer.
+    pub add_trailer: Vec<(String, Template, bool)>,
     pub error_page: Vec<ErrorPage>,
     pub proxy: Option<Arc<Proxy>>,
     pub max_body: u64,
+    /// max_headers: the header lines a request may have; one more is refused with 400.
+    pub max_headers: usize,
     pub body_buffer: u64,
     pub body_in_file_only: bool,
     pub body_temp_path: PathBuf,
@@ -131,12 +143,30 @@ pub struct Level {
     pub absolute_redirect: bool,
     pub server_name_in_redirect: bool,
     pub port_in_redirect: bool,
+    /// keepalive_requests: the requests a connection may serve.
+    pub keepalive_requests: u64,
+    /// keepalive_timeout: how long a kept-alive connection waits for the next
+    /// request (zero: no keepalive), and the timeout of the Keep-Alive header.
+    pub keepalive_timeout: Duration,
+    pub keepalive_header: Option<u64>,
+    /// keepalive_time: how long a connection may serve requests.
+    pub keepalive_time: Duration,
+    /// keepalive_disable: no keepalive for POST from MSIE 6 and older, and for Safari.
+    pub keepalive_disable_msie6: bool,
+    pub keepalive_disable_safari: bool,
     /// default_type: the Content-Type of files whose extension has no type.
     pub default_type: String,
     /// proxy_set_header: the headers sent to the proxied server instead of the client's.
     pub proxy_set_header: Vec<(String, Template)>,
+    /// proxy_hide_header: the headers of the proxied server's answer not passed
+    /// to the client besides those nginx never passes, lowercased.
+    pub proxy_hide_header: Vec<String>,
     /// gzip_static: None when off, Some(true) for "always".
     pub gzip_static: Option<bool>,
+    /// gzip: compress answers for clients that take gzip.
+    pub gzip: bool,
+    /// gzip_types: the types compressed besides text/html, "*" for any.
+    pub gzip_types: Vec<String>,
     pub gunzip: bool,
     pub gzip_vary: bool,
     /// gzip_http_version 1.1 (the default): HTTP/1.0 requests are not given gzip.
@@ -233,7 +263,8 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true, ..Level::default() };
+        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
+            keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -279,9 +310,10 @@ impl Builder<'_> {
     /// access_log replaces what the level above set as a whole.
     fn level(&mut self, block: &[Directive], ctx: u8, level: &mut Level) -> Result<(), String> {
         let mut logs: Option<Vec<Arc<AccessLog>>> = None;
-        let mut headers: Option<Vec<(String, Template, bool)>> = None;
+        let (mut headers, mut trailers): (Option<Vec<(String, Template, bool)>>, Option<Vec<_>>) = (None, None);
         let mut pages: Option<Vec<ErrorPage>> = None;
         let mut proxy_headers: Option<Vec<(String, Template)>> = None;
+        let mut hidden: Option<Vec<String>> = None;
         for d in block {
             self.check(d, ctx)?;
             let at = |e: String| format!("{e} in {}", d.at);
@@ -301,6 +333,7 @@ impl Builder<'_> {
                 "open_log_file_cache" => level.log_cache = log_cache(&d.args).map_err(at)?,
                 "access_log" => logs.get_or_insert_default().extend(self.access_log(&d.args).map_err(at)?),
                 "add_header" => headers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
+                "add_trailer" => trailers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
                 "error_page" => pages.get_or_insert_default().push(error_page(&d.args).map_err(at)?),
                 "proxy_pass" => level.proxy = Some(Arc::new(self.proxy(&d.args[0]).map_err(at)?)),
                 "client_max_body_size" => level.max_body = size(&d.args[0]).map_err(at)?,
@@ -309,13 +342,30 @@ impl Builder<'_> {
                     let number = d.args.len() == 1 || d.args[0].parse::<u64>().is_ok_and(|n| n > 0);
                     if !number || size(d.args.last().unwrap()).is_err() { return Err(at(format!("\"{}\" directive invalid value", d.name))); }
                 }
+                "max_headers" => level.max_headers = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
                 "default_type" => level.default_type = d.args[0].clone(),
                 "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
+                "proxy_hide_header" => hidden.get_or_insert_default().push(d.args[0].to_ascii_lowercase()),
                 "gzip_static" => level.gzip_static = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\"", d.args[0])))?.1,
                 "gunzip" => level.gunzip = flag(d).map_err(at)?,
+                "gzip" => level.gzip = flag(d).map_err(at)?,
+                "keepalive_requests" => level.keepalive_requests = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
+                "keepalive_timeout" | "keepalive_time" => {
+                    let secs = d.args.iter().map(|a| crate::expires::parse_time(a).filter(|s| *s >= 0)).collect::<Option<Vec<_>>>();
+                    let secs = secs.ok_or_else(|| at(format!("\"{}\" directive invalid value", d.name)))?;
+                    let time = Duration::from_secs(secs[0] as u64);
+                    if d.name == "keepalive_time" { level.keepalive_time = time } else { level.keepalive_timeout = time }
+                    if let Some(&header) = secs.get(1) { level.keepalive_header = Some(header as u64); }
+                }
+                "keepalive_disable" => {
+                    let unknown = d.args.iter().find(|a| !["none", "msie6", "safari"].contains(&a.as_str()));
+                    if let Some(a) = unknown { return Err(at(format!("invalid value \"{a}\""))); }
+                    (level.keepalive_disable_msie6, level.keepalive_disable_safari) = (d.args.iter().any(|a| a == "msie6"), d.args.iter().any(|a| a == "safari"));
+                }
+                "gzip_types" => level.gzip_types = d.args.iter().map(|t| t.to_ascii_lowercase()).collect(),
                 "gzip_vary" => level.gzip_vary = flag(d).map_err(at)?,
                 "gzip_http_version" => level.gzip_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))? == 1,
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
@@ -324,8 +374,10 @@ impl Builder<'_> {
         }
         if let Some(logs) = logs { level.access_log = logs; }
         if let Some(headers) = headers { level.add_header = headers; }
+        if let Some(trailers) = trailers { level.add_trailer = trailers; }
         if let Some(pages) = pages { level.error_page = pages; }
         if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
+        if let Some(hidden) = hidden { level.proxy_hide_header = hidden; }
         Ok(())
     }
 
@@ -507,8 +559,8 @@ mod tests {
     fn proxy_upstream_and_body_settings() {
         let c = build_text(
             "http { upstream u { server 127.0.0.1:8082 backup; server 127.0.0.1:8081 weight=2; } \
-             client_max_body_size 1k; server { listen 127.0.0.1:8080; add_header X a; \
-             location /a { proxy_pass http://u/x; client_body_buffer_size 2k; client_body_in_file_only on; } \
+             client_max_body_size 1k; server { listen 127.0.0.1:8080; add_header X a; add_trailer T b; \
+             location /a { add_trailer U c always; proxy_pass http://u/x; client_body_buffer_size 2k; client_body_in_file_only on; } \
              location /b { proxy_pass http://127.0.0.1:8083; error_page 404 =301 http://e/; } } }",
         )
         .unwrap();
@@ -519,6 +571,7 @@ mod tests {
         assert_eq!(addrs, vec!["127.0.0.1:8082 1 true", "127.0.0.1:8081 2 false"]);
         assert_eq!((a.max_body, a.body_buffer, a.body_in_file_only), (1024, 2048, true));
         assert_eq!(a.add_header[0].0, "X");
+        assert_eq!((a.add_trailer[0].0.as_str(), a.add_trailer[0].2, b.add_trailer[0].0.as_str()), ("U", true, "T"));
         assert_eq!(b.proxy.as_ref().unwrap().host, "127.0.0.1:8083");
         assert_eq!((b.error_page[0].codes.clone(), b.error_page[0].status), (vec![404], Some(301)));
         assert_eq!(b.body_buffer, 16384);
@@ -526,6 +579,21 @@ mod tests {
         assert!(e.servers[0].level.expires.is_some() && e.servers[0].locations[0].level.expires.is_some());
         let e = build_text("http { expires bad; }").unwrap_err();
         assert_eq!(e, "invalid value \"bad\" in t.conf:1");
+    }
+
+    #[test]
+    fn max_headers() {
+        let c = build_text("http { max_headers 5; server { } server { max_headers 7; } }").unwrap();
+        assert_eq!((c.servers[0].level.max_headers, c.servers[1].level.max_headers), (5, 7));
+        assert_eq!(build_text("http { server { } }").unwrap().servers[0].level.max_headers, 1000);
+        assert_eq!(build_text("http { max_headers x; }").unwrap_err(), "invalid number in t.conf:1");
+    }
+
+    #[test]
+    fn proxy_hide_header_inherits_as_a_whole() {
+        let c = build_text("http { proxy_hide_header X-A; server { location /a { proxy_hide_header X-B; proxy_hide_header x-c; } location /b { } } }").unwrap();
+        let (a, b) = (&c.servers[0].locations[0].level, &c.servers[0].locations[1].level);
+        assert_eq!((a.proxy_hide_header.clone(), b.proxy_hide_header.clone()), (vec!["x-b".to_string(), "x-c".into()], vec!["x-a".to_string()]));
     }
 
     #[test]
@@ -620,18 +688,33 @@ mod tests {
     fn gzip_and_proxy_headers() {
         let c = build_text(
             "http { proxy_set_header X $uri; gzip_http_version 1.0; server { default_type a/b; gunzip on; gzip_vary on; gzip_types text/plain; \
-             location /a { gzip_static always; proxy_set_header Y 1; proxy_set_header Z ''; } location /b { gzip_static on; } } }",
+             location /a { gzip on; gzip_static always; proxy_set_header Y 1; proxy_set_header Z ''; } location /b { gzip_static on; } } }",
         )
         .unwrap();
         let s = &c.servers[0];
         let (a, b) = (&s.locations[0].level, &s.locations[1].level);
         assert_eq!((s.level.default_type.as_str(), s.level.gunzip, s.level.gzip_vary, s.level.gzip_http_11), ("a/b", true, true, false));
         assert_eq!((a.gzip_static, b.gzip_static, s.level.gzip_static), (Some(true), Some(false), None));
+        assert_eq!((a.gzip, s.level.gzip, b.gzip_types.clone()), (true, false, vec!["text/plain".to_string()]));
         let names = |l: &Level| l.proxy_set_header.iter().map(|h| h.0.clone()).collect::<Vec<_>>();
         assert_eq!((names(a), names(b)), (vec!["Y".to_string(), "Z".to_string()], vec!["X".to_string()]));
         let e = build_text("http { gzip_static yes; }").unwrap_err();
         assert_eq!(e, "invalid value \"yes\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\" in t.conf:1");
         assert_eq!(build_text("http { gzip_http_version 2; }").unwrap_err(), "invalid value \"2\" in t.conf:1");
+    }
+
+    #[test]
+    fn keepalive_settings() {
+        let c = build_text("http { server { keepalive_requests 2; keepalive_timeout 1 9; location /a { keepalive_timeout 30s; keepalive_time 1s; keepalive_disable none; } location /b { keepalive_disable safari msie6; } } }").unwrap();
+        let s = &c.servers[0];
+        let (a, b) = (&s.locations[0].level, &s.locations[1].level);
+        assert_eq!((s.level.keepalive_requests, s.level.keepalive_timeout, s.level.keepalive_header), (2, Duration::from_secs(1), Some(9)));
+        assert_eq!((a.keepalive_requests, a.keepalive_timeout, a.keepalive_header, a.keepalive_time), (2, Duration::from_secs(30), Some(9), Duration::from_secs(1)));
+        assert_eq!((a.keepalive_disable_msie6, a.keepalive_disable_safari, b.keepalive_disable_msie6, b.keepalive_disable_safari), (false, false, true, true));
+        assert_eq!((s.level.keepalive_time, s.level.keepalive_disable_msie6), (Duration::from_secs(3600), true));
+        assert_eq!(build_text("http { keepalive_requests x; }").unwrap_err(), "invalid number in t.conf:1");
+        assert_eq!(build_text("http { keepalive_timeout 1x; }").unwrap_err(), "\"keepalive_timeout\" directive invalid value in t.conf:1");
+        assert_eq!(build_text("http { keepalive_disable opera; }").unwrap_err(), "invalid value \"opera\" in t.conf:1");
     }
 
     #[test]
