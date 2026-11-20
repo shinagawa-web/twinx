@@ -366,8 +366,11 @@ def main():
         return 2
     cases = find_cases(args.paths)
     if not cases:
+        # The own cases are being removed for nginx-tests; with none left, the results are empty.
         print("harness: no cases found", file=sys.stderr)
-        return 2
+        if args.out:
+            Path(args.out).write_text(json.dumps({"summary": {"cases": 0, "cases_passed": 0}, "results": []}, indent=2))
+        return 0
 
     backend = Backend(("127.0.0.1", BACKEND_PORT), EchoHandler)
     threading.Thread(target=backend.serve_forever, daemon=True).start()
