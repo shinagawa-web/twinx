@@ -1,0 +1,9 @@
+[package]
+name = "twinx"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+signal-hook = "0.4.6"
