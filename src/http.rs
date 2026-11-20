@@ -686,11 +686,17 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     let mut req = (req + "\r\n").into_bytes();
     req.extend_from_slice(&body);
+    // proxy_bind: an empty value binds to nothing; a value that is no address fails the request.
+    let bind = level.proxy_bind.as_ref().map(|(a, t)| (a.render(r, &Sent::default()), *t)).filter(|(a, _)| !a.is_empty());
+    let Some(bind) = bind.map(|(a, t)| crate::conf::local_addr(&a).map(|a| (a, t))).map_or(Some(None), |b| b.map(Some)) else { return special(500) };
     let (mut tried, mut answer, mut addrs, mut times) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new());
     while answer.is_none() && let Some(i) = up.pick(&mut tried) {
         addrs.push(up.peers[i].addr.to_string());
+        // A socket that cannot be bound fails the request without trying the next server.
+        let socket = bind.map(|b| bound(&up.peers[i].addr, b));
+        if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
         let (start, mut time) = (Instant::now(), [None; 3]);
-        answer = fetch(&up.peers[i].addr, &req, level, r.client, &mut time);
+        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, &mut time);
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         up.done(i, answer.is_none());
@@ -727,9 +733,12 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
 /// it took to connect and to send the response head. While it waits for the
 /// head, the client closing the connection ends the request with 499, as
 /// proxy_ignore_client_abort off does.
-fn fetch(peer: &SocketAddr, req: &[u8], level: &Level, client: i32, time: &mut [Option<u128>; 3]) -> Option<Response> {
+fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, time: &mut [Option<u128>; 3]) -> Option<Response> {
     let start = Instant::now();
-    let mut s = TcpStream::connect_timeout(peer, level.proxy_connect_timeout).ok()?;
+    let mut s = match socket {
+        Some(socket) => socket.connect_timeout(&(*peer).into(), level.proxy_connect_timeout).ok().map(|()| TcpStream::from(socket))?,
+        None => TcpStream::connect_timeout(peer, level.proxy_connect_timeout).ok()?,
+    };
     time[0] = Some(start.elapsed().as_millis());
     let _ = s.set_read_timeout(Some(level.proxy_read_timeout));
     let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
@@ -776,6 +785,24 @@ fn fetch(peer: &SocketAddr, req: &[u8], level: &Level, client: i32, time: &mut [
     let body = &answer[end..];
     resp.body = body[..length.unwrap_or(body.len()).min(body.len())].to_vec();
     Some(resp)
+}
+
+/// A socket for connecting to a proxied server from a local address, set up
+/// as nginx does: with a port, the address may be reused; without one, the
+/// port is chosen when connecting; "transparent" allows a foreign address.
+fn bound(peer: &SocketAddr, (local, transparent): (SocketAddr, bool)) -> Option<socket2::Socket> {
+    use std::os::fd::AsRawFd;
+    let s = socket2::Socket::new(socket2::Domain::for_address(*peer), socket2::Type::STREAM, None).ok()?;
+    let set = |level: i32, name: i32| {
+        let on: libc::c_int = 1;
+        // SAFETY: the option value is a c_int that lives through the call.
+        unsafe { libc::setsockopt(s.as_raw_fd(), level, name, (&on as *const libc::c_int).cast(), size_of::<libc::c_int>() as libc::socklen_t) == 0 }
+    };
+    let v4 = peer.is_ipv4();
+    if transparent && !(if v4 { set(libc::IPPROTO_IP, libc::IP_TRANSPARENT) } else { set(libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT) }) { return None; }
+    let _ = if local.port() == 0 { set(libc::IPPROTO_IP, libc::IP_BIND_ADDRESS_NO_PORT) } else { set(libc::SOL_SOCKET, libc::SO_REUSEADDR) };
+    s.bind(&local.into()).ok()?;
+    Some(s)
 }
 
 /// Waits until the proxied server sends something or the client closes the
@@ -1055,11 +1082,30 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let mut time = [None; 3];
-        let resp = fetch(&addr, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut time).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut time).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
         assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
+    }
+
+    #[test]
+    fn connects_from_the_bound_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let from = thread::spawn(move || {
+            let (mut s, from) = listener.accept().unwrap();
+            let _ = s.read(&mut [0u8; 1024]).unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+            from
+        });
+        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
+        let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
+        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3]).unwrap().status, 200);
+        assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
+        let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        assert!(bound(&addr, (taken, false)).is_some());
+        assert!(bound(&addr, ("192.0.2.1:0".parse().unwrap(), false)).is_none());
     }
 
     #[test]
@@ -1082,10 +1128,10 @@ mod tests {
             }
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = fetch(&addr, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3]).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3]).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(fetch(&addr, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3]).is_none());
+            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3]).is_none());
         }
     }
 
