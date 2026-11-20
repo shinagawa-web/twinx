@@ -34,6 +34,9 @@ pub struct Request {
     pub body_file: Option<PathBuf>,
     /// The proxied servers tried before an internal redirect ($upstream_addr).
     pub upstream_addr: Option<String>,
+    /// The headers of the proxied server's answer that redirected with
+    /// X-Accel-Redirect, for $upstream_http_* after the redirect.
+    pub upstream: Vec<(String, String)>,
     /// The named captures of the server name that matched the host.
     pub captures: Vec<(String, String)>,
     /// The client's socket, watched for the client closing the connection while
@@ -121,6 +124,7 @@ pub struct Sent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Var {
     Uri,
+    RequestMethod,
     Status,
     RequestLength,
     RequestTime,
@@ -182,7 +186,7 @@ impl Var {
             ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("pid", Var::Pid),
             ("upstream_connect_time", Var::UpstreamTime(0)), ("upstream_header_time", Var::UpstreamTime(1)), ("upstream_response_time", Var::UpstreamTime(2)),
             ("proxy_host", Var::ProxyHost), ("proxy_port", Var::ProxyPort), ("proxy_add_x_forwarded_for", Var::ProxyAddXForwardedFor),
-            ("server_name", Var::ServerName), ("limit_rate", Var::LimitRate),
+            ("server_name", Var::ServerName), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -201,6 +205,7 @@ impl Var {
     pub fn value(&self, r: &Request, s: &Sent, now: &DateTime<Local>) -> Option<Vec<u8>> {
         Some(match self {
             Var::Uri => r.uri.clone(),
+            Var::RequestMethod => r.method.clone(),
             Var::Status => format!("{:03}", s.status),
             Var::RequestLength => r.length.to_string(),
             Var::RequestTime => format!("{:.3}", r.started.elapsed().as_secs_f64()),
@@ -248,8 +253,8 @@ impl Var {
             Var::Cookie(name) => cookie(&r.headers, name)?,
             Var::SentHttp(name) => joined(&s.headers, name, ", ")?,
             Var::SentTrailer(name) => joined(&s.trailers, name, ", ")?,
-            Var::UpstreamHttp(name) => joined(&s.upstream, name, ", ")?,
-            Var::UpstreamCookie(name) => set_cookie(&s.upstream, name)?,
+            Var::UpstreamHttp(name) => joined(if s.upstream.is_empty() { &r.upstream } else { &s.upstream }, name, ", ")?,
+            Var::UpstreamCookie(name) => set_cookie(if s.upstream.is_empty() { &r.upstream } else { &s.upstream }, name)?,
         }.into_bytes())
     }
 }
@@ -435,6 +440,7 @@ mod tests {
             body: b"xy".to_vec(),
             body_file: None,
             upstream_addr: None,
+            upstream: Vec::new(),
             captures: Vec::new(),
             limit_rate: Default::default(),
             vars: Default::default(),
@@ -491,6 +497,8 @@ mod tests {
         r.upstream_addr = Some("a".into());
         let t = Template::parse("$pid|$upstream_addr").unwrap();
         assert_eq!(t.render(&r, &Sent::default()), format!("{}|a", std::process::id()));
+        r.method = "PUT".into();
+        assert_eq!(Template::parse("$request_method").unwrap().render(&r, &Sent::default()), "PUT");
         assert_eq!(t.render(&r, &Sent { upstream_addr: Some("b".into()), ..Sent::default() }), format!("{}|b", std::process::id()));
         let t = Template::parse("$upstream_response_time|$limit_rate").unwrap();
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"-|0");
