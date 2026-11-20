@@ -38,6 +38,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("server_names_hash_bucket_size", HTTP, 1, 1, false),
     ("server_names_hash_max_size", HTTP, 1, 1, false),
     ("location", SRV | LOC, 1, 2, true),
+    ("try_files", SRV | LOC, 2, usize::MAX, false),
     ("return", SRV | LOC, 1, 2, false),
     ("root", HTTP | SRV | LOC, 1, 1, false),
     ("log_format", HTTP, 2, usize::MAX, false),
@@ -146,6 +147,11 @@ pub struct Level {
     pub expires: Option<Template>,
     /// alias: the path that replaces the location's prefix, instead of root.
     pub alias: Option<PathBuf>,
+    /// The length of the location prefix that alias replaces; None when alias is
+    /// in a regular expression location, where it names the whole path.
+    pub alias_len: Option<usize>,
+    /// try_files, which locations do not inherit.
+    pub try_files: Option<Arc<TryFiles>>,
     /// How a Location that starts with "/" is sent: made absolute with
     /// "http://host[:port]" (absolute_redirect), the host being the server's
     /// name rather than the request's (server_name_in_redirect), and the port
@@ -186,6 +192,21 @@ pub struct Level {
     pub resolver: Option<Arc<Resolver>>,
     pub resolver_timeout: Duration,
     pub proxy_connect_timeout: Duration,
+}
+
+/// try_files: the files tried in order, each a directory when its parameter
+/// ends with "/" (here left out), and what is done when none exists.
+#[derive(Debug)]
+pub struct TryFiles {
+    pub files: Vec<(Template, bool)>,
+    pub fallback: Fallback,
+}
+
+/// The last parameter of try_files: "=code", or a URI to redirect to internally.
+#[derive(Debug, PartialEq)]
+pub enum Fallback {
+    Status(u16),
+    Uri(Template),
 }
 
 /// How a location matches the URI: "=", a prefix, "^~" (a prefix that stops
@@ -329,11 +350,12 @@ impl Builder<'_> {
 
     fn locations(&mut self, block: &[Directive], parent: &Level, out: &mut Vec<Location>) -> Result<(), String> {
         for d in block.iter().filter(|d| d.name == "location") {
-            let mut level = Level { proxy: None, ..parent.clone() };
+            let mut level = Level { proxy: None, try_files: None, ..parent.clone() };
             let inner = d.block.as_deref().unwrap_or_default();
             self.level(inner, LOC, &mut level)?;
             let (kind, path) = location(&d.args).map_err(|e| format!("{e} in {}", d.at))?;
             let auto_redirect = level.proxy.is_some() && path.ends_with('/') && !matches!(kind, Match::Regex(_));
+            if inner.iter().any(|d| d.name == "alias") { level.alias_len = (!matches!(kind, Match::Regex(_))).then_some(path.len()); }
             out.push(Location { kind, path, level: level.clone(), auto_redirect });
             self.locations(inner, &level, out)?;
         }
@@ -356,6 +378,7 @@ impl Builder<'_> {
                 "rewrite" => level.rewrite.push(rewrite(&d.args).map_err(at)?),
                 "root" => (level.root, level.alias) = (self.path(&d.args[0]), None),
                 "alias" => level.alias = Some(self.path(&d.args[0])),
+                "try_files" => level.try_files = Some(Arc::new(try_files(&d.args).map_err(at)?)),
                 "absolute_redirect" => level.absolute_redirect = flag(d).map_err(at)?,
                 "server_name_in_redirect" => level.server_name_in_redirect = flag(d).map_err(at)?,
                 "port_in_redirect" => level.port_in_redirect = flag(d).map_err(at)?,
@@ -484,6 +507,19 @@ fn log_cache(args: &[String]) -> Result<Option<Arc<Cache>>, String> {
 }
 
 /// location [ = | ^~ | ~ | ~* ] uri
+fn try_files(args: &[String]) -> Result<TryFiles, String> {
+    let (last, files) = args.split_last().unwrap_or((&args[0], &[]));
+    let files = files.iter().map(|f| {
+        let dir = f.ends_with('/');
+        Template::parse(&f[..f.len() - dir as usize]).map(|t| (t, dir))
+    });
+    let fallback = match last.strip_prefix('=') {
+        Some(code) => Fallback::Status(code.parse().ok().filter(|c| *c <= 999).ok_or_else(|| format!("invalid code \"{last}\""))?),
+        None => Fallback::Uri(Template::parse(last)?),
+    };
+    Ok(TryFiles { files: files.collect::<Result<_, _>>()?, fallback })
+}
+
 fn location(args: &[String]) -> Result<(Match, String), String> {
     let (modifier, path) = if args.len() == 2 { (args[0].as_str(), &args[1]) } else { ("", &args[0]) };
     let regex = |p: String| regex::Regex::new(&p).map(Match::Regex).map_err(|e| format!("invalid regular expression \"{path}\": {e}"));
@@ -717,6 +753,16 @@ mod tests {
         assert_eq!((i.level.alias.as_deref(), i.level.port_in_redirect, i.auto_redirect), (Some(Path::new("/a/")), false, false));
         assert_eq!((x.level.alias.as_deref(), x.level.root.as_path()), (None, Path::new("/r")));
         assert!(p.auto_redirect);
+        let e = build_text("http { absolute_redirect yes; }").unwrap_err();
+        assert_eq!(e, "invalid value \"yes\" in \"absolute_redirect\" directive, it must be \"on\" or \"off\" in t.conf:1");
+        let c = build_text("http { server { try_files $uri $uri/ =404; location /a/ { alias /b/; location ~ x { } } location ~ y { alias /c; } } }").unwrap();
+        let s = &c.servers[0];
+        let tf = s.level.try_files.as_deref().unwrap();
+        assert_eq!((tf.files.len(), tf.files[0].1, tf.files[1].1, &tf.fallback), (2, false, true, &Fallback::Status(404)));
+        let alias_len = |i: usize| (s.locations[i].level.alias_len, s.locations[i].level.try_files.is_none());
+        assert_eq!((alias_len(0), alias_len(1), alias_len(2)), ((Some(3), true), (Some(3), true), (None, true)));
+        assert!(matches!(try_files(&["a".into(), "/b".into()]).unwrap().fallback, Fallback::Uri(_)));
+        assert_eq!(try_files(&["a".into(), "=1000".into()]).unwrap_err(), "invalid code \"=1000\"");
         let e = build_text("http { absolute_redirect yes; }").unwrap_err();
         assert_eq!(e, "invalid value \"yes\" in \"absolute_redirect\" directive, it must be \"on\" or \"off\" in t.conf:1");
     }
