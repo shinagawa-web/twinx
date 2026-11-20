@@ -228,6 +228,22 @@ struct Response {
     /// Whether this is the answer of a proxied server, which error_page
     /// replaces only with proxy_intercept_errors on.
     proxied: bool,
+    /// What is left to read of a proxied answer's body that proxy_limit_rate
+    /// paces: it is read once the head is made, as nginx sends the head first.
+    rest: Option<Rest>,
+}
+
+/// The connection to a proxied server whose body is still to be read, with
+/// what has been read of the answer, where its head ends, how the body's end
+/// is found, the rate, and when the request to it started.
+#[derive(Debug)]
+struct Rest { s: TcpStream, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant }
+
+/// Reads the rest of a proxied answer's body, noting how long the whole answer took.
+fn finish(resp: &mut Response) {
+    let Some(mut rest) = resp.rest.take() else { return };
+    resp.body = read_body(&mut rest.s, rest.answer, rest.end, rest.length, rest.chunked, rest.rate).unwrap_or_default();
+    if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
 }
 
 /// The page nginx generates for an error status.
@@ -372,6 +388,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let gzipped = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && h.1.eq_ignore_ascii_case("gzip"));
     if level.gunzip && gzipped {
         resp.vary = true;
+        finish(&mut resp);
         if !gzip_ok(r, level) { gunzip(&mut resp); }
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
@@ -401,6 +418,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         if ["etag", "last-modified"].contains(&name.to_ascii_lowercase().as_str()) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case(name)); }
         if !value.is_empty() { resp.headers.push((name.clone(), value)); }
     }
+    finish(&mut resp);
     gzip(r, level, &mut resp);
     let status = resp.status;
     // A body of unknown length is chunked for HTTP/1.1; otherwise the connection
@@ -476,7 +494,7 @@ fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
     let (ims, inm) = (header(r, "if-modified-since"), header(r, "if-none-match"));
     let same = |t: &str| level.if_modified_since.zip(modified).is_some_and(|(before, m)| expires::http_time(t).is_some_and(|t| t == m || before && t > m));
     if (ims.is_none() && inm.is_none()) || ims.is_some_and(|t| !same(t)) || inm.is_some_and(|v| !etag_match(v, etag.as_deref(), true)) { return; }
-    (resp.status, resp.ctype, resp.body) = (304, None, Vec::new());
+    (resp.status, resp.ctype, resp.body, resp.rest) = (304, None, Vec::new(), None);
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges") && !h.0.eq_ignore_ascii_case("content-encoding"));
 }
 
@@ -731,6 +749,8 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     // proxy_bind: an empty value binds to nothing; a value that is no address fails the request.
     let bind = level.proxy_bind.as_ref().map(|(a, t)| (a.render(r, &Sent::default()), *t)).filter(|(a, _)| !a.is_empty());
     let Some(bind) = bind.map(|(a, t)| crate::conf::local_addr(&a).map(|a| (a, t))).map_or(Some(None), |b| b.map(Some)) else { return special(500) };
+    // proxy_limit_rate, which may have the answer's headers ($upstream_http_*).
+    let rate = |resp: &Response| crate::conf::size(&level.proxy_limit_rate.render(r, &Sent { upstream: resp.upstream.clone(), ..Sent::default() })).unwrap_or(0);
     let (mut tried, mut answer, mut addrs, mut times) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new());
     while answer.is_none() && let Some(i) = up.pick(&mut tried) {
         addrs.push(up.peers[i].addr.to_string());
@@ -738,7 +758,7 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
         let socket = bind.map(|b| bound(&up.peers[i].addr, b));
         if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
         let (start, mut time) = (Instant::now(), [None; 3]);
-        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, &mut time);
+        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, &mut time, &rate);
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         up.done(i, answer.is_none());
@@ -839,7 +859,7 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
 /// it took to connect and to send the response head. While it waits for the
 /// head, the client closing the connection ends the request with 499, as
 /// proxy_ignore_client_abort off does.
-fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, time: &mut [Option<u128>; 3]) -> Option<Response> {
+fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, time: &mut [Option<u128>; 3], rate: &dyn Fn(&Response) -> u64) -> Option<Response> {
     let start = Instant::now();
     let mut s = match socket {
         Some(socket) => socket.connect_timeout(&(*peer).into(), level.proxy_connect_timeout).ok().map(|()| TcpStream::from(socket))?,
@@ -879,20 +899,34 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
         ([], [c]) if c.eq_ignore_ascii_case("chunked") => (None, true),
         _ => return None,
     };
-    let no_body = req.starts_with(b"HEAD ") || [204, 304].contains(&status);
-    let (length, chunked) = if no_body { (Some(0), false) } else { (length, chunked) };
-    // The body of an answer that redirects with X-Accel-Redirect is not read;
-    // otherwise it is read up to its length, up to its last chunk, or until
-    // the server closes the connection. What follows the last chunk is dropped.
+    // The body of an answer that redirects with X-Accel-Redirect is not read.
     let accel = resp.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect"));
-    while !accel && length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1) {
-        let n = s.read(&mut chunk).ok()?;
+    let no_body = req.starts_with(b"HEAD ") || [204, 304].contains(&status) || accel;
+    let (length, chunked) = if no_body { (Some(0), false) } else { (length, chunked) };
+    let rate = rate(&resp);
+    if rate > 0 { return Some(Response { rest: Some(Rest { s, answer, end, length, chunked, rate, started: start }), ..resp }); }
+    resp.body = read_body(&mut s, answer, end, length, chunked, 0)?;
+    Some(resp)
+}
+
+/// Reads a proxied answer's body up to its length, up to its last chunk, or
+/// until the server closes the connection; what follows the last chunk is
+/// dropped. With a rate it is read as ngx_event_pipe_read_upstream() paces
+/// proxy_limit_rate: by the end of each second since the body started
+/// (counted in whole seconds of the clock) up to the rate for each second has
+/// been read, and when that much has, it waits for the time it is worth.
+fn read_body(s: &mut TcpStream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64) -> Option<Vec<u8>> {
+    let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let (start, rate, mut chunk) = (secs(), rate as i64, [0u8; 4096]);
+    while length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1) {
+        let limit = if rate == 0 { chunk.len() as i64 } else { rate * (secs() - start + 1) - (answer.len() - end) as i64 };
+        if limit <= 0 { thread::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)); continue; }
+        let n = s.read(&mut chunk[..(limit as usize).min(4096)]).ok()?;
         if n == 0 { break; }
         answer.extend_from_slice(&chunk[..n]);
     }
     let body = &answer[end..];
-    resp.body = if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() };
-    Some(resp)
+    Some(if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() })
 }
 
 /// A socket for connecting to a proxied server from a local address, set up
@@ -1208,7 +1242,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let mut time = [None; 3];
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut time).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut time, &|_| 0).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
@@ -1260,11 +1294,35 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
-        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3]).unwrap().status, 200);
+        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
         assert!(bound(&addr, ("192.0.2.1:0".parse().unwrap(), false)).is_none());
+    }
+
+    #[test]
+    fn reads_proxied_answers_at_the_rate() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.read(&mut [0u8; 1024]).unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12000\r\nX-Rate: 4000\r\n\r\n").unwrap();
+            s.write_all(&[b'x'; 12000]).unwrap();
+        });
+        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
+        let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
+        let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &rate).unwrap();
+        // The body is read after the head, 4000 bytes (what came with the head too)
+        // in each second of the clock: it ends in the third second.
+        assert!(resp.body.is_empty() && resp.rest.is_some());
+        resp.upstream_time = Some(vec![[None; 3]]);
+        let started = Instant::now();
+        finish(&mut resp);
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert_eq!((resp.body.len(), resp.rest.is_none()), (12000, true));
+        assert!(resp.upstream_time.unwrap()[0][2].is_some());
     }
 
     #[test]
@@ -1296,10 +1354,10 @@ mod tests {
             }
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3]).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3]).is_none());
+            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0).is_none());
         }
     }
 
