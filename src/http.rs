@@ -2,13 +2,14 @@
 //! answering, and writing the access log.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::conf::{Config, Level, Match, Proxy, Rewrite, Server, ServerName};
+use crate::conf::{Config, Fallback, Level, Match, Proxy, Rewrite, Server, ServerName, TryFiles};
 use crate::vars::Template;
 use crate::expires;
 use crate::upstream::{Peer, Upstream};
@@ -205,8 +206,9 @@ struct Response {
     vary: bool,
     /// Every header of the proxied server's answer, for $upstream_http_*.
     upstream: Vec<(String, String)>,
-    /// The URI the index module redirects to internally, with "index.html" added.
-    index: Option<String>,
+    /// The URI and arguments to redirect to internally: the index module's, with
+    /// "index.html" added, or the last parameter of try_files.
+    internal: Option<String>,
     /// The proxied servers tried ($upstream_addr).
     upstream_addr: Option<String>,
     /// Whether the length is not known when the head is sent (the gzip filter
@@ -254,15 +256,38 @@ fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -
 
 /// The answer of return, else of proxy_pass, else of the static module.
 fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<&(u16, Template)>) -> Response {
-    match (ret, &level.proxy) {
-        (Some((code, text)), _) if REDIRECTS.contains(code) => redirect(*code, text.render(r, &Sent::default())),
-        (Some((code, text)), _) if text.0.is_empty() && *code >= 400 => special(*code),
-        (Some((code, text)), _) => {
+    match (ret, &level.proxy, level.try_files.as_deref()) {
+        (Some((code, text)), _, _) if REDIRECTS.contains(code) => redirect(*code, text.render(r, &Sent::default())),
+        (Some((code, text)), _, _) if text.0.is_empty() && *code >= 400 => special(*code),
+        (Some((code, text)), _, _) => {
             let ctype = Some("text/plain".to_string());
             Response { status: *code, ctype, body: text.render(r, &Sent::default()).into_bytes(), ..Response::default() }
         }
-        (None, Some(p)) => proxy(p, level, r, prefix),
-        (None, None) => file(level, r, prefix),
+        (None, _, Some(tf)) => try_files(tf, level, r, prefix),
+        (None, Some(p), None) => proxy(p, level, r, prefix),
+        (None, None, None) => file(level, r, prefix),
+    }
+}
+
+/// try_files: the first parameter whose file exists (a directory when it ends
+/// with "/") is served, the URI changed to it; when none does, the last
+/// parameter gives a status or a URI to redirect to internally.
+fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str) -> Response {
+    let sent = Sent::default();
+    for (name, dir) in &tf.files {
+        let name = name.render(r, &sent);
+        let base = level.alias.as_ref().unwrap_or(&level.root);
+        // With alias, the location's prefix at the start of the name is replaced, as in the URI.
+        let rest = level.alias.as_ref().and(level.alias_len).and_then(|n| name.strip_prefix(r.uri.get(..n)?)).unwrap_or(&name);
+        let path = PathBuf::from(format!("{}{rest}", base.display()));
+        if std::fs::metadata(&path).is_ok_and(|m| m.is_dir() == *dir) {
+            let to = Request { uri: name, ..r.clone() };
+            return match &level.proxy { Some(p) => proxy(p, level, &to, prefix), None => file_at(level, &to, path) };
+        }
+    }
+    match &tf.fallback {
+        Fallback::Status(code) => special(*code),
+        Fallback::Uri(uri) => Response { internal: Some(uri.render(r, &sent)), ..Response::default() },
     }
 }
 
@@ -399,12 +424,12 @@ fn browser(ua: &str) -> (bool, bool) {
 fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>) -> (Response, &'a Level) {
     let mut resp = respond(r, parsed, (prefix, level, auto));
     let mut redirects = 0;
-    while let Some(uri) = resp.index.take() {
+    while let Some(target) = resp.internal.take() {
         // nginx gives up after 10 internal redirects.
         redirects += 1;
         let mut to = r.clone();
-        to.target = format!("{uri}{}", args(r));
-        to.uri = uri;
+        to.uri = target.split('?').next().unwrap_or_default().to_string();
+        to.target = target;
         let found = location(server, &to.uri);
         level = found.1;
         resp = if redirects > 10 { special(500) } else { respond(&to, Ok(()), found) };
@@ -423,9 +448,14 @@ fn file(level: &Level, r: &Request, prefix: &str) -> Response {
         None => level.root.join(r.uri.trim_start_matches('/')),
     };
     if r.uri.ends_with('/') {
-        let index = path.join("index.html").is_file().then(|| format!("{}index.html", r.uri));
-        return if index.is_some() { Response { index, ..Response::default() } } else { special(if path.is_dir() { 403 } else { 404 }) };
+        let internal = path.join("index.html").is_file().then(|| format!("{}index.html{}", r.uri, args(r)));
+        return if internal.is_some() { Response { internal, ..Response::default() } } else { special(if path.is_dir() { 403 } else { 404 }) };
     }
+    file_at(level, r, path)
+}
+
+/// Serves the file at a path, or redirects to the directory there.
+fn file_at(level: &Level, r: &Request, path: PathBuf) -> Response {
     if !r.uri.ends_with('/') && path.is_dir() { return redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))); }
     let read = |p: &std::path::Path| std::fs::metadata(p).ok().filter(|m| m.is_file()).zip(std::fs::read(p).ok());
     // gzip_static: the file with ".gz" added, for clients that take gzip ("always": for all).
@@ -970,6 +1000,33 @@ mod tests {
         assert_eq!(status("/a/?x"), (200, "i/a/index.html".to_string()));
         assert_eq!(status("/a/empty/").0, 403);
         assert_eq!(status("/a/none/").0, 404);
+    }
+
+    #[test]
+    fn try_files() {
+        let dir = std::env::temp_dir().join(format!("twinx-try-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("f.html"), "f").unwrap();
+        std::fs::write(dir.join("d/r.html"), "r").unwrap();
+        let text = format!(
+            "http {{ server {{ root {0}; location / {{ try_files $uri /x/ /back?a=1; }} location /back {{ return 200 $uri:$args; }} \
+             location /s/ {{ try_files /f.html/ =410; }} location /t/ {{ try_files /d/ =404; }} location ~ /r.html {{ alias {0}/d; try_files $uri =404; }} \
+             location /n/ {{ alias {0}/; try_files $uri =404; }} }} }}",
+            dir.display()
+        );
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let answer = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            let (resp, _) = answer(s, &r, Ok(()), location(s, &r.uri));
+            (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
+        };
+        assert_eq!(answer("/f.html"), (200, "f".to_string()));
+        assert_eq!(answer("/r.html"), (200, "r".to_string()));
+        assert_eq!(answer("/n/f.html"), (200, "f".to_string()));
+        assert_eq!(answer("/none"), (200, "/back:a=1".to_string()));
+        assert_eq!(answer("/s/").0, 410);
+        assert_eq!(answer("/t/").0, 301);
     }
 
     #[test]
