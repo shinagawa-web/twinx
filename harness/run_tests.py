@@ -38,6 +38,9 @@ TESTS_DIR = HARNESS / "nginx-tests"
 # The image twinx is built in by the judge (rust:1.100-slim-bookworm).
 RUST_IMAGE = "rust@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37"
 
+# Where the nginx-tests images are published, under the tag image() gives them.
+REGISTRY = "ghcr.io/shinagawa-web"
+
 NGINX_BINARY = "/usr/sbin/nginx"
 TWINX_BINARY = "/usr/local/bin/twinx"
 TIMEOUT = 300
@@ -56,10 +59,18 @@ def image(target):
 
 
 def build_image(target):
+    """Make the image available: already here, pulled from REGISTRY, or built."""
     tag = image(target)
-    if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode != 0:
-        subprocess.run(["docker", "build", "-q", "--target", target, "-t", tag, str(TESTS_DIR)],
-                       check=True, stdout=subprocess.DEVNULL)
+    if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode == 0:
+        return tag
+    # .github/workflows/nginx-tests-image.yml pushes every image main builds, so a machine
+    # whose containers cannot reach apt or GitHub can still run the tests.
+    published = f"{REGISTRY}/{tag}"
+    if subprocess.run(["docker", "pull", "-q", published], capture_output=True).returncode == 0:
+        subprocess.run(["docker", "tag", published, tag], check=True)
+        return tag
+    subprocess.run(["docker", "build", "-q", "--target", target, "-t", tag, str(TESTS_DIR)],
+                   check=True, stdout=subprocess.DEVNULL)
     return tag
 
 

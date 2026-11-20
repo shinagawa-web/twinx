@@ -1,0 +1,42 @@
+name: nginx-tests image
+
+# Builds the images nginx-tests run in (harness/nginx-tests) from main and
+# publishes them, so harness/run_tests.py can pull them where containers cannot
+# reach apt or GitHub to build them. Only main's code runs here.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - harness/nginx-tests/**
+      - harness/run_tests.py
+      - .github/workflows/nginx-tests-image.yml
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Log in to the GitHub Container Registry
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push both targets
+        run: |
+          for target in nginx twinx; do
+            tag=$(python3 -c "import sys; sys.path.insert(0, 'harness'); import run_tests; print(run_tests.image('$target'))")
+            published=$(python3 -c "import sys; sys.path.insert(0, 'harness'); import run_tests; print(run_tests.REGISTRY)")/$tag
+            docker build -q --target "$target" \
+              --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+              -t "$published" harness/nginx-tests
+            docker push -q "$published"
+            echo "pushed $published" >> "$GITHUB_STEP_SUMMARY"
+          done
