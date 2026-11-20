@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::conf::{Config, CookiePattern, CookieRewrite, Fallback, Level, Match, Op, Proxy, Rewrite, Server, ServerName, TryFiles};
+use crate::conf::{Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Level, Match, Op, Proxy, Rewrite, Server, ServerName, TryFiles};
 use crate::vars::Template;
 use crate::expires;
 use crate::upstream::{Peer, Upstream};
@@ -758,9 +758,9 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
 /// matches them. A cookie changed is written again as nginx writes it, its
 /// attributes separated by "; "; None leaves it as it was.
 fn rewrite_cookie(r: &Request, cookie: &str, level: &Level) -> Option<String> {
-    let mut attrs: Vec<(&str, Option<String>)> = cookie.split(';').map(|a| {
+    let mut attrs: Vec<(String, Option<String>)> = cookie.split(';').map(|a| {
         let a = a.trim_start_matches(' ');
-        a.split_once('=').map_or((a.trim_end_matches(' '), None), |(n, v)| (n.trim_end_matches(' '), Some(v.trim_matches(' ').to_string())))
+        a.split_once('=').map_or((a.trim_end_matches(' ').to_string(), None), |(n, v)| (n.trim_end_matches(' ').to_string(), Some(v.trim_matches(' ').to_string())))
     }).collect();
     attrs[0].1.as_ref()?;
     let mut changed = false;
@@ -769,7 +769,33 @@ fn rewrite_cookie(r: &Request, cookie: &str, level: &Level) -> Option<String> {
         let (Some(rules), Some(v)) = (rules, value.as_mut()) else { continue };
         if let Some(new) = rules.iter().find_map(|rw| cookie_value(r, rw, v, domain)) { (*v, changed) = (new, true); }
     }
+    if let Some(rules) = &level.proxy_cookie_flags { changed |= cookie_flags(r, rules, level, &mut attrs); }
     changed.then(|| attrs.iter().map(|(n, v)| v.as_ref().map_or(n.to_string(), |v| format!("{n}={v}"))).collect::<Vec<_>>().join("; "))
+}
+
+/// proxy_cookie_flags: the flags of the first rule whose cookie the name
+/// matches set Secure, HttpOnly and SameSite (changing the value of one the
+/// cookie has), or remove them; false when no rule matches or it gives no
+/// flag. A flag that is not one nginx knows is logged and left out.
+fn cookie_flags(r: &Request, rules: &[CookieFlags], level: &Level, attrs: &mut Vec<(String, Option<String>)>) -> bool {
+    let (sent, name) = (Sent::default(), attrs[0].0.clone());
+    let matches = |rule: &&CookieFlags| match &rule.cookie { CookiePattern::Regex(re) => re.captures(&name).map(|c| r.set_captures(&c)).is_some(), CookiePattern::Text(t) => t.render(r, &sent).eq_ignore_ascii_case(&name) };
+    let Some(rule) = rules.iter().find(matches) else { return false };
+    let mut bits = 0;
+    for f in rule.flags.iter().map(|f| f.render(r, &sent)).filter(|f| !f.is_empty()) {
+        match crate::conf::COOKIE_FLAGS.iter().position(|k| k.eq_ignore_ascii_case(&f)) { Some(i) => bits |= 1 << i, None => error_log(level, r, &format!("invalid proxy_cookie_flags flag \"{f}\"")) }
+    }
+    // Secure, HttpOnly and SameSite: whether each is set (SameSite to Strict
+    // before Lax before None), and whether it is removed.
+    let samesite = [6, 5, 4].into_iter().find(|i| bits & 1 << i != 0).map(|i| ["None", "Lax", "Strict"][i - 4]);
+    let (mut set, removed) = ([bits & 1 != 0, bits & 2 != 0, samesite.is_some()], [bits & 4 != 0, bits & 8 != 0, bits & 128 != 0]);
+    attrs.retain_mut(|(name, value)| {
+        let Some(k) = ["secure", "httponly", "samesite"].iter().position(|k| k.eq_ignore_ascii_case(name)) else { return true };
+        if k == 2 && set[k] { *value = samesite.map(String::from); }
+        std::mem::take(&mut set[k]) || !removed[k]
+    });
+    attrs.extend((0..3).filter(|&k| set[k]).map(|k| (["Secure", "HttpOnly", "SameSite"][k].to_string(), samesite.filter(|_| k == 2).map(String::from))));
+    bits != 0
 }
 
 /// The value one rewrite makes of a Domain or Path, None when it does not match.
@@ -1490,6 +1516,27 @@ mod tests {
         let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { proxy_cookie_path off; proxy_cookie_path /a /b; }"), "\"proxy_cookie_path\" directive is duplicate in t:1");
         assert_eq!(refused("http { proxy_cookie_path on; }"), "invalid parameter \"on\" in t:1");
+    }
+
+    #[test]
+    fn sets_cookie_flags() {
+        let text = "http { server { proxy_cookie_flags a secure SameSite=Lax samesite=strict; proxy_cookie_flags ~^B nosecure nosamesite $arg_f; \
+                    proxy_cookie_flags c; location /off/ { proxy_cookie_flags off; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let (on, off) = (&config.servers[0].level, &config.servers[0].locations[0].level);
+        let (_, r) = request("GET /?f=httponly HTTP/1.0\n\n");
+        let rw = |cookie: &str, level: &Level| rewrite_cookie(&r, cookie, level);
+        assert_eq!(rw("A=1;HttpOnly;samesite", on).as_deref(), Some("A=1; HttpOnly; samesite=Strict; Secure"));
+        assert_eq!(rw("bb=1; Secure; HttpOnly; SameSite=None", on).as_deref(), Some("bb=1; HttpOnly"));
+        assert_eq!(rw("bb=1", on).as_deref(), Some("bb=1; HttpOnly"));
+        // A rule without flags, no rule, or off: as it was.
+        assert_eq!(rw("c=1;Secure", on), None);
+        assert_eq!(rw("d=1;Secure", on), None);
+        assert_eq!(rw("a=1", off), None);
+        let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        assert_eq!(refused("http { proxy_cookie_flags a secure; proxy_cookie_flags off; }"), "\"proxy_cookie_flags\" directive is duplicate in t:1");
+        assert_eq!(refused("http { proxy_cookie_flags off; proxy_cookie_flags a secure; }"), "\"proxy_cookie_flags\" directive is duplicate in t:1");
+        assert_eq!(refused("http { proxy_cookie_flags a sure; }"), "invalid parameter \"sure\" in t:1");
     }
 
     #[test]

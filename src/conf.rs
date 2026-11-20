@@ -92,6 +92,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_buffers", HSL, 2, 2, false),
     ("proxy_cookie_domain", HSL, 1, 2, false),
     ("proxy_cookie_path", HSL, 1, 2, false),
+    ("proxy_cookie_flags", HSL, 1, 4, false),
     ("resolver", HSL, 1, usize::MAX, false),
     ("resolver_timeout", HSL, 1, 1, false),
     ("gzip", HSL | LIF, 1, 1, false),
@@ -166,11 +167,24 @@ pub struct CookieRewrite {
 #[derive(Debug, Clone)]
 pub enum CookiePattern {
     /// A domain equal to it (case-insensitively, a leading "." of either left
-    /// out), or a path that starts with it.
+    /// out), a path that starts with it, or a cookie name equal to it
+    /// (case-insensitively).
     Text(Template),
-    /// A regular expression the whole value is replaced on a match of.
+    /// A regular expression: the whole value is replaced on a match of it,
+    /// or the cookie name matches it.
     Regex(regex::Regex),
 }
+
+/// proxy_cookie_flags: the cookies whose name matches, and the flags, which
+/// may have variables, set on them.
+#[derive(Debug, Clone)]
+pub struct CookieFlags {
+    pub cookie: CookiePattern,
+    pub flags: Vec<Template>,
+}
+
+/// The flags proxy_cookie_flags knows, the bits of a set of them being their places here.
+pub const COOKIE_FLAGS: [&str; 8] = ["secure", "httponly", "nosecure", "nohttponly", "samesite=none", "samesite=lax", "samesite=strict", "nosamesite"];
 
 /// The settings of one level (http, server or location) after inheriting from the one above.
 #[derive(Debug, Clone, Default)]
@@ -185,6 +199,8 @@ pub struct Level {
     /// proxy_cookie_domain and proxy_cookie_path; None when off.
     pub proxy_cookie_domain: Option<Vec<CookieRewrite>>,
     pub proxy_cookie_path: Option<Vec<CookieRewrite>>,
+    /// proxy_cookie_flags, the first whose cookie matches applying; None when off.
+    pub proxy_cookie_flags: Option<Vec<CookieFlags>>,
     pub access_log: Vec<Arc<AccessLog>>,
     /// open_log_file_cache, for the access logs whose paths have variables.
     pub log_cache: Option<Arc<Cache>>,
@@ -467,6 +483,7 @@ impl Builder<'_> {
         let mut hidden: Option<Vec<String>> = None;
         // proxy_cookie_domain and proxy_cookie_path of this level: Some(None) once "off".
         let mut cookies: [Option<Option<Vec<CookieRewrite>>>; 2] = [None, None];
+        let mut flags: Option<Option<Vec<CookieFlags>>> = None;
         let mut ifs = Vec::new();
         for d in block {
             self.check(d, ctx)?;
@@ -487,6 +504,12 @@ impl Builder<'_> {
                         // More after "off", or "off" after more, is a duplicate.
                         (Some(Some(list)), Some(rewrite)) => list.push(rewrite), _ => return Err(at(format!("\"{}\" directive is duplicate", d.name))),
                     }
+                }
+                "proxy_cookie_flags" => {
+                    // As with proxy_cookie_domain, "off" goes with nothing else at a level.
+                    let rule = cookie_flags(&d.args).map_err(at)?;
+                    if rule.is_none() && flags.is_some() || matches!(flags, Some(None)) { return Err(at("\"proxy_cookie_flags\" directive is duplicate".into())); }
+                    flags = Some(rule.map(|rule| flags.take().flatten().unwrap_or_default().into_iter().chain([rule]).collect()));
                 }
                 "root" => (level.root, level.alias) = (self.path(&d.args[0]), None),
                 "alias" => level.alias = Some(self.path(&d.args[0])),
@@ -578,6 +601,7 @@ impl Builder<'_> {
         let [domain, path] = cookies;
         if let Some(domain) = domain { level.proxy_cookie_domain = domain; }
         if let Some(path) = path { level.proxy_cookie_path = path; }
+        if let Some(flags) = flags { level.proxy_cookie_flags = flags; }
         // An if block inherits everything its level has, wherever it is written there.
         for (i, d) in ifs {
             let mut inner = Level { script: Vec::new(), server_script: Vec::new(), ..level.clone() };
@@ -772,6 +796,19 @@ fn condition(args: &[String]) -> Result<Template, String> {
     let inner = all.strip_prefix('(').and_then(|c| c.strip_suffix(')')).ok_or_else(|| format!("invalid condition \"{}\"", args[0]))?;
     if !inner.starts_with('$') || inner.contains(' ') { return Err(format!("twinx does not support the condition \"{inner}\" yet")); }
     Template::parse(inner)
+}
+
+/// proxy_cookie_flags off | cookie [flag ...]: the cookie is a name, which may
+/// have variables, or after "~" a caseless regular expression; a flag without
+/// variables must be one nginx knows.
+fn cookie_flags(args: &[String]) -> Result<Option<CookieFlags>, String> {
+    if args == ["off"] { return Ok(None); }
+    let cookie = match args[0].strip_prefix('~') {
+        Some(re) => CookiePattern::Regex(regex::Regex::new(&format!("(?i){}", pcre(re))).map_err(|e| format!("invalid regular expression \"{re}\": {e}"))?),
+        None => CookiePattern::Text(Template::parse(&args[0])?),
+    };
+    let flag = |f: &String| Template::parse(f).and_then(|t| if t.0.iter().all(|p| matches!(p, Part::Text(_))) && !COOKIE_FLAGS.iter().any(|k| k.eq_ignore_ascii_case(f)) { Err(format!("invalid parameter \"{f}\"")) } else { Ok(t) });
+    Ok(Some(CookieFlags { cookie, flags: args[1..].iter().map(flag).collect::<Result<_, _>>()? }))
 }
 
 /// proxy_cookie_domain / proxy_cookie_path: off, or a pattern and its
