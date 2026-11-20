@@ -69,6 +69,10 @@ def passing(results, name):
     return {n for n, s in file["tests"].items() if s == "ok"} if file else set()
 
 
+def load_json(path):
+    return json.loads(Path(path).read_text()) if path and Path(path).exists() else None
+
+
 def markdown(verdict):
     lines = [f"## judge: {'pass' if verdict['passed'] else 'fail'}", ""]
     if verdict["problems"]:
@@ -91,6 +95,12 @@ def markdown(verdict):
         lines.append(f"- Added code regions run by nginx-tests (recorded, not judged): {coverage['regions_run']} of "
                      f"{coverage['added_regions']} ({coverage['regions_percent']}%)"
                      + (f"; not run: {', '.join(coverage['regions_not_run'][:20])}" if coverage["regions_not_run"] else ""))
+    unit, unit_main = verdict.get("unit"), verdict.get("unit_main")
+    if unit and unit.get("percent") is not None:
+        # Recorded, not judged: the whole of src/ the unit tests run, against main.
+        main_part = f"; main: {unit_main['percent']}%" if unit_main and unit_main.get("percent") is not None else ""
+        lines.append(f"- src/ lines run by the unit tests (recorded, not judged): {unit['covered']} of "
+                     f"{unit['lines']} ({unit['percent']}%){main_part}")
     lines += ["", f"main `{verdict['base'][:7]}`, pull request head `{verdict['head'][:7]}`"]
     return "\n".join(lines) + "\n"
 
@@ -106,6 +116,8 @@ def main():
     parser.add_argument("--baseline", help="run_tests.py results for twinx built from main")
     parser.add_argument("--results", help="run_tests.py results for twinx built from the merged tree")
     parser.add_argument("--coverage", help="JSON written by coverage.py")
+    parser.add_argument("--unit", help="JSON written by unit_coverage.py for the merged tree")
+    parser.add_argument("--unit-main", help="JSON written by unit_coverage.py for main")
     parser.add_argument("--verdict", required=True, help="where to write the verdict JSON")
     parser.add_argument("--comment", required=True, help="where to write the Markdown comment")
     args = parser.parse_args()
@@ -178,6 +190,8 @@ def main():
         "newly_passing": sorted(set(passing_after) - set(passing_before)),
         "failing": sorted(set(expected) - set(passing_after)),
         "coverage": coverage,
+        "unit": load_json(args.unit),
+        "unit_main": load_json(args.unit_main),
     }
     Path(args.verdict).write_text(json.dumps(verdict, indent=2))
     Path(args.comment).write_text(markdown(verdict))

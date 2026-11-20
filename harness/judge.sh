@@ -30,10 +30,43 @@ cd "$TWINX_REPO"
 cargo_in() {
   local tree=$1 network=$2 rustflags=$3
   shift 3
+  local profiles=()
+  # With UNIT_PROFILES set, the instrumented test binaries write their profiles there.
+  if [ -n "${UNIT_PROFILES:-}" ]; then
+    profiles=(-v "$UNIT_PROFILES:/unit-profiles" -e "LLVM_PROFILE_FILE=/unit-profiles/unit-%p-%m.profraw")
+  fi
   docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
     --network "$([ "$network" = net ] && echo bridge || echo none)" \
-    -e HOME=/tmp -e CARGO_HOME=/cargo -e RUSTFLAGS="$rustflags" --tmpfs /tmp:rw,exec \
+    -e HOME=/tmp -e CARGO_HOME=/cargo -e RUSTFLAGS="$rustflags" --tmpfs /tmp:rw,exec "${profiles[@]}" \
     -v "$JUDGE_DIR/cargo:/cargo" -v "$tree:$tree" -w "$tree" "$IMAGE" cargo "$@"
+}
+
+# Run cargo test in the tree at $1 with coverage; succeeds only when the tests do.
+# Writes the share of src/ the unit tests run to $2 (recorded, not judged).
+unit_tests() {
+  local tree=$1 out=$2 profiles="$JUDGE_DIR/unit-profiles"
+  rm -rf "$profiles" && mkdir -p "$profiles" && chmod 0777 "$profiles"
+  UNIT_PROFILES="$profiles" cargo_in "$tree" none "$RUSTFLAGS_COVERAGE" test --release --offline || return 1
+  local objects=()
+  mapfile -t objects < <(cargo_in "$tree" none "$RUSTFLAGS_COVERAGE" test --release --offline --no-run \
+    --message-format=json 2>/dev/null | python3 -c '
+import json, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get("reason") == "compiler-artifact" and m.get("executable") and m.get("profile", {}).get("test"):
+        print(m["executable"])')
+  if ls "$profiles"/*.profraw >/dev/null 2>&1 && [ ${#objects[@]} -gt 0 ]; then
+    docker run --rm --cap-drop ALL --security-opt no-new-privileges \
+      -v "$tree:$tree:ro" -v "$profiles:/profiles:ro" "$IMAGE" sh -c '
+        rustup component add llvm-tools-preview >/dev/null 2>&1
+        bin=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n "s/^host: //p")/bin
+        "$bin/llvm-profdata" merge -sparse /profiles/*.profraw -o /tmp/merged.profdata
+        first=$1; shift
+        "$bin/llvm-cov" export "$first" $(for o in "$@"; do printf -- "-object %s " "$o"; done) \
+          -instr-profile=/tmp/merged.profdata -format=lcov --ignore-filename-regex="/registry/src/|/rustc/"' \
+      sh "${objects[@]}" > "$out.lcov" \
+      && python3 "$HARNESS/unit_coverage.py" --lcov "$out.lcov" --tree "$tree" --out "$out" || true
+  fi
 }
 
 # Build the tree at $1; succeeds only when the build does.
@@ -46,7 +79,10 @@ baseline() {
   local tree="$JUDGE_DIR/main"
   rm -rf "$tree" && mkdir -p "$tree"
   git archive HEAD | tar -x -C "$tree"
-  if [ -f "$tree/Cargo.toml" ]; then build "$tree" "" || true; fi
+  if [ -f "$tree/Cargo.toml" ]; then
+    build "$tree" "" || true
+    unit_tests "$tree" "$OUT/unit-main.json" || true
+  fi
   python3 "$HARNESS/run_tests.py" --nginx --out "$OUT/reference.json"
   python3 "$HARNESS/run_tests.py" --twinx "$tree/target/release/twinx" --out "$OUT/baseline.json"
 }
@@ -77,7 +113,7 @@ pr() {
   if [ -f "$tree/Cargo.toml" ]; then
     if build "$tree" "$RUSTFLAGS_COVERAGE"; then
       build=success
-      cargo_in "$tree" none "$RUSTFLAGS_COVERAGE" test --release --offline && test=success || test=failure
+      unit_tests "$tree" "$OUT/unit.json" && test=success || test=failure
     else
       build=failure
     fi
@@ -111,6 +147,7 @@ pr() {
     --branch "$BRANCH" --base "$BASE" --head "$PR_HEAD" --build "$build" --test "$test" \
     --reference "$OUT/reference.json" --baseline "$OUT/baseline.json" \
     --results "$OUT/results.json" --coverage "$OUT/coverage.json" \
+    --unit "$OUT/unit.json" --unit-main "$OUT/unit-main.json" \
     --verdict "$OUT/verdict.json" --comment "$OUT/comment.md"
 }
 
