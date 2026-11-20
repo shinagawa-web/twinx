@@ -93,6 +93,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_read_timeout", HSL, 1, 1, false),
     ("proxy_buffer_size", HSL, 1, 1, false),
     ("proxy_buffering", HSL, 1, 1, false),
+    ("proxy_request_buffering", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
     ("proxy_buffers", HSL, 2, 2, false),
     ("proxy_max_temp_file_size", HSL, 1, 1, false),
@@ -286,6 +287,9 @@ pub struct Level {
     /// client's headers and body are passed to the proxied server.
     pub proxy_pass_request_headers: bool,
     pub proxy_pass_request_body: bool,
+    /// proxy_request_buffering: whether the whole body is read before the
+    /// request is passed; when off, a body with a Content-Length is passed as it comes.
+    pub proxy_request_buffering: bool,
     /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
     pub proxy_next_upstream: Vec<String>,
     /// proxy_next_upstream_tries: how many servers a request may try, 0 for any.
@@ -449,7 +453,7 @@ impl Builder<'_> {
         let temp = self.path("client_body_temp");
         let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_redirect: Some(Vec::new()), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -598,6 +602,7 @@ impl Builder<'_> {
                 // How the proxied answer is read changes nothing that is sent: the values are only checked.
                 "proxy_buffer_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_buffering" => { flag(d).map_err(at)?; }
+                "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
                 "proxy_max_temp_file_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
                 "proxy_buffers" => if d.args[0].parse::<u64>().map_or(true, |n| n == 0) || size(&d.args[1]).map_or(true, |n| n == 0) { return Err(at("\"proxy_buffers\" directive invalid value".into())); }
@@ -972,6 +977,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         build(&parse(text, Path::new("t.conf")).unwrap(), &dir)
+    }
+
+    #[test]
+    fn proxy_request_buffering() {
+        let c = build_text("http { proxy_request_buffering off; server { location /a { } location /b { proxy_request_buffering on; } } }").unwrap();
+        let on: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.proxy_request_buffering).collect();
+        assert_eq!(on, [false, true]);
+        assert!(build_text("http { proxy_request_buffering 1; }").is_err());
     }
 
     #[test]
