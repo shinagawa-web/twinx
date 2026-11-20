@@ -48,6 +48,10 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("error_page", HSL, 2, usize::MAX, false),
     ("proxy_pass", LOC, 1, 1, false),
     ("expires", HSL, 1, 2, false),
+    ("alias", LOC, 1, 1, false),
+    ("absolute_redirect", HSL, 1, 1, false),
+    ("server_name_in_redirect", HSL, 1, 1, false),
+    ("port_in_redirect", HSL, 1, 1, false),
 ];
 
 const COMBINED: &str =
@@ -94,6 +98,15 @@ pub struct Level {
     pub body_temp_path: PathBuf,
     /// expires, as written ("modified 1h", "$arg_e"): parsed for each response.
     pub expires: Option<Template>,
+    /// alias: the path that replaces the location's prefix, instead of root.
+    pub alias: Option<PathBuf>,
+    /// How a Location that starts with "/" is sent: made absolute with
+    /// "http://host[:port]" (absolute_redirect), the host being the server's
+    /// name rather than the request's (server_name_in_redirect), and the port
+    /// left out when port_in_redirect is off.
+    pub absolute_redirect: bool,
+    pub server_name_in_redirect: bool,
+    pub port_in_redirect: bool,
 }
 
 /// How a location matches the URI: "=", a prefix, "^~" (a prefix that stops
@@ -111,6 +124,9 @@ pub struct Location {
     pub kind: Match,
     pub path: String,
     pub level: Level,
+    /// A request for the path without its trailing "/" is redirected to it,
+    /// as nginx does for locations ending with "/" that proxy_pass passes on.
+    pub auto_redirect: bool,
 }
 
 #[derive(Debug)]
@@ -181,7 +197,7 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { max_body: 1 << 20, body_buffer: 16 << 10, body_temp_path: temp, ..Level::default() };
+        let mut level = Level { max_body: 1 << 20, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -216,7 +232,8 @@ impl Builder<'_> {
             let inner = d.block.as_deref().unwrap_or_default();
             self.level(inner, LOC, &mut level)?;
             let (kind, path) = location(&d.args).map_err(|e| format!("{e} in {}", d.at))?;
-            out.push(Location { kind, path, level: level.clone() });
+            let auto_redirect = level.proxy.is_some() && path.ends_with('/') && !matches!(kind, Match::Regex(_));
+            out.push(Location { kind, path, level: level.clone(), auto_redirect });
             self.locations(inner, &level, out)?;
         }
         Ok(())
@@ -233,7 +250,11 @@ impl Builder<'_> {
             let at = |e: String| format!("{e} in {}", d.at);
             match d.name.as_str() {
                 "return" => level.ret = Some(ret(&d.args).map_err(at)?),
-                "root" => level.root = self.path(&d.args[0]),
+                "root" => (level.root, level.alias) = (self.path(&d.args[0]), None),
+                "alias" => level.alias = Some(self.path(&d.args[0])),
+                "absolute_redirect" => level.absolute_redirect = flag(d).map_err(at)?,
+                "server_name_in_redirect" => level.server_name_in_redirect = flag(d).map_err(at)?,
+                "port_in_redirect" => level.port_in_redirect = flag(d).map_err(at)?,
                 "log_format" => {
                     let t = Template::parse(&d.args[1..].concat()).map_err(at)?;
                     self.formats.insert(d.args[0].clone(), Arc::new(t));
@@ -312,6 +333,13 @@ fn expires(args: &[String]) -> Result<Template, String> {
     Ok(t)
 }
 
+/// "on" or "off".
+fn flag(d: &Directive) -> Result<bool, String> {
+    let (value, name) = (&d.args[0], &d.name);
+    let found = [("on", true), ("off", false)].into_iter().find(|f| f.0 == value.to_ascii_lowercase()).map(|f| f.1);
+    found.ok_or_else(|| format!("invalid value \"{value}\" in \"{name}\" directive, it must be \"on\" or \"off\""))
+}
+
 /// A size such as "512", "8k" or "1m".
 fn size(s: &str) -> Result<u64, String> {
     let (digits, unit) = s.find(|c: char| !c.is_ascii_digit()).map_or((s, ""), |i| s.split_at(i));
@@ -324,8 +352,8 @@ fn add_header(args: &[String]) -> Result<(String, Template, bool), String> {
     Ok((args[0].clone(), Template::parse(&args[1])?, always))
 }
 
-/// error_page code ... [=[response]] url. twinx sends redirects only, so the
-/// target must be a URL; nginx's internal redirects to a local URI are not done yet.
+/// error_page code ... [=[response]] uri: a local URI the request is redirected
+/// to internally, or a URL the client is redirected to. Named locations are not done yet.
 fn error_page(args: &[String]) -> Result<ErrorPage, String> {
     let (url, rest) = args.split_last().unwrap();
     let (status, codes) = match rest.split_last() {
@@ -334,7 +362,7 @@ fn error_page(args: &[String]) -> Result<ErrorPage, String> {
     };
     let codes = codes.iter().map(|c| c.parse::<u16>().ok().filter(|c| (300..=599).contains(c)).ok_or_else(|| format!("value \"{c}\" must be between 300 and 599")));
     let codes = codes.collect::<Result<Vec<u16>, String>>()?;
-    if url.starts_with('/') || url.starts_with('@') { return Err(format!("twinx does not support redirecting errors to \"{url}\" yet")); }
+    if url.starts_with('@') { return Err(format!("twinx does not support redirecting errors to \"{url}\" yet")); }
     Ok(ErrorPage { codes, status, url: Template::parse(url)? })
 }
 
@@ -422,8 +450,26 @@ mod tests {
         assert_eq!(size("10"), Ok(10));
         assert_eq!(size("1x"), Err("\"1x\" is invalid".into()));
         assert_eq!(error_page(&["200".into(), "http://e/".into()]).unwrap_err(), "value \"200\" must be between 300 and 599");
-        assert!(error_page(&["404".into(), "/local".into()]).is_err());
+        assert!(error_page(&["404".into(), "@named".into()]).is_err());
+        assert_eq!(error_page(&["404".into(), "/local".into()]).unwrap().status, None);
         assert_eq!(error_page(&["404".into(), "500".into(), "http://e/".into()]).unwrap().codes, vec![404, 500]);
+    }
+
+    #[test]
+    fn redirect_settings_and_alias() {
+        let c = build_text(
+            "http { absolute_redirect off; server { server_name_in_redirect on; location /i/ { alias /a/; port_in_redirect OFF; \
+             location /i/x { root /r; } } location /p/ { proxy_pass http://127.0.0.1:1; } } }",
+        )
+        .unwrap();
+        let s = &c.servers[0];
+        assert_eq!((s.level.absolute_redirect, s.level.server_name_in_redirect, s.level.port_in_redirect), (false, true, true));
+        let (i, x, p) = (&s.locations[0], &s.locations[1], &s.locations[2]);
+        assert_eq!((i.level.alias.as_deref(), i.level.port_in_redirect, i.auto_redirect), (Some(Path::new("/a/")), false, false));
+        assert_eq!((x.level.alias.as_deref(), x.level.root.as_path()), (None, Path::new("/r")));
+        assert!(p.auto_redirect);
+        let e = build_text("http { absolute_redirect yes; }").unwrap_err();
+        assert_eq!(e, "invalid value \"yes\" in \"absolute_redirect\" directive, it must be \"on\" or \"off\" in t.conf:1");
     }
 
     #[test]
