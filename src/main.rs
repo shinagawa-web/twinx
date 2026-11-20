@@ -4,6 +4,7 @@ mod conf;
 mod expires;
 mod config;
 mod http;
+mod log;
 mod upstream;
 mod vars;
 
@@ -17,7 +18,7 @@ use signal_hook::iterator::Signals;
 
 /// What `-V` prints: Test::Nginx reads it to tell which modules twinx has.
 const CONFIGURE: &str = "--without-http_fastcgi_module --without-http_uwsgi_module \
---without-http_scgi_module --without-http_grpc_module --without-http_memcached_module";
+--with-http_gunzip_module --with-http_gzip_static_module --without-http_scgi_module --without-http_grpc_module --without-http_memcached_module";
 
 /// The command line, as nginx takes it.
 #[derive(Debug, PartialEq)]
