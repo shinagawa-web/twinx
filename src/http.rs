@@ -29,12 +29,17 @@ const REASONS: &[(u16, &str)] = &[
 ];
 
 /// Binds every address the servers listen on and accepts connections on each in a thread.
-pub fn listen(config: Arc<Config>) -> Result<(), String> {
+/// Opens the listening sockets: the master does this, so that bind errors stop it and every worker shares them.
+pub fn bind(config: &Config) -> Result<Vec<(TcpListener, SocketAddr)>, String> {
     let mut addrs: Vec<SocketAddr> = config.servers.iter().flat_map(|s| s.listen.clone()).collect();
     addrs.dedup();
-    for addr in addrs {
-        let listener = TcpListener::bind(addr).map_err(|e| format!("bind() to {addr} failed ({e})"))?;
-        let config = config.clone();
+    addrs.into_iter().map(|addr| TcpListener::bind(addr).map(|l| (l, addr)).map_err(|e| format!("bind() to {addr} failed ({e})"))).collect()
+}
+
+/// Accepts connections on the listening sockets, in a worker process.
+pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> Result<(), String> {
+    for (listener, addr) in listeners {
+        let (listener, addr, config) = (listener.try_clone().map_err(|e| e.to_string())?, *addr, config.clone());
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let config = config.clone();
