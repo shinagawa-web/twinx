@@ -37,7 +37,21 @@ pub struct Request {
     /// The named captures of the server name that matched the host.
     pub captures: Vec<(String, String)>,
     /// $limit_rate, which set changes; shared by the internal redirects of the request.
-    pub limit_rate: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub limit_rate: std::sync::Arc<Rate>,
+}
+
+/// The limit_rate of a request, once set $limit_rate or X-Accel-Limit-Rate set
+/// it (r->limit_rate_set): the limit_rate directive is not looked at then.
+#[derive(Debug)]
+pub struct Rate(std::sync::atomic::AtomicU64);
+
+impl Default for Rate {
+    fn default() -> Rate { Rate(std::sync::atomic::AtomicU64::new(u64::MAX)) }
+}
+
+impl Rate {
+    pub fn set(&self, rate: u64) { self.0.store(rate, std::sync::atomic::Ordering::Relaxed) }
+    pub fn get(&self) -> Option<u64> { Some(self.0.load(std::sync::atomic::Ordering::Relaxed)).filter(|r| *r != u64::MAX) }
 }
 
 /// The names of the captures that are variables.
@@ -61,6 +75,8 @@ pub struct Sent {
     pub trailers: Vec<(String, String)>,
     /// The proxied servers tried, as $upstream_addr gives them.
     pub upstream_addr: Option<String>,
+    /// How long each of them took to answer ($upstream_response_time).
+    pub upstream_time: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +108,7 @@ pub enum Var {
     RequestPort,
     IsRequestPort,
     UpstreamAddr,
+    UpstreamResponseTime,
     Pid,
     ServerName,
     LimitRate,
@@ -118,6 +135,7 @@ impl Var {
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
             ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
             ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("pid", Var::Pid),
+            ("upstream_response_time", Var::UpstreamResponseTime),
             ("server_name", Var::ServerName), ("limit_rate", Var::LimitRate),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
@@ -160,9 +178,10 @@ impl Var {
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
             Var::Pid => std::process::id().to_string(),
             Var::ServerName => r.server_name.clone(),
-            Var::LimitRate => r.limit_rate.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+            Var::LimitRate => r.limit_rate.get().unwrap_or(0).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
             Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
+            Var::UpstreamResponseTime => s.upstream_time.clone()?,
             Var::Args => r.target.split_once('?').map_or("", |(_, a)| a).to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
@@ -405,6 +424,10 @@ mod tests {
         let t = Template::parse("$pid|$upstream_addr").unwrap();
         assert_eq!(t.render(&r, &Sent::default()), format!("{}|a", std::process::id()));
         assert_eq!(t.render(&r, &Sent { upstream_addr: Some("b".into()), ..Sent::default() }), format!("{}|b", std::process::id()));
+        let t = Template::parse("$upstream_response_time|$limit_rate").unwrap();
+        assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"-|0");
+        r.limit_rate.set(5);
+        assert_eq!(t.render(&r, &Sent { upstream_time: Some("0.001, 2.040".into()), ..Sent::default() }), "0.001, 2.040|5");
     }
 
     #[test]
