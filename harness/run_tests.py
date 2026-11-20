@@ -66,7 +66,12 @@ def build_image(target):
     # .github/workflows/nginx-tests-image.yml pushes every image main builds, so a machine
     # whose containers cannot reach apt or GitHub can still run the tests.
     published = f"{REGISTRY}/{tag}"
-    if subprocess.run(["docker", "pull", "-q", published], capture_output=True).returncode == 0:
+    # Ask for this machine's architecture: without it, docker pulls an image built for
+    # another one with only a warning, and nothing in it can run.
+    arch = subprocess.run(["docker", "version", "-f", "{{.Server.Arch}}"],
+                          capture_output=True, text=True).stdout.strip()
+    pull = ["docker", "pull", "-q", "--platform", f"linux/{arch}", published]
+    if arch and subprocess.run(pull, capture_output=True).returncode == 0:
         subprocess.run(["docker", "tag", published, tag], check=True)
         return tag
     subprocess.run(["docker", "build", "-q", "--target", target, "-t", tag, str(TESTS_DIR)],
