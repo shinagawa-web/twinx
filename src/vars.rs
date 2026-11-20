@@ -2,6 +2,7 @@
 //! complex values of directives such as return, and access log formats.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use chrono::{DateTime, Local};
@@ -11,6 +12,8 @@ use chrono::{DateTime, Local};
 pub struct Request {
     pub method: String,
     pub uri: String,
+    /// The URI as the request line has it, with the arguments ($request_uri).
+    pub target: String,
     pub line: String,
     pub headers: Vec<(String, String)>,
     /// The validated host of the request line or the Host header.
@@ -21,6 +24,9 @@ pub struct Request {
     pub started: Instant,
     pub pipelined: bool,
     pub length: usize,
+    /// The body when it is kept in memory, and the file it was written to otherwise.
+    pub body: Vec<u8>,
+    pub body_file: Option<PathBuf>,
 }
 
 /// What the answer to a request was, once it was sent.
@@ -47,6 +53,9 @@ pub enum Var {
     RemoteUser,
     Request,
     Host,
+    RequestUri,
+    RequestBody,
+    RequestBodyFile,
     Http(String),
 }
 
@@ -58,6 +67,7 @@ impl Var {
             ("body_bytes_sent", Var::BodyBytesSent), ("pipe", Var::Pipe), ("msec", Var::Msec),
             ("time_iso8601", Var::TimeIso8601), ("time_local", Var::TimeLocal),
             ("remote_addr", Var::RemoteAddr), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
+            ("request_uri", Var::RequestUri), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
         ];
         let header = name.strip_prefix("http_").map(|h| Var::Http(h.replace('_', "-")));
         header.or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v))
@@ -80,6 +90,9 @@ impl Var {
             Var::RemoteUser => return None,
             Var::Request => r.line.clone(),
             Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
+            Var::RequestUri => r.target.clone(),
+            Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
+            Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
             Var::Http(name) => r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))?.1.clone(),
         })
     }
@@ -155,6 +168,7 @@ mod tests {
         Request {
             method: "GET".into(),
             uri: "/a".into(),
+            target: "/a?b".into(),
             line: "GET /a?b HTTP/1.0".into(),
             headers: vec![("User-Agent".into(), "x\"y".into())],
             host: None,
@@ -163,6 +177,8 @@ mod tests {
             started: Instant::now(),
             pipelined: true,
             length: 39,
+            body: b"xy".to_vec(),
+            body_file: None,
         }
     }
 
@@ -176,9 +192,11 @@ mod tests {
 
     #[test]
     fn not_found_variables() {
-        let t = Template::parse("[$remote_user][$http_referer]").unwrap();
-        assert_eq!(t.render(&request(), &Sent::default()), "[][]");
-        assert_eq!(t.log_line(&request(), &Sent::default()), "[-][-]");
+        let t = Template::parse("[$remote_user][$http_referer][$request_body_file]").unwrap();
+        assert_eq!(t.render(&request(), &Sent::default()), "[][][]");
+        assert_eq!(t.log_line(&request(), &Sent::default()), "[-][-][-]");
+        let t = Template::parse("$request_uri $request_body").unwrap();
+        assert_eq!(t.render(&request(), &Sent::default()), "/a?b xy");
     }
 
     #[test]

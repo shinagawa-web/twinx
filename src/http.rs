@@ -2,13 +2,14 @@
 //! answering, and writing the access log.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::conf::{Config, Level, Server};
-use crate::vars::{Request, Sent, Template};
+use crate::conf::{Config, Level, Proxy, Server};
+use crate::vars::{Request, Sent};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
 
@@ -61,9 +62,10 @@ fn connection(config: &Config, mut stream: TcpStream, local: SocketAddr) {
             buf.extend_from_slice(&chunk[..n]);
         };
         let head: Vec<u8> = buf.drain(..end).collect();
-        let request = Request {
+        let mut r = Request {
             method: String::new(),
             uri: String::new(),
+            target: String::new(),
             line: String::new(),
             headers: Vec::new(),
             host: None,
@@ -72,41 +74,148 @@ fn connection(config: &Config, mut stream: TcpStream, local: SocketAddr) {
             started,
             pipelined,
             length: head.len(),
+            body: Vec::new(),
+            body_file: None,
         };
-        if !exchange(server, &mut stream, request, &head) { return; }
+        let parsed = parse(&mut r, &head);
+        let (prefix, level) = location(server, &r.uri);
+        let length = header(&r, "content-length").map_or(Ok(0), |v| v.parse::<u64>().map_err(|_| 400u16));
+        let parsed = parsed.and(length).and_then(|n| if n > level.max_body { Err(413) } else { Ok(n as usize) });
+        if let Ok(n) = parsed {
+            while buf.len() < n {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 { return; }
+                buf.extend_from_slice(&chunk[..read]);
+            }
+            r.length += n;
+            keep_body(&mut r, level, buf.drain(..n).collect());
+        }
+        let open = exchange(&mut stream, &r, parsed.map(drop), prefix, level);
+        if !level.body_in_file_only { r.body_file.map(std::fs::remove_file); }
+        if !open { return linger(&mut stream); }
     }
 }
 
+/// Closes the connection as nginx's lingering close does: stops sending, then
+/// reads what the client still sends so that it gets the whole answer.
+fn linger(stream: &mut TcpStream) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut chunk = [0u8; 4096];
+    while matches!(stream.read(&mut chunk), Ok(n) if n > 0) {}
+}
+
+/// Keeps the request body in memory, or in a file under client_body_temp_path
+/// when it does not fit client_body_buffer_size or client_body_in_file_only is on.
+fn keep_body(r: &mut Request, level: &Level, body: Vec<u8>) {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    let to_file = !body.is_empty() && (level.body_in_file_only || body.len() as u64 > level.body_buffer);
+    if !to_file { return r.body = body; }
+    let path = level.body_temp_path.join(format!("{:010}", NEXT.fetch_add(1, Ordering::Relaxed)));
+    let _ = std::fs::create_dir_all(&level.body_temp_path);
+    r.body_file = std::fs::write(&path, &body).is_ok().then_some(path);
+}
+
+fn header<'a>(r: &'a Request, name: &str) -> Option<&'a str> {
+    r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+}
+
+/// An answer before it is written: the status, Content-Type, the other headers in order, and the body.
+#[derive(Debug, Default)]
+struct Response {
+    status: u16,
+    ctype: Option<String>,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// The page nginx generates for an error status.
+fn special(status: u16) -> Response {
+    let ctype = Some("text/html".to_string());
+    Response { status, ctype, headers: Vec::new(), body: page(status).into_bytes() }
+}
+
 /// Answers one request; true when the connection stays open for the next one.
-fn exchange(server: &Server, stream: &mut TcpStream, mut r: Request, head: &[u8]) -> bool {
-    let parsed = parse(&mut r, head);
-    let keepalive = parsed.is_ok() && keepalive(&r);
-    let level = location(server, &r.uri);
-    let (code, text) = level.ret.clone().unwrap_or((404, Template::default()));
-    let (status, body) = match parsed {
-        Err(status) => (status, None),
-        Ok(()) => (code, (!text.0.is_empty() || code < 400).then(|| text.render(&r, &Sent::default()))),
+fn exchange(stream: &mut TcpStream, r: &Request, parsed: Result<(), u16>, prefix: &str, level: &Level) -> bool {
+    let mut resp = match (parsed, &level.ret, &level.proxy) {
+        (Err(status), _, _) => special(status),
+        (Ok(()), Some((code, text)), _) if text.0.is_empty() && *code >= 400 => special(*code),
+        (Ok(()), Some((code, text)), _) => {
+            let ctype = Some("text/plain".to_string());
+            Response { status: *code, ctype, headers: Vec::new(), body: text.render(r, &Sent::default()).into_bytes() }
+        }
+        (Ok(()), None, Some(p)) => proxy(p, r, prefix),
+        (Ok(()), None, None) => special(404),
     };
-    let ctype = if body.is_some() { "text/plain" } else { "text/html" };
-    let body = body.unwrap_or_else(|| page(status));
-    let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
-    let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
-    let connection = if keepalive { "keep-alive" } else { "close" };
-    let mut out = format!(
-        "HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\nContent-Type: {ctype}\r\n\
-         Content-Length: {}\r\nConnection: {connection}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    let body_len = if r.method == "HEAD" { 0 } else { body.len() };
-    out.extend_from_slice(&body.as_bytes()[..body_len]);
+    if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)) {
+        let location = ep.url.render(r, &Sent::default());
+        resp = special(ep.status.unwrap_or(302));
+        resp.headers.push(("Location".to_string(), location));
+    }
+    const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
+    for (name, value, always) in &level.add_header {
+        let value = value.render(r, &Sent::default());
+        if !value.is_empty() && (*always || ADDED.contains(&resp.status)) { resp.headers.push((name.clone(), value)); }
+    }
+    let status = resp.status;
+    let keepalive = parsed.is_ok() && keepalive(r) && ![400, 413, 414, 500, 501].contains(&status);
+    let mut out = Vec::new();
+    if status != 444 {
+        let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
+        let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
+        let ctype = resp.ctype.map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
+        let connection = if keepalive { "keep-alive" } else { "close" };
+        let len = resp.body.len();
+        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}Content-Length: {len}\r\nConnection: {connection}\r\n");
+        resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
+        out = (head + "\r\n").into_bytes();
+    }
+    let body_len = if r.method == "HEAD" || status == 444 { 0 } else { resp.body.len() };
+    out.extend_from_slice(&resp.body[..body_len]);
     let written = stream.write_all(&out).is_ok();
     let sent = Sent { status, bytes: out.len(), body: body_len };
     for log in &level.access_log {
-        let line = log.format.log_line(&r, &sent) + "\n";
+        let line = log.format.log_line(r, &sent) + "\n";
         let _ = (&*log.file).write_all(line.as_bytes());
     }
-    written && keepalive
+    written && keepalive && status != 444
+}
+
+/// Passes the request to the proxied servers in turn, as HTTP/1.0 with
+/// "Connection: close", until one answers with a response head.
+fn proxy(p: &Proxy, r: &Request, prefix: &str) -> Response {
+    let args = r.target.find('?').map_or("", |i| &r.target[i..]);
+    let uri = p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{}{args}", &r.uri[prefix.len()..]));
+    let body = r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default());
+    let mut req = format!("{} {uri} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n", r.method, p.host);
+    if header(r, "content-length").is_some() { req += &format!("Content-Length: {}\r\n", body.len()); }
+    const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
+    let passed = r.headers.iter().filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()));
+    passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
+    let mut req = (req + "\r\n").into_bytes();
+    req.extend_from_slice(&body);
+    p.peers.iter().find_map(|peer| fetch(peer, &req)).unwrap_or_else(|| special(502))
+}
+
+/// Sends a request to one server and reads its whole answer.
+fn fetch(peer: &SocketAddr, req: &[u8]) -> Option<Response> {
+    let timeout = Duration::from_secs(60);
+    let mut s = TcpStream::connect_timeout(peer, timeout).ok()?;
+    let _ = s.set_read_timeout(Some(timeout));
+    let mut answer = Vec::new();
+    s.write_all(req).and_then(|_| s.read_to_end(&mut answer)).ok()?;
+    let end = head_end(&answer)?;
+    let head = String::from_utf8_lossy(&answer[..end]).into_owned();
+    let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
+    let status = lines.next()?.strip_prefix("HTTP/1.")?.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()?;
+    let mut resp = Response { status, body: answer[end..].to_vec(), ..Response::default() };
+    const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
+    for (name, value) in lines.filter_map(|l| l.split_once(':')) {
+        let (lower, value) = (name.to_ascii_lowercase(), value.trim().to_string());
+        if lower == "content-type" { resp.ctype = Some(value); continue; }
+        if !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
+    }
+    Some(resp)
 }
 
 /// Fills the request from its head, or gives the status nginx refuses it with.
@@ -136,6 +245,7 @@ fn parse(r: &mut Request, head: &[u8]) -> Result<(), u16> {
         _ => target,
     };
     if !path.starts_with('/') { return Err(400); }
+    r.target = path.to_string();
     r.uri = path.split('?').next().unwrap_or_default().to_string();
     if method == "TRACE" { return Err(405); }
     Ok(())
@@ -156,15 +266,15 @@ fn valid_host(h: &str) -> Option<String> {
 }
 
 fn keepalive(r: &Request) -> bool {
-    let connection = r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("connection")).map(|(_, v)| v.to_ascii_lowercase());
+    let connection = header(r, "connection").map(|v| v.to_ascii_lowercase());
     let http11 = r.line.ends_with("HTTP/1.1");
     connection.map_or(http11, |c| if http11 { c != "close" } else { c == "keep-alive" })
 }
 
 /// The location whose prefix is the longest one matching the URI, or the server's own settings.
-fn location<'a>(server: &'a Server, uri: &str) -> &'a Level {
+fn location<'a>(server: &'a Server, uri: &str) -> (&'a str, &'a Level) {
     let matching = server.locations.iter().filter(|(prefix, _)| uri.starts_with(prefix.as_str()));
-    matching.max_by_key(|(prefix, _)| prefix.len()).map_or(&server.level, |(_, level)| level)
+    matching.max_by_key(|(prefix, _)| prefix.len()).map_or(("", &server.level), |(prefix, level)| (prefix, level))
 }
 
 /// The page nginx generates for an error status.
@@ -184,6 +294,7 @@ mod tests {
         let mut r = Request {
             method: String::new(),
             uri: String::new(),
+            target: String::new(),
             line: String::new(),
             headers: Vec::new(),
             host: None,
@@ -192,6 +303,8 @@ mod tests {
             started: Instant::now(),
             pipelined: false,
             length: 0,
+            body: Vec::new(),
+            body_file: None,
         };
         (parse(&mut r, head.as_bytes()), r)
     }
@@ -233,6 +346,33 @@ mod tests {
         }
         assert_eq!(valid_host("A.b.:"), Some("a.b".into()));
         assert_eq!(valid_host("[::1]:80"), Some("[::1]".into()));
+    }
+
+    #[test]
+    fn fetches_from_a_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf).unwrap();
+            s.write_all(b"HTTP/1.1 201 Created\r\nServer: x\r\nContent-Type: a/b\r\nX-A: 1\r\nX-Accel-B: 2\r\n\r\nbody").unwrap();
+        });
+        let resp = fetch(&addr, b"GET / HTTP/1.0\r\n\r\n").unwrap();
+        assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
+        assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn keeps_large_bodies_in_files() {
+        let dir = std::env::temp_dir().join(format!("twinx-body-{}", std::process::id()));
+        let level = Level { body_buffer: 4, body_temp_path: dir, ..Level::default() };
+        let (_, mut r) = request("GET / HTTP/1.0\n\n");
+        keep_body(&mut r, &level, b"abc".to_vec());
+        assert_eq!((r.body.as_slice(), r.body_file.is_none()), (&b"abc"[..], true));
+        let (_, mut r) = request("GET / HTTP/1.0\n\n");
+        keep_body(&mut r, &level, b"abcde".to_vec());
+        assert_eq!(std::fs::read(r.body_file.unwrap()).unwrap(), b"abcde");
     }
 
     #[test]
