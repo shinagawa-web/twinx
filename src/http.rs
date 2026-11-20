@@ -778,11 +778,17 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
             None => return special(502),
         },
     };
-    // proxy_pass_request_body off sends no body, and so no Content-Length.
-    let pass_body = level.proxy_pass_request_body;
-    let body = if pass_body { r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default()) } else { Vec::new() };
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
+    // proxy_set_body replaces the client's body, whatever proxy_pass_request_body
+    // says; proxy_pass_request_body off sends no body, and so no Content-Length.
+    let set_body = level.proxy_set_body.as_ref().map(|b| b.render(r, &sent).into_bytes());
+    let pass_body = level.proxy_pass_request_body && set_body.is_none();
+    let body = match &set_body {
+        Some(b) => b.clone(),
+        None if pass_body => r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default()),
+        None => Vec::new(),
+    };
     let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &sent))).collect();
     let is_set = |name: &str| set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
     // proxy_method replaces the request's method.
@@ -796,7 +802,8 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let chunked = unread.as_ref().is_some_and(|u| u.chunked.is_some());
     if pass_body && chunked { req += "Transfer-Encoding: chunked\r\n"; }
     if pass_body && !chunked && framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len() as u64 + unread.as_ref().map_or(0, |u| u.left)); }
-    let body = if chunked && !body.is_empty() { chunk(&body) } else { body };
+    if set_body.is_some() { req += &format!("Content-Length: {}\r\n", body.len()); }
+    let body = if pass_body && chunked && !body.is_empty() { chunk(&body) } else { body };
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
     // proxy_pass_request_headers off passes none of the client's headers.
     let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()) && !is_set(n));
@@ -1779,6 +1786,28 @@ mod tests {
         let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { proxy_cookie_path off; proxy_cookie_path /a /b; }"), "\"proxy_cookie_path\" directive is duplicate in t:1");
         assert_eq!(refused("http { proxy_cookie_path on; }"), "invalid parameter \"on\" in t:1");
+    }
+
+    #[test]
+    fn sets_the_body_sent_to_proxied_servers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let got = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = s.read(&mut buf).unwrap();
+            s.write_all(b"HTTP/1.0 204 No Content\r\n\r\n").unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
+        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default() };
+        let set = Some(Template::parse("b=$arg_a").unwrap());
+        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), proxy_set_body: set, ..Level::default() };
+        let (_, mut r) = request("POST /a?a=1 HTTP/1.0\nContent-Length: 3\n\n");
+        r.body = b"xyz".to_vec();
+        assert_eq!(proxy(&p, &level, &r, "").status, 204);
+        let sent = got.join().unwrap();
+        assert!(sent.contains("Content-Length: 3\r\n") && sent.ends_with("\r\n\r\nb=1"), "{sent}");
     }
 
     #[test]
