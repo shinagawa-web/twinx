@@ -526,9 +526,10 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     // A body of unknown length is chunked for HTTP/1.1; otherwise the connection
     // closes after it. A HEAD answer has neither.
     // add_trailer makes it chunked too, except for a status that has no body.
+    // chunked_transfer_encoding off leaves both unchunked.
     let unknown = resp.unknown_length && r.method != "HEAD";
     let trailing = level.add_trailer.iter().any(|t| t.2 || added) && r.method != "HEAD" && ![204, 304].contains(&status);
-    let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1");
+    let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1") && level.chunked;
     let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown);
     let mut out = Vec::new();
     // 444 closes the connection without an answer; 499 is the status of a client that closed it.
