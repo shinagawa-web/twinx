@@ -139,7 +139,9 @@ def send_raw(raw):
     return data
 
 
-def parse(response):
+def parse(response, twin=None):
+    """Split a response into status, headers and body, with the server's name replaced.
+    twin is the answer to the same request sent as GET, for a HEAD request."""
     head, sep, body = response.partition(b"\r\n\r\n")
     if not sep:
         return {"status": response.decode("latin-1"), "headers": [], "body": ""}
@@ -155,6 +157,13 @@ def parse(response):
         # that described the original body is recounted for the replaced one.
         if name == "content-length" and normalized != body and value == str(len(body)):
             value = str(len(normalized))
+        # A HEAD response has no body to replace the name in, so the GET answer's body
+        # tells the length the replaced body would have.
+        elif name == "content-length" and twin is not None and not body:
+            twin_body = twin.partition(b"\r\n\r\n")[2]
+            twin_normalized = SERVER_NAMES.sub(SERVER_PLACEHOLDER, twin_body)
+            if twin_normalized != twin_body and value == str(len(twin_body)):
+                value = str(len(twin_normalized))
         headers.append([name, value])
     return {"status": lines[0], "headers": sorted(headers), "body": normalized.decode("latin-1")}
 
@@ -291,13 +300,17 @@ def run_twinx_sandboxed(binary, work, requests, profiles):
 def run_case(case_dir, binary, sandbox=None):
     case = tomllib.loads((case_dir / "case.toml").read_text())
     requests = [r["raw"].encode("latin-1") for r in case.get("requests", [])]
+    # Every HEAD request is also sent as GET, after all the case's requests so their
+    # answers do not change, to recount the Content-Length of a generated page.
+    twins = {i: b"GET" + raw[4:] for i, raw in enumerate(requests) if raw.startswith(b"HEAD ")}
+    sent = requests + list(twins.values())
     work = prepare(case_dir, case)
-    nginx, nginx_error = run_nginx(work, requests)
+    nginx, nginx_error = run_nginx(work, sent)
     # nginx's workers read the files as another user, so a case that sets modes runs
     # twinx as another user too: in the sandbox, whether or not --sandbox was given.
     if case.get("modes") and sandbox is None:
         sandbox = ""
-    twinx, twinx_error = run_twinx(binary, work, requests, sandbox)
+    twinx, twinx_error = run_twinx(binary, work, sent, sandbox)
     result = {"case": str(case_dir.relative_to(REPO)), "description": case.get("description", "")}
     if nginx is None:
         # A configuration nginx refuses must be refused by twinx too.
@@ -314,9 +327,11 @@ def run_case(case_dir, binary, sandbox=None):
             for raw, expected in zip(requests, nginx)
         ]
         return result
+    nginx_twins = dict(zip(twins, nginx[len(requests):]))
+    twinx_twins = dict(zip(twins, twinx[len(requests):]))
     outcomes = []
-    for raw, expected, actual in zip(requests, nginx, twinx):
-        expected, actual = parse(expected), parse(actual)
+    for i, (raw, expected, actual) in enumerate(zip(requests, nginx, twinx)):
+        expected, actual = parse(expected, nginx_twins.get(i)), parse(actual, twinx_twins.get(i))
         problems = diff(expected, actual)
         outcomes.append({"request": raw.decode("latin-1"), "passed": not problems, "problems": problems,
                          "nginx": expected, "twinx": actual})
