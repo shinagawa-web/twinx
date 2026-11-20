@@ -81,6 +81,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_next_upstream", HSL, 1, usize::MAX, false),
     ("proxy_intercept_errors", HSL, 1, 1, false),
     ("proxy_connect_timeout", HSL, 1, 1, false),
+    ("proxy_read_timeout", HSL, 1, 1, false),
     ("resolver", HSL, 1, usize::MAX, false),
     ("resolver_timeout", HSL, 1, 1, false),
     ("gzip", HSL, 1, 1, false),
@@ -107,6 +108,8 @@ pub struct Proxy {
     pub upstream: Arc<Upstream>,
     pub uri: Option<String>,
     pub url: Option<Template>,
+    /// The upstream groups a URL with variables may name.
+    pub groups: HashMap<String, Arc<Upstream>>,
 }
 
 /// An error_page: the statuses, the status to answer with instead (None keeps
@@ -221,6 +224,7 @@ pub struct Level {
     pub resolver: Option<Arc<Resolver>>,
     pub resolver_timeout: Duration,
     pub proxy_connect_timeout: Duration,
+    pub proxy_read_timeout: Duration,
     /// limit_rate and limit_rate_after: sizes, which may have variables,
     /// evaluated when the answer is sent.
     pub limit_rate: Template,
@@ -349,7 +353,7 @@ impl Builder<'_> {
         let temp = self.path("client_body_temp");
         let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -455,6 +459,7 @@ impl Builder<'_> {
                 "resolver" => level.resolver = Some(Arc::new(Resolver::parse(&d.args).map_err(at)?)),
                 "resolver_timeout" => level.resolver_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_connect_timeout" => level.proxy_connect_timeout = seconds(&d.args[0]).map_err(at)?,
+                "proxy_read_timeout" => level.proxy_read_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_intercept_errors" => drop(flag(d).map_err(at)?),
                 "proxy_next_upstream" => {
                     const VALUES: &[&str] = &["error", "timeout", "invalid_header", "http_500", "http_502", "http_503", "http_504", "http_403", "http_404", "http_429", "non_idempotent", "updating", "off"];
@@ -525,13 +530,13 @@ impl Builder<'_> {
         let rest = url.strip_prefix("http://").ok_or_else(|| format!("invalid URL prefix in \"{url}\""))?;
         let template = Template::parse(url)?;
         if template.0.iter().any(|p| matches!(p, Part::Var(_))) {
-            return Ok(Proxy { host: String::new(), upstream: Arc::new(Upstream::new(Vec::new())), uri: None, url: Some(template) });
+            return Ok(Proxy { host: String::new(), upstream: Arc::new(Upstream::new(Vec::new())), uri: None, url: Some(template), groups: self.upstreams.clone() });
         }
         let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
         let single = || listen(host).map(|a| Arc::new(Upstream::new(vec![Peer::new(a)])));
         let upstream = self.upstreams.get(host).cloned().map_or_else(single, Ok);
         let upstream = upstream.map_err(|_| format!("host not found in upstream \"{host}\""))?;
-        Ok(Proxy { host: host.to_string(), upstream, uri, url: None })
+        Ok(Proxy { host: host.to_string(), upstream, uri, url: None, groups: HashMap::new() })
     }
 }
 
