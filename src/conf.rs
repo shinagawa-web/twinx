@@ -90,6 +90,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_buffering", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
     ("proxy_buffers", HSL, 2, 2, false),
+    ("proxy_max_temp_file_size", HSL, 1, 1, false),
     ("proxy_cookie_domain", HSL, 1, 2, false),
     ("proxy_cookie_path", HSL, 1, 2, false),
     ("proxy_cookie_flags", HSL, 1, 4, false),
@@ -555,6 +556,7 @@ impl Builder<'_> {
                 // How the proxied answer is read changes nothing that is sent: the values are only checked.
                 "proxy_buffer_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_buffering" => { flag(d).map_err(at)?; }
+                "proxy_max_temp_file_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
                 "proxy_buffers" => if d.args[0].parse::<u64>().map_or(true, |n| n == 0) || size(&d.args[1]).map_or(true, |n| n == 0) { return Err(at("\"proxy_buffers\" directive invalid value".into())); }
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
@@ -985,6 +987,8 @@ mod tests {
     fn checks_proxy_buffering() {
         assert!(build_text("http { server { location / { proxy_buffer_size 512; proxy_buffering off; } } }").is_ok());
         assert!(build_text("http { proxy_buffer_size 5x; }").unwrap_err().starts_with("\"5x\" is invalid"));
+        assert!(build_text("http { proxy_max_temp_file_size 0; server { proxy_max_temp_file_size 4k; } }").is_ok());
+        assert!(build_text("http { proxy_max_temp_file_size 1x; }").unwrap_err().starts_with("\"1x\" is invalid"));
         assert!(build_text("http { proxy_buffering of; }").is_err());
     }
 
