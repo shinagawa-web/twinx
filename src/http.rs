@@ -94,6 +94,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             body: Vec::new(),
             body_file: None,
             upstream_addr: None,
+            upstream: Vec::new(),
             captures: Vec::new(),
             limit_rate: Default::default(),
             vars: Default::default(),
@@ -560,12 +561,24 @@ fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix,
     while let Some(target) = resp.internal.take() {
         // nginx gives up after 10 internal redirects.
         redirects += 1;
-        if resp.as_get && to.method != "HEAD" { to.method = "GET".to_string(); }
-        to.uri = target.split('?').next().unwrap_or_default().to_string();
-        to.target = target;
-        let (prefix, found, auto) = location(server, &to.uri);
-        level = run(&to, &found.script, run(&to, &found.server_script, found));
-        resp = if redirects > 10 { special(500) } else { respond(&to, Ok(()), (prefix, level, auto)) };
+        // After X-Accel-Redirect the proxied answer's headers stay ($upstream_http_*),
+        // and the new answer has those of them nginx keeps.
+        let kept = resp.proxied.then(|| { to.upstream = std::mem::take(&mut resp.upstream); (std::mem::take(&mut resp.headers), resp.ctype.take()) });
+        // A named location answers the request as it is, without the server's rewrites.
+        let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == target);
+        let (prefix, found, auto) = if let Some(l) = named { (l.path.as_str(), &l.level, false) } else {
+            if resp.as_get && to.method != "HEAD" { to.method = "GET".to_string(); }
+            to.uri = target.split('?').next().unwrap_or_default().to_string();
+            to.target = target.clone();
+            location(server, &to.uri)
+        };
+        level = run(&to, &found.script, if named.is_some() { found } else { run(&to, &found.server_script, found) });
+        resp = if redirects > 10 || (target.starts_with('@') && named.is_none()) { special(500) } else { respond(&to, Ok(()), (prefix, level, auto)) };
+        if let Some((headers, ctype)) = kept {
+            resp.headers.splice(0..0, headers);
+            if let Some(ctype) = ctype.filter(|_| resp.status < 300) { resp.ctype = Some(ctype); }
+            resp.upstream = to.upstream.clone();
+        }
     }
     (resp, level, to)
 }
@@ -736,7 +749,9 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &sent))).collect();
     let is_set = |name: &str| set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
-    let mut req = format!("{} {uri} HTTP/1.0\r\n", r.method);
+    // proxy_method replaces the request's method.
+    let method = level.proxy_method.as_ref().map_or_else(|| r.method.clone(), |m| m.render(r, &sent));
+    let mut req = format!("{method} {uri} HTTP/1.0\r\n");
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     if !is_set("host") { req += &format!("Host: {host}\r\n"); }
     if !is_set("connection") { req += "Connection: close\r\n"; }
@@ -770,7 +785,14 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     // replaces the answer with an internal redirect to its URI.
     let accel = |name: &str| resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     if let Some(rate) = accel("x-accel-limit-rate").and_then(|v| v.parse().ok()) { r.limit_rate.set(rate); }
-    if let Some(uri) = accel("x-accel-redirect").filter(|u| u.starts_with('/')) { return Response { internal: Some(uri), as_get: true, ..resp }; }
+    // It keeps Content-Type and the headers below; an unsafe URI is 404.
+    if let Some(to) = accel("x-accel-redirect") {
+        const KEPT: &[&str] = &["set-cookie", "content-disposition", "cache-control", "expires", "accept-ranges"];
+        resp.headers.retain(|h| KEPT.contains(&h.0.to_ascii_lowercase().as_str()));
+        let named = to.starts_with('@');
+        let Some((uri, args)) = (if named { Some((to, None)) } else { unsafe_uri(&to) }) else { return special(404) };
+        return Response { internal: Some(args.map_or_else(|| uri.clone(), |a| format!("{uri}?{a}"))), as_get: !named, ..resp };
+    }
     let hidden = |name: &str| level.proxy_hide_header.iter().any(|h| h.eq_ignore_ascii_case(name));
     resp.headers.retain(|h| !hidden(&h.0));
     if hidden("content-type") { resp.ctype = None; }
@@ -1037,6 +1059,17 @@ fn decode(s: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// An X-Accel-Redirect URI as ngx_http_parse_unsafe_uri() takes it: its path,
+/// unescaped, and its arguments; None when it is empty, has no path, has a NUL
+/// or a ".." segment, before or after unescaping.
+fn unsafe_uri(value: &str) -> Option<(String, Option<String>)> {
+    let (path, args) = value.split_once('?').map_or((value, None), |(p, a)| (p, Some(a)));
+    if path.is_empty() || value.contains('\0') || path.split('/').any(|s| s == "..") { return None; }
+    // An unescaped path is looked at again; arguments it has replace the others.
+    if let Some(d) = decode(path).filter(|d| d != path) { return unsafe_uri(&d).map(|(p, a)| (p, a.or(args.map(String::from)))); }
+    Some((path.to_string(), args.map(String::from)))
+}
+
 /// The path with each run of slashes made one, as merge_slashes does.
 fn merge_slashes(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
@@ -1167,6 +1200,7 @@ mod tests {
             body: Vec::new(),
             body_file: None,
             upstream_addr: None,
+            upstream: Vec::new(),
             captures: Vec::new(),
             limit_rate: Default::default(),
             vars: Default::default(),
@@ -1359,6 +1393,13 @@ mod tests {
         for _ in 1..answers.len() {
             assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3], &|_| 0).is_none());
         }
+    }
+
+    #[test]
+    fn unsafe_uris() {
+        assert_eq!(unsafe_uri("/a%20b?c=1"), Some(("/a b".into(), Some("c=1".into()))));
+        assert_eq!(unsafe_uri("/a%3Fd?c"), Some(("/a".into(), Some("d".into()))));
+        for u in ["", "?a", "..", "../a", "/a/..", "/a/../b", "/a/.%2e", "/a\0"] { assert_eq!(unsafe_uri(u), None, "{u}"); }
     }
 
     #[test]
@@ -1565,7 +1606,7 @@ mod tests {
         let s = &config.servers[0];
         let rate = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            String::from_utf8(answer(s, &r, Ok(()), location(s, &r.uri)).0.body).unwrap()
+            String::from_utf8(super::answer(s, &r, Ok(()), location(s, &r.uri)).0.body).unwrap()
         };
         assert_eq!(rate("/a?l=40k"), "40960");
         assert_eq!(rate("/a?l=2M"), "2097152");
@@ -1588,6 +1629,15 @@ mod tests {
         // "0" and "" are false.
         assert_eq!(answer("/?a=0"), ("x".to_string(), 0));
         assert_eq!(answer("/"), ("x".to_string(), 0));
+        // return in an if of the server answers at once.
+        let text = "http { server { if ($arg_r) { return 200 r; } location / { return 200 l; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let body = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            String::from_utf8(super::answer(s, &r, Ok(()), location(s, &r.uri)).0.body).unwrap()
+        };
+        assert_eq!((body("/?r=1"), body("/")), ("r".to_string(), "l".to_string()));
         let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { server { set $uri x; } }"), "the duplicate \"uri\" variable in t:1");
         assert_eq!(refused("http { server { if $a { } } }"), "invalid condition \"$a\" in t:1");

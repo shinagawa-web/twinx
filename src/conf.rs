@@ -72,6 +72,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("keepalive_disable", HSL, 1, usize::MAX, false),
     ("error_page", HSL | LIF, 2, usize::MAX, false),
     ("proxy_pass", LOC | LIF, 1, 1, false),
+    ("proxy_method", HSL, 1, 1, false),
     ("expires", HSL | LIF, 1, 2, false),
     ("post_action", HSL, 1, 1, false),
     ("alias", LOC, 1, 1, false),
@@ -296,6 +297,9 @@ pub struct Level {
     /// evaluated when the answer is sent.
     pub limit_rate: Template,
     pub limit_rate_after: Template,
+    /// proxy_method: the method, which may have variables, sent to proxied
+    /// servers instead of the request's.
+    pub proxy_method: Option<Template>,
     /// proxy_limit_rate: the rate a proxied answer is read at, a size that may
     /// have variables, evaluated once its head has come; 0 or none is no limit.
     pub proxy_limit_rate: Template,
@@ -596,6 +600,7 @@ impl Builder<'_> {
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
                 "limit_rate" => level.limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "limit_rate_after" => level.limit_rate_after = size_value(&d.args[0]).map_err(at)?,
+                "proxy_method" => level.proxy_method = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_limit_rate" => level.proxy_limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "if_modified_since" => level.if_modified_since = [("off", None), ("exact", Some(false)), ("before", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"if_modified_since\" directive, it must be \"off\", \"exact\" or \"before\"", d.args[0])))?.1,
                 _ => {}
@@ -612,11 +617,12 @@ impl Builder<'_> {
         if let Some(path) = path { level.proxy_cookie_path = path; }
         if let Some(flags) = flags { level.proxy_cookie_flags = flags; }
         // An if block inherits everything its level has, wherever it is written there.
+        // One in a server block gives a level only to return, which answers at once.
         for (i, d) in ifs {
             let mut inner = Level { script: Vec::new(), server_script: Vec::new(), ..level.clone() };
             self.level(d.block.as_deref().unwrap_or_default(), if ctx == SRV { SIF } else { LIF }, &mut inner)?;
             let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
-            if let Op::If(_, body, to) = &mut script[i] { (*body, *to) = (std::mem::take(&mut inner.script), (ctx != SRV).then(|| Arc::new(inner))); }
+            if let Op::If(_, body, to) = &mut script[i] { (*body, *to) = (std::mem::take(&mut inner.script), (ctx != SRV || inner.ret.is_some()).then(|| Arc::new(inner))); }
         }
         Ok(())
     }
@@ -1115,6 +1121,8 @@ mod tests {
         let level = &c.servers[0].level;
         assert_eq!((level.limit_rate.0.len(), level.limit_rate_after.0.len()), (1, 1));
         assert_eq!(build_text("http { limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
+        let c = build_text("http { proxy_method POST; server { location / { } } }").unwrap();
+        assert_eq!(c.servers[0].locations[0].level.proxy_method.as_ref().map(|m| m.0.len()), Some(1));
         let c = build_text("http { proxy_limit_rate $upstream_http_x_rate; server { proxy_limit_rate 8k; } }").unwrap();
         assert_eq!(c.servers[0].level.proxy_limit_rate.0.len(), 1);
         assert_eq!(build_text("http { proxy_limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
