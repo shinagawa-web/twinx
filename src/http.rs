@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::conf::{Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, Step, TryFiles};
+use crate::conf::{Condition, Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, Step, TryFiles};
 use crate::vars::{Part, Template};
 use crate::expires;
 use crate::upstream::{Peer, Upstream};
@@ -688,13 +688,27 @@ fn run<'a>(r: &Request, ops: &'a [Op], mut level: &'a Level) -> &'a Level {
             // set $limit_rate: a value that is not a size leaves it as it was.
             Op::Set(name, value) if name == "limit_rate" => if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.limit_rate.set(rate); },
             Op::Set(name, value) => r.set_var(name, value.render(r, &Sent::default())),
-            Op::If(cond, body, to) => {
-                let value = cond.render(r, &Sent::default());
-                if !value.is_empty() && value != "0" { level = run(r, body, to.as_deref().unwrap_or(level)); }
-            }
+            Op::If(cond, body, to) => if holds(r, cond) { level = run(r, body, to.as_deref().unwrap_or(level)); },
         }
     }
     level
+}
+
+/// Whether the condition of an if holds; a regular expression that matches
+/// gives its captures.
+fn holds(r: &Request, cond: &Condition) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let value = |t: &Template| t.render(r, &Sent::default());
+    match cond {
+        Condition::Var(var) => !matches!(value(var).as_str(), "" | "0"),
+        Condition::Equal(var, to, not) => (value(var) == value(to)) != *not,
+        Condition::Match(var, re, not) => re.captures(&value(var)).map(|c| r.set_captures(&c)).is_some() != *not,
+        Condition::File(path, test, not) => {
+            let meta = std::fs::metadata(value(path));
+            let is = meta.is_ok_and(|m| match test { 'f' => m.is_file(), 'd' => m.is_dir(), 'x' => m.permissions().mode() & 0o111 != 0, _ => true });
+            is != *not
+        }
+    }
 }
 
 /// Serves a file under root (or alias), as nginx's static module does; a
@@ -1888,8 +1902,34 @@ mod tests {
         let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { server { set $uri x; } }"), "the duplicate \"uri\" variable in t:1");
         assert_eq!(refused("http { server { if $a { } } }"), "invalid condition \"$a\" in t:1");
-        assert!(refused("http { server { if ($a = b) { } } }").contains("does not support"));
+        assert_eq!(refused("http { server { if ($arg_a <> b) { } } }"), "invalid condition \"($arg_a\" in t:1");
+        assert_eq!(refused("http { server { if ($arg_a ~ a( ) { } } }").split(':').next().unwrap(), "invalid regular expression \"a(\"");
         assert_eq!(refused("http { server { location / { if ($arg_a) { listen 80; } } } }"), "\"listen\" directive is not allowed here in t:1");
+    }
+
+    #[test]
+    fn if_conditions() {
+        let dir = std::env::temp_dir().join(format!("twinx-if-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("f"), "").unwrap();
+        let text = format!("http {{ server {{ location /eq {{ if ( $arg_c != 1 ) {{ return 204; }} }} \
+                            location /re {{ if ($arg_c ~* ^F(o+)) {{ return 200 $1; }} }} \
+                            location /f {{ if (!-f {d}/$arg_c) {{ return 204; }} }} location /x {{ if (-x {d}/$arg_c) {{ return 204; }} }} \
+                            location /e {{ if (-e {d}/$arg_c) {{ return 204; }} }} location /d {{ if (-d {d}/$arg_c) {{ return 204; }} }} }} }}", d = dir.display());
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            let resp = answer(s, &r, Ok(()), location(s, &r.uri)).0;
+            (resp.status, String::from_utf8(resp.body).unwrap())
+        };
+        assert_eq!((get("/eq?c=2").0, get("/eq?c=1").0), (204, 404));
+        assert_eq!(get("/re?c=fOOd"), (200, "OO".to_string()));
+        assert_eq!(get("/re?c=bar").0, 404);
+        assert_eq!((get("/f?c=d").0, get("/f?c=f").0), (204, 404));
+        assert_eq!((get("/x?c=d").0, get("/x?c=f").0), (204, 404));
+        assert_eq!((get("/e?c=f").0, get("/e?c=n").0), (204, 404));
+        assert_eq!((get("/d?c=d").0, get("/d?c=f").0), (204, 404));
     }
 
     #[test]

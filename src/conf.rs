@@ -186,7 +186,20 @@ pub enum Op {
     /// if ($variable) { ... }: when the value is neither empty nor "0", the
     /// directives of the block, and from then on the settings of the block
     /// (None for a block in a server, whose settings the location replaces).
-    If(Template, Vec<Op>, Option<Arc<Level>>),
+    If(Condition, Vec<Op>, Option<Arc<Level>>),
+}
+
+/// The condition of if, the last field of each saying whether it is negated ("!").
+#[derive(Debug, Clone)]
+pub enum Condition {
+    /// $variable: true when neither empty nor "0".
+    Var(Template),
+    /// $variable = value, $variable != value.
+    Equal(Template, Template, bool),
+    /// $variable ~ regex, ~* (caseless), !~, !~*: the captures become $1, $2, ...
+    Match(Template, regex::Regex, bool),
+    /// -f, -d, -e or -x (the letter) and the path.
+    File(Template, char, bool),
 }
 
 /// proxy_cookie_domain and proxy_cookie_path: what a Domain or Path attribute
@@ -908,11 +921,23 @@ fn set(args: &[String]) -> Result<Op, String> {
 
 /// The condition of if, "(" and ")" around it. Of the conditions nginx has,
 /// twinx has only a variable alone, true when not empty and not "0".
-fn condition(args: &[String]) -> Result<Template, String> {
-    let all = args.join(" ");
-    let inner = all.strip_prefix('(').and_then(|c| c.strip_suffix(')')).ok_or_else(|| format!("invalid condition \"{}\"", args[0]))?;
-    if !inner.starts_with('$') || inner.contains(' ') { return Err(format!("twinx does not support the condition \"{inner}\" yet")); }
-    Template::parse(inner)
+fn condition(args: &[String]) -> Result<Condition, String> {
+    // As ngx_http_rewrite_if_condition() reads it: "(" and ")" may be arguments of their own.
+    let invalid = || format!("invalid condition \"{}\"", args[0]);
+    let mut words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let last = words.len() - 1;
+    words[0] = words[0].strip_prefix('(').ok_or_else(invalid)?;
+    words[last] = words[last].strip_suffix(')').ok_or_else(invalid)?;
+    words.retain(|w| !w.is_empty());
+    match words[..] {
+        [var] if var.starts_with('$') => Ok(Condition::Var(Template::parse(var)?)),
+        [var, op @ ("=" | "!="), value] if var.starts_with('$') => Ok(Condition::Equal(Template::parse(var)?, Template::parse(value)?, op == "!=")),
+        [var, op @ ("~" | "~*" | "!~" | "!~*"), re] if var.starts_with('$') => {
+            let regex = regex::Regex::new(&format!("{}{}", if op.ends_with('*') { "(?i)" } else { "" }, pcre(re))).map_err(|e| format!("invalid regular expression \"{re}\": {e}"))?;
+            Ok(Condition::Match(Template::parse(var)?, regex, op.starts_with('!')))
+        }
+        [op @ ("-f" | "-d" | "-e" | "-x" | "!-f" | "!-d" | "!-e" | "!-x"), path] => Ok(Condition::File(Template::parse(path)?, op.chars().last().unwrap_or_default(), op.starts_with('!'))), _ => Err(invalid()),
+    }
 }
 
 /// proxy_cookie_flags off | cookie [flag ...]: the cookie is a name, which may
