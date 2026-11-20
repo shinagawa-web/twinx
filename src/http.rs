@@ -96,6 +96,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             upstream_addr: None,
             captures: Vec::new(),
             limit_rate: Default::default(),
+            client: std::os::fd::AsRawFd::as_raw_fd(&stream),
         };
         // Header lines are read with the settings of the default server of the address.
         let default = config.servers.iter().find(|s| s.listen.contains(&listen)).unwrap_or(&config.servers[0]);
@@ -214,7 +215,9 @@ struct Response {
     internal: Option<String>,
     /// The proxied servers tried ($upstream_addr), and how long each took ($upstream_response_time).
     upstream_addr: Option<String>,
-    upstream_time: Option<String>,
+    upstream_time: Option<Vec<[Option<u128>; 3]>>,
+    /// The host of the proxy_pass URL ($proxy_host).
+    proxy_host: Option<String>,
     /// Whether the internal redirect makes the request a GET, unless it is a
     /// HEAD (X-Accel-Redirect).
     as_get: bool,
@@ -360,10 +363,16 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let so_far = |resp: &Response, trailers: &[(String, String)]| {
         let ctype = resp.ctype.iter().map(|t| ("Content-Type".to_string(), t.clone()));
         let headers = ctype.chain(resp.headers.iter().cloned()).collect();
-        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), upstream_addr: resp.upstream_addr.clone(), upstream_time: resp.upstream_time.clone(), ..Sent::default() }
+        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), upstream_addr: resp.upstream_addr.clone(), upstream_time: resp.upstream_time.clone(), proxy_host: resp.proxy_host.clone(), ..Sent::default() }
+    };
+    // While the head is made, the last proxied server is still sending ($upstream_response_time).
+    let at_head = |resp: &Response| {
+        let mut sent = so_far(resp, &[]);
+        sent.upstream_time.iter_mut().filter_map(|t| t.last_mut()).for_each(|t| t[2] = None);
+        sent
     };
     for (name, value, _) in level.add_header.iter().filter(|h| h.2 || added) {
-        let value = value.render(r, &so_far(&resp, &[]));
+        let value = value.render(r, &at_head(&resp));
         // These replace what the response has, and an empty value removes it.
         if ["etag", "last-modified"].contains(&name.to_ascii_lowercase().as_str()) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case(name)); }
         if !value.is_empty() { resp.headers.push((name.clone(), value)); }
@@ -378,7 +387,9 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1");
     let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown);
     let mut out = Vec::new();
-    if status != 444 {
+    // 444 closes the connection without an answer; 499 is the status of a client that closed it.
+    let silent = [444, 499].contains(&status);
+    if !silent {
         let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
         let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
         let ctype = resp.ctype.as_ref().map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
@@ -391,7 +402,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
         out = (head + "\r\n").into_bytes();
     }
-    let body_len = if r.method == "HEAD" || status == 444 { 0 } else { resp.body.len() };
+    let body_len = if r.method == "HEAD" || silent { 0 } else { resp.body.len() };
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
     out.extend_from_slice(&resp.body[..body_len]);
     // The trailers are made after the body, each seeing those before it ($sent_trailer_*).
@@ -412,7 +423,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let sent = Sent { bytes: out.len(), body: body_len, ..so_far(&resp, &trailers) };
     if written { post_action(server, r, level); }
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
-    (written && keepalive && status != 444).then_some(level.keepalive_timeout)
+    (written && keepalive && !silent).then_some(level.keepalive_timeout)
 }
 
 /// post_action: once the answer is sent, the request is redirected internally
@@ -655,14 +666,15 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let rest = escape_uri(r.uri.get(prefix.len()..).unwrap_or_default());
     let (host, uri, up) = match &p.url {
         None => (p.host.clone(), p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{rest}{}", args(r))), p.upstream.clone()),
-        Some(url) => match resolved(&url.render(r, &Sent::default()), level, r) {
+        Some(url) => match resolved(&url.render(r, &Sent::default()), p, level, r) {
             Some(t) => t,
             None => return special(502),
         },
     };
     let body = r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default());
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
-    let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &Sent::default()))).collect();
+    let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
+    let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &sent))).collect();
     let is_set = |name: &str| set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
     let mut req = format!("{} {uri} HTTP/1.0\r\n", r.method);
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
@@ -677,15 +689,15 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let (mut tried, mut answer, mut addrs, mut times) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new());
     while answer.is_none() && let Some(i) = up.pick(&mut tried) {
         addrs.push(up.peers[i].addr.to_string());
-        let start = Instant::now();
-        answer = fetch(&up.peers[i].addr, &req, level.proxy_connect_timeout);
-        let ms = start.elapsed().as_millis();
-        times.push(format!("{}.{:03}", ms / 1000, ms % 1000));
+        let (start, mut time) = (Instant::now(), [None; 3]);
+        answer = fetch(&up.peers[i].addr, &req, level, r.client, &mut time);
+        time[2] = Some(start.elapsed().as_millis());
+        times.push(time);
         up.done(i, answer.is_none());
     }
-    let (upstream_addr, upstream_time) = (Some(addrs.join(", ")), Some(times.join(", ")));
-    let Some(mut resp) = answer else { return Response { upstream_addr, upstream_time, ..special(502) } };
-    (resp.upstream_addr, resp.upstream_time) = (upstream_addr, upstream_time);
+    let (upstream_addr, upstream_time, proxy_host) = (Some(addrs.join(", ")), Some(times), Some(host));
+    let Some(mut resp) = answer else { return Response { upstream_addr, upstream_time, proxy_host, ..special(502) } };
+    (resp.upstream_addr, resp.upstream_time, resp.proxy_host) = (upstream_addr, upstream_time, proxy_host);
     // X-Accel-Limit-Rate sets the rate the answer is sent at; X-Accel-Redirect
     // replaces the answer with an internal redirect to its URI.
     let accel = |name: &str| resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
@@ -698,11 +710,12 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
 }
 
 /// The Host, the URI and the servers of a proxy_pass URL with variables: its
-/// host is an address, or a name the location's resolver looks up. The URI,
-/// when the URL has one, is sent as it is.
-fn resolved(url: &str, level: &Level, r: &Request) -> Option<(String, String, Arc<Upstream>)> {
+/// host is an upstream group, an address, or a name the location's resolver
+/// looks up. The URI, when the URL has one, is sent as it is.
+fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String, String, Arc<Upstream>)> {
     let rest = url.strip_prefix("http://")?;
     let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
+    if let Some(up) = p.groups.get(host) { return Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), up.clone())); }
     let (name, port) = host.rsplit_once(':').map_or(Some((host, 80)), |(h, p)| p.parse().ok().map(|p| (h, p)))?;
     let resolve = || level.resolver.as_ref()?.resolve(name, level.resolver_timeout);
     let addrs = name.parse::<IpAddr>().map(|a| vec![a]).ok().or_else(resolve)?;
@@ -710,33 +723,69 @@ fn resolved(url: &str, level: &Level, r: &Request) -> Option<(String, String, Ar
     Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), Arc::new(Upstream::new(peers))))
 }
 
-/// Sends a request to one server and reads its whole answer.
-fn fetch(peer: &SocketAddr, req: &[u8], connect: Duration) -> Option<Response> {
-    let timeout = Duration::from_secs(60);
-    let mut s = TcpStream::connect_timeout(peer, connect).ok()?;
-    let _ = s.set_read_timeout(Some(timeout));
+/// Sends a request to one server and reads its whole answer, noting how long
+/// it took to connect and to send the response head. While it waits for the
+/// head, the client closing the connection ends the request with 499, as
+/// proxy_ignore_client_abort off does.
+fn fetch(peer: &SocketAddr, req: &[u8], level: &Level, client: i32, time: &mut [Option<u128>; 3]) -> Option<Response> {
+    let start = Instant::now();
+    let mut s = TcpStream::connect_timeout(peer, level.proxy_connect_timeout).ok()?;
+    time[0] = Some(start.elapsed().as_millis());
+    let _ = s.set_read_timeout(Some(level.proxy_read_timeout));
     let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
     s.write_all(req).ok()?;
     let end = loop {
         if let Some(end) = head_end(&answer) { break end; }
+        if client_closed(&s, client, level.proxy_read_timeout)? { return Some(Response { status: 499, ..Response::default() }); }
         let n = s.read(&mut chunk).ok().filter(|n| *n > 0)?;
         answer.extend_from_slice(&chunk[..n]);
     };
+    time[1] = Some(start.elapsed().as_millis());
     let head = String::from_utf8_lossy(&answer[..end]).into_owned();
-    // The body of an answer that redirects with X-Accel-Redirect is not read.
-    let accel = head.split('\n').any(|l| l.get(..17).is_some_and(|n| n.eq_ignore_ascii_case("x-accel-redirect:")));
-    if !accel { s.read_to_end(&mut answer).ok()?; }
     let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
     let status = lines.next()?.strip_prefix("HTTP/1.")?.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()?;
-    let mut resp = Response { status, body: answer[end..].to_vec(), ..Response::default() };
+    let mut resp = Response { status, ..Response::default() };
     const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
     for (name, value) in lines.filter_map(|l| l.split_once(':')) {
         let (lower, value) = (name.to_ascii_lowercase(), value.trim().to_string());
         resp.upstream.push((name.to_string(), value.clone()));
         if lower == "content-type" { resp.ctype = Some(value); continue; }
-        if !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
+        // A second Expires is ignored.
+        let again = lower == "expires" && resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("expires"));
+        if !again && !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
     }
+    // The body's length: one Content-Length of digits, or one "Transfer-Encoding:
+    // chunked" without it; any other mix makes the answer invalid. A HEAD, 204
+    // or 304 answer has no body.
+    let values = |name: &str| resp.upstream.iter().filter(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone()).collect::<Vec<_>>();
+    let length = match (&values("content-length")[..], &values("transfer-encoding")[..]) {
+        ([], []) => None,
+        ([l], []) => Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten()?),
+        ([], [c]) if c.eq_ignore_ascii_case("chunked") => None,
+        _ => return None,
+    };
+    let length = if req.starts_with(b"HEAD ") || [204, 304].contains(&status) { Some(0) } else { length };
+    // The body of an answer that redirects with X-Accel-Redirect is not read;
+    // otherwise it is read up to its length, or until the server closes the connection.
+    let accel = resp.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect"));
+    while !accel && length.is_none_or(|n| answer.len() - end < n) {
+        let n = s.read(&mut chunk).ok()?;
+        if n == 0 { break; }
+        answer.extend_from_slice(&chunk[..n]);
+    }
+    let body = &answer[end..];
+    resp.body = body[..length.unwrap_or(body.len()).min(body.len())].to_vec();
     Some(resp)
+}
+
+/// Waits until the proxied server sends something or the client closes the
+/// connection (true); None when proxy_read_timeout passes first.
+fn client_closed(s: &TcpStream, client: i32, timeout: Duration) -> Option<bool> {
+    use std::os::fd::AsRawFd;
+    let mut fds = [libc::pollfd { fd: s.as_raw_fd(), events: libc::POLLIN, revents: 0 }, libc::pollfd { fd: client, events: libc::POLLRDHUP, revents: 0 }];
+    // SAFETY: fds is an array of two pollfd that lives through the call.
+    let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout.as_millis().try_into().unwrap_or(i32::MAX)) };
+    (n > 0).then_some(fds[1].revents != 0)
 }
 
 /// Fills the request from its head, or gives the status nginx refuses it with.
@@ -934,6 +983,7 @@ mod tests {
             upstream_addr: None,
             captures: Vec::new(),
             limit_rate: Default::default(),
+            client: -1,
         };
         (parse(&mut r, head.as_bytes(), &Level::default()), r)
     }
@@ -1003,10 +1053,40 @@ mod tests {
             let _ = s.read(&mut buf).unwrap();
             s.write_all(b"HTTP/1.1 201 Created\r\nServer: x\r\nContent-Type: a/b\r\nX-A: 1\r\nX-Accel-B: 2\r\n\r\nbody").unwrap();
         });
-        let resp = fetch(&addr, b"GET / HTTP/1.0\r\n\r\n", Duration::from_secs(1)).unwrap();
+        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
+        let mut time = [None; 3];
+        let resp = fetch(&addr, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut time).unwrap();
+        assert!(time[0].is_some() && time[1].is_some());
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
         assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
+    }
+
+    #[test]
+    fn checks_the_length_of_answers() {
+        let answers: [&[u8]; 4] = [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nExpires: a\r\nExpires: b\r\n\r\nabcd",
+            b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for answer in answers {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = s.read(&mut [0u8; 1024]).unwrap();
+                s.write_all(answer).unwrap();
+                // The connection stays open: Content-Length says where the body ends.
+                thread::spawn(move || { thread::sleep(Duration::from_secs(5)); drop(s) });
+            }
+        });
+        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
+        let resp = fetch(&addr, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3]).unwrap();
+        assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
+        for _ in 1..answers.len() {
+            assert!(fetch(&addr, b"GET / HTTP/1.0\r\n\r\n", &level, -1, &mut [None; 3]).is_none());
+        }
     }
 
     #[test]
@@ -1022,12 +1102,12 @@ mod tests {
             thread::sleep(Duration::from_secs(5));
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
-        let p = Proxy { host: "h".into(), upstream, uri: None, url: None };
-        let level = Level { proxy_connect_timeout: Duration::from_secs(1), ..Level::default() };
+        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default() };
+        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("POST /a HTTP/1.0\n\n");
         let resp = proxy(&p, &level, &r, "");
         assert_eq!((resp.internal.as_deref(), resp.as_get, r.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
-        assert!(resp.upstream_time.unwrap().starts_with("0."));
+        assert!(resp.upstream_time.unwrap()[0][2].unwrap() < 1000);
     }
 
     #[test]
@@ -1082,8 +1162,8 @@ mod tests {
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: a/b\r\nX-Location: 1\r\nX-B: 2\r\n\r\n").unwrap();
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
-        let p = Proxy { host: "h".into(), upstream, uri: None, url: None };
-        let level = Level { proxy_hide_header: vec!["x-location".into(), "content-type".into()], proxy_connect_timeout: Duration::from_secs(1), ..Level::default() };
+        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default() };
+        let level = Level { proxy_hide_header: vec!["x-location".into(), "content-type".into()], proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("GET / HTTP/1.0\n\n");
         let resp = proxy(&p, &level, &r, "/");
         assert_eq!(resp.upstream_addr, Some(addr.to_string()));
@@ -1093,10 +1173,13 @@ mod tests {
     #[test]
     fn urls_with_variables() {
         let (_, r) = request("GET /a?b HTTP/1.0\n\n");
-        let (host, uri, up) = resolved("http://127.0.0.2:81/x", &Level::default(), &r).unwrap();
+        let group = Arc::new(Upstream::new(Vec::new()));
+        let p = Proxy { host: String::new(), upstream: group.clone(), uri: None, url: None, groups: [("u".to_string(), group)].into() };
+        assert_eq!(resolved("http://u/y", &p, &Level::default(), &r).map(|t| (t.0, t.1)), Some(("u".into(), "/y".into())));
+        let (host, uri, up) = resolved("http://127.0.0.2:81/x", &p, &Level::default(), &r).unwrap();
         assert_eq!((host.as_str(), uri.as_str(), up.peers[0].addr.to_string()), ("127.0.0.2:81", "/x", "127.0.0.2:81".to_string()));
-        assert_eq!(resolved("http://127.0.0.2", &Level::default(), &r).map(|t| (t.0, t.1)), Some(("127.0.0.2".into(), "/a?b".into())));
-        assert!(resolved("http://example.net/x", &Level::default(), &r).is_none());
+        assert_eq!(resolved("http://127.0.0.2", &p, &Level::default(), &r).map(|t| (t.0, t.1)), Some(("127.0.0.2".into(), "/a?b".into())));
+        assert!(resolved("http://example.net/x", &p, &Level::default(), &r).is_none());
     }
 
     #[test]

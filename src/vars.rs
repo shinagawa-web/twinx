@@ -36,6 +36,9 @@ pub struct Request {
     pub upstream_addr: Option<String>,
     /// The named captures of the server name that matched the host.
     pub captures: Vec<(String, String)>,
+    /// The client's socket, watched for the client closing the connection while
+    /// a proxied server is answering; -1 when there is none.
+    pub client: i32,
     /// $limit_rate, which set changes; shared by the internal redirects of the request.
     pub limit_rate: std::sync::Arc<Rate>,
 }
@@ -75,8 +78,12 @@ pub struct Sent {
     pub trailers: Vec<(String, String)>,
     /// The proxied servers tried, as $upstream_addr gives them.
     pub upstream_addr: Option<String>,
-    /// How long each of them took to answer ($upstream_response_time).
-    pub upstream_time: Option<String>,
+    /// For each of them, the milliseconds it took to connect, to send the
+    /// response head and to send the whole answer, None when it did not
+    /// ($upstream_connect_time, $upstream_header_time, $upstream_response_time).
+    pub upstream_time: Option<Vec<[Option<u128>; 3]>>,
+    /// The host of the proxy_pass URL ($proxy_host, $proxy_port).
+    pub proxy_host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,7 +115,11 @@ pub enum Var {
     RequestPort,
     IsRequestPort,
     UpstreamAddr,
-    UpstreamResponseTime,
+    /// $upstream_connect_time (0), $upstream_header_time (1), $upstream_response_time (2).
+    UpstreamTime(usize),
+    ProxyHost,
+    ProxyPort,
+    ProxyAddXForwardedFor,
     Pid,
     ServerName,
     LimitRate,
@@ -135,7 +146,8 @@ impl Var {
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
             ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
             ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("pid", Var::Pid),
-            ("upstream_response_time", Var::UpstreamResponseTime),
+            ("upstream_connect_time", Var::UpstreamTime(0)), ("upstream_header_time", Var::UpstreamTime(1)), ("upstream_response_time", Var::UpstreamTime(2)),
+            ("proxy_host", Var::ProxyHost), ("proxy_port", Var::ProxyPort), ("proxy_add_x_forwarded_for", Var::ProxyAddXForwardedFor),
             ("server_name", Var::ServerName), ("limit_rate", Var::LimitRate),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
@@ -181,7 +193,13 @@ impl Var {
             Var::LimitRate => r.limit_rate.get().unwrap_or(0).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
             Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
-            Var::UpstreamResponseTime => s.upstream_time.clone()?,
+            Var::UpstreamTime(i) => {
+                let time = |t: &[Option<u128>; 3]| t[*i].map_or("-".to_string(), |ms| format!("{}.{:03}", ms / 1000, ms % 1000));
+                s.upstream_time.as_ref()?.iter().map(time).collect::<Vec<_>>().join(", ")
+            }
+            Var::ProxyHost => s.proxy_host.clone()?,
+            Var::ProxyPort => s.proxy_host.as_ref()?.rsplit_once(':').map_or("80", |(_, p)| p).to_string(),
+            Var::ProxyAddXForwardedFor => joined(&r.headers, "x-forwarded-for", ", ").map_or_else(|| r.peer.ip().to_string(), |x| format!("{x}, {}", r.peer.ip())),
             Var::Args => r.target.split_once('?').map_or("", |(_, a)| a).to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
@@ -382,6 +400,7 @@ mod tests {
             upstream_addr: None,
             captures: Vec::new(),
             limit_rate: Default::default(),
+            client: -1,
         }
     }
 
@@ -418,6 +437,17 @@ mod tests {
     }
 
     #[test]
+    fn proxy_variables() {
+        let t = Template::parse("$proxy_host|$proxy_port|$proxy_add_x_forwarded_for|$upstream_connect_time|$upstream_header_time").unwrap();
+        let mut r = request();
+        let s = Sent { proxy_host: Some("h:81".into()), upstream_time: Some(vec![[Some(2), None, None], [Some(1001), Some(1002), None]]), ..Sent::default() };
+        assert_eq!(t.render(&r, &s), "h:81|81|127.0.0.1|0.002, 1.001|-, 1.002");
+        r.headers.push(("X-Forwarded-For".into(), "192.0.2.1".into()));
+        let s = Sent { proxy_host: Some("u".into()), ..Sent::default() };
+        assert_eq!(t.render(&r, &s), "u|80|192.0.2.1, 127.0.0.1||");
+    }
+
+    #[test]
     fn pid_and_upstream_addr() {
         let mut r = request();
         r.upstream_addr = Some("a".into());
@@ -427,7 +457,7 @@ mod tests {
         let t = Template::parse("$upstream_response_time|$limit_rate").unwrap();
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"-|0");
         r.limit_rate.set(5);
-        assert_eq!(t.render(&r, &Sent { upstream_time: Some("0.001, 2.040".into()), ..Sent::default() }), "0.001, 2.040|5");
+        assert_eq!(t.render(&r, &Sent { upstream_time: Some(vec![[Some(1), None, Some(1)], [None, None, Some(2040)]]), ..Sent::default() }), "0.001, 2.040|5");
     }
 
     #[test]
