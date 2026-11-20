@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::conf::{Config, Fallback, Level, Match, Proxy, Rewrite, Server, ServerName, TryFiles};
+use crate::conf::{Config, CookiePattern, CookieRewrite, Fallback, Level, Match, Op, Proxy, Rewrite, Server, ServerName, TryFiles};
 use crate::vars::Template;
 use crate::expires;
 use crate::upstream::{Peer, Upstream};
@@ -96,6 +96,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             upstream_addr: None,
             captures: Vec::new(),
             limit_rate: Default::default(),
+            vars: Default::default(),
             client: std::os::fd::AsRawFd::as_raw_fd(&stream),
         };
         // Header lines are read with the settings of the default server of the address.
@@ -243,14 +244,11 @@ fn redirect(status: u16, location: String) -> Response {
 
 /// The answer the location gives, before error_page and the headers every answer gets.
 fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -> Response {
-    // set $limit_rate: a value that is not a size leaves it as it was.
-    for value in level.set.iter().filter(|_| parsed.is_ok()) {
-        if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.limit_rate.set(rate); }
-    }
     let rewrite = level.rewrite.iter().find(|rw| rw.regex.is_match(&r.uri));
     let url = rewrite.map(|rw| (rw, rw.url.render(r, &Sent::default()), args(r)));
     let with_args = |(rw, url, args): (&Rewrite, String, &str)| {
-        let sep = if url.contains('?') { "&" } else { "?" };
+        // "&" when the replacement as written has a "?", whatever its variables give.
+        let sep = if rw.url.0.iter().any(|p| matches!(p, crate::vars::Part::Text(t) if t.contains('?'))) { "&" } else { "?" };
         if rw.add_args && !args.is_empty() { format!("{url}{sep}{}", &args[1..]) } else { url }
     };
     match (parsed, url) {
@@ -263,7 +261,7 @@ fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -
             to.uri = to.target.split('?').next().unwrap_or_default().to_string();
             serve(&to, level, prefix, None)
         }
-        (Ok(()), Some(u)) => redirect(u.0.status, with_args(u)),
+        (Ok(()), Some((rw, url, a))) => redirect(rw.status, with_args((rw, unescape_redirect(&url), a))),
         (Ok(()), None) => serve(r, level, prefix, level.ret.as_ref()),
     }
 }
@@ -303,6 +301,25 @@ fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str) -> Respons
         Fallback::Status(code) => special(*code),
         Fallback::Uri(uri) => Response { internal: Some(uri.render(r, &sent)), ..Response::default() },
     }
+}
+
+/// The URL a rewrite redirects to, as ngx_unescape_uri() with
+/// NGX_UNESCAPE_REDIRECT leaves it: "%XX" of a character after "%" and before
+/// DEL is decoded and the others kept, an invalid escape loses its "%" (and,
+/// after a valid first digit, both characters), and a "?" ends the decoding.
+fn unescape_redirect(url: &str) -> String {
+    let (b, mut out, mut i) = (url.as_bytes(), Vec::new(), 0);
+    let hex = |at: usize| b.get(at).and_then(|&c| (c as char).to_digit(16)).map(|d| d as u8);
+    while i < b.len() {
+        if b[i] == b'?' { break; }
+        if b[i] != b'%' { out.push(b[i]); i += 1; continue; }
+        let (c, n) = match (hex(i + 1), hex(i + 2)) { (Some(h), Some(l)) => (Some(h << 4 | l), 3), (Some(_), None) => (None, 3), (None, _) => (None, 2) };
+        if c == Some(b'?') { out.push(b'?'); i += 3; break; }
+        match c { Some(c) if c > b'%' && c < 0x7f => out.push(c), Some(_) => out.extend_from_slice(&b[i..i + 3]), None => out.extend(b.get(i + 1).filter(|_| n == 2)) }
+        i = (i + n).min(b.len());
+    }
+    out.extend_from_slice(&b[i..]);
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// "?" and the arguments of the request, or "" when it has none.
@@ -512,6 +529,7 @@ fn browser(ua: &str) -> (bool, bool) {
 /// The answer of the location found, after the internal redirects of the
 /// index module, and the settings of the location that gave it.
 fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>) -> (Response, &'a Level, Request) {
+    if parsed.is_ok() { level = run(r, &level.script, run(r, &level.server_script, level)); }
     let mut resp = respond(r, parsed, (prefix, level, auto));
     let (mut redirects, mut to) = (0, r.clone());
     while let Some(target) = resp.internal.take() {
@@ -520,11 +538,28 @@ fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix,
         if resp.as_get && to.method != "HEAD" { to.method = "GET".to_string(); }
         to.uri = target.split('?').next().unwrap_or_default().to_string();
         to.target = target;
-        let found = location(server, &to.uri);
-        level = found.1;
-        resp = if redirects > 10 { special(500) } else { respond(&to, Ok(()), found) };
+        let (prefix, found, auto) = location(server, &to.uri);
+        level = run(&to, &found.script, run(&to, &found.server_script, found));
+        resp = if redirects > 10 { special(500) } else { respond(&to, Ok(()), (prefix, level, auto)) };
     }
     (resp, level, to)
+}
+
+/// Runs set and if in order, and gives the settings the request goes on with:
+/// those of the last if block whose condition held, else the level's own.
+fn run<'a>(r: &Request, ops: &'a [Op], mut level: &'a Level) -> &'a Level {
+    for op in ops {
+        match op {
+            // set $limit_rate: a value that is not a size leaves it as it was.
+            Op::Set(name, value) if name == "limit_rate" => if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.limit_rate.set(rate); },
+            Op::Set(name, value) => r.set_var(name, value.render(r, &Sent::default())),
+            Op::If(cond, body, to) => {
+                let value = cond.render(r, &Sent::default());
+                if !value.is_empty() && value != "0" { level = run(r, body, to.as_deref().unwrap_or(level)); }
+            }
+        }
+    }
+    level
 }
 
 /// Serves a file under root (or alias), as nginx's static module does; a
@@ -712,7 +747,45 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let hidden = |name: &str| level.proxy_hide_header.iter().any(|h| h.eq_ignore_ascii_case(name));
     resp.headers.retain(|h| !hidden(&h.0));
     if hidden("content-type") { resp.ctype = None; }
+    for h in resp.headers.iter_mut().filter(|h| h.0.eq_ignore_ascii_case("set-cookie")) {
+        if let Some(cookie) = rewrite_cookie(r, &h.1, level) { h.1 = cookie; }
+    }
     resp
+}
+
+/// proxy_cookie_domain and proxy_cookie_path: the Domain and Path attributes of
+/// a Set-Cookie the proxied server sends are replaced by the first rewrite that
+/// matches them. A cookie changed is written again as nginx writes it, its
+/// attributes separated by "; "; None leaves it as it was.
+fn rewrite_cookie(r: &Request, cookie: &str, level: &Level) -> Option<String> {
+    let mut attrs: Vec<(&str, Option<String>)> = cookie.split(';').map(|a| {
+        let a = a.trim_start_matches(' ');
+        a.split_once('=').map_or((a.trim_end_matches(' '), None), |(n, v)| (n.trim_end_matches(' '), Some(v.trim_matches(' ').to_string())))
+    }).collect();
+    attrs[0].1.as_ref()?;
+    let mut changed = false;
+    for (name, value) in attrs.iter_mut().skip(1) {
+        let (domain, rules) = match name.to_ascii_lowercase().as_str() { "domain" => (true, &level.proxy_cookie_domain), "path" => (false, &level.proxy_cookie_path), _ => continue };
+        let (Some(rules), Some(v)) = (rules, value.as_mut()) else { continue };
+        if let Some(new) = rules.iter().find_map(|rw| cookie_value(r, rw, v, domain)) { (*v, changed) = (new, true); }
+    }
+    changed.then(|| attrs.iter().map(|(n, v)| v.as_ref().map_or(n.to_string(), |v| format!("{n}={v}"))).collect::<Vec<_>>().join("; "))
+}
+
+/// The value one rewrite makes of a Domain or Path, None when it does not match.
+fn cookie_value(r: &Request, rw: &CookieRewrite, value: &str, domain: bool) -> Option<String> {
+    let replacement = || rw.replacement.render(r, &Sent::default());
+    match &rw.pattern {
+        CookiePattern::Regex(re) => {
+            r.set_captures(&re.captures(value)?);
+            Some(replacement())
+        }
+        CookiePattern::Text(p) if domain => {
+            let (dot, rest) = value.strip_prefix('.').map_or(("", value), |rest| (".", rest));
+            rest.eq_ignore_ascii_case(&p.render(r, &Sent::default())).then(|| format!("{dot}{}", replacement()))
+        }
+        CookiePattern::Text(p) => value.strip_prefix(p.render(r, &Sent::default()).as_str()).map(|rest| format!("{}{rest}", replacement())),
+    }
 }
 
 /// The Host, the URI and the servers of a proxy_pass URL with variables: its
@@ -1029,6 +1102,7 @@ mod tests {
             upstream_addr: None,
             captures: Vec::new(),
             limit_rate: Default::default(),
+            vars: Default::default(),
             client: -1,
         };
         (parse(&mut r, head.as_bytes(), &Level::default()), r)
@@ -1341,6 +1415,10 @@ mod tests {
         assert_eq!(answer("/b?x=1"), (302, "http://e/?y=1&x=1".to_string()));
         assert_eq!(answer("/b"), (302, "http://e/?y=1".to_string()));
         assert_eq!(answer("/c?x=1"), (301, "http://e/".to_string()));
+        // The URL is unescaped as far as its first "?", the arguments are not.
+        assert_eq!(answer("/a?x=%2Fa%0D%3Fb%3D?c%3D"), (302, "http://e//a%0D?b%3D?c%3D?x=%2Fa%0D%3Fb%3D?c%3D".to_string()));
+        assert_eq!(unescape_redirect("/%zz/%4z/%41%3d?%41"), "/zz//A=?%41");
+        assert_eq!(unescape_redirect("/%4"), "/");
     }
 
     #[test]
@@ -1363,13 +1441,55 @@ mod tests {
         let s = &config.servers[0];
         let rate = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            String::from_utf8(respond(&r, Ok(()), location(s, &r.uri)).body).unwrap()
+            String::from_utf8(answer(s, &r, Ok(()), location(s, &r.uri)).0.body).unwrap()
         };
         assert_eq!(rate("/a?l=40k"), "40960");
         assert_eq!(rate("/a?l=2M"), "2097152");
         // A value that is not a size keeps what the server level set.
         assert_eq!(rate("/a?l=x"), "1024");
         assert_eq!(rate("/a"), "1024");
+    }
+
+    #[test]
+    fn set_and_if() {
+        let text = "http { server { set $s srv; if ($s) { set $t x; } location / { if ($arg_a) { set $v \"[$arg_a]\"; add_header X-If $s; } set $w $v$t; return 200 $v$w; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let answer = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            let (resp, level, _) = answer(s, &r, Ok(()), location(s, &r.uri));
+            (String::from_utf8(resp.body).unwrap(), level.add_header.len())
+        };
+        assert_eq!(answer("/?a=1"), ("[1][1]x".to_string(), 1));
+        // "0" and "" are false.
+        assert_eq!(answer("/?a=0"), ("x".to_string(), 0));
+        assert_eq!(answer("/"), ("x".to_string(), 0));
+        let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        assert_eq!(refused("http { server { set $uri x; } }"), "the duplicate \"uri\" variable in t:1");
+        assert_eq!(refused("http { server { if $a { } } }"), "invalid condition \"$a\" in t:1");
+        assert!(refused("http { server { if ($a = b) { } } }").contains("does not support"));
+        assert_eq!(refused("http { server { location / { if ($arg_a) { listen 80; } } } }"), "\"listen\" directive is not allowed here in t:1");
+    }
+
+    #[test]
+    fn rewrites_cookies() {
+        let text = "http { server { proxy_cookie_domain .a.org b.org; proxy_cookie_domain ~^(.+)\\.com$ $1.net; proxy_cookie_path /p/ /$server_name/; proxy_cookie_path ~*^/R/(.*) /$1; \
+                    location /off/ { proxy_cookie_domain off; proxy_cookie_path off; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let (on, off) = (&config.servers[0].level, &config.servers[0].locations[0].level);
+        let (_, r) = request("GET / HTTP/1.0\n\n");
+        let rw = |cookie: &str, level: &Level| rewrite_cookie(&r, cookie, level);
+        assert_eq!(rw("v=1;domain=.A.org", on).as_deref(), Some("v=1; domain=.b.org"));
+        assert_eq!(rw("v=1; Domain = x.COM ;Secure", on).as_deref(), Some("v=1; Domain=x.net; Secure"));
+        assert_eq!(rw("v=1; Path=/p/x; Domain=c.org", on).as_deref(), Some("v=1; Path=/localhost/x; Domain=c.org"));
+        assert_eq!(rw("v=1; Path=/r/x", on).as_deref(), Some("v=1; Path=/x"));
+        // Nothing matches, the cookie has no value, or the rewrites are off: as it was.
+        assert_eq!(rw("v=1; Path=/q/; Domain=c.org; Max-Age=1", on), None);
+        assert_eq!(rw("v; Path=/p/", on), None);
+        assert_eq!(rw("v=1; Path=/p/", off), None);
+        let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        assert_eq!(refused("http { proxy_cookie_path off; proxy_cookie_path /a /b; }"), "\"proxy_cookie_path\" directive is duplicate in t:1");
+        assert_eq!(refused("http { proxy_cookie_path on; }"), "invalid parameter \"on\" in t:1");
     }
 
     #[test]

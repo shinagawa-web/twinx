@@ -20,6 +20,9 @@ const HTTP: u8 = 4;
 const SRV: u8 = 8;
 const LOC: u8 = 16;
 const UPS: u8 = 32;
+/// An "if" block in a location, and in a server.
+const LIF: u8 = 64;
+const SIF: u8 = 128;
 const HSL: u8 = HTTP | SRV | LOC;
 
 /// Every directive twinx knows: where it may appear, its argument counts, and
@@ -41,11 +44,12 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("server_names_hash_max_size", HTTP, 1, 1, false),
     ("location", SRV | LOC, 1, 2, true),
     ("try_files", SRV | LOC, 2, usize::MAX, false),
-    ("return", SRV | LOC, 1, 2, false),
-    ("set", SRV | LOC, 2, 2, false),
-    ("root", HTTP | SRV | LOC, 1, 1, false),
+    ("return", SRV | LOC | SIF | LIF, 1, 2, false),
+    ("set", SRV | LOC | SIF | LIF, 2, 2, false),
+    ("if", SRV | LOC, 1, usize::MAX, true),
+    ("root", HSL | LIF, 1, 1, false),
     ("log_format", HTTP, 2, usize::MAX, false),
-    ("access_log", HTTP | SRV | LOC, 1, usize::MAX, false),
+    ("access_log", HSL | LIF, 1, usize::MAX, false),
     ("open_log_file_cache", HSL, 1, 4, false),
     ("client_body_temp_path", HTTP | SRV | LOC, 1, 4, false),
     ("proxy_temp_path", HTTP | SRV | LOC, 1, 4, false),
@@ -60,21 +64,21 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("client_body_in_file_only", HSL, 1, 1, false),
     ("client_body_in_single_buffer", HSL, 1, 1, false),
     ("client_max_body_size", HSL, 1, 1, false),
-    ("add_header", HSL, 2, 3, false),
-    ("add_trailer", HSL, 2, 3, false),
+    ("add_header", HSL | LIF, 2, 3, false),
+    ("add_trailer", HSL | LIF, 2, 3, false),
     ("keepalive_requests", HSL, 1, 1, false),
     ("keepalive_timeout", HSL, 1, 2, false),
     ("keepalive_time", HSL, 1, 1, false),
     ("keepalive_disable", HSL, 1, usize::MAX, false),
-    ("error_page", HSL, 2, usize::MAX, false),
-    ("proxy_pass", LOC, 1, 1, false),
-    ("expires", HSL, 1, 2, false),
+    ("error_page", HSL | LIF, 2, usize::MAX, false),
+    ("proxy_pass", LOC | LIF, 1, 1, false),
+    ("expires", HSL | LIF, 1, 2, false),
     ("post_action", HSL, 1, 1, false),
     ("alias", LOC, 1, 1, false),
     ("absolute_redirect", HSL, 1, 1, false),
     ("server_name_in_redirect", HSL, 1, 1, false),
     ("port_in_redirect", HSL, 1, 1, false),
-    ("rewrite", SRV | LOC, 2, 3, false),
+    ("rewrite", SRV | LOC | SIF | LIF, 2, 3, false),
     ("default_type", HSL, 1, 1, false),
     ("proxy_set_header", HSL, 2, 2, false),
     ("proxy_hide_header", HSL, 1, 1, false),
@@ -86,16 +90,18 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_buffering", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
     ("proxy_buffers", HSL, 2, 2, false),
+    ("proxy_cookie_domain", HSL, 1, 2, false),
+    ("proxy_cookie_path", HSL, 1, 2, false),
     ("resolver", HSL, 1, usize::MAX, false),
     ("resolver_timeout", HSL, 1, 1, false),
-    ("gzip", HSL, 1, 1, false),
+    ("gzip", HSL | LIF, 1, 1, false),
     ("gzip_static", HSL, 1, 1, false),
     ("gunzip", HSL, 1, 1, false),
     ("gzip_vary", HSL, 1, 1, false),
     ("gzip_http_version", HSL, 1, 1, false),
     ("gzip_types", HSL, 1, usize::MAX, false),
-    ("limit_rate", HSL, 1, 1, false),
-    ("limit_rate_after", HSL, 1, 1, false),
+    ("limit_rate", HSL | LIF, 1, 1, false),
+    ("limit_rate_after", HSL | LIF, 1, 1, false),
     ("if_modified_since", HSL, 1, 1, false),
 ];
 
@@ -138,14 +144,47 @@ pub struct Rewrite {
     pub internal: bool,
 }
 
+/// What set and if do, in the order they are written.
+#[derive(Debug, Clone)]
+pub enum Op {
+    /// set $name value.
+    Set(String, Template),
+    /// if ($variable) { ... }: when the value is neither empty nor "0", the
+    /// directives of the block, and from then on the settings of the block
+    /// (None for a block in a server, whose settings the location replaces).
+    If(Template, Vec<Op>, Option<Arc<Level>>),
+}
+
+/// proxy_cookie_domain and proxy_cookie_path: what a Domain or Path attribute
+/// of a Set-Cookie is matched against, and the value that replaces it.
+#[derive(Debug, Clone)]
+pub struct CookieRewrite {
+    pub pattern: CookiePattern,
+    pub replacement: Template,
+}
+
+#[derive(Debug, Clone)]
+pub enum CookiePattern {
+    /// A domain equal to it (case-insensitively, a leading "." of either left
+    /// out), or a path that starts with it.
+    Text(Template),
+    /// A regular expression the whole value is replaced on a match of.
+    Regex(regex::Regex),
+}
+
 /// The settings of one level (http, server or location) after inheriting from the one above.
 #[derive(Debug, Clone, Default)]
 pub struct Level {
     pub ret: Option<(u16, Template)>,
     /// rewrite directives, in order: the regular expression and the redirect it makes.
     pub rewrite: Vec<Rewrite>,
-    /// set $limit_rate: the values given to $limit_rate, in order.
-    pub set: Vec<Template>,
+    /// set and if of the server, run before those of the location.
+    pub server_script: Vec<Op>,
+    /// set and if of the location, which nested locations do not inherit.
+    pub script: Vec<Op>,
+    /// proxy_cookie_domain and proxy_cookie_path; None when off.
+    pub proxy_cookie_domain: Option<Vec<CookieRewrite>>,
+    pub proxy_cookie_path: Option<Vec<CookieRewrite>>,
     pub access_log: Vec<Arc<AccessLog>>,
     /// open_log_file_cache, for the access logs whose paths have variables.
     pub log_cache: Option<Arc<Cache>>,
@@ -372,6 +411,14 @@ impl Builder<'_> {
         // Named captures of server names are variables everywhere, so they are known first.
         let names = block.iter().filter(|d| d.name == "server").flat_map(|d| d.block.iter().flatten()).filter(|d| d.name == "server_name");
         names.flat_map(|d| d.args.iter()).filter(|n| n.starts_with('~')).for_each(|n| drop(server_name(n)));
+        // So are the variables set gives values to, wherever it is.
+        fn declare(block: &[Directive]) {
+            for d in block {
+                if let Some(name) = d.args.first().and_then(|a| a.strip_prefix('$')).filter(|_| d.name == "set") { crate::vars::add_user(name); }
+                declare(d.block.as_deref().unwrap_or_default());
+            }
+        }
+        declare(block);
         self.level(block, HTTP, &mut level)?;
         let servers = block.iter().filter(|d| d.name == "server");
         servers.map(|d| self.server(d.block.as_deref().unwrap_or_default(), &level)).collect()
@@ -398,7 +445,7 @@ impl Builder<'_> {
 
     fn locations(&mut self, block: &[Directive], parent: &Level, out: &mut Vec<Location>) -> Result<(), String> {
         for d in block.iter().filter(|d| d.name == "location") {
-            let mut level = Level { proxy: None, try_files: None, ..parent.clone() };
+            let mut level = Level { proxy: None, try_files: None, script: Vec::new(), ..parent.clone() };
             let inner = d.block.as_deref().unwrap_or_default();
             self.level(inner, LOC, &mut level)?;
             let (kind, path) = location(&d.args).map_err(|e| format!("{e} in {}", d.at))?;
@@ -418,13 +465,29 @@ impl Builder<'_> {
         let mut pages: Option<Vec<ErrorPage>> = None;
         let mut proxy_headers: Option<Vec<(String, Template)>> = None;
         let mut hidden: Option<Vec<String>> = None;
+        // proxy_cookie_domain and proxy_cookie_path of this level: Some(None) once "off".
+        let mut cookies: [Option<Option<Vec<CookieRewrite>>>; 2] = [None, None];
+        let mut ifs = Vec::new();
         for d in block {
             self.check(d, ctx)?;
             let at = |e: String| format!("{e} in {}", d.at);
             match d.name.as_str() {
                 "return" => level.ret = Some(ret(&d.args).map_err(at)?),
                 "rewrite" => level.rewrite.push(rewrite(&d.args).map_err(at)?),
-                "set" => level.set.push(set(&d.args).map_err(at)?),
+                "set" | "if" => {
+                    let op = if d.name == "set" { set(&d.args) } else { condition(&d.args).map(|c| Op::If(c, Vec::new(), None)) }.map_err(at)?;
+                    let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
+                    if d.name == "if" { ifs.push((script.len(), d)); }
+                    script.push(op);
+                }
+                "proxy_cookie_domain" | "proxy_cookie_path" => {
+                    let (i, rewrite) = (d.name.ends_with("path") as usize, cookie_rewrite(&d.args, d.name.ends_with("domain")).map_err(at)?);
+                    match (&mut cookies[i], rewrite) {
+                        (None, rewrite) => cookies[i] = Some(rewrite.map(|r| vec![r])),
+                        // More after "off", or "off" after more, is a duplicate.
+                        (Some(Some(list)), Some(rewrite)) => list.push(rewrite), _ => return Err(at(format!("\"{}\" directive is duplicate", d.name))),
+                    }
+                }
                 "root" => (level.root, level.alias) = (self.path(&d.args[0]), None),
                 "alias" => level.alias = Some(self.path(&d.args[0])),
                 "try_files" => level.try_files = Some(Arc::new(try_files(&d.args).map_err(at)?)),
@@ -512,6 +575,16 @@ impl Builder<'_> {
         if let Some(pages) = pages { level.error_page = pages; }
         if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
         if let Some(hidden) = hidden { level.proxy_hide_header = hidden; }
+        let [domain, path] = cookies;
+        if let Some(domain) = domain { level.proxy_cookie_domain = domain; }
+        if let Some(path) = path { level.proxy_cookie_path = path; }
+        // An if block inherits everything its level has, wherever it is written there.
+        for (i, d) in ifs {
+            let mut inner = Level { script: Vec::new(), server_script: Vec::new(), ..level.clone() };
+            self.level(d.block.as_deref().unwrap_or_default(), if ctx == SRV { SIF } else { LIF }, &mut inner)?;
+            let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
+            if let Op::If(_, body, to) = &mut script[i] { (*body, *to) = (std::mem::take(&mut inner.script), (ctx != SRV).then(|| Arc::new(inner))); }
+        }
         Ok(())
     }
 
@@ -684,11 +757,34 @@ fn flag(d: &Directive) -> Result<bool, String> {
     found.ok_or_else(|| format!("invalid value \"{value}\" in \"{name}\" directive, it must be \"on\" or \"off\""))
 }
 
-/// set $variable value. Of the variables that can be set, twinx has only $limit_rate.
-fn set(args: &[String]) -> Result<Template, String> {
+/// set $variable value: a variable of its own, or $limit_rate; the other
+/// variables twinx makes cannot be set.
+fn set(args: &[String]) -> Result<Op, String> {
     let name = args[0].strip_prefix('$').ok_or_else(|| format!("invalid variable name \"{}\"", args[0]))?;
-    if name != "limit_rate" { return Err(format!("setting the \"{name}\" variable is not supported")); }
-    Template::parse(&args[1])
+    if name != "limit_rate" && crate::vars::builtin(name) { return Err(format!("the duplicate \"{name}\" variable")); }
+    Ok(Op::Set(name.to_string(), Template::parse(&args[1])?))
+}
+
+/// The condition of if, "(" and ")" around it. Of the conditions nginx has,
+/// twinx has only a variable alone, true when not empty and not "0".
+fn condition(args: &[String]) -> Result<Template, String> {
+    let all = args.join(" ");
+    let inner = all.strip_prefix('(').and_then(|c| c.strip_suffix(')')).ok_or_else(|| format!("invalid condition \"{}\"", args[0]))?;
+    if !inner.starts_with('$') || inner.contains(' ') { return Err(format!("twinx does not support the condition \"{inner}\" yet")); }
+    Template::parse(inner)
+}
+
+/// proxy_cookie_domain / proxy_cookie_path: off, or a pattern and its
+/// replacement. A pattern that starts with "~" is a regular expression,
+/// caseless for domains and with "~*" for paths; a leading "." of a domain
+/// and of its replacement is left out.
+fn cookie_rewrite(args: &[String], domain: bool) -> Result<Option<CookieRewrite>, String> {
+    if args.len() == 1 { return if args[0] == "off" { Ok(None) } else { Err(format!("invalid parameter \"{}\"", args[0])) }; }
+    let dot = |s: &str| Template::parse(if domain { s.strip_prefix('.').unwrap_or(s) } else { s });
+    let Some(re) = args[0].strip_prefix('~') else { return Ok(Some(CookieRewrite { pattern: CookiePattern::Text(dot(&args[0])?), replacement: dot(&args[1])? })) };
+    let (caseless, re) = if domain { (true, re) } else { re.strip_prefix('*').map_or((false, re), |re| (true, re)) };
+    let regex = regex::Regex::new(&format!("{}{}", if caseless { "(?i)" } else { "" }, pcre(re))).map_err(|e| format!("invalid regular expression \"{re}\": {e}"))?;
+    Ok(Some(CookieRewrite { pattern: CookiePattern::Regex(regex), replacement: Template::parse(&args[1])? }))
 }
 
 /// A size that may have variables; one without them must be valid.
@@ -1017,8 +1113,8 @@ mod tests {
         assert_eq!(e, "\"listen\" directive is not allowed here in t.conf:1");
         let e = build_text("http { server { set limit_rate 1; } }").unwrap_err();
         assert_eq!(e, "invalid variable name \"limit_rate\" in t.conf:1");
-        let e = build_text("http { server { set $x 1; } }").unwrap_err();
-        assert_eq!(e, "setting the \"x\" variable is not supported in t.conf:1");
+        let e = build_text("http { server { set $remote_addr 1; } }").unwrap_err();
+        assert_eq!(e, "the duplicate \"remote_addr\" variable in t.conf:1");
         let e = build_text("http { access_log a.log nope; }").unwrap_err();
         assert_eq!(e, "unknown log format \"nope\" in t.conf:1");
     }
