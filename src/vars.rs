@@ -1,7 +1,7 @@
 //! Variables ($uri, $status, ...) and the strings built from them: the
 //! complex values of directives such as return, and access log formats.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -21,6 +21,8 @@ pub struct Request {
     /// The first name of the server that answers, for $host when the request has none.
     pub server_name: String,
     pub peer: SocketAddr,
+    /// The address the connection was accepted on.
+    pub local: SocketAddr,
     pub started: Instant,
     pub pipelined: bool,
     pub length: usize,
@@ -50,6 +52,10 @@ pub enum Var {
     TimeIso8601,
     TimeLocal,
     RemoteAddr,
+    RemotePort,
+    BinaryRemoteAddr,
+    ServerAddr,
+    ServerPort,
     RemoteUser,
     Request,
     Host,
@@ -68,7 +74,8 @@ impl Var {
             ("request_time", Var::RequestTime), ("bytes_sent", Var::BytesSent),
             ("body_bytes_sent", Var::BodyBytesSent), ("pipe", Var::Pipe), ("msec", Var::Msec),
             ("time_iso8601", Var::TimeIso8601), ("time_local", Var::TimeLocal),
-            ("remote_addr", Var::RemoteAddr), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
+            ("remote_addr", Var::RemoteAddr), ("remote_port", Var::RemotePort), ("binary_remote_addr", Var::BinaryRemoteAddr),
+            ("server_addr", Var::ServerAddr), ("server_port", Var::ServerPort), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
         ];
         let header = name.strip_prefix("http_").map(|h| Var::Http(h.replace('_', "-")));
@@ -77,7 +84,7 @@ impl Var {
     }
 
     /// The value, or None when the variable is "not found" (no such header, no user).
-    pub fn value(&self, r: &Request, s: &Sent, now: &DateTime<Local>) -> Option<String> {
+    pub fn value(&self, r: &Request, s: &Sent, now: &DateTime<Local>) -> Option<Vec<u8>> {
         Some(match self {
             Var::Uri => r.uri.clone(),
             Var::Status => format!("{:03}", s.status),
@@ -90,6 +97,10 @@ impl Var {
             Var::TimeIso8601 => now.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
             Var::TimeLocal => now.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
             Var::RemoteAddr => r.peer.ip().to_string(),
+            Var::RemotePort => r.peer.port().to_string(),
+            Var::BinaryRemoteAddr => return Some(match r.peer.ip() { IpAddr::V4(a) => a.octets().to_vec(), IpAddr::V6(a) => a.octets().to_vec() }),
+            Var::ServerAddr => r.local.ip().to_string(),
+            Var::ServerPort => r.local.port().to_string(),
             Var::RemoteUser => return None,
             Var::Request => r.line.clone(),
             Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
@@ -102,7 +113,7 @@ impl Var {
                 args.filter_map(|a| a.split_once('=')).find(|(n, _)| n.eq_ignore_ascii_case(name))?.1.to_string()
             }
             Var::Http(name) => r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))?.1.clone(),
-        })
+        }.into_bytes())
     }
 }
 
@@ -140,32 +151,52 @@ impl Template {
 
     /// The value for a directive: variables that are not found give "".
     pub fn render(&self, r: &Request, s: &Sent) -> String {
-        self.join(r, s, |v| v.unwrap_or_default())
-    }
-
-    /// The value for an access log line: "-" for variables that are not found,
-    /// and the bytes nginx's default escaping replaces written as \xXX.
-    pub fn log_line(&self, r: &Request, s: &Sent) -> String {
-        self.join(r, s, |v| v.map_or_else(|| "-".to_string(), |v| escape(&v)))
-    }
-
-    fn join(&self, r: &Request, s: &Sent, value: impl Fn(Option<String>) -> String) -> String {
         let now = Local::now();
-        let piece = |p: &Part| match p {
-            Part::Text(t) => t.clone(),
-            Part::Var(v) => value(v.value(r, s, &now)),
-        };
-        self.0.iter().map(piece).collect()
+        let value = |v: &Var| v.value(r, s, &now).map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default();
+        self.0.iter().map(|p| match p { Part::Text(t) => t.clone(), Part::Var(v) => value(v) }).collect()
+    }
+
+    /// The value for an access log line, its variables escaped as log_format
+    /// says: "-" for variables that are not found by default, nothing otherwise.
+    pub fn log_line(&self, r: &Request, s: &Sent, escape: Escape) -> Vec<u8> {
+        let (now, mut out) = (Local::now(), Vec::new());
+        for part in &self.0 {
+            let value = match part { Part::Text(t) => { out.extend_from_slice(t.as_bytes()); continue } Part::Var(v) => v.value(r, s, &now) };
+            match (value, escape) {
+                (None, Escape::Default) => out.push(b'-'),
+                (None, _) => {}
+                (Some(v), Escape::Default) => v.iter().for_each(|&b| escape_default(b, &mut out)),
+                (Some(v), Escape::Json) => v.iter().for_each(|&b| escape_json(b, &mut out)),
+                (Some(v), Escape::None) => out.extend(v),
+            }
+        }
+        out
     }
 }
 
-fn escape(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    for b in v.bytes() {
-        let plain = (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\';
-        if plain { out.push(b as char) } else { out.push_str(&format!("\\x{b:02X}")) }
+/// How log_format escapes the values of variables (its "escape=" parameter).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Escape {
+    Default,
+    Json,
+    None,
+}
+
+/// '"', '\\', control characters and bytes above 0x7e as \xXX.
+fn escape_default(b: u8, out: &mut Vec<u8>) {
+    let plain = (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\';
+    if plain { out.push(b) } else { out.extend(format!("\\x{b:02X}").bytes()) }
+}
+
+/// As in a JSON string: '"' and '\\' with a backslash, control characters as
+/// \n, \r, \t, \b, \f or \u00XX.
+fn escape_json(b: u8, out: &mut Vec<u8>) {
+    const NAMED: &[(u8, u8)] = &[(b'"', b'"'), (b'\\', b'\\'), (b'\n', b'n'), (b'\r', b'r'), (b'\t', b't'), (8, b'b'), (12, b'f')];
+    match NAMED.iter().find(|e| e.0 == b) {
+        Some(&(_, c)) => out.extend([b'\\', c]),
+        None if b < 0x20 => out.extend(format!("\\u{b:04X}").bytes()),
+        None => out.push(b),
     }
-    out
 }
 
 #[cfg(test)]
@@ -182,6 +213,7 @@ mod tests {
             host: None,
             server_name: "localhost".into(),
             peer: "127.0.0.1:1234".parse().unwrap(),
+            local: "127.0.0.1:8080".parse().unwrap(),
             started: Instant::now(),
             pipelined: true,
             length: 39,
@@ -195,20 +227,31 @@ mod tests {
         let t = Template::parse("$uri ${status}x $pipe $request_length $http_user_agent").unwrap();
         let s = Sent { status: 200, bytes: 10, body: 2 };
         assert_eq!(t.render(&request(), &s), "/a 200x p 39 x\"y");
-        assert_eq!(t.log_line(&request(), &s), "/a 200x p 39 x\\x22y");
+        assert_eq!(t.log_line(&request(), &s, Escape::Default), b"/a 200x p 39 x\\x22y");
     }
 
     #[test]
     fn not_found_variables() {
         let t = Template::parse("[$remote_user][$http_referer][$request_body_file]").unwrap();
         assert_eq!(t.render(&request(), &Sent::default()), "[][][]");
-        assert_eq!(t.log_line(&request(), &Sent::default()), "[-][-][-]");
+        assert_eq!(t.log_line(&request(), &Sent::default(), Escape::Default), b"[-][-][-]");
+        assert_eq!(t.log_line(&request(), &Sent::default(), Escape::Json), b"[][][]");
         let t = Template::parse("$request_uri $request_body").unwrap();
         assert_eq!(t.render(&request(), &Sent::default()), "/a?b xy");
         assert_eq!(Template::parse("[$args]").unwrap().render(&request(), &Sent::default()), "[b]");
         let mut r = request();
         r.target = "/a?x=1&E=2".into();
         assert_eq!(Template::parse("[$arg_e][$arg_y]").unwrap().render(&r, &Sent::default()), "[2][]");
+    }
+
+    #[test]
+    fn addresses_and_escaping() {
+        let t = Template::parse("$remote_addr:$remote_port:$server_addr:$server_port|$binary_remote_addr|$http_x").unwrap();
+        let mut r = request();
+        r.headers = vec![("X".into(), "\"\\\n\x01\u{e9}".into())];
+        assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"127.0.0.1:1234:127.0.0.1:8080|\\x7F\\x00\\x00\\x01|\\x22\\x5C\\x0A\\x01\\xC3\\xA9");
+        assert_eq!(t.log_line(&r, &Sent::default(), Escape::Json), b"127.0.0.1:1234:127.0.0.1:8080|\x7F\\u0000\\u0000\\u0001|\\\"\\\\\\n\\u0001\xC3\xA9".as_slice());
+        assert_eq!(t.log_line(&r, &Sent::default(), Escape::None), b"127.0.0.1:1234:127.0.0.1:8080|\x7F\x00\x00\x01|\"\\\n\x01\xC3\xA9");
     }
 
     #[test]
