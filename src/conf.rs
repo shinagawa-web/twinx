@@ -52,6 +52,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("absolute_redirect", HSL, 1, 1, false),
     ("server_name_in_redirect", HSL, 1, 1, false),
     ("port_in_redirect", HSL, 1, 1, false),
+    ("rewrite", SRV | LOC, 2, 3, false),
 ];
 
 const COMBINED: &str =
@@ -82,10 +83,23 @@ pub struct ErrorPage {
     pub url: Template,
 }
 
+/// rewrite regex replacement [flag], where the replacement is a URL the
+/// client is redirected to: with 301 for "permanent", 302 otherwise. A
+/// replacement ending with "?" does not get the request's arguments.
+#[derive(Debug, Clone)]
+pub struct Rewrite {
+    pub regex: regex::Regex,
+    pub url: Template,
+    pub status: u16,
+    pub add_args: bool,
+}
+
 /// The settings of one level (http, server or location) after inheriting from the one above.
 #[derive(Debug, Clone, Default)]
 pub struct Level {
     pub ret: Option<(u16, Template)>,
+    /// rewrite directives, in order: the regular expression and the redirect it makes.
+    pub rewrite: Vec<Rewrite>,
     pub access_log: Vec<Arc<AccessLog>>,
     pub root: PathBuf,
     /// add_header: name, value, and whether it is added whatever the status ("always").
@@ -250,6 +264,7 @@ impl Builder<'_> {
             let at = |e: String| format!("{e} in {}", d.at);
             match d.name.as_str() {
                 "return" => level.ret = Some(ret(&d.args).map_err(at)?),
+                "rewrite" => level.rewrite.push(rewrite(&d.args).map_err(at)?),
                 "root" => (level.root, level.alias) = (self.path(&d.args[0]), None),
                 "alias" => level.alias = Some(self.path(&d.args[0])),
                 "absolute_redirect" => level.absolute_redirect = flag(d).map_err(at)?,
@@ -366,6 +381,16 @@ fn error_page(args: &[String]) -> Result<ErrorPage, String> {
     Ok(ErrorPage { codes, status, url: Template::parse(url)? })
 }
 
+fn rewrite(args: &[String]) -> Result<Rewrite, String> {
+    let regex = regex::Regex::new(&args[0]).map_err(|e| format!("invalid regular expression \"{}\": {e}", args[0]))?;
+    let flag = args.get(2).map_or("", |f| f.as_str());
+    if !["", "last", "break", "redirect", "permanent"].contains(&flag) { return Err(format!("invalid parameter \"{flag}\"")); }
+    let (url, add_args) = args[1].strip_suffix('?').map_or((args[1].as_str(), true), |u| (u, false));
+    let is_url = ["http://", "https://", "$scheme"].iter().any(|p| url.starts_with(p)) || ["redirect", "permanent"].contains(&flag);
+    if !is_url { return Err(format!("twinx does not support rewriting to \"{url}\" yet")); }
+    Ok(Rewrite { regex, url: Template::parse(url)?, status: if flag == "permanent" { 301 } else { 302 }, add_args })
+}
+
 fn ret(args: &[String]) -> Result<(u16, Template), String> {
     let code = args[0].parse::<u16>().ok().filter(|c| *c <= 999);
     let code = code.ok_or_else(|| format!("invalid return code \"{}\"", args[0]))?;
@@ -470,6 +495,19 @@ mod tests {
         assert!(p.auto_redirect);
         let e = build_text("http { absolute_redirect yes; }").unwrap_err();
         assert_eq!(e, "invalid value \"yes\" in \"absolute_redirect\" directive, it must be \"on\" or \"off\" in t.conf:1");
+    }
+
+    #[test]
+    fn rewrites() {
+        let r = rewrite(&["^/a".into(), "http://e/?".into(), "permanent".into()]).unwrap();
+        assert_eq!((r.status, r.add_args, r.regex.is_match("/ab")), (301, false, true));
+        let r = rewrite(&["^".into(), "/x".into(), "redirect".into()]).unwrap();
+        assert_eq!((r.status, r.add_args), (302, true));
+        assert_eq!(rewrite(&["^".into(), "/x".into()]).unwrap_err(), "twinx does not support rewriting to \"/x\" yet");
+        assert_eq!(rewrite(&["^".into(), "http://e/".into(), "x".into()]).unwrap_err(), "invalid parameter \"x\"");
+        assert!(rewrite(&["(".into(), "http://e/".into()]).is_err());
+        let c = build_text("http { server { rewrite ^/s http://s/; location / { rewrite ^/l http://l/; } } }").unwrap();
+        assert_eq!(c.servers[0].locations[0].level.rewrite.len(), 2);
     }
 
     #[test]
