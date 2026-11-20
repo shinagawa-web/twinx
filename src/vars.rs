@@ -54,6 +54,7 @@ pub enum Var {
     Request,
     Host,
     RequestUri,
+    Args,
     RequestBody,
     RequestBodyFile,
     Arg(String),
@@ -68,7 +69,7 @@ impl Var {
             ("body_bytes_sent", Var::BodyBytesSent), ("pipe", Var::Pipe), ("msec", Var::Msec),
             ("time_iso8601", Var::TimeIso8601), ("time_local", Var::TimeLocal),
             ("remote_addr", Var::RemoteAddr), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
-            ("request_uri", Var::RequestUri), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
+            ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
         ];
         let header = name.strip_prefix("http_").map(|h| Var::Http(h.replace('_', "-")));
         let arg = || name.strip_prefix("arg_").map(|a| Var::Arg(a.to_string()));
@@ -93,6 +94,7 @@ impl Var {
             Var::Request => r.line.clone(),
             Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
             Var::RequestUri => r.target.clone(),
+            Var::Args => r.target.split_once('?').map_or("", |(_, a)| a).to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
             Var::Arg(name) => {
@@ -203,6 +205,7 @@ mod tests {
         assert_eq!(t.log_line(&request(), &Sent::default()), "[-][-][-]");
         let t = Template::parse("$request_uri $request_body").unwrap();
         assert_eq!(t.render(&request(), &Sent::default()), "/a?b xy");
+        assert_eq!(Template::parse("[$args]").unwrap().render(&request(), &Sent::default()), "[b]");
         let mut r = request();
         r.target = "/a?x=1&E=2".into();
         assert_eq!(Template::parse("[$arg_e][$arg_y]").unwrap().render(&r, &Sent::default()), "[2][]");

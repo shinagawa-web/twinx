@@ -190,6 +190,8 @@ fn special(status: u16) -> Response {
     Response { status, ctype, headers: Vec::new(), body: page(status).into_bytes() }
 }
 
+const REDIRECTS: &[u16] = &[301, 302, 303, 307, 308];
+
 /// A redirect: the page nginx generates for the status, with a Location.
 fn redirect(status: u16, location: String) -> Response {
     let mut resp = special(status);
@@ -199,10 +201,14 @@ fn redirect(status: u16, location: String) -> Response {
 
 /// The answer the location gives, before error_page and the headers every answer gets.
 fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -> Response {
-    const REDIRECTS: &[u16] = &[301, 302, 303, 307, 308];
     match (parsed, &level.ret, &level.proxy) {
         (Err(status), _, _) => special(status),
         (Ok(()), _, _) if auto => redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
+        (Ok(()), _, _) if let Some(rw) = level.rewrite.iter().find(|rw| rw.regex.is_match(&r.uri)) => {
+            let (url, args) = (rw.url.render(r, &Sent::default()), args(r));
+            let sep = if url.contains('?') { "&" } else { "?" };
+            redirect(rw.status, if rw.add_args && !args.is_empty() { format!("{url}{sep}{}", &args[1..]) } else { url })
+        }
         (Ok(()), Some((code, text)), _) if REDIRECTS.contains(code) => redirect(*code, text.render(r, &Sent::default())),
         (Ok(()), Some((code, text)), _) if text.0.is_empty() && *code >= 400 => special(*code),
         (Ok(()), Some((code, text)), _) => {
@@ -238,7 +244,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
             resp = respond(&to, Ok(()), found);
             if resp.status == 200 { resp.status = status; }
         } else {
-            resp = redirect(ep.status.unwrap_or(302), url);
+            resp = redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url);
         }
     }
     if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| level.absolute_redirect) {
@@ -577,6 +583,23 @@ mod tests {
         assert_eq!((location(s, "/p/x").0, location(s, "/p/x").2), ("/p/", false));
         assert_eq!((location(s, "/q").0, location(s, "/q").2), ("/q", false));
         assert!(!location(s, "").2);
+    }
+
+    #[test]
+    fn rewrites_redirect_with_the_arguments() {
+        let text = "http { server { location /a { rewrite ^ http://e/$arg_x; } location /b { rewrite ^ http://e/?y=1; } \
+                    location /c { rewrite ^/c http://e/? permanent; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let answer = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            let resp = respond(&r, Ok(()), location(s, &r.uri));
+            (resp.status, resp.headers[0].1.clone())
+        };
+        assert_eq!(answer("/a?x=1"), (302, "http://e/1?x=1".to_string()));
+        assert_eq!(answer("/b?x=1"), (302, "http://e/?y=1&x=1".to_string()));
+        assert_eq!(answer("/b"), (302, "http://e/?y=1".to_string()));
+        assert_eq!(answer("/c?x=1"), (301, "http://e/".to_string()));
     }
 
     #[test]
