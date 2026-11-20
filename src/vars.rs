@@ -36,6 +36,8 @@ pub struct Request {
     pub upstream_addr: Option<String>,
     /// The named captures of the server name that matched the host.
     pub captures: Vec<(String, String)>,
+    /// $limit_rate, which set changes; shared by the internal redirects of the request.
+    pub limit_rate: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The names of the captures that are variables.
@@ -92,6 +94,7 @@ pub enum Var {
     UpstreamAddr,
     Pid,
     ServerName,
+    LimitRate,
     /// A named capture of the server name's regular expression.
     Capture(String),
     Arg(String),
@@ -115,7 +118,7 @@ impl Var {
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
             ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
             ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("pid", Var::Pid),
-            ("server_name", Var::ServerName),
+            ("server_name", Var::ServerName), ("limit_rate", Var::LimitRate),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -157,6 +160,7 @@ impl Var {
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
             Var::Pid => std::process::id().to_string(),
             Var::ServerName => r.server_name.clone(),
+            Var::LimitRate => r.limit_rate.load(std::sync::atomic::Ordering::Relaxed).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
             Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
             Var::Args => r.target.split_once('?').map_or("", |(_, a)| a).to_string(),
@@ -358,6 +362,7 @@ mod tests {
             body_file: None,
             upstream_addr: None,
             captures: Vec::new(),
+            limit_rate: Default::default(),
         }
     }
 
