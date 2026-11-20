@@ -94,6 +94,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_buffer_size", HSL, 1, 1, false),
     ("proxy_buffering", HSL, 1, 1, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
+    ("proxy_http_version", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
     ("proxy_buffers", HSL, 2, 2, false),
     ("proxy_max_temp_file_size", HSL, 1, 1, false),
@@ -290,6 +291,9 @@ pub struct Level {
     /// proxy_request_buffering: whether the whole body is read before the
     /// request is passed; when off, a body with a Content-Length is passed as it comes.
     pub proxy_request_buffering: bool,
+    /// proxy_http_version 1.1: requests are passed as HTTP/1.1, and a chunked
+    /// body that is not buffered is passed chunked as it comes.
+    pub proxy_http_11: bool,
     /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
     pub proxy_next_upstream: Vec<String>,
     /// proxy_next_upstream_tries: how many servers a request may try, 0 for any.
@@ -603,6 +607,7 @@ impl Builder<'_> {
                 "proxy_buffer_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_buffering" => { flag(d).map_err(at)?; }
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
+                "proxy_http_version" => level.proxy_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\" or \"1.1\"", d.args[0])))? == 1,
                 "proxy_max_temp_file_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
                 "proxy_buffers" => if d.args[0].parse::<u64>().map_or(true, |n| n == 0) || size(&d.args[1]).map_or(true, |n| n == 0) { return Err(at("\"proxy_buffers\" directive invalid value".into())); }
@@ -985,6 +990,10 @@ mod tests {
         let on: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.proxy_request_buffering).collect();
         assert_eq!(on, [false, true]);
         assert!(build_text("http { proxy_request_buffering 1; }").is_err());
+        let c = build_text("http { proxy_http_version 1.1; server { location /a { proxy_http_version 1.0; } location /b { } } }").unwrap();
+        let v: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.proxy_http_11).collect();
+        assert_eq!(v, [false, true]);
+        assert!(build_text("http { proxy_http_version 2; }").unwrap_err().starts_with("invalid value \"2\" in \"proxy_http_version\" directive, it must be \"1.0\" or \"1.1\""));
     }
 
     #[test]

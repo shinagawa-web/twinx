@@ -44,10 +44,10 @@ pub struct Request {
     /// The client's socket, watched for the client closing the connection while
     /// a proxied server is answering; -1 when there is none.
     pub client: i32,
-    /// With proxy_request_buffering off: the client's socket and how much of
-    /// the body is still to be read from it, sent on to the proxied server as
-    /// it comes; what the proxy does not take is read and dropped afterwards.
-    pub unread: std::sync::Arc<std::sync::Mutex<Option<(std::net::TcpStream, u64)>>>,
+    /// With proxy_request_buffering off: the body still to be read from the
+    /// client, sent on to the proxied server as it comes; what the proxy does
+    /// not take is read and dropped afterwards.
+    pub unread: std::sync::Arc<std::sync::Mutex<Option<crate::http::Unread>>>,
     /// $limit_rate, which set changes; shared by the internal redirects of the request.
     pub limit_rate: std::sync::Arc<Rate>,
     /// The variables set gives values to, and the captures of the last regular
