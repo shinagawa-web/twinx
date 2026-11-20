@@ -84,6 +84,8 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_set_header", HSL, 2, 2, false),
     ("proxy_hide_header", HSL, 1, 1, false),
     ("proxy_next_upstream", HSL, 1, usize::MAX, false),
+    ("proxy_next_upstream_tries", HSL, 1, 1, false),
+    ("proxy_next_upstream_timeout", HSL, 1, 1, false),
     ("proxy_intercept_errors", HSL, 1, 1, false),
     ("proxy_connect_timeout", HSL, 1, 1, false),
     ("proxy_read_timeout", HSL, 1, 1, false),
@@ -275,6 +277,10 @@ pub struct Level {
     pub proxy_intercept_errors: bool,
     /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
     pub proxy_next_upstream: Vec<String>,
+    /// proxy_next_upstream_tries: how many servers a request may try, 0 for any.
+    pub proxy_next_upstream_tries: usize,
+    /// proxy_next_upstream_timeout: how long servers may be tried, zero for ever.
+    pub proxy_next_upstream_timeout: Duration,
     /// gzip_static: None when off, Some(true) for "always".
     pub gzip_static: Option<bool>,
     /// gzip: compress answers for clients that take gzip.
@@ -580,6 +586,8 @@ impl Builder<'_> {
                     // "off" turns every other condition off.
                     level.proxy_next_upstream = if d.args.iter().any(|a| a == "off") { Vec::new() } else { d.args.clone() };
                 }
+                "proxy_next_upstream_tries" => level.proxy_next_upstream_tries = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
+                "proxy_next_upstream_timeout" => level.proxy_next_upstream_timeout = millis(&d.args[0]).map_err(at)?,
                 "proxy_hide_header" => hidden.get_or_insert_default().push(d.args[0].to_ascii_lowercase()),
                 "gzip_static" => level.gzip_static = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\"", d.args[0])))?.1,
                 "gunzip" => level.gunzip = flag(d).map_err(at)?,
@@ -759,6 +767,11 @@ fn expires(args: &[String]) -> Result<Template, String> {
     let literal = t.0.iter().all(|p| matches!(p, crate::vars::Part::Text(_)));
     if literal && crate::expires::parse(&value).is_none() { return Err(format!("invalid value \"{value}\"")); }
     Ok(t)
+}
+
+/// A time that may be in milliseconds, such as "3800ms" or "2s".
+fn millis(s: &str) -> Result<Duration, String> {
+    s.strip_suffix("ms").and_then(|ms| ms.parse().ok()).map(Duration::from_millis).map_or_else(|| seconds(s), Ok)
 }
 
 /// A time such as "1s" or "30", for directives that take one.
@@ -1134,6 +1147,10 @@ mod tests {
         assert_eq!(build_text("http { proxy_limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
         let c = build_text("http { proxy_next_upstream http_404; server { proxy_next_upstream error off; } server { } }").unwrap();
         assert_eq!((c.servers[0].level.proxy_next_upstream.len(), c.servers[1].level.proxy_next_upstream.as_slice()), (0, &["http_404".to_string()][..]));
+        let c = build_text("http { proxy_next_upstream_tries 2; proxy_next_upstream_timeout 3800ms; server { proxy_next_upstream_timeout 2s; } }").unwrap();
+        assert_eq!((c.servers[0].level.proxy_next_upstream_tries, c.servers[0].level.proxy_next_upstream_timeout), (2, Duration::from_secs(2)));
+        assert_eq!(millis("3800ms"), Ok(Duration::from_millis(3800)));
+        assert!(build_text("http { proxy_next_upstream_tries x; }").is_err());
         let c = build_text("http { if_modified_since before; server { location / { if_modified_since off; } } }").unwrap();
         assert_eq!((c.servers[0].level.if_modified_since, c.servers[0].locations[0].level.if_modified_since), (Some(true), None));
         assert!(build_text("http { if_modified_since x; }").unwrap_err().starts_with("invalid value \"x\""));
