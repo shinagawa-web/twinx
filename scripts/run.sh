@@ -6,7 +6,7 @@
 # twinx), the command runs there, and results/ is copied back. The VM keeps
 # target/ between runs so builds stay incremental.
 #
-#   scripts/run.sh python3 harness/compare.py --out results/latest.json
+#   scripts/run.sh python3 harness/run_tests.py --nginx --out results/nginx.json
 set -euo pipefail
 [ $# -ge 1 ] || { echo "usage: scripts/run.sh <command> [args ...]" >&2; exit 2; }
 root=$(cd "$(dirname "$0")/.." && pwd)

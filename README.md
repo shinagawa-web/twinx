@@ -6,69 +6,61 @@ An experiment to find out how far an agent loop can take an HTTP server that beh
 
 | Question | Records that answer it |
 |---|---|
-| How much can be automated? | The number of cases made to pass automatically, and the number of blocked issues the loop opened for a human |
+| How much can be automated? | The number of nginx-tests files made to pass automatically, and the number of blocked issues the loop opened for a human |
 | Where does a human have to step in? | The intervention log (`docs/interventions.md`) |
-| What quality do we get, in how much time and at what cost? | The differential test pass rate over elapsed time, the number of nginx-tests passed, and the time and tokens spent per iteration |
+| What quality do we get, in how much time and at what cost? | The nginx-tests pass rate over elapsed time, and the time and tokens spent per iteration |
 
 ## Approach
 
-Real nginx is the reference. nginx runs in Docker and reads the same configuration file as twinx, and both receive the same requests. A case passes when the status, headers and body match.
+twinx is judged by nginx's own test suite, nginx-tests (https://github.com/nginx/nginx-tests), pinned to one commit. nginx-tests starts the server under test from the binary it is given, writes each test's configuration, sends requests and checks the answers.
 
-One nginx version is pinned when the comparison harness is built, and it does not change during the experiment.
-
-If the official nginx test suite (nginx-tests) can be pointed at the twinx binary, it is also used to judge pass or fail. Whether it can is checked when the comparison harness is built.
+nginx 1.30.6, pinned by its Docker image digest, is the reference: it passes every nginx-tests file at that commit. A subtest is expected of twinx only when it passes on nginx in the same environment, and a file passes when twinx passes every subtest of it that nginx passes.
 
 ## Stages
 
-A stage is done when every item of its checklist (`harness/checklist.toml`, from nginx's documentation for the directives in its scope) has a case that passes on main. Time spent, pass rate and the number of interventions are recorded separately for each stage. Every differential test from earlier stages keeps running in later stages.
+Each stage is a list of nginx-tests files (`harness/stages.toml`). A stage is done when every file in it passes on main. Time spent, pass rate and the number of interventions are recorded separately for each stage, and the files of earlier stages keep running in later stages.
 
-| Stage | Scope |
-|---|---|
-| 1 | Static file serving and reverse proxying over HTTP/1.1: server and location selection, root, alias, index, try_files, return, rewrite, error_page, add_header, default_type, proxy_pass, upstream |
-| 2 | gzip |
-| 3 | TLS |
-| 4 | HTTP/2 |
-| 5 | Caching (proxy_cache) |
+| Stage | Scope | Files |
+|---|---|---|
+| 1 | Static file serving and reverse proxying over HTTP/1.1 | those that need only the http, rewrite and proxy modules |
+| 2 | gzip | to be listed |
+| 3 | TLS | to be listed |
+| 4 | HTTP/2 | to be listed |
+| 5 | Caching (proxy_cache) | to be listed |
 
 ## The automated loop
 
-The work queue is the set of cases that fail on main: each failing case holds the configuration, the requests and what nginx answered.
+The work queue is the set of nginx-tests files in the current stages that fail on main.
 
-Claude Code works in two roles. Neither decides whether its own change is good; the judge does:
+The Fixer, a scheduled Claude Code session, picks one failing file, changes the Rust code until it passes, and opens a pull request from `claude/fix-<stage>-<file>` with auto-merge on. It does not decide whether its change is good; the judge does. main's ruleset (`main requires judge`) accepts a merge only through a pull request whose `judge` check passed on a branch that is up to date with main, with no exceptions, the owner included.
 
-- The Fixer picks one failing case, changes the Rust code until that case passes, and opens a pull request from `claude/fix-<stage>-<case>`.
-- The Finder writes new cases for the current stage and opens a pull request from `claude/find-<name>`.
-
-Both turn on auto-merge when they open the pull request. main's ruleset (`main requires judge`) accepts a merge only through a pull request whose `judge` check passed on a branch that is up to date with main, with no exceptions, the owner included. Whoever presses merge, the judge decides.
-
-The judge is a GitHub Actions workflow (`.github/workflows/judge.yml`, `harness/judge.py`). It runs on `pull_request_target`, so the workflow and the harness always come from main, never from the pull request. The job that runs the pull request's code can only read the repository, and it runs that code (cargo build with its build scripts, cargo test, twinx) only in containers that see a copy of the merged tree, never the harness or the results (`harness/judge.sh`). For every pull request it runs every case against main as it is, merges the pull request into main without committing, builds twinx with coverage instrumentation, runs `cargo test`, runs every case again, and comments the verdict on the pull request.
+The judge is a GitHub Actions workflow (`.github/workflows/judge.yml`, `harness/judge.sh`, `harness/judge.py`). It runs on `pull_request_target`, so the workflow and the harness always come from main, never from the pull request. The job that runs the pull request's code can only read the repository, and it runs that code (cargo build with its build scripts, cargo test, twinx) only in containers: the build sees a copy of the merged tree, and twinx runs inside the nginx-tests container, from which the reference nginx is removed, with no network but loopback. For every pull request it runs nginx-tests against nginx and against main as it is, merges the pull request into main without committing, builds twinx with coverage instrumentation, runs `cargo test`, runs nginx-tests again, and comments the verdict on the pull request.
 
 ```
 pull request into main
   ├─ it touched only what its role may touch?
   │     Fixer: src/, tests/, benches/, Cargo.toml, Cargo.lock
-  │     Finder: new files under cases/
-  │     anything else: a human, no limit
+  │     anything not under claude/: a human, no limit
   ├─ build and cargo test pass?
-  ├─ every case that passes on main still passes?
-  ├─ (Fixer) the case it names now passes?
-  ├─ (Fixer) the cases run at least 99% of the lines it adds?
+  ├─ every subtest that passes on main still passes?
+  ├─ (Fixer) the file it names now passes?
+  ├─ (Fixer) nginx-tests run at least 99% of the lines it adds?
   │
   ├─ yes → judge passes, auto-merge merges it
   └─ no  → judge fails with the reasons in a comment; the pull request stays open
 ```
 
-Cases that fail on main are allowed: they are the Fixer's work queue. A green `judge` on main means main did not get worse, not that every case passes.
+Files that fail on main are allowed: they are the Fixer's work queue. A green `judge` on main means main did not get worse, not that every file passes.
 
-A pull request the judge fails stays open, and its author pushes fixes to it.
+A pull request the judge fails stays open, and the Fixer pushes fixes to it.
 
-When the Fixer or the Finder judges that it cannot fix something within its role, it is blocked. It opens an issue labelled `blocked` saying what it was working on, why it cannot go on and what a human has to decide, links the issue from its pull request, leaves the pull request open and sends a push notification. A case with an open `blocked` issue is not picked again. A human decides how to fix it, fixes it and closes the issue. The next Fixer run first takes up the pull requests whose `blocked` issue was closed, updating them with main so the judge runs again.
+When the Fixer judges that it cannot fix something within its role, it is blocked. It opens an issue labelled `blocked` saying what it was working on, why it cannot go on and what a human has to decide, links the issue from its pull request, leaves the pull request open and sends a push notification. A file with an open `blocked` issue is not picked again. A human decides how to fix it, fixes it and closes the issue. The next Fixer run first takes up the pull requests whose `blocked` issue was closed, updating them with main so the judge runs again.
 
 `scripts/run.sh` is the one way to run a command: in place on Linux, inside the Lima VM on macOS.
 
 ## Where a human steps in
 
-Only through what the judge enforces: the harness, the judging rules, the cases and these documents, changed by pull requests that pass the same `judge` check.
+Only through what the judge enforces: the harness, the judging rules, the stage lists and these documents, changed by pull requests that pass the same `judge` check.
 
 - Blocked issues: deciding how to fix what the loop could not, and fixing it
 - Whether to move on to the next stage (`status/stage.txt`)
@@ -79,10 +71,10 @@ Only through what the judge enforces: the harness, the judging rules, the cases 
 | Kind | Opened by | Closed by |
 |---|---|---|
 | Plan (label `plan`): what the human follows, such as finishing a stage | the human | the human |
-| Harness work: a change to the harness, the judging rules, the cases or the documents | the human | the pull request that makes the change, when it merges |
-| Blocked (label `blocked`): something the loop cannot fix within its role | the Fixer or the Finder | the human, after fixing it |
+| Harness work: a change to the harness, the judging rules, the stage lists or the documents | the human | the pull request that makes the change, when it merges |
+| Blocked (label `blocked`): something the loop cannot fix within its role | the Fixer | the human, after fixing it |
 
-The human includes the Claude Code session the human instructs; the loop is the scheduled Fixer and Finder.
+The human includes the Claude Code session the human instructs; the loop is the scheduled Fixer.
 
 Every intervention adds one row to `docs/interventions.md`. Decisions made before the experiment starts are recorded there too, as human decisions.
 

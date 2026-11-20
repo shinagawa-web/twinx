@@ -1,15 +1,28 @@
 # One run of the loop
 
-Both schedules are paused since 2026-11-20T02:25Z (they ran from 2026-11-19T23:16Z), until the loop keeps the state of main in one place. A human may start a run by hand; a run that has started goes ahead.
+The schedule is paused since 2026-11-20T02:25Z, while twinx starts over on nginx-tests. A human may start a run by hand; a run that has started goes ahead.
 
-Two scheduled Claude Code sessions run the loop, both with model `claude-opus-5-5`. Each session has one role and never takes the other, so the Finder writes cases without knowing how twinx is written.
+A scheduled Claude Code session runs the loop as the Fixer, with model `claude-opus-5-5`, following `docs/fixer.md`.
 
-| Role | Routine | Schedule | Rules |
-|---|---|---|---|
-| Fixer | `trig_01YX3pTLi2c3KYXT33CabyPp` | every hour at :30 (cron `30 * * * *`) | `docs/fixer.md` |
-| Finder | `trig_01GqFt2a2yGPCmAoq9UnXr3y` | every hour at :49 (cron `49 * * * *`); its checkout leaves out `src/`, `tests/`, `benches/` and `Cargo.*` | `docs/finder.md` |
+| Role | Routine | Schedule |
+|---|---|---|
+| Fixer | `trig_01YX3pTLi2c3KYXT33CabyPp` | every hour at :30 (cron `30 * * * *`) |
 
-The very first run (`trig_012ER29uuypTqhUEnHtyZfrF`, 2026-11-18T23:30:00Z) was a single session that took both roles, before they were separated.
+Before twinx started over on nginx-tests (2026-11-20), a second session, the Finder (`trig_01GqFt2a2yGPCmAoq9UnXr3y`), wrote cases of its own; that role is gone. The very first run (`trig_012ER29uuypTqhUEnHtyZfrF`, 2026-11-18T23:30:00Z) was a single session that took both roles.
+
+## Which files fail on main
+
+Find them yourself on a fresh `origin/main`; nothing else records them:
+
+```
+scripts/run.sh cargo build --release
+scripts/run.sh python3 harness/run_tests.py --nginx --out results/nginx.json
+scripts/run.sh python3 harness/run_tests.py --twinx target/release/twinx --reference results/nginx.json --out results/twinx.json
+```
+
+A file fails when a subtest that passes on nginx does not pass on twinx; the last command prints `FAIL` and those subtests. With no `Cargo.toml` on main there is no twinx yet, and every file fails.
+
+An open failing file is one that fails on main, has no open pull request from its branch (`claude/fix-<stage>-<file>`, without `.t`) and no open issue labelled `blocked` for it.
 
 ## Pull requests
 
@@ -17,45 +30,35 @@ Every change reaches main through a pull request that the `judge` check passes. 
 
 - Open the pull request against main with squash auto-merge turned on, so it merges as soon as the judge passes. If auto-merge cannot be turned on, merge it with squash yourself once the check passes.
 - Wait, for up to 20 minutes, until it is merged.
-- When the judge fails, it comments the reasons on the pull request. Read them, then close the pull request.
+- When the judge fails, it comments the reasons on the pull request. Fix them and push to the same branch; the judge runs again. Never close the pull request.
 - When main moved and the branch is behind, update the branch and keep waiting.
 
-## Open failing cases
+## Blocked
 
-The cases that fail on main are listed in the judge's comment on the most recently merged pull request (the "Failing:" line). A Fixer can also find them by building twinx and running every case.
+When something outside your role keeps a file from passing (the harness, nginx-tests, the judging rules, a decision only a human can make), stop working on it:
 
-An open failing case is one under `cases/stage<N>/`, for every stage up to the one in `status/stage.txt`, that fails on main, is not stuck, and has no open pull request yet. A case is stuck when three pull requests from its branch (`claude/fix-<stage>-<case>`) were closed without being merged.
+1. Open an issue labelled `blocked`: the file, what fails, why you cannot fix it within your role, and what a human has to decide.
+2. Write `Blocked by #<issue>` in the pull request's description and leave the pull request open.
+3. Send a push notification with the issue's link.
+4. Go on with the next open failing file.
+
+A human fixes it and closes the issue.
 
 ## A Fixer run
 
 Up to three iterations. Each one:
 
 1. `git fetch --prune origin` and start from a fresh `origin/main`.
-2. If there is no open failing case, stop.
-3. Fix one case as `docs/fixer.md` says, open the pull request and wait for it as above.
-
-## A Finder run
-
-One iteration:
-
-1. `git fetch --prune origin` and start from a fresh `origin/main`.
-2. If there are three or more open failing cases, stop: the Fixer has enough work.
-3. If the judge's checklist line says no item is left, stop: the stage is done, and a human decides when to move on.
-4. Add cases as `docs/finder.md` says, open the pull request and wait for it as above.
+2. If one of your open pull requests says `Blocked by #<issue>` and that issue is closed, update its branch with main, remove the line, and wait for the judge as above. Otherwise:
+3. If one of your open pull requests failed the judge, fix it as the judge's comment says. Otherwise:
+4. If there is no open failing file, stop. Otherwise fix one as `docs/fixer.md` says, open the pull request and wait for it as above.
 
 ## What you never do
 
 - Push to main. The ruleset refuses it anyway; every change goes through a pull request.
 - Merge a pull request whose `judge` check has not passed, or one that is not yours.
-- Change `harness/`, `cases/` that already exist, `.github/`, `scripts/`, `status/` or the documents. If one of them is in your way, stop and say so in your final message; a human decides.
+- Change `harness/`, `.github/`, `scripts/`, `status/` or the documents. If one of them is in your way, you are blocked.
 
 ## Running commands
 
-Run every build and comparison through `scripts/run.sh`, for example:
-
-```
-scripts/run.sh cargo build --release
-scripts/run.sh python3 harness/compare.py cases/stage1/static-file --out results/static-file.json
-```
-
-`results/*.json` holds, for each request, what nginx answered (`nginx`), what twinx answered (`twinx`) and the differences (`problems`).
+Run every build and test through `scripts/run.sh`: in place on Linux, inside the Lima VM on macOS. `results/*.json` holds, for each nginx-tests file, every subtest's result (`ok`, `not ok` or `skip`), the plan, and the end of its error output.
