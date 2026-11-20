@@ -50,9 +50,9 @@ fn head_end(buf: &[u8]) -> Option<usize> {
     lf.into_iter().chain(crlf).min()
 }
 
-fn connection(config: &Config, mut stream: TcpStream, local: SocketAddr) {
+fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
+    let local = stream.local_addr().unwrap_or(listen);
     let peer = stream.peer_addr().unwrap_or(local);
-    let server = config.servers.iter().find(|s| s.listen.contains(&local)).unwrap_or(&config.servers[0]);
     let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
     loop {
         let (pipelined, started) = (!buf.is_empty(), Instant::now());
@@ -70,7 +70,7 @@ fn connection(config: &Config, mut stream: TcpStream, local: SocketAddr) {
             line: String::new(),
             headers: Vec::new(),
             host: None,
-            server_name: server.names.first().cloned().unwrap_or_default(),
+            server_name: String::new(),
             peer,
             started,
             pipelined,
@@ -79,7 +79,10 @@ fn connection(config: &Config, mut stream: TcpStream, local: SocketAddr) {
             body_file: None,
         };
         let parsed = parse(&mut r, &head);
-        let (prefix, level) = location(server, &r.uri);
+        let server = server(config, listen, r.host.as_deref());
+        r.server_name = server.names.first().cloned().unwrap_or_default();
+        let found = location(server, &r.uri);
+        let level = found.1;
         let framing = parsed.and_then(|()| framing(&r)).and_then(|n| if n.unwrap_or(0) > level.max_body { Err(413) } else { Ok(n) });
         let expect = header(&r, "expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue"));
         if framing.is_ok() && expect && r.line.ends_with("HTTP/1.1") { let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n"); }
@@ -101,7 +104,7 @@ fn connection(config: &Config, mut stream: TcpStream, local: SocketAddr) {
                 buf.extend_from_slice(&chunk[..read]);
             },
         };
-        let open = exchange(&mut stream, &r, parsed, prefix, level);
+        let open = exchange(&mut stream, server, &r, parsed, found, local);
         if !level.body_in_file_only { r.body_file.map(std::fs::remove_file); }
         if !open { return linger(&mut stream); }
     }
@@ -187,22 +190,61 @@ fn special(status: u16) -> Response {
     Response { status, ctype, headers: Vec::new(), body: page(status).into_bytes() }
 }
 
-/// Answers one request; true when the connection stays open for the next one.
-fn exchange(stream: &mut TcpStream, r: &Request, parsed: Result<(), u16>, prefix: &str, level: &Level) -> bool {
-    let mut resp = match (parsed, &level.ret, &level.proxy) {
+/// A redirect: the page nginx generates for the status, with a Location.
+fn redirect(status: u16, location: String) -> Response {
+    let mut resp = special(status);
+    resp.headers.push(("Location".to_string(), location));
+    resp
+}
+
+/// The answer the location gives, before error_page and the headers every answer gets.
+fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -> Response {
+    const REDIRECTS: &[u16] = &[301, 302, 303, 307, 308];
+    match (parsed, &level.ret, &level.proxy) {
         (Err(status), _, _) => special(status),
+        (Ok(()), _, _) if auto => redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
+        (Ok(()), Some((code, text)), _) if REDIRECTS.contains(code) => redirect(*code, text.render(r, &Sent::default())),
         (Ok(()), Some((code, text)), _) if text.0.is_empty() && *code >= 400 => special(*code),
         (Ok(()), Some((code, text)), _) => {
             let ctype = Some("text/plain".to_string());
             Response { status: *code, ctype, headers: Vec::new(), body: text.render(r, &Sent::default()).into_bytes() }
         }
         (Ok(()), None, Some(p)) => proxy(p, r, prefix),
-        (Ok(()), None, None) => file(level, r),
-    };
+        (Ok(()), None, None) => file(level, r, prefix),
+    }
+}
+
+/// "?" and the arguments of the request, or "" when it has none.
+fn args(r: &Request) -> &str {
+    r.target.find('?').map_or("", |i| &r.target[i..])
+}
+
+/// Answers one request; true when the connection stays open for the next one.
+fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr) -> bool {
+    let mut level = found.1;
+    let mut resp = respond(r, parsed, found);
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)) {
-        let location = ep.url.render(r, &Sent::default());
-        resp = special(ep.status.unwrap_or(302));
-        resp.headers.push(("Location".to_string(), location));
+        let url = ep.url.render(r, &Sent::default());
+        if url.starts_with('/') {
+            // An internal redirect: the URI is answered as a GET (or HEAD) request
+            // by its location, with the error's status unless that answer has its own.
+            let mut to = r.clone();
+            to.uri = url.split('?').next().unwrap_or_default().to_string();
+            to.target = url;
+            to.method = if r.method == "HEAD" { "HEAD" } else { "GET" }.to_string();
+            let status = ep.status.unwrap_or(resp.status);
+            let found = location(server, &to.uri);
+            level = found.1;
+            resp = respond(&to, Ok(()), found);
+            if resp.status == 200 { resp.status = status; }
+        } else {
+            resp = redirect(ep.status.unwrap_or(302), url);
+        }
+    }
+    if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| level.absolute_redirect) {
+        let host = if level.server_name_in_redirect { r.server_name.clone() } else { r.host.clone().unwrap_or_else(|| local.ip().to_string()) };
+        let port = if level.port_in_redirect && local.port() != 80 { format!(":{}", local.port()) } else { String::new() };
+        h.1 = format!("http://{host}{port}{}", h.1);
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
     let added = ADDED.contains(&resp.status);
@@ -243,10 +285,15 @@ fn exchange(stream: &mut TcpStream, r: &Request, parsed: Result<(), u16>, prefix
     written && keepalive && status != 444
 }
 
-/// Serves a file under root, as nginx's static module does.
-fn file(level: &Level, r: &Request) -> Response {
+/// Serves a file under root (or alias), as nginx's static module does; a
+/// directory asked for without the trailing "/" is redirected to it.
+fn file(level: &Level, r: &Request, prefix: &str) -> Response {
     if !matches!(r.method.as_str(), "GET" | "HEAD" | "POST") { return special(405); }
-    let path = level.root.join(r.uri.trim_start_matches('/'));
+    let path = match &level.alias {
+        Some(alias) => std::path::PathBuf::from(format!("{}{}", alias.display(), r.uri.get(prefix.len()..).unwrap_or_default())),
+        None => level.root.join(r.uri.trim_start_matches('/')),
+    };
+    if !r.uri.ends_with('/') && path.is_dir() { return redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))); }
     let found = std::fs::metadata(&path).ok().filter(|m| m.is_file()).zip(std::fs::read(&path).ok());
     let Some((meta, body)) = found else { return special(404) };
     if r.method == "POST" { return special(405); }
@@ -266,8 +313,8 @@ fn file(level: &Level, r: &Request) -> Response {
 /// Passes the request to the proxied servers in turn, as HTTP/1.0 with
 /// "Connection: close", until one answers with a response head.
 fn proxy(p: &Proxy, r: &Request, prefix: &str) -> Response {
-    let args = r.target.find('?').map_or("", |i| &r.target[i..]);
-    let uri = p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{}{args}", &r.uri[prefix.len()..]));
+    let rest = escape_uri(r.uri.get(prefix.len()..).unwrap_or_default());
+    let uri = p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{rest}{}", args(r)));
     let body = r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default());
     let mut req = format!("{} {uri} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n", r.method, p.host);
     if framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len()); }
@@ -334,9 +381,35 @@ fn parse(r: &mut Request, head: &[u8]) -> Result<(), u16> {
     };
     if !path.starts_with('/') { return Err(400); }
     r.target = path.to_string();
-    r.uri = path.split('?').next().unwrap_or_default().to_string();
+    r.uri = decode(path.split('?').next().unwrap_or_default()).ok_or(400u16)?;
     if method == "TRACE" { return Err(405); }
     Ok(())
+}
+
+/// The path with its %XX escapes decoded; None when one is malformed.
+fn decode(s: &str) -> Option<String> {
+    let (b, mut out, mut i) = (s.as_bytes(), Vec::with_capacity(s.len()), 0);
+    while i < b.len() {
+        let hex = |h: &str| h.bytes().all(|c| c.is_ascii_hexdigit()).then(|| u8::from_str_radix(h, 16).ok()).flatten();
+        out.push(if b[i] == b'%' { i += 2; hex(s.get(i - 1..i + 1)?)? } else { b[i] });
+        i += 1;
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Escapes what may not appear as such in a URI, as nginx's NGX_ESCAPE_URI
+/// does: control characters, space, `"#%<>?\^`{|}` and bytes above 0x7e.
+fn escape_uri(s: &str) -> String {
+    let plain = |c: u8| c > 0x20 && c < 0x7f && !b"\"#%<>?\\^`{|}".contains(&c);
+    s.bytes().map(|c| if plain(c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
+}
+
+/// The server that answers on a listening address: the one named by the
+/// host, else the first one listening there.
+fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) -> &'a Server {
+    let on = || config.servers.iter().filter(|s| s.listen.contains(&listen));
+    let named = host.and_then(|h| on().find(|s| s.names.iter().any(|n| n == h)));
+    named.or_else(|| on().next()).unwrap_or(&config.servers[0])
 }
 
 /// The host as $host gives it: lower case, without the port or a trailing
@@ -359,18 +432,25 @@ fn keepalive(r: &Request) -> bool {
     connection.map_or(http11, |c| if http11 { c != "close" } else { c == "keep-alive" })
 }
 
-/// The location whose prefix is the longest one matching the URI, or the server's own settings.
-/// The location for a URI as nginx finds it: an exact match, else the longest
-/// prefix if it is "^~", else the first regular expression that matches, else
-/// the longest prefix; the server's own settings when nothing matches.
-fn location<'a>(server: &'a Server, uri: &str) -> (&'a str, &'a Level) {
+/// A location found for a URI: its prefix, its settings, and whether the
+/// request is redirected to the URI with "/" added.
+type Found<'a> = (&'a str, &'a Level, bool);
+
+/// The location for a URI as nginx finds it: an exact match, else a location
+/// whose path is the URI with "/" added and that redirects to it, else the
+/// longest prefix if it is "^~", else the first regular expression that
+/// matches, else the longest prefix; the server's own settings when nothing matches.
+fn location<'a>(server: &'a Server, uri: &str) -> Found<'a> {
     let locs = &server.locations;
     let exact = locs.iter().find(|l| matches!(l.kind, Match::Exact) && l.path == uri);
+    let equal = locs.iter().any(|l| !matches!(l.kind, Match::Regex(_)) && l.path == uri);
+    let auto = locs.iter().find(|l| l.auto_redirect && !equal && !uri.is_empty() && l.path.strip_prefix(uri) == Some("/"));
+    if let Some(l) = auto { return (l.path.as_str(), &l.level, true); }
     let prefixes = locs.iter().filter(|l| matches!(l.kind, Match::Prefix | Match::NoRegex) && uri.starts_with(l.path.as_str()));
     let longest = prefixes.max_by_key(|l| l.path.len());
     let regex = || locs.iter().find(|l| matches!(&l.kind, Match::Regex(re) if re.is_match(uri)));
     let found = exact.or(longest.filter(|l| matches!(l.kind, Match::NoRegex))).or_else(regex).or(longest);
-    found.map_or(("", &server.level), |l| (l.path.as_str(), &l.level))
+    found.map_or(("", &server.level, false), |l| (l.path.as_str(), &l.level, false))
 }
 
 /// The page nginx generates for an error status.
@@ -469,6 +549,34 @@ mod tests {
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
         keep_body(&mut r, &level, b"abcde".to_vec());
         assert_eq!(std::fs::read(r.body_file.unwrap()).unwrap(), b"abcde");
+    }
+
+    #[test]
+    fn decodes_and_escapes_uris() {
+        assert_eq!(decode("/a%20b%2fc").as_deref(), Some("/a b/c"));
+        assert_eq!(decode("/a%2"), None);
+        assert_eq!(decode("/a%zz"), None);
+        assert_eq!(decode("/a%+1"), None);
+        assert_eq!(escape_uri("/a b\"#%<>?\\^`{|}~\u{7f}"), "/a%20b%22%23%25%3C%3E%3F%5C%5E%60%7B%7C%7D~%7F");
+        let (res, r) = request("GET /d%20s?a=b HTTP/1.0\n\n");
+        assert_eq!((res, r.uri.as_str(), args(&r)), (Ok(()), "/d s", "?a=b"));
+        assert_eq!(request("GET /%g HTTP/1.0\n\n").0, Err(400));
+    }
+
+    #[test]
+    fn finds_servers_and_auto_redirects() {
+        let text = "http { server { listen 127.0.0.1:8080; server_name a; location /p/ { proxy_pass http://127.0.0.1:8081; } \
+                    location /q { } location /q/ { proxy_pass http://127.0.0.1:8081; } } \
+                    server { listen 127.0.0.1:8080; server_name b; } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let listen = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(server(&config, listen, Some("b")).names, vec!["b"]);
+        assert_eq!(server(&config, listen, Some("c")).names, vec!["a"]);
+        let s = &config.servers[0];
+        assert_eq!((location(s, "/p").0, location(s, "/p").2), ("/p/", true));
+        assert_eq!((location(s, "/p/x").0, location(s, "/p/x").2), ("/p/", false));
+        assert_eq!((location(s, "/q").0, location(s, "/q").2), ("/q", false));
+        assert!(!location(s, "").2);
     }
 
     #[test]
