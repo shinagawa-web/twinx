@@ -762,7 +762,8 @@ fn parse(r: &mut Request, head: &[u8], level: &Level) -> Result<(), u16> {
         _ => target.to_string(),
     };
     if !path.starts_with('/') { return Err(400); }
-    r.uri = decode(path.split('?').next().unwrap_or_default()).and_then(|u| dots(&u)).ok_or(400u16)?;
+    let uri = decode(path.split('?').next().unwrap_or_default()).ok_or(400u16)?;
+    r.uri = dots(&if level.merge_slashes { merge_slashes(&uri) } else { uri }).ok_or(400u16)?;
     r.target = path;
     if method == "TRACE" { return Err(405); }
     Ok(())
@@ -787,6 +788,13 @@ fn decode(s: &str) -> Option<String> {
         i += 1;
     }
     Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The path with each run of slashes made one, as merge_slashes does.
+fn merge_slashes(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() { if c != '/' || !out.ends_with('/') { out.push(c); } }
+    out
 }
 
 /// The path with its "." and ".." segments resolved, as nginx does; None when
@@ -1103,6 +1111,12 @@ mod tests {
         let (res, r) = request("GET /d%20s?a=b HTTP/1.0\n\n");
         assert_eq!((res, r.uri.as_str(), args(&r)), (Ok(()), "/d s", "?a=b"));
         assert_eq!(request("GET /%g HTTP/1.0\n\n").0, Err(400));
+        assert_eq!(merge_slashes("//a///b/%2F/"), "/a/b/%2F/");
+        let mut r = request("GET / HTTP/1.0\n\n").1;
+        let level = Level { merge_slashes: true, ..Level::default() };
+        assert_eq!((parse(&mut r, b"GET /foo//../b%2F/c HTTP/1.0\r\n\r\n", &level), r.uri.as_str()), (Ok(()), "/b/c"));
+        let (_, r) = request("GET /foo///../bar HTTP/1.0\n\n");
+        assert_eq!(r.uri, "/foo//bar");
         assert_eq!(request("GET /\x02 HTTP/1.0\n\n").0, Err(400));
         let (res, r) = request("GET /a/%2e/b/..?x#f HTTP/1.0\n\n");
         assert_eq!((res, r.uri.as_str(), args(&r)), (Ok(()), "/a/", "?x"));
