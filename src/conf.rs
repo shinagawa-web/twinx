@@ -84,6 +84,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_read_timeout", HSL, 1, 1, false),
     ("proxy_buffer_size", HSL, 1, 1, false),
     ("proxy_buffering", HSL, 1, 1, false),
+    ("proxy_bind", HSL, 1, 2, false),
     ("resolver", HSL, 1, usize::MAX, false),
     ("resolver_timeout", HSL, 1, 1, false),
     ("gzip", HSL, 1, 1, false),
@@ -227,6 +228,10 @@ pub struct Level {
     pub resolver_timeout: Duration,
     pub proxy_connect_timeout: Duration,
     pub proxy_read_timeout: Duration,
+    /// proxy_bind: the local address, which may have variables, that
+    /// connections to proxied servers are made from, and whether it may be
+    /// a foreign one ("transparent"); None when off.
+    pub proxy_bind: Option<(Template, bool)>,
     /// limit_rate and limit_rate_after: sizes, which may have variables,
     /// evaluated when the answer is sent.
     pub limit_rate: Template,
@@ -457,6 +462,7 @@ impl Builder<'_> {
                 // How the proxied answer is read changes nothing that is sent: the values are only checked.
                 "proxy_buffer_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_buffering" => { flag(d).map_err(at)?; }
+                "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
                 "default_type" => level.default_type = d.args[0].clone(),
@@ -543,6 +549,24 @@ impl Builder<'_> {
         let upstream = upstream.map_err(|_| format!("host not found in upstream \"{host}\""))?;
         Ok(Proxy { host: host.to_string(), upstream, uri, url: None, groups: HashMap::new() })
     }
+}
+
+/// proxy_bind address [transparent] | off. An address without variables is
+/// checked here; one with variables when it is used.
+fn proxy_bind(args: &[String]) -> Result<Option<(Template, bool)>, String> {
+    if args.len() == 1 && args[0] == "off" { return Ok(None); }
+    if let Some(a) = args.get(1).filter(|a| *a != "transparent") { return Err(format!("invalid parameter \"{a}\"")); }
+    let address = Template::parse(&args[0])?;
+    let literal = address.0.iter().all(|p| matches!(p, Part::Text(_)));
+    if literal && local_addr(&args[0]).is_none() { return Err(format!("invalid address \"{}\"", args[0])); }
+    Ok(Some((address, args.len() == 2)))
+}
+
+/// An address to bind to, as nginx parses it: an IP address, with ":port" or
+/// in brackets for IPv6 when a port follows; port 0 when there is none.
+pub fn local_addr(s: &str) -> Option<SocketAddr> {
+    let ip = |a: &str| a.parse::<std::net::IpAddr>().ok().map(|ip| SocketAddr::new(ip, 0));
+    ip(s).or_else(|| s.strip_prefix('[')?.strip_suffix(']').and_then(ip)).or_else(|| s.parse().ok())
 }
 
 /// escape=default|json|none of log_format.
@@ -948,6 +972,19 @@ mod tests {
         let e = build_text("http { large_client_header_buffers 0 1k; }").unwrap_err();
         assert_eq!(e, "\"large_client_header_buffers\" directive invalid value in t.conf:1");
         assert!(build_text("http { connection_pool_size 1x; }").is_err());
+    }
+
+    #[test]
+    fn proxy_bind_values() {
+        assert!(build_text("http { proxy_bind 127.0.0.2; server { location / { proxy_bind off; } location /v { proxy_bind $arg_b transparent; } } }").is_ok());
+        assert_eq!(build_text("http { proxy_bind localhost; }").unwrap_err(), "invalid address \"localhost\" in t.conf:1");
+        assert_eq!(build_text("http { proxy_bind 127.0.0.1 x; }").unwrap_err(), "invalid parameter \"x\" in t.conf:1");
+        assert_eq!(local_addr("127.0.0.2"), Some("127.0.0.2:0".parse().unwrap()));
+        assert_eq!(local_addr("127.0.0.2:8000"), Some("127.0.0.2:8000".parse().unwrap()));
+        assert_eq!(local_addr("::1"), Some("[::1]:0".parse().unwrap()));
+        assert_eq!(local_addr("[::1]"), Some("[::1]:0".parse().unwrap()));
+        assert_eq!(local_addr("[::1]:81"), Some("[::1]:81".parse().unwrap()));
+        assert_eq!(local_addr("127.0.0.1:x"), None);
     }
 
     #[test]
