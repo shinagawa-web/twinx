@@ -38,6 +38,13 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
+      # nginx-tests run with main's harness, so a fix to the harness reaches every tag.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main
+          persist-credentials: false
+
       - name: Build twinx in the judge's Rust image
         run: |
           image=$(python3 -c "import sys; sys.path.insert(0, 'harness'); import run_tests; print(run_tests.RUST_IMAGE)")
@@ -52,8 +59,9 @@ jobs:
 
       - name: Run nginx-tests against nginx and against this twinx
         run: |
-          python3 harness/run_tests.py --nginx --out "dist/nginx-tests-nginx-$ARCH.json"
-          python3 harness/run_tests.py --twinx "dist/twinx-$TAG-$ARCH-linux-gnu" \
+          export TWINX_REPO="$GITHUB_WORKSPACE"
+          python3 main/harness/run_tests.py --nginx --out "dist/nginx-tests-nginx-$ARCH.json"
+          python3 main/harness/run_tests.py --twinx "dist/twinx-$TAG-$ARCH-linux-gnu" \
             --reference "dist/nginx-tests-nginx-$ARCH.json" --out "dist/nginx-tests-twinx-$ARCH.json"
 
       - uses: actions/upload-artifact@v4

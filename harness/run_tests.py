@@ -58,22 +58,27 @@ def image(target):
     return f"twinx-nginx-tests:{digest.hexdigest()[:12]}-{target}"
 
 
+def image_arch(tag):
+    out = subprocess.run(["docker", "image", "inspect", "-f", "{{.Architecture}}", tag], capture_output=True, text=True)
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
 def build_image(target):
-    """Make the image available: already here, pulled from REGISTRY, or built."""
+    """Make the image available for this machine: already here, pulled from REGISTRY, or built."""
     tag = image(target)
-    if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode == 0:
+    arch = subprocess.run(["docker", "version", "-f", "{{.Server.Arch}}"], capture_output=True, text=True).stdout.strip()
+    if image_arch(tag) == arch:
         return tag
     # .github/workflows/nginx-tests-image.yml pushes every image main builds, so a machine
-    # whose containers cannot reach apt or GitHub can still run the tests.
+    # whose containers cannot reach apt or GitHub can still run the tests. Docker may pull
+    # an image built for another architecture with only a warning, so check what came.
     published = f"{REGISTRY}/{tag}"
-    # Ask for this machine's architecture: without it, docker pulls an image built for
-    # another one with only a warning, and nothing in it can run.
-    arch = subprocess.run(["docker", "version", "-f", "{{.Server.Arch}}"],
-                          capture_output=True, text=True).stdout.strip()
-    pull = ["docker", "pull", "-q", "--platform", f"linux/{arch}", published]
-    if arch and subprocess.run(pull, capture_output=True).returncode == 0:
-        subprocess.run(["docker", "tag", published, tag], check=True)
-        return tag
+    if subprocess.run(["docker", "pull", "-q", "--platform", f"linux/{arch}", published], capture_output=True).returncode == 0:
+        if image_arch(published) == arch:
+            subprocess.run(["docker", "tag", published, tag], check=True)
+            return tag
+        subprocess.run(["docker", "rmi", "-f", published], capture_output=True)
+    subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
     subprocess.run(["docker", "build", "-q", "--target", target, "-t", tag, str(TESTS_DIR)],
                    check=True, stdout=subprocess.DEVNULL)
     return tag
