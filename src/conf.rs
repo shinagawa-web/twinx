@@ -40,6 +40,8 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("client_body_temp_path", HTTP | SRV | LOC, 1, 4, false),
     ("proxy_temp_path", HTTP | SRV | LOC, 1, 4, false),
     ("client_header_buffer_size", HTTP | SRV, 1, 1, false),
+    ("large_client_header_buffers", HTTP | SRV, 2, 2, false),
+    ("connection_pool_size", HTTP | SRV, 1, 1, false),
     ("client_body_buffer_size", HSL, 1, 1, false),
     ("client_body_in_file_only", HSL, 1, 1, false),
     ("client_body_in_single_buffer", HSL, 1, 1, false),
@@ -279,6 +281,11 @@ impl Builder<'_> {
                 "error_page" => pages.get_or_insert_default().push(error_page(&d.args).map_err(at)?),
                 "proxy_pass" => level.proxy = Some(Arc::new(self.proxy(&d.args[0]).map_err(at)?)),
                 "client_max_body_size" => level.max_body = size(&d.args[0]).map_err(at)?,
+                // Headers are read whole whatever the buffers, so these are only checked.
+                "large_client_header_buffers" | "connection_pool_size" => {
+                    let number = d.args.len() == 1 || d.args[0].parse::<u64>().is_ok_and(|n| n > 0);
+                    if !number || size(d.args.last().unwrap()).is_err() { return Err(at(format!("\"{}\" directive invalid value", d.name))); }
+                }
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
@@ -508,6 +515,14 @@ mod tests {
         assert!(rewrite(&["(".into(), "http://e/".into()]).is_err());
         let c = build_text("http { server { rewrite ^/s http://s/; location / { rewrite ^/l http://l/; } } }").unwrap();
         assert_eq!(c.servers[0].locations[0].level.rewrite.len(), 2);
+    }
+
+    #[test]
+    fn header_buffers() {
+        assert!(build_text("http { connection_pool_size 128; server { large_client_header_buffers 5 256; } }").is_ok());
+        let e = build_text("http { large_client_header_buffers 0 1k; }").unwrap_err();
+        assert_eq!(e, "\"large_client_header_buffers\" directive invalid value in t.conf:1");
+        assert!(build_text("http { connection_pool_size 1x; }").is_err());
     }
 
     #[test]
