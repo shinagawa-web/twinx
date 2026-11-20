@@ -2,7 +2,7 @@
 //! answering, and writing the access log.
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::conf::{Config, Level, Match, Proxy, Rewrite, Server};
 use crate::vars::Template;
 use crate::expires;
+use crate::upstream::{Peer, Upstream};
 use crate::vars::{Request, Sent};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
@@ -86,6 +87,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             length: head.len(),
             body: Vec::new(),
             body_file: None,
+            upstream_addr: None,
         };
         let parsed = parse(&mut r, &head);
         let server = server(config, listen, r.host.as_deref());
@@ -198,6 +200,8 @@ struct Response {
     upstream: Vec<(String, String)>,
     /// The URI the index module redirects to internally, with "index.html" added.
     index: Option<String>,
+    /// The proxied servers tried ($upstream_addr).
+    upstream_addr: Option<String>,
     /// Whether the length is not known when the head is sent (the gzip filter
     /// compresses as it goes): the body is chunked, or the connection closed after it.
     unknown_length: bool,
@@ -272,6 +276,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
             // by its location, with the error's status unless that answer has its own.
             // A named location answers the request as it is.
             let mut to = r.clone();
+            to.upstream_addr = resp.upstream_addr.take();
             if named.is_none() {
                 to.uri = url.split('?').next().unwrap_or_default().to_string();
                 to.target = url;
@@ -309,7 +314,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let so_far = |resp: &Response, trailers: &[(String, String)]| {
         let ctype = resp.ctype.iter().map(|t| ("Content-Type".to_string(), t.clone()));
         let headers = ctype.chain(resp.headers.iter().cloned()).collect();
-        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), ..Sent::default() }
+        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), upstream_addr: resp.upstream_addr.clone(), ..Sent::default() }
     };
     for (name, value, _) in level.add_header.iter().filter(|h| h.2 || added) {
         let value = value.render(r, &so_far(&resp, &[]));
@@ -490,14 +495,20 @@ fn gunzip(resp: &mut Response) {
 /// "Connection: close", until one answers with a response head.
 fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let rest = escape_uri(r.uri.get(prefix.len()..).unwrap_or_default());
-    let uri = p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{rest}{}", args(r)));
+    let (host, uri, up) = match &p.url {
+        None => (p.host.clone(), p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{rest}{}", args(r))), p.upstream.clone()),
+        Some(url) => match resolved(&url.render(r, &Sent::default()), level, r) {
+            Some(t) => t,
+            None => return special(502),
+        },
+    };
     let body = r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default());
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
     let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &Sent::default()))).collect();
     let is_set = |name: &str| set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
     let mut req = format!("{} {uri} HTTP/1.0\r\n", r.method);
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
-    if !is_set("host") { req += &format!("Host: {}\r\n", p.host); }
+    if !is_set("host") { req += &format!("Host: {host}\r\n"); }
     if !is_set("connection") { req += "Connection: close\r\n"; }
     if framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len()); }
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
@@ -505,23 +516,38 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     let mut req = (req + "\r\n").into_bytes();
     req.extend_from_slice(&body);
-    let up = &p.upstream;
-    let (mut tried, mut answer) = (vec![false; up.peers.len()], None);
+    let (mut tried, mut answer, mut addrs) = (vec![false; up.peers.len()], None, Vec::new());
     while answer.is_none() && let Some(i) = up.pick(&mut tried) {
-        answer = fetch(&up.peers[i].addr, &req);
+        addrs.push(up.peers[i].addr.to_string());
+        answer = fetch(&up.peers[i].addr, &req, level.proxy_connect_timeout);
         up.done(i, answer.is_none());
     }
-    let Some(mut resp) = answer else { return special(502) };
+    let upstream_addr = Some(addrs.join(", "));
+    let Some(mut resp) = answer else { return Response { upstream_addr, ..special(502) } };
+    resp.upstream_addr = upstream_addr;
     let hidden = |name: &str| level.proxy_hide_header.iter().any(|h| h.eq_ignore_ascii_case(name));
     resp.headers.retain(|h| !hidden(&h.0));
     if hidden("content-type") { resp.ctype = None; }
     resp
 }
 
+/// The Host, the URI and the servers of a proxy_pass URL with variables: its
+/// host is an address, or a name the location's resolver looks up. The URI,
+/// when the URL has one, is sent as it is.
+fn resolved(url: &str, level: &Level, r: &Request) -> Option<(String, String, Arc<Upstream>)> {
+    let rest = url.strip_prefix("http://")?;
+    let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
+    let (name, port) = host.rsplit_once(':').map_or(Some((host, 80)), |(h, p)| p.parse().ok().map(|p| (h, p)))?;
+    let resolve = || level.resolver.as_ref()?.resolve(name, level.resolver_timeout);
+    let addrs = name.parse::<IpAddr>().map(|a| vec![a]).ok().or_else(resolve)?;
+    let peers = addrs.into_iter().map(|a| Peer::new(SocketAddr::new(a, port))).collect();
+    Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), Arc::new(Upstream::new(peers))))
+}
+
 /// Sends a request to one server and reads its whole answer.
-fn fetch(peer: &SocketAddr, req: &[u8]) -> Option<Response> {
+fn fetch(peer: &SocketAddr, req: &[u8], connect: Duration) -> Option<Response> {
     let timeout = Duration::from_secs(60);
-    let mut s = TcpStream::connect_timeout(peer, timeout).ok()?;
+    let mut s = TcpStream::connect_timeout(peer, connect).ok()?;
     let _ = s.set_read_timeout(Some(timeout));
     let mut answer = Vec::new();
     s.write_all(req).and_then(|_| s.read_to_end(&mut answer)).ok()?;
@@ -676,6 +702,7 @@ mod tests {
             length: 0,
             body: Vec::new(),
             body_file: None,
+            upstream_addr: None,
         };
         (parse(&mut r, head.as_bytes()), r)
     }
@@ -729,7 +756,7 @@ mod tests {
             let _ = s.read(&mut buf).unwrap();
             s.write_all(b"HTTP/1.1 201 Created\r\nServer: x\r\nContent-Type: a/b\r\nX-A: 1\r\nX-Accel-B: 2\r\n\r\nbody").unwrap();
         });
-        let resp = fetch(&addr, b"GET / HTTP/1.0\r\n\r\n").unwrap();
+        let resp = fetch(&addr, b"GET / HTTP/1.0\r\n\r\n", Duration::from_secs(1)).unwrap();
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
         assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
@@ -746,11 +773,21 @@ mod tests {
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: a/b\r\nX-Location: 1\r\nX-B: 2\r\n\r\n").unwrap();
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
-        let p = Proxy { host: "h".into(), upstream, uri: None };
-        let level = Level { proxy_hide_header: vec!["x-location".into(), "content-type".into()], ..Level::default() };
+        let p = Proxy { host: "h".into(), upstream, uri: None, url: None };
+        let level = Level { proxy_hide_header: vec!["x-location".into(), "content-type".into()], proxy_connect_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("GET / HTTP/1.0\n\n");
         let resp = proxy(&p, &level, &r, "/");
+        assert_eq!(resp.upstream_addr, Some(addr.to_string()));
         assert_eq!((resp.ctype, resp.headers), (None, vec![("X-B".to_string(), "2".to_string())]));
+    }
+
+    #[test]
+    fn urls_with_variables() {
+        let (_, r) = request("GET /a?b HTTP/1.0\n\n");
+        let (host, uri, up) = resolved("http://127.0.0.2:81/x", &Level::default(), &r).unwrap();
+        assert_eq!((host.as_str(), uri.as_str(), up.peers[0].addr.to_string()), ("127.0.0.2:81", "/x", "127.0.0.2:81".to_string()));
+        assert_eq!(resolved("http://127.0.0.2", &Level::default(), &r).map(|t| (t.0, t.1)), Some(("127.0.0.2".into(), "/a?b".into())));
+        assert!(resolved("http://example.net/x", &Level::default(), &r).is_none());
     }
 
     #[test]

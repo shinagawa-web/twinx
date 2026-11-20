@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::config::Directive;
 use crate::log::{AccessLog, Cache, Format, Target};
+use crate::resolver::Resolver;
 use crate::upstream::{Peer, Upstream};
 use crate::vars::{Escape, Part, Template};
 
@@ -67,6 +68,11 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("default_type", HSL, 1, 1, false),
     ("proxy_set_header", HSL, 2, 2, false),
     ("proxy_hide_header", HSL, 1, 1, false),
+    ("proxy_next_upstream", HSL, 1, usize::MAX, false),
+    ("proxy_intercept_errors", HSL, 1, 1, false),
+    ("proxy_connect_timeout", HSL, 1, 1, false),
+    ("resolver", HSL, 1, usize::MAX, false),
+    ("resolver_timeout", HSL, 1, 1, false),
     ("gzip", HSL, 1, 1, false),
     ("gzip_static", HSL, 1, 1, false),
     ("gunzip", HSL, 1, 1, false),
@@ -80,12 +86,14 @@ const COMBINED: &str =
 
 /// Where proxy_pass sends requests: the servers in the order they are tried
 /// (backup servers last), the Host to send, and the URI that replaces the
-/// location's prefix, if the directive has one.
+/// location's prefix, if the directive has one. A URL with variables is made
+/// for each request instead, and its host resolved then.
 #[derive(Debug)]
 pub struct Proxy {
     pub host: String,
     pub upstream: Arc<Upstream>,
     pub uri: Option<String>,
+    pub url: Option<Template>,
 }
 
 /// An error_page: the statuses, the status to answer with instead (None keeps
@@ -171,6 +179,11 @@ pub struct Level {
     pub gzip_vary: bool,
     /// gzip_http_version 1.1 (the default): HTTP/1.0 requests are not given gzip.
     pub gzip_http_11: bool,
+    /// resolver: what looks up the names of proxy_pass URLs with variables,
+    /// waiting for an answer up to resolver_timeout.
+    pub resolver: Option<Arc<Resolver>>,
+    pub resolver_timeout: Duration,
+    pub proxy_connect_timeout: Duration,
 }
 
 /// How a location matches the URI: "=", a prefix, "^~" (a prefix that stops
@@ -264,7 +277,8 @@ impl Builder<'_> {
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
         let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
-            keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, ..Level::default() };
+            keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -348,6 +362,14 @@ impl Builder<'_> {
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
                 "default_type" => level.default_type = d.args[0].clone(),
                 "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
+                "resolver" => level.resolver = Some(Arc::new(Resolver::parse(&d.args).map_err(at)?)),
+                "resolver_timeout" => level.resolver_timeout = seconds(&d.args[0]).map_err(at)?,
+                "proxy_connect_timeout" => level.proxy_connect_timeout = seconds(&d.args[0]).map_err(at)?,
+                "proxy_intercept_errors" => drop(flag(d).map_err(at)?),
+                "proxy_next_upstream" => {
+                    const VALUES: &[&str] = &["error", "timeout", "invalid_header", "http_500", "http_502", "http_503", "http_504", "http_403", "http_404", "http_429", "non_idempotent", "updating", "off"];
+                    if let Some(a) = d.args.iter().find(|a| !VALUES.contains(&a.as_str())) { return Err(at(format!("invalid value \"{a}\""))); }
+                }
                 "proxy_hide_header" => hidden.get_or_insert_default().push(d.args[0].to_ascii_lowercase()),
                 "gzip_static" => level.gzip_static = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\"", d.args[0])))?.1,
                 "gunzip" => level.gunzip = flag(d).map_err(at)?,
@@ -407,11 +429,15 @@ impl Builder<'_> {
     /// proxy_pass http://host[:port][/uri], where host may name an upstream block.
     fn proxy(&self, url: &str) -> Result<Proxy, String> {
         let rest = url.strip_prefix("http://").ok_or_else(|| format!("invalid URL prefix in \"{url}\""))?;
+        let template = Template::parse(url)?;
+        if template.0.iter().any(|p| matches!(p, Part::Var(_))) {
+            return Ok(Proxy { host: String::new(), upstream: Arc::new(Upstream::new(Vec::new())), uri: None, url: Some(template) });
+        }
         let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
         let single = || listen(host).map(|a| Arc::new(Upstream::new(vec![Peer::new(a)])));
         let upstream = self.upstreams.get(host).cloned().map_or_else(single, Ok);
         let upstream = upstream.map_err(|_| format!("host not found in upstream \"{host}\""))?;
-        Ok(Proxy { host: host.to_string(), upstream, uri })
+        Ok(Proxy { host: host.to_string(), upstream, uri, url: None })
     }
 }
 
@@ -473,6 +499,11 @@ fn expires(args: &[String]) -> Result<Template, String> {
     let literal = t.0.iter().all(|p| matches!(p, crate::vars::Part::Text(_)));
     if literal && crate::expires::parse(&value).is_none() { return Err(format!("invalid value \"{value}\"")); }
     Ok(t)
+}
+
+/// A time such as "1s" or "30", for directives that take one.
+fn seconds(s: &str) -> Result<Duration, String> {
+    crate::expires::parse_time(s).filter(|t| *t >= 0).map(|t| Duration::from_secs(t as u64)).ok_or_else(|| "invalid value".to_string())
 }
 
 /// "on" or "off".
