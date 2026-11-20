@@ -69,6 +69,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("error_page", HSL, 2, usize::MAX, false),
     ("proxy_pass", LOC, 1, 1, false),
     ("expires", HSL, 1, 2, false),
+    ("post_action", HSL, 1, 1, false),
     ("alias", LOC, 1, 1, false),
     ("absolute_redirect", HSL, 1, 1, false),
     ("server_name_in_redirect", HSL, 1, 1, false),
@@ -170,6 +171,9 @@ pub struct Level {
     pub body_temp_path: PathBuf,
     /// expires, as written ("modified 1h", "$arg_e"): parsed for each response.
     pub expires: Option<Template>,
+    /// post_action: the URI (or named location) asked for after the answer is
+    /// sent, its own answer discarded; None when "off".
+    pub post_action: Option<String>,
     /// alias: the path that replaces the location's prefix, instead of root.
     pub alias: Option<PathBuf>,
     /// The length of the location prefix that alias replaces; None when alias is
@@ -476,6 +480,7 @@ impl Builder<'_> {
                 "gzip_types" => level.gzip_types = d.args.iter().map(|t| t.to_ascii_lowercase()).collect(),
                 "gzip_vary" => level.gzip_vary = flag(d).map_err(at)?,
                 "gzip_http_version" => level.gzip_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))? == 1,
+                "post_action" => level.post_action = Some(d.args[0].clone()).filter(|a| a != "off"),
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
                 "limit_rate" => level.limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "limit_rate_after" => level.limit_rate_after = size_value(&d.args[0]).map_err(at)?,
@@ -714,6 +719,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         build(&parse(text, Path::new("t.conf")).unwrap(), &dir)
+    }
+
+    #[test]
+    fn post_action_inherits_and_turns_off() {
+        let c = build_text("http { post_action /p; server { location /a { } location /b { post_action off; } location /c { post_action @n; } } }").unwrap();
+        let actions: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.post_action.as_deref()).collect();
+        assert_eq!(actions, [Some("/p"), None, Some("@n")]);
     }
 
     #[test]
