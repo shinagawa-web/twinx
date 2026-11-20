@@ -183,12 +183,14 @@ struct Response {
     ctype: Option<String>,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// Whether "Vary: Accept-Encoding" is sent when gzip_vary is on.
+    vary: bool,
 }
 
 /// The page nginx generates for an error status.
 fn special(status: u16) -> Response {
     let ctype = Some("text/html".to_string());
-    Response { status, ctype, headers: Vec::new(), body: page(status).into_bytes() }
+    Response { status, ctype, body: page(status).into_bytes(), ..Response::default() }
 }
 
 const REDIRECTS: &[u16] = &[301, 302, 303, 307, 308];
@@ -214,9 +216,9 @@ fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -
         (Ok(()), Some((code, text)), _) if text.0.is_empty() && *code >= 400 => special(*code),
         (Ok(()), Some((code, text)), _) => {
             let ctype = Some("text/plain".to_string());
-            Response { status: *code, ctype, headers: Vec::new(), body: text.render(r, &Sent::default()).into_bytes() }
+            Response { status: *code, ctype, body: text.render(r, &Sent::default()).into_bytes(), ..Response::default() }
         }
-        (Ok(()), None, Some(p)) => proxy(p, r, prefix),
+        (Ok(()), None, Some(p)) => proxy(p, level, r, prefix),
         (Ok(()), None, None) => file(level, r, prefix),
     }
 }
@@ -253,6 +255,11 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         let port = if level.port_in_redirect && local.port() != 80 { format!(":{}", local.port()) } else { String::new() };
         h.1 = format!("http://{host}{port}{}", h.1);
     }
+    let gzipped = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && h.1.eq_ignore_ascii_case("gzip"));
+    if level.gunzip && gzipped {
+        resp.vary = true;
+        if !gzip_ok(r, level) { gunzip(&mut resp); }
+    }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
     let added = ADDED.contains(&resp.status);
     let expires = level.expires.as_ref().filter(|_| added).and_then(|e| expires::parse(&e.render(r, &Sent::default())));
@@ -277,7 +284,8 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         let ctype = resp.ctype.map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
         let connection = if keepalive { "keep-alive" } else { "close" };
         let len = resp.body.len();
-        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}Content-Length: {len}\r\nConnection: {connection}\r\n");
+        let vary = if resp.vary && level.gzip_vary { "Vary: Accept-Encoding\r\n" } else { "" };
+        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}Content-Length: {len}\r\nConnection: {connection}\r\n{vary}");
         resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
         out = (head + "\r\n").into_bytes();
     }
@@ -298,32 +306,64 @@ fn file(level: &Level, r: &Request, prefix: &str) -> Response {
         None => level.root.join(r.uri.trim_start_matches('/')),
     };
     if !r.uri.ends_with('/') && path.is_dir() { return redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))); }
-    let found = std::fs::metadata(&path).ok().filter(|m| m.is_file()).zip(std::fs::read(&path).ok());
-    let Some((meta, body)) = found else { return special(404) };
+    let read = |p: &std::path::Path| std::fs::metadata(p).ok().filter(|m| m.is_file()).zip(std::fs::read(p).ok());
+    // gzip_static: the file with ".gz" added, for clients that take gzip ("always": for all).
+    let gz = level.gzip_static.filter(|_| r.method != "POST" && !r.uri.ends_with('/')).and_then(|always| read(&path.with_added_extension("gz")).map(|f| (always, f)));
+    let vary = gz.is_some();
+    let gz = gz.filter(|(always, _)| *always || gzip_ok(r, level)).map(|g| g.1);
+    let Some((meta, body)) = gz.as_ref().cloned().or_else(|| read(&path)) else { return special(404) };
     if r.method == "POST" { return special(405); }
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
     let modified = expires::http_date(mtime as i64);
     const TYPES: &[(&str, &str)] = &[("html", "text/html"), ("gif", "image/gif"), ("jpg", "image/jpeg")];
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
-    let ctype = TYPES.iter().find(|t| t.0 == ext).map_or("text/plain", |t| t.1);
-    let headers = vec![
-        ("Last-Modified".to_string(), modified),
-        ("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", body.len())),
-        ("Accept-Ranges".to_string(), "bytes".to_string()),
-    ];
-    Response { status: 200, ctype: Some(ctype.to_string()), headers, body }
+    let ctype = TYPES.iter().find(|t| t.0 == ext).map_or(level.default_type.as_str(), |t| t.1);
+    let mut headers = vec![("Last-Modified".to_string(), modified)];
+    headers.extend(gz.map(|_| ("Content-Encoding".to_string(), "gzip".to_string())));
+    headers.push(("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", body.len())));
+    headers.push(("Accept-Ranges".to_string(), "bytes".to_string()));
+    Response { status: 200, ctype: Some(ctype.to_string()), headers, body, vary }
+}
+
+/// Whether the client takes gzip, as ngx_http_gzip_ok() decides: it accepts the
+/// gzip coding, its HTTP version is at least gzip_http_version, and the request
+/// did not come through a proxy (a Via header).
+fn gzip_ok(r: &Request, level: &Level) -> bool {
+    // A coding is "name" or "name;q=value"; q=0 refuses it.
+    let gzip = |c: &str| {
+        let (name, q) = c.split_once(';').unwrap_or((c, ""));
+        name.trim().eq_ignore_ascii_case("gzip") && q.trim().strip_prefix("q=").is_none_or(|q| q.parse::<f64>() != Ok(0.0))
+    };
+    let accepts = header(r, "accept-encoding").is_some_and(|v| v.split(',').any(gzip));
+    accepts && (r.line.ends_with("HTTP/1.1") || !level.gzip_http_11) && header(r, "via").is_none()
+}
+
+/// gunzip: decompresses a gzip answer for a client that does not take gzip,
+/// without its Content-Encoding and Accept-Ranges, and with a weak ETag.
+fn gunzip(resp: &mut Response) {
+    resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("content-encoding") && !h.0.eq_ignore_ascii_case("accept-ranges"));
+    resp.headers.retain_mut(|h| !h.0.eq_ignore_ascii_case("etag") || h.1.starts_with("W/") || h.1.starts_with('"') && { h.1.insert_str(0, "W/"); true });
+    let mut body = Vec::new();
+    let _ = flate2::read::MultiGzDecoder::new(resp.body.as_slice()).read_to_end(&mut body);
+    resp.body = body;
 }
 
 /// Passes the request to the proxied servers in turn, as HTTP/1.0 with
 /// "Connection: close", until one answers with a response head.
-fn proxy(p: &Proxy, r: &Request, prefix: &str) -> Response {
+fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let rest = escape_uri(r.uri.get(prefix.len()..).unwrap_or_default());
     let uri = p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{rest}{}", args(r)));
     let body = r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default());
-    let mut req = format!("{} {uri} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n", r.method, p.host);
+    // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
+    let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &Sent::default()))).collect();
+    let is_set = |name: &str| set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
+    let mut req = format!("{} {uri} HTTP/1.0\r\n", r.method);
+    set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
+    if !is_set("host") { req += &format!("Host: {}\r\n", p.host); }
+    if !is_set("connection") { req += "Connection: close\r\n"; }
     if framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len()); }
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
-    let passed = r.headers.iter().filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()));
+    let passed = r.headers.iter().filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()) && !is_set(n));
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     let mut req = (req + "\r\n").into_bytes();
     req.extend_from_slice(&body);
@@ -599,6 +639,26 @@ mod tests {
         assert_eq!(answer("/b?x=1"), (302, "http://e/?y=1&x=1".to_string()));
         assert_eq!(answer("/b"), (302, "http://e/?y=1".to_string()));
         assert_eq!(answer("/c?x=1"), (301, "http://e/".to_string()));
+    }
+
+    #[test]
+    fn gzip_ok_and_gunzip() {
+        let level = Level { gzip_http_11: true, ..Level::default() };
+        let ok = |head: &str, level: &Level| gzip_ok(&request(head).1, level);
+        assert!(ok("GET / HTTP/1.1\nHost: a\nAccept-Encoding: deflate, GZIP;q=0.5\n\n", &level));
+        assert!(!ok("GET / HTTP/1.1\nHost: a\nAccept-Encoding: gzip;q=0\n\n", &level));
+        assert!(!ok("GET / HTTP/1.1\nHost: a\nAccept-Encoding: gzip\nVia: x\n\n", &level));
+        assert!(!ok("GET / HTTP/1.0\nAccept-Encoding: gzip\n\n", &level));
+        assert!(ok("GET / HTTP/1.0\nAccept-Encoding: gzip\n\n", &Level::default()));
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(b"abc").unwrap();
+        let member = gz.finish().unwrap();
+        let headers = [("Content-Encoding", "gzip"), ("ETag", "\"1-2\""), ("Accept-Ranges", "bytes"), ("X", "y")];
+        let mut resp = Response { body: [member.clone(), member].concat(), ..Response::default() };
+        resp.headers = headers.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        gunzip(&mut resp);
+        assert_eq!(resp.body, b"abcabc");
+        assert_eq!(resp.headers, vec![("ETag".to_string(), "W/\"1-2\"".to_string()), ("X".to_string(), "y".to_string())]);
     }
 
     #[test]
