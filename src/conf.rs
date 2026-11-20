@@ -45,6 +45,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("client_header_buffer_size", HTTP | SRV, 1, 1, false),
     ("large_client_header_buffers", HTTP | SRV, 2, 2, false),
     ("connection_pool_size", HTTP | SRV, 1, 1, false),
+    ("max_headers", HTTP | SRV, 1, 1, false),
     ("client_body_buffer_size", HSL, 1, 1, false),
     ("client_body_in_file_only", HSL, 1, 1, false),
     ("client_body_in_single_buffer", HSL, 1, 1, false),
@@ -126,6 +127,8 @@ pub struct Level {
     pub error_page: Vec<ErrorPage>,
     pub proxy: Option<Arc<Proxy>>,
     pub max_body: u64,
+    /// max_headers: the header lines a request may have; one more is refused with 400.
+    pub max_headers: usize,
     pub body_buffer: u64,
     pub body_in_file_only: bool,
     pub body_temp_path: PathBuf,
@@ -260,7 +263,7 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
+        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
@@ -339,6 +342,7 @@ impl Builder<'_> {
                     let number = d.args.len() == 1 || d.args[0].parse::<u64>().is_ok_and(|n| n > 0);
                     if !number || size(d.args.last().unwrap()).is_err() { return Err(at(format!("\"{}\" directive invalid value", d.name))); }
                 }
+                "max_headers" => level.max_headers = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
@@ -575,6 +579,14 @@ mod tests {
         assert!(e.servers[0].level.expires.is_some() && e.servers[0].locations[0].level.expires.is_some());
         let e = build_text("http { expires bad; }").unwrap_err();
         assert_eq!(e, "invalid value \"bad\" in t.conf:1");
+    }
+
+    #[test]
+    fn max_headers() {
+        let c = build_text("http { max_headers 5; server { } server { max_headers 7; } }").unwrap();
+        assert_eq!((c.servers[0].level.max_headers, c.servers[1].level.max_headers), (5, 7));
+        assert_eq!(build_text("http { server { } }").unwrap().servers[0].level.max_headers, 1000);
+        assert_eq!(build_text("http { max_headers x; }").unwrap_err(), "invalid number in t.conf:1");
     }
 
     #[test]

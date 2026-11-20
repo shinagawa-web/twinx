@@ -89,6 +89,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
         };
         let parsed = parse(&mut r, &head);
         let server = server(config, listen, r.host.as_deref());
+        let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
         r.server_name = server.names.first().cloned().unwrap_or_default();
         let found = location(server, &r.uri);
         let level = found.1;
