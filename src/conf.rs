@@ -30,6 +30,7 @@ const HSL: u8 = HTTP | SRV | LOC;
 const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("daemon", MAIN, 1, 1, false),
     ("pid", MAIN, 1, 1, false),
+    ("worker_rlimit_nofile", MAIN, 1, 1, false),
     ("error_log", MAIN | HSL, 1, usize::MAX, false),
     ("log_not_found", HSL, 1, 1, false),
     ("index", HSL, 1, usize::MAX, false),
@@ -441,6 +442,8 @@ pub struct Server {
 #[derive(Debug)]
 pub struct Config {
     pub pid: PathBuf,
+    /// worker_rlimit_nofile: the limit on open files the worker sets for itself.
+    pub rlimit_nofile: Option<u64>,
     pub servers: Vec<Server>,
 }
 
@@ -459,11 +462,12 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), location: String::new() };
-    let mut config = Config { pid: prefix.join("logs/nginx.pid"), servers: Vec::new() };
+    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, servers: Vec::new() };
     for d in main {
         b.check(d, MAIN)?;
         match d.name.as_str() {
             "pid" => config.pid = b.path(&d.args[0]),
+            "worker_rlimit_nofile" => config.rlimit_nofile = Some(d.args[0].parse().map_err(|_| format!("invalid number in {}", d.at))?),
             "error_log" => b.open(&d.args[0]).map(drop).map_err(|e| format!("{e} in {}", d.at))?,
             "events" => d.block.iter().flatten().try_for_each(|e| b.check(e, EVENTS))?,
             "http" => config.servers = b.http(d.block.as_deref().unwrap_or_default())?,
@@ -1098,6 +1102,13 @@ mod tests {
         let l = &c.servers[0].locations;
         assert_eq!((l[0].level.chunked, l[1].level.chunked), (false, true));
         assert!(build_text("http { chunked_transfer_encoding x; }").is_err());
+    }
+
+    #[test]
+    fn worker_rlimit_nofile() {
+        assert_eq!(build_text("worker_rlimit_nofile 32; http { }").unwrap().rlimit_nofile, Some(32));
+        assert_eq!(build_text("http { }").unwrap().rlimit_nofile, None);
+        assert_eq!(build_text("worker_rlimit_nofile x;").unwrap_err(), "invalid number in t.conf:1");
     }
 
     #[test]

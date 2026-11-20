@@ -106,6 +106,10 @@ fn forked(child: pid_t, config: &Arc<conf::Config>, listeners: &[(TcpListener, S
 }
 
 fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> ! {
+    // worker_rlimit_nofile: as in nginx, a failure leaves the limit as it was.
+    let limit = config.rlimit_nofile.map(|n| libc::rlimit { rlim_cur: n, rlim_max: n });
+    // SAFETY: setrlimit() only reads the structure it is given.
+    if let Some(l) = limit { unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &l) }; }
     if let Err(e) = http::accept(config.clone(), listeners) { fail(&e, None) }
     wait_signal(set);
     std::process::exit(0)
