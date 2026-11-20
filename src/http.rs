@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::conf::{Config, Level, Match, Proxy, Rewrite, Server};
+use crate::conf::{Config, Level, Match, Proxy, Rewrite, Server, ServerName};
 use crate::vars::Template;
 use crate::expires;
 use crate::upstream::{Peer, Upstream};
@@ -88,11 +88,13 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             body: Vec::new(),
             body_file: None,
             upstream_addr: None,
+            captures: Vec::new(),
         };
         let parsed = parse(&mut r, &head);
-        let server = server(config, listen, r.host.as_deref());
+        let (server, captures) = server(config, listen, r.host.as_deref());
+        r.captures = captures;
         let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
-        r.server_name = server.names.first().cloned().unwrap_or_default();
+        r.server_name = server.name.clone();
         let found = location(server, &r.uri);
         let level = found.1;
         let framing = parsed.and_then(|()| framing(&r)).and_then(|n| if n.unwrap_or(0) > level.max_body { Err(413) } else { Ok(n) });
@@ -622,12 +624,30 @@ fn escape_uri(s: &str) -> String {
     s.bytes().map(|c| if plain(c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
 }
 
-/// The server that answers on a listening address: the one named by the
-/// host, else the first one listening there.
-fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) -> &'a Server {
+/// The server that answers on a listening address, and the named captures of
+/// its name: the one with the host as its name, else the longest "*.name"
+/// that matches, else the longest "name.*", else the first regular expression
+/// that matches, else the first server listening there. No host is "".
+fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) -> (&'a Server, Vec<(String, String)>) {
     let on = || config.servers.iter().filter(|s| s.listen.contains(&listen));
-    let named = host.and_then(|h| on().find(|s| s.names.iter().any(|n| n == h)));
-    named.or_else(|| on().next()).unwrap_or(&config.servers[0])
+    let host = host.unwrap_or_default();
+    let mut best: Option<(u8, std::cmp::Reverse<usize>, &Server)> = None;
+    for (s, n) in on().flat_map(|s| s.names.iter().map(move |n| (s, n))) {
+        let found = match n {
+            ServerName::Exact(name) => (name == host).then_some((0, 0)),
+            ServerName::Leading(suffix) => (host.len() > suffix.len() && host.ends_with(suffix.as_str())).then_some((1, suffix.len())),
+            ServerName::Trailing(prefix) => (host.len() > prefix.len() && host.starts_with(prefix.as_str())).then_some((2, prefix.len())),
+            ServerName::Regex(_) => None,
+        };
+        let found = found.map(|(rank, len)| (rank, std::cmp::Reverse(len), s));
+        if found.as_ref().is_some_and(|f| best.as_ref().is_none_or(|b| (f.0, f.1) < (b.0, b.1))) { best = found; }
+    }
+    if let Some((_, _, s)) = best { return (s, Vec::new()); }
+    let regex = on().flat_map(|s| s.names.iter().map(move |n| (s, n))).find_map(|(s, n)| match n {
+        ServerName::Regex(re) => re.captures(host).map(|c| (s, re.capture_names().flatten().filter_map(|name| Some((name.to_string(), c.name(name)?.as_str().to_string()))).collect())),
+        _ => None,
+    });
+    regex.unwrap_or_else(|| (on().next().unwrap_or(&config.servers[0]), Vec::new()))
 }
 
 /// The host as $host gives it: lower case, without the port or a trailing
@@ -703,6 +723,7 @@ mod tests {
             body: Vec::new(),
             body_file: None,
             upstream_addr: None,
+            captures: Vec::new(),
         };
         (parse(&mut r, head.as_bytes()), r)
     }
@@ -815,14 +836,32 @@ mod tests {
     }
 
     #[test]
+    fn server_names() {
+        let text = "http { server { listen 127.0.0.1:8080; server_name a; } server { listen 127.0.0.1:8080; server_name \"\"; } \
+                    server { listen 127.0.0.1:8080; server_name *.b.c; } server { listen 127.0.0.1:8080; server_name *.x.b.c .d.e; } \
+                    server { listen 127.0.0.1:8080; server_name f.*; server_name f.g.*; } \
+                    server { listen 127.0.0.1:8080; server_name \"~^(?P<n1>[a-z]+)\\Q.h\\E$\"; } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let listen = "127.0.0.1:8080".parse().unwrap();
+        let name = |host: Option<&str>| server(&config, listen, host).0.name.clone();
+        let cases = [(Some("zz"), "a"), (None, ""), (Some("y.b.c"), "*.b.c"), (Some("y.x.b.c"), "*.x.b.c"), (Some("d.e"), "*.x.b.c"), (Some("y.d.e"), "*.x.b.c"),
+                     (Some("f.z"), "f.*"), (Some("f.g.z"), "f.*"), (Some("xyz.h"), "~^(?P<n1>[a-z]+)\\Q.h\\E$"), (Some("xyzah"), "a")];
+        for (host, expected) in cases { assert_eq!(name(host), expected, "{host:?}"); }
+        assert_eq!(server(&config, listen, Some("xyz.h")).1, vec![("n1".to_string(), "xyz".to_string())]);
+        let (_, mut r) = request("GET / HTTP/1.0\n\n");
+        r.captures = vec![("n1".into(), "v".into())];
+        assert_eq!(Template::parse("[$n1]").unwrap().render(&r, &Sent::default()), "[v]");
+    }
+
+    #[test]
     fn finds_servers_and_auto_redirects() {
         let text = "http { server { listen 127.0.0.1:8080; server_name a; location /p/ { proxy_pass http://127.0.0.1:8081; } \
                     location /q { } location /q/ { proxy_pass http://127.0.0.1:8081; } } \
                     server { listen 127.0.0.1:8080; server_name b; } }";
         let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let listen = "127.0.0.1:8080".parse().unwrap();
-        assert_eq!(server(&config, listen, Some("b")).names, vec!["b"]);
-        assert_eq!(server(&config, listen, Some("c")).names, vec!["a"]);
+        assert_eq!(server(&config, listen, Some("b")).0.name, "b");
+        assert_eq!(server(&config, listen, Some("c")).0.name, "a");
         let s = &config.servers[0];
         assert_eq!((location(s, "/p").0, location(s, "/p").2), ("/p/", true));
         assert_eq!((location(s, "/p/x").0, location(s, "/p/x").2), ("/p/", false));
