@@ -97,7 +97,9 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             captures: Vec::new(),
             limit_rate: Default::default(),
         };
-        let parsed = parse(&mut r, &head);
+        // Header lines are read with the settings of the default server of the address.
+        let default = config.servers.iter().find(|s| s.listen.contains(&listen)).unwrap_or(&config.servers[0]);
+        let parsed = parse(&mut r, &head, &default.level);
         let (server, captures) = server(config, listen, r.host.as_deref());
         r.captures = captures;
         let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
@@ -609,7 +611,7 @@ fn fetch(peer: &SocketAddr, req: &[u8], connect: Duration) -> Option<Response> {
 }
 
 /// Fills the request from its head, or gives the status nginx refuses it with.
-fn parse(r: &mut Request, head: &[u8]) -> Result<(), u16> {
+fn parse(r: &mut Request, head: &[u8], level: &Level) -> Result<(), u16> {
     let text = String::from_utf8_lossy(head);
     let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     r.line = lines.next().unwrap_or_default().to_string();
@@ -619,7 +621,7 @@ fn parse(r: &mut Request, head: &[u8]) -> Result<(), u16> {
     let valid_method = method.bytes().all(|c| c.is_ascii_uppercase() || c == b'_' || c == b'-');
     if !valid_method || !matches!(version, "HTTP/1.0" | "HTTP/1.1") { return Err(400); }
     for line in lines.filter(|l| !l.is_empty()) {
-        let (name, value) = line.split_once(':').ok_or(400u16)?;
+        let Some((name, value)) = header_line(line, level)? else { continue };
         r.headers.push((name.to_string(), value.trim_matches([' ', '\t']).to_string()));
     }
     // Headers nginx takes only once: a second one is refused.
@@ -647,6 +649,16 @@ fn parse(r: &mut Request, head: &[u8]) -> Result<(), u16> {
     r.target = path;
     if method == "TRACE" { return Err(405); }
     Ok(())
+}
+
+/// A header line's name and value as ngx_http_parse_header_line() reads
+/// them: 400 for a name that is empty or has spaces or control characters,
+/// None for a line ignore_invalid_headers drops.
+fn header_line<'a>(line: &'a str, level: &Level) -> Result<Option<(&'a str, &'a str)>, u16> {
+    let (name, value) = line.split_once(':').ok_or(400u16)?;
+    if name.is_empty() || name.bytes().any(|c| c <= 0x20 || c == 0x7f) { return Err(400); }
+    let valid = name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || (c == b'_' && level.underscores_in_headers));
+    Ok((valid || !level.ignore_invalid_headers).then_some((name, value)))
 }
 
 /// The path with its %XX escapes decoded; None when one is malformed.
@@ -786,7 +798,23 @@ mod tests {
             captures: Vec::new(),
             limit_rate: Default::default(),
         };
-        (parse(&mut r, head.as_bytes()), r)
+        (parse(&mut r, head.as_bytes(), &Level::default()), r)
+    }
+
+    #[test]
+    fn ignores_invalid_headers() {
+        let names = |head: &str, ignore: bool, underscores: bool| {
+            let level = Level { ignore_invalid_headers: ignore, underscores_in_headers: underscores, ..Level::default() };
+            let mut r = request("GET / HTTP/1.0\n\n").1;
+            parse(&mut r, head.as_bytes(), &level).map(|()| r.headers.iter().map(|h| h.0.clone()).collect::<Vec<_>>())
+        };
+        let head = "GET / HTTP/1.0\nx_foo: a\n_y: b\nx.z: c\nA-1: d\n\n";
+        assert_eq!(names(head, true, false), Ok(vec!["A-1".to_string()]));
+        assert_eq!(names(head, true, true), Ok(vec!["x_foo".to_string(), "_y".to_string(), "A-1".to_string()]));
+        assert_eq!(names(head, false, false).unwrap().len(), 4);
+        for bad in [":a: b", " a: b", "a\x02: b", "a b: c"] {
+            assert_eq!(names(&format!("GET / HTTP/1.0\n{bad}\n\n"), false, false), Err(400));
+        }
     }
 
     #[test]
