@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure how much of the code a branch adds is run by the cases.
+"""Measure how much of the code a branch adds is run by nginx-tests.
 
 Reads an LCOV file exported from the profiles twinx wrote while every case
 ran against it, and the lines added under src/ since a base commit (the
@@ -65,7 +65,7 @@ def ranges(numbers):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", required=True)
-    parser.add_argument("--lcov", help="LCOV exported from the case runs; missing means nothing ran")
+    parser.add_argument("--lcov", help="LCOV exported from the nginx-tests runs; missing means nothing ran")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 

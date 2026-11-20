@@ -2,14 +2,17 @@
 # Judge a pull request into main. Run by .github/workflows/judge.yml from a copy
 # of main's harness, in a checkout of main ($TWINX_REPO), in two phases:
 #
-#   judge.sh baseline   run every case against main as it is
+#   judge.sh baseline   run nginx-tests against nginx (the reference) and
+#                       against twinx built from main as it is
 #   judge.sh pr         merge the pull request without committing, build and test
-#                       it, run every case, measure coverage and write the verdict
+#                       it, run nginx-tests against it, measure coverage and
+#                       write the verdict
 #
 # Everything that comes from the pull request (cargo build with its build
 # scripts, cargo test, twinx) runs in a container that sees only a copy of the
-# merged tree and a cargo directory. The checkout with its .git, this harness
-# and the results stay on the host, out of the containers' reach.
+# merged tree and a cargo directory, or, for twinx, its binary and the tests.
+# The checkout with its .git, this harness and the results stay on the host,
+# out of the containers' reach.
 #
 # Environment: TWINX_REPO, JUDGE_DIR (scratch space, outputs in $JUDGE_DIR/out),
 # and for the pr phase BRANCH, PR_NUMBER, PR_HEAD and BASE (main's commit).
@@ -17,7 +20,7 @@
 set -euo pipefail
 
 HARNESS=$(cd "$(dirname "$0")" && pwd)
-IMAGE=$(python3 -c "import sys; sys.path.insert(0, '$HARNESS'); import compare; print(compare.SANDBOX_IMAGE)")
+IMAGE=$(python3 -c "import sys; sys.path.insert(0, '$HARNESS'); import run_tests; print(run_tests.RUST_IMAGE)")
 RUSTFLAGS_COVERAGE="-C instrument-coverage -C llvm-args=-runtime-counter-relocation"
 OUT="$JUDGE_DIR/out"
 mkdir -p "$OUT" "$JUDGE_DIR/cargo"
@@ -44,8 +47,8 @@ baseline() {
   rm -rf "$tree" && mkdir -p "$tree"
   git archive HEAD | tar -x -C "$tree"
   if [ -f "$tree/Cargo.toml" ]; then build "$tree" "" || true; fi
-  python3 "$HARNESS/compare.py" --sandbox --twinx "$tree/target/release/twinx" --out "$OUT/baseline.json" || true
-  [ -f "$OUT/baseline.json" ]
+  python3 "$HARNESS/run_tests.py" --nginx --out "$OUT/reference.json"
+  python3 "$HARNESS/run_tests.py" --twinx "$tree/target/release/twinx" --out "$OUT/baseline.json"
 }
 
 fail_merge() {
@@ -82,7 +85,7 @@ pr() {
 
   local profiles="$JUDGE_DIR/profiles"
   rm -rf "$profiles" && mkdir -p "$profiles" && chmod 0777 "$profiles"
-  python3 "$HARNESS/compare.py" --sandbox --profiles "$profiles" \
+  python3 "$HARNESS/run_tests.py" --profiles "$profiles" \
     --twinx "$tree/target/release/twinx" --out "$OUT/results.json" || true
 
   local lcov=()
@@ -94,13 +97,14 @@ pr() {
         "$bin/llvm-profdata" merge -sparse /profiles/*.profraw -o /tmp/merged.profdata
         "$bin/llvm-cov" export "$0" -instr-profile=/tmp/merged.profdata -format=lcov \
           --ignore-filename-regex="/registry/src/|/rustc/"' "$tree/target/release/twinx" \
-      > "$OUT/cases.lcov" && lcov=(--lcov "$OUT/cases.lcov")
+      > "$OUT/tests.lcov" && lcov=(--lcov "$OUT/tests.lcov")
   fi
   python3 "$HARNESS/coverage.py" --base "$BASE" "${lcov[@]}" --out "$OUT/coverage.json" || true
 
   python3 "$HARNESS/judge.py" \
     --branch "$BRANCH" --base "$BASE" --head "$PR_HEAD" --build "$build" --test "$test" \
-    --baseline "$OUT/baseline.json" --results "$OUT/results.json" --coverage "$OUT/coverage.json" \
+    --reference "$OUT/reference.json" --baseline "$OUT/baseline.json" \
+    --results "$OUT/results.json" --coverage "$OUT/coverage.json" \
     --verdict "$OUT/verdict.json" --comment "$OUT/comment.md"
 }
 

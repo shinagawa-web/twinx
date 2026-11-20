@@ -1,0 +1,33 @@
+# The nginx-tests files each stage is judged by. A file is in stage 1 when it
+# needs only the http, rewrite and proxy modules (its Test::Nginx has() line),
+# the modules behind static files and reverse proxying over HTTP/1.1, or names
+# no module at all. Later stages add files by the module they bring in.
+#
+# Only subtests that pass on nginx 1.30.6 count: a file or subtest nginx skips
+# here (it needs root, another OS, or a tool the image lacks) is not expected.
+
+[stage1]
+files = [
+  "access_log_variables.t", "binary_upgrade.t", "body.t", "body_chunked.t",
+  "client_body_early_read.t", "headers.t", "http_absolute_redirect.t",
+  "http_error_page.t", "http_expect_100_continue.t", "http_header_buffers.t",
+  "http_headers_multi.t", "http_host.t", "http_keepalive.t", "http_listen.t",
+  "http_listen_wildcard.t", "http_location.t", "http_location_auto.t",
+  "http_location_predicate.t", "http_location_win32.t", "http_max_headers.t",
+  "http_method.t", "http_request_port.t", "http_resolver.t", "http_resolver_aaaa.t",
+  "http_resolver_cleanup.t", "http_resolver_cname.t", "http_resolver_ipv4.t",
+  "http_server_name.t", "http_try_files.t", "http_uri.t", "http_variables.t",
+  "ignore_invalid_headers.t", "index.t", "limit_rate.t", "merge_slashes.t",
+  "not_modified.t", "post_action.t", "proxy.t", "proxy_available.t", "proxy_bind.t",
+  "proxy_bind_transparent.t", "proxy_bind_transparent_capability.t",
+  "proxy_chunked_extra.t", "proxy_cookie.t", "proxy_cookie_flags.t",
+  "proxy_duplicate_headers.t", "proxy_implicit.t", "proxy_intercept_errors.t",
+  "proxy_limit_rate2.t", "proxy_max_temp_file_size.t", "proxy_method.t",
+  "proxy_next_upstream.t", "proxy_next_upstream_tries.t", "proxy_noclose.t",
+  "proxy_pass_request.t", "proxy_redirect.t", "proxy_request_buffering.t",
+  "proxy_request_buffering_chunked.t", "proxy_set_body.t", "proxy_upstream_cookie.t",
+  "proxy_variables.t", "proxy_websocket.t", "proxy_xar.t", "range_if_range.t",
+  "rewrite.t", "rewrite_if.t", "rewrite_unescape.t", "server_tokens.t", "trailers.t",
+  "upstream.t", "worker_channel.t", "worker_shutdown_timeout.t",
+  "worker_shutdown_timeout_proxy_upgrade.t", "working_directory.t",
+]

@@ -2,22 +2,22 @@
 """Decide whether a pull request into main passes the judge.
 
 Run from a checkout of main with the pull request merged but not
-committed, after every case has run twice: against main as it is (the
-baseline) and against the merged tree. The branch name says what the pull
+committed, after nginx-tests ran three times (harness/run_tests.py):
+against nginx 1.30.6 (the reference), against twinx built from main (the
+baseline) and against twinx built from the merged tree. Only a subtest
+that passes on nginx is expected of twinx; a file passes when twinx passes
+every subtest of it that nginx passes. The branch name says what the pull
 request is for:
 
-  claude/fix-<stage>-<case>   a Fixer change that makes cases/<stage>/<case> pass
-  claude/find-<anything>      a Finder change that adds new cases
-  anything else               a change by a human
+  claude/fix-<stage>-<file>   a Fixer change that makes <file>.t pass
+  anything not under claude/  a change by a human
 
-Every pull request must build, pass cargo test and keep every case that
-passes on main passing. A Fixer pull request may only touch twinx's code,
-must make the case it names pass, and the cases must run at least 99% of
-the executable lines it adds. A Finder pull request may only add files
-under cases/. Every case must name, in `covers`, the items of
-harness/checklist.toml it shows. Cases that fail on main are allowed:
-they are the Fixer's work queue, so a green check means main did not get
-worse, not that every case passes.
+Every pull request must build, pass cargo test and keep every expected
+subtest that passes on main passing. A Fixer pull request may only touch
+twinx's code, must make the file it names pass, and nginx-tests must run
+at least 99% of the executable lines it adds. Files that fail on main are
+allowed: they are the Fixer's work queue, so a green check means main did
+not get worse, not that every file passes.
 
 Exit status 0 means the pull request passes. The verdict is written as
 JSON and as Markdown for the pull request comment.
@@ -29,21 +29,16 @@ import os
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 # The repository the scripts work on. The judge runs copies of these scripts taken from
 # main before the pull request is merged, so a pull request cannot change how it is judged.
 REPO = Path(os.environ.get("TWINX_REPO") or Path(__file__).resolve().parent.parent).resolve()
 
-# Share of the executable lines a Fixer pull request adds that the cases must run.
+# Share of the executable lines a Fixer pull request adds that nginx-tests must run.
 COVERAGE_THRESHOLD = 99.0
 
 FIXER_MAY_TOUCH = ("src/", "tests/", "benches/", "Cargo.toml", "Cargo.lock")
-FINDER_MAY_ADD = ("cases/",)
-
-# What each stage has to cover, read from main's copy of the harness.
-CHECKLIST = Path(__file__).resolve().parent / "checklist.toml"
 
 
 def changed_files(base, head):
@@ -57,52 +52,21 @@ def changed_files(base, head):
 def role_of(branch):
     match = re.fullmatch(r"claude/fix-(stage\d+)-(.+)", branch)
     if match:
-        return "fix", f"cases/{match.group(1)}/{match.group(2)}"
-    if re.fullmatch(r"claude/find-.+", branch):
-        return "find", None
+        return "fix", f"{match.group(2)}.t"
     if branch.startswith("claude/"):
         return None, None
     return "human", None
 
 
-def path_problems(role, changes):
-    problems = []
-    for status, path in changes:
-        if role == "fix" and not path.startswith(FIXER_MAY_TOUCH):
-            problems.append(f"a Fixer pull request may not touch {path}")
-        if role == "find":
-            if not path.startswith(FINDER_MAY_ADD):
-                problems.append(f"a Finder pull request may not touch {path}")
-            elif status != "A":
-                problems.append(f"a Finder pull request may only add files, but {path} is {status}")
-    return problems
+def load(path):
+    if not path or not Path(path).exists():
+        return None
+    return json.loads(Path(path).read_text())["files"]
 
 
-def passing(results_file):
-    if not results_file or not Path(results_file).exists():
-        return []
-    return sorted(r["case"] for r in json.loads(Path(results_file).read_text())["results"] if r["passed"])
-
-
-def checklist(results):
-    """Check every case's `covers` against the checklist and list the items of the
-    current stage that no passing case covers yet."""
-    stage = int((REPO / "status" / "stage.txt").read_text().strip())
-    stages = tomllib.loads(CHECKLIST.read_text())
-    known = {item for name, items in stages.items() if int(name.removeprefix("stage")) <= stage for item in items}
-    current = list(stages.get(f"stage{stage}", {}))
-    problems, covered = [], set()
-    for result in results:
-        covers = tomllib.loads((REPO / result["case"] / "case.toml").read_text()).get("covers", [])
-        if not covers:
-            problems.append(f"{result['case']} lists no checklist item in covers")
-        for item in covers:
-            if item not in known:
-                problems.append(f"{result['case']} covers {item}, which is not in the checklist up to stage {stage}")
-        if result["passed"]:
-            covered.update(covers)
-    missing = [item for item in current if item not in covered]
-    return problems, {"stage": stage, "items": len(current), "covered": len(current) - len(missing), "missing": missing}
+def passing(results, name):
+    file = (results or {}).get(name)
+    return {n for n, s in file["tests"].items() if s == "ok"} if file else set()
 
 
 def markdown(verdict):
@@ -111,21 +75,16 @@ def markdown(verdict):
         lines += ["Problems:", ""] + [f"- {p}" for p in verdict["problems"]] + [""]
     lines += [
         f"- Role: {verdict['role'] or 'unknown'}" + (f", target `{verdict['target']}`" if verdict["target"] else ""),
-        f"- Cases passing on main: {verdict['cases_passing_before']}; with this pull request: "
-        f"{verdict['cases_passing_after']} of {verdict['cases']}",
+        f"- nginx-tests files passing on main: {verdict['files_passing_before']}; with this pull request: "
+        f"{verdict['files_passing_after']} of {verdict['files']} "
+        f"({verdict['subtests_passing_after']} of {verdict['subtests']} subtests)",
     ]
     if verdict["newly_passing"]:
-        lines.append("- Newly passing: " + ", ".join(f"`{c}`" for c in verdict["newly_passing"]))
-    # The Finder cannot build twinx, so it reads which cases fail from this line.
-    lines.append("- Failing: " + (", ".join(f"`{c}`" for c in verdict["failing"]) or "none"))
-    stage = verdict.get("checklist")
-    if stage:
-        # The Finder reads which items still need a case from this line.
-        lines.append(f"- Stage {stage['stage']} checklist: {stage['covered']} of {stage['items']} items have a passing case; "
-                     "not yet: " + (", ".join(f"`{i}`" for i in stage["missing"]) or "none"))
+        lines.append("- Newly passing: " + ", ".join(f"`{f}`" for f in verdict["newly_passing"]))
+    lines.append("- Failing: " + (", ".join(f"`{f}`" for f in verdict["failing"]) or "none"))
     coverage = verdict.get("coverage")
     if coverage and coverage.get("percent") is not None:
-        lines.append(f"- Added executable lines run by the cases: {coverage['covered_by_cases']} of "
+        lines.append(f"- Added executable lines run by nginx-tests: {coverage['covered_by_cases']} of "
                      f"{coverage['added_executable_lines']} ({coverage['percent']}%)")
     lines += ["", f"main `{verdict['base'][:7]}`, pull request head `{verdict['head'][:7]}`"]
     return "\n".join(lines) + "\n"
@@ -138,8 +97,9 @@ def main():
     parser.add_argument("--head", required=True, help="the pull request head commit")
     parser.add_argument("--build", required=True, choices=["success", "failure", "skipped"])
     parser.add_argument("--test", required=True, choices=["success", "failure", "skipped"])
-    parser.add_argument("--baseline", help="JSON written by compare.py for main as it is")
-    parser.add_argument("--results", help="JSON written by compare.py for the merged tree")
+    parser.add_argument("--reference", required=True, help="run_tests.py results for nginx")
+    parser.add_argument("--baseline", help="run_tests.py results for twinx built from main")
+    parser.add_argument("--results", help="run_tests.py results for twinx built from the merged tree")
     parser.add_argument("--coverage", help="JSON written by coverage.py")
     parser.add_argument("--verdict", required=True, help="where to write the verdict JSON")
     parser.add_argument("--comment", required=True, help="where to write the Markdown comment")
@@ -148,32 +108,43 @@ def main():
     role, target = role_of(args.branch)
     problems = []
     if role is None:
-        problems.append(f"{args.branch} is neither claude/fix-<stage>-<case> nor claude/find-<name>")
-    else:
-        problems += path_problems(role, changed_files(args.base, args.head))
+        problems.append(f"{args.branch} is neither claude/fix-<stage>-<file> nor a human branch")
+    elif role == "fix":
+        problems += [f"a Fixer pull request may not touch {path}"
+                     for _, path in changed_files(args.base, args.head) if not path.startswith(FIXER_MAY_TOUCH)]
     if args.build == "failure":
         problems.append("cargo build failed")
     if args.test == "failure":
         problems.append("cargo test failed")
 
-    if not args.results or not Path(args.results).exists():
-        problems.append("the cases did not run")
-        results = []
-    else:
-        results = json.loads(Path(args.results).read_text())["results"]
-    passing_now = sorted(r["case"] for r in results if r["passed"])
-    passing_before = passing(args.baseline)
-    known = {r["case"] for r in results}
-    regressed = [c for c in passing_before if c in known and c not in passing_now]
+    reference = load(args.reference) or {}
+    baseline = load(args.baseline)
+    results = load(args.results)
+    if results is None:
+        problems.append("nginx-tests did not run")
+        results = {}
+
+    expected = {name: passing(reference, name) for name in reference}
+    expected = {name: tests for name, tests in expected.items() if tests}
+    regressed = []
+    for name, tests in sorted(expected.items()):
+        lost = sorted((tests & passing(baseline, name)) - passing(results, name), key=int)
+        if lost:
+            regressed.append(f"{name} ({', '.join(lost)})")
     if regressed:
-        problems.append(f"cases that pass on main no longer pass: {regressed}")
-    checklist_problems, stage = checklist(results)
-    problems += checklist_problems
+        problems.append("subtests that pass on main no longer pass: " + "; ".join(regressed))
+
+    def file_passes(run, name):
+        return expected[name] <= passing(run, name)
+
+    passing_before = [n for n in expected if baseline is not None and file_passes(baseline, n)]
+    passing_after = [n for n in expected if file_passes(results, n)]
     if role == "fix":
-        if target not in known:
-            problems.append(f"{target} does not exist")
-        elif target not in passing_now:
-            problems.append(f"{target} still does not pass")
+        if target not in expected:
+            problems.append(f"{target} is not an nginx-tests file that nginx passes in the current stages")
+        elif target not in passing_after:
+            missing = sorted(expected[target] - passing(results, target), key=int)
+            problems.append(f"{target} still does not pass: subtests {', '.join(missing)}")
 
     coverage = json.loads(Path(args.coverage).read_text()) if args.coverage and Path(args.coverage).exists() else None
     if role == "fix":
@@ -182,8 +153,8 @@ def main():
         elif coverage["percent"] is not None and coverage["percent"] < COVERAGE_THRESHOLD:
             missed = "; ".join(f"{path}:{','.join(lines)}" for path, lines in coverage["missed"].items())
             problems.append(
-                f"the cases run {coverage['percent']}% of the {coverage['added_executable_lines']} lines "
-                f"this pull request adds, below {COVERAGE_THRESHOLD}%; not run by any case: {missed}"
+                f"nginx-tests run {coverage['percent']}% of the {coverage['added_executable_lines']} lines "
+                f"this pull request adds, below {COVERAGE_THRESHOLD}%; not run: {missed}"
             )
 
     verdict = {
@@ -194,12 +165,13 @@ def main():
         "head": args.head,
         "passed": not problems,
         "problems": problems,
-        "cases": len(results),
-        "cases_passing_before": len(passing_before),
-        "cases_passing_after": len(passing_now),
-        "newly_passing": [c for c in passing_now if c not in passing_before],
-        "failing": sorted(known - set(passing_now)),
-        "checklist": stage,
+        "files": len(expected),
+        "files_passing_before": len(passing_before),
+        "files_passing_after": len(passing_after),
+        "subtests": sum(len(t) for t in expected.values()),
+        "subtests_passing_after": sum(len(t & passing(results, n)) for n, t in expected.items()),
+        "newly_passing": sorted(set(passing_after) - set(passing_before)),
+        "failing": sorted(set(expected) - set(passing_after)),
         "coverage": coverage,
     }
     Path(args.verdict).write_text(json.dumps(verdict, indent=2))

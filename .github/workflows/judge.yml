@@ -56,10 +56,12 @@ jobs:
         id: baseline-cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/judge/out/baseline.json
-          key: baseline-sandboxed-${{ steps.base.outputs.sha }}
+          path: |
+            ${{ runner.temp }}/judge/out/reference.json
+            ${{ runner.temp }}/judge/out/baseline.json
+          key: nginx-tests-${{ steps.base.outputs.sha }}
 
-      - name: Run every case against main
+      - name: Run nginx-tests against nginx and against main
         if: steps.baseline-cache.outputs.cache-hit != 'true'
         run: '"$RUNNER_TEMP/harness/judge.sh" baseline'
 
@@ -67,8 +69,10 @@ jobs:
         if: steps.baseline-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ${{ runner.temp }}/judge/out/baseline.json
-          key: baseline-sandboxed-${{ steps.base.outputs.sha }}
+          path: |
+            ${{ runner.temp }}/judge/out/reference.json
+            ${{ runner.temp }}/judge/out/baseline.json
+          key: nginx-tests-${{ steps.base.outputs.sha }}
 
       - name: Judge the pull request
         env:
@@ -84,6 +88,7 @@ jobs:
         with:
           name: judge-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
           path: |
+            ${{ runner.temp }}/judge/out/reference.json
             ${{ runner.temp }}/judge/out/baseline.json
             ${{ runner.temp }}/judge/out/results.json
             ${{ runner.temp }}/judge/out/coverage.json
