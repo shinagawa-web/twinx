@@ -186,6 +186,11 @@ struct Response {
     body: Vec<u8>,
     /// Whether "Vary: Accept-Encoding" is sent when gzip_vary is on.
     vary: bool,
+    /// The URI the index module redirects to internally, with "index.html" added.
+    index: Option<String>,
+    /// Whether the length is not known when the head is sent (the gzip filter
+    /// compresses as it goes): the body is chunked, or the connection closed after it.
+    unknown_length: bool,
 }
 
 /// The page nginx generates for an error status.
@@ -247,8 +252,7 @@ fn args(r: &Request) -> &str {
 
 /// Answers one request; true when the connection stays open for the next one.
 fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr) -> bool {
-    let mut level = found.1;
-    let mut resp = respond(r, parsed, found);
+    let (mut resp, mut level) = answer(server, r, parsed, found);
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)) {
         let url = ep.url.render(r, &Sent::default());
         let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == url);
@@ -264,8 +268,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
             }
             let status = ep.status.unwrap_or(resp.status);
             let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
-            level = found.1;
-            resp = respond(&to, Ok(()), found);
+            (resp, level) = answer(server, &to, Ok(()), found);
             if resp.status == 200 { resp.status = status; }
         } else {
             // A named location that does not exist is an error.
@@ -297,8 +300,13 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         if ["etag", "last-modified"].contains(&name.to_ascii_lowercase().as_str()) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case(name)); }
         if !value.is_empty() { resp.headers.push((name.clone(), value)); }
     }
+    gzip(r, level, &mut resp);
     let status = resp.status;
-    let keepalive = parsed.is_ok() && keepalive(r) && ![400, 413, 414, 500, 501].contains(&status);
+    // A body of unknown length is chunked for HTTP/1.1; otherwise the connection
+    // closes after it. A HEAD answer has neither.
+    let unknown = resp.unknown_length && r.method != "HEAD";
+    let chunked = unknown && r.line.ends_with("HTTP/1.1");
+    let keepalive = parsed.is_ok() && keepalive(r) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown);
     let mut out = Vec::new();
     if status != 444 {
         let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
@@ -306,31 +314,58 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         let ctype = resp.ctype.map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
         let connection = if keepalive { "keep-alive" } else { "close" };
         let len = resp.body.len();
+        let length = if !resp.unknown_length { format!("Content-Length: {len}\r\n") } else if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else { String::new() };
         let vary = if resp.vary && level.gzip_vary { "Vary: Accept-Encoding\r\n" } else { "" };
-        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}Content-Length: {len}\r\nConnection: {connection}\r\n{vary}");
+        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{vary}");
         resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
         out = (head + "\r\n").into_bytes();
     }
     let body_len = if r.method == "HEAD" || status == 444 { 0 } else { resp.body.len() };
+    if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
     out.extend_from_slice(&resp.body[..body_len]);
+    if chunked { out.extend_from_slice(if body_len > 0 { b"\r\n0\r\n\r\n" } else { b"0\r\n\r\n" }); }
     let written = stream.write_all(&out).is_ok();
     let sent = Sent { status, bytes: out.len(), body: body_len };
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     written && keepalive && status != 444
 }
 
+/// The answer of the location found, after the internal redirects of the
+/// index module, and the settings of the location that gave it.
+fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>) -> (Response, &'a Level) {
+    let mut resp = respond(r, parsed, (prefix, level, auto));
+    let mut redirects = 0;
+    while let Some(uri) = resp.index.take() {
+        // nginx gives up after 10 internal redirects.
+        redirects += 1;
+        let mut to = r.clone();
+        to.target = format!("{uri}{}", args(r));
+        to.uri = uri;
+        let found = location(server, &to.uri);
+        level = found.1;
+        resp = if redirects > 10 { special(500) } else { respond(&to, Ok(()), found) };
+    }
+    (resp, level)
+}
+
 /// Serves a file under root (or alias), as nginx's static module does; a
-/// directory asked for without the trailing "/" is redirected to it.
+/// directory asked for without the trailing "/" is redirected to it. A URI
+/// that ends with "/" is the index module's: "index.html" in that directory,
+/// by an internal redirect, else 403 when the directory exists and 404 when not.
 fn file(level: &Level, r: &Request, prefix: &str) -> Response {
     if !matches!(r.method.as_str(), "GET" | "HEAD" | "POST") { return special(405); }
     let path = match &level.alias {
         Some(alias) => std::path::PathBuf::from(format!("{}{}", alias.display(), r.uri.get(prefix.len()..).unwrap_or_default())),
         None => level.root.join(r.uri.trim_start_matches('/')),
     };
+    if r.uri.ends_with('/') {
+        let index = path.join("index.html").is_file().then(|| format!("{}index.html", r.uri));
+        return if index.is_some() { Response { index, ..Response::default() } } else { special(if path.is_dir() { 403 } else { 404 }) };
+    }
     if !r.uri.ends_with('/') && path.is_dir() { return redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))); }
     let read = |p: &std::path::Path| std::fs::metadata(p).ok().filter(|m| m.is_file()).zip(std::fs::read(p).ok());
     // gzip_static: the file with ".gz" added, for clients that take gzip ("always": for all).
-    let gz = level.gzip_static.filter(|_| r.method != "POST" && !r.uri.ends_with('/')).and_then(|always| read(&path.with_added_extension("gz")).map(|f| (always, f)));
+    let gz = level.gzip_static.filter(|_| r.method != "POST").and_then(|always| read(&path.with_added_extension("gz")).map(|f| (always, f)));
     let vary = gz.is_some();
     let gz = gz.filter(|(always, _)| *always || gzip_ok(r, level)).map(|g| g.1);
     let Some((meta, body)) = gz.as_ref().cloned().or_else(|| read(&path)) else { return special(404) };
@@ -344,7 +379,7 @@ fn file(level: &Level, r: &Request, prefix: &str) -> Response {
     headers.extend(gz.map(|_| ("Content-Encoding".to_string(), "gzip".to_string())));
     headers.push(("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", body.len())));
     headers.push(("Accept-Ranges".to_string(), "bytes".to_string()));
-    Response { status: 200, ctype: Some(ctype.to_string()), headers, body, vary }
+    Response { status: 200, ctype: Some(ctype.to_string()), headers, body, vary, ..Response::default() }
 }
 
 /// Whether the client takes gzip, as ngx_http_gzip_ok() decides: it accepts the
@@ -360,11 +395,40 @@ fn gzip_ok(r: &Request, level: &Level) -> bool {
     accepts && (r.line.ends_with("HTTP/1.1") || !level.gzip_http_11) && header(r, "via").is_none()
 }
 
+/// Takes away what no longer holds once the body is recoded: Content-Encoding,
+/// Accept-Ranges, and a strong ETag, which becomes weak (one not quoted is dropped).
+fn recoded(resp: &mut Response) {
+    resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("content-encoding") && !h.0.eq_ignore_ascii_case("accept-ranges"));
+    resp.headers.retain_mut(|h| !h.0.eq_ignore_ascii_case("etag") || h.1.starts_with("W/") || h.1.starts_with('"') && { h.1.insert_str(0, "W/"); true });
+}
+
+/// The gzip filter: with gzip on, an answer with status 200, 403 or 404, no
+/// Content-Encoding, at least 20 bytes (gzip_min_length) and a type of
+/// gzip_types (text/html always) is compressed for a client that takes gzip,
+/// at gzip_comp_level 1, and sent without a length.
+fn gzip(r: &Request, level: &Level, resp: &mut Response) {
+    let ctype = resp.ctype.as_deref().unwrap_or_default().split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    let typed = ctype == "text/html" || level.gzip_types.iter().any(|t| t == "*" || *t == ctype);
+    let encoded = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && !h.1.is_empty());
+    if !level.gzip || ![200, 403, 404].contains(&resp.status) || encoded || resp.body.len() < 20 || !typed { return; }
+    resp.vary = true;
+    if !gzip_ok(r, level) { return; }
+    recoded(resp);
+    resp.headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
+    // The header nginx writes: no name, no time, the Unix OS code.
+    let mut crc = flate2::Crc::new();
+    crc.update(&resp.body);
+    let mut deflate = flate2::write::DeflateEncoder::new(vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3], flate2::Compression::new(1));
+    let _ = deflate.write_all(&resp.body);
+    let mut body = deflate.finish().unwrap_or_default();
+    body.extend(crc.sum().to_le_bytes().into_iter().chain((resp.body.len() as u32).to_le_bytes()));
+    (resp.body, resp.unknown_length) = (body, true);
+}
+
 /// gunzip: decompresses a gzip answer for a client that does not take gzip,
 /// without its Content-Encoding and Accept-Ranges, and with a weak ETag.
 fn gunzip(resp: &mut Response) {
-    resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("content-encoding") && !h.0.eq_ignore_ascii_case("accept-ranges"));
-    resp.headers.retain_mut(|h| !h.0.eq_ignore_ascii_case("etag") || h.1.starts_with("W/") || h.1.starts_with('"') && { h.1.insert_str(0, "W/"); true });
+    recoded(resp);
     let mut body = Vec::new();
     let _ = flate2::read::MultiGzDecoder::new(resp.body.as_slice()).read_to_end(&mut body);
     resp.body = body;
@@ -694,6 +758,54 @@ mod tests {
         gunzip(&mut resp);
         assert_eq!(resp.body, b"abcabc");
         assert_eq!(resp.headers, vec![("ETag".to_string(), "W/\"1-2\"".to_string()), ("X".to_string(), "y".to_string())]);
+    }
+
+    #[test]
+    fn gzip_compresses_what_it_may() {
+        let level = Level { gzip: true, gzip_http_11: true, gzip_types: vec!["text/plain".to_string()], ..Level::default() };
+        let (_, r) = request("GET / HTTP/1.1\nHost: a\nAccept-Encoding: gzip\n\n");
+        let make = |status, ctype: &str, len| {
+            let headers = vec![("ETag".to_string(), "\"1-2\"".to_string()), ("Accept-Ranges".to_string(), "bytes".to_string())];
+            Response { status, ctype: Some(ctype.to_string()), headers, body: vec![b'X'; len], ..Response::default() }
+        };
+        let mut resp = make(404, "text/plain; charset=utf-8", 64);
+        gzip(&r, &level, &mut resp);
+        assert!(resp.vary && resp.unknown_length);
+        assert_eq!(&resp.body[..10], &[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
+        let mut plain = Vec::new();
+        flate2::read::GzDecoder::new(resp.body.as_slice()).read_to_end(&mut plain).unwrap();
+        assert_eq!(plain, vec![b'X'; 64]);
+        let etag = ("ETag".to_string(), "W/\"1-2\"".to_string());
+        assert_eq!(resp.headers, vec![etag, ("Content-Encoding".to_string(), "gzip".to_string())]);
+        // Too short, another type, another status, or gzip off: left as it is.
+        for (mut resp, level) in [(make(200, "text/html", 19), &level), (make(200, "image/gif", 64), &level),
+                                  (make(301, "text/html", 64), &level), (make(200, "text/html", 64), &Level::default())] {
+            gzip(&r, level, &mut resp);
+            assert!(!resp.unknown_length && !resp.vary && resp.body.iter().all(|&c| c == b'X'));
+        }
+        // A client that does not take gzip still makes it vary.
+        let (_, r) = request("GET / HTTP/1.1\nHost: a\n\n");
+        let mut resp = make(200, "text/html", 64);
+        gzip(&r, &level, &mut resp);
+        assert!(resp.vary && !resp.unknown_length);
+    }
+
+    #[test]
+    fn index_redirects_internally() {
+        let dir = std::env::temp_dir().join(format!("twinx-index-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a/empty")).unwrap();
+        std::fs::write(dir.join("a/index.html"), "hi").unwrap();
+        let text = format!("http {{ server {{ root {}; location /a/ {{ }} location = /a/index.html {{ return 200 i$uri; }} }} }}", dir.display());
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let status = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            let (resp, _) = answer(s, &r, Ok(()), location(s, &r.uri));
+            (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
+        };
+        assert_eq!(status("/a/?x"), (200, "i/a/index.html".to_string()));
+        assert_eq!(status("/a/empty/").0, 403);
+        assert_eq!(status("/a/none/").0, 404);
     }
 
     #[test]
