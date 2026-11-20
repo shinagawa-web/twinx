@@ -1,25 +1,41 @@
 name: release
 
-# When a version tag (v*) is pushed, builds twinx from that tag the way the judge
-# does, runs nginx-tests against it and against nginx, and publishes a GitHub
-# release with the binary and the results. twinx's code runs only in containers;
-# the token that creates the release stays on the runner.
+# For a version tag (v*): builds twinx from that tag the way the judge does, for
+# x86_64 and aarch64 Linux on runners of each, runs nginx-tests against it and
+# against nginx there, and publishes a GitHub release with the binaries and the
+# results. Run by hand with a tag to add what an existing release lacks.
+# twinx's code runs only in containers; the token that publishes stays on the
+# runner, in the last job, which runs none of twinx's code.
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: an existing version tag to build and publish again
+        required: true
 
 jobs:
-  release:
-    runs-on: ubuntu-24.04
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     permissions:
-      contents: write
+      contents: read
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.tag || github.ref_name }}
+      ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
       - name: Build twinx in the judge's Rust image
@@ -32,39 +48,63 @@ jobs:
             -e HOME=/tmp -e CARGO_HOME=/cargo --tmpfs /tmp:rw,exec \
             -v "$RUNNER_TEMP/cargo:/cargo" -v "$tree:$tree" -w "$tree" "$image" cargo build --release --locked
           mkdir -p dist
-          cp "$tree/target/release/twinx" "dist/twinx-$TAG-x86_64-linux-gnu"
+          cp "$tree/target/release/twinx" "dist/twinx-$TAG-$ARCH-linux-gnu"
 
       - name: Run nginx-tests against nginx and against this twinx
         run: |
-          python3 harness/run_tests.py --nginx --out dist/nginx-tests-nginx.json
-          python3 harness/run_tests.py --twinx "dist/twinx-$TAG-x86_64-linux-gnu" \
-            --reference dist/nginx-tests-nginx.json --out dist/nginx-tests-twinx.json
+          python3 harness/run_tests.py --nginx --out "dist/nginx-tests-nginx-$ARCH.json"
+          python3 harness/run_tests.py --twinx "dist/twinx-$TAG-$ARCH-linux-gnu" \
+            --reference "dist/nginx-tests-nginx-$ARCH.json" --out "dist/nginx-tests-twinx-$ARCH.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
 
       - name: Write the release notes
         run: |
           python3 - <<'PY' > notes.md
           import json, os
-          ref = json.load(open("dist/nginx-tests-nginx.json"))["files"]
-          got = json.load(open("dist/nginx-tests-twinx.json"))["files"]
-          stage = json.load(open("dist/nginx-tests-twinx.json"))["summary"]["stage"]
           ok = lambda r: {n for n, s in r["tests"].items() if s == "ok"}
-          expected = {f: ok(r) for f, r in ref.items() if ok(r)}
-          passing = sorted(f for f, t in expected.items() if t <= ok(got[f]))
-          subtests = sum(len(t & ok(got[f])) for f, t in expected.items())
-          print(f"twinx {os.environ['TAG']}, judged by nginx-tests (harness/nginx-tests/Dockerfile) against nginx 1.30.6.")
+          print(f"twinx {os.environ['TAG']}, judged by nginx-tests (harness/nginx-tests/Dockerfile) against nginx 1.30.6 on each architecture.")
           print()
-          print(f"- Stages 1 to {stage}: {len(passing)} of {len(expected)} files pass, "
-                f"{subtests} of {sum(len(t) for t in expected.values())} subtests")
-          print("- Passing files: " + ", ".join(f"`{f}`" for f in passing))
+          for arch in ("x86_64", "aarch64"):
+              ref = json.load(open(f"dist/nginx-tests-nginx-{arch}.json"))["files"]
+              run = json.load(open(f"dist/nginx-tests-twinx-{arch}.json"))
+              got, stage = run["files"], run["summary"]["stage"]
+              expected = {f: ok(r) for f, r in ref.items() if ok(r)}
+              passing = sorted(f for f, t in expected.items() if t <= ok(got[f]))
+              subtests = sum(len(t & ok(got[f])) for f, t in expected.items())
+              print(f"- {arch} Linux, stages 1 to {stage}: {len(passing)} of {len(expected)} files pass, "
+                    f"{subtests} of {sum(len(t) for t in expected.values())} subtests")
           print()
-          print("The binary is built for x86_64 Linux in rust:1.100-slim-bookworm (glibc 2.36). "
-                "The JSON files hold every subtest's result for nginx and for this binary.")
+          print("The binaries are built in rust:1.100-slim-bookworm (glibc 2.36). The JSON files hold every "
+                "subtest's result for nginx and for each binary.")
           PY
           cat notes.md >> "$GITHUB_STEP_SUMMARY"
-          (cd dist && sha256sum * > SHA256SUMS)
+          (cd dist && sha256sum twinx-* nginx-tests-* > SHA256SUMS)
 
       - name: Publish the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: gh release create "$TAG" dist/* --title "twinx $TAG" --notes-file notes.md --verify-tag
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" dist/* --title "twinx $TAG" --notes-file notes.md --verify-tag
+          fi
