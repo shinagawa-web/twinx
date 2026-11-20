@@ -81,6 +81,7 @@ pub enum Var {
     RequestPort,
     IsRequestPort,
     UpstreamAddr,
+    Pid,
     Arg(String),
     Http(String),
     Cookie(String),
@@ -101,7 +102,7 @@ impl Var {
             ("server_addr", Var::ServerAddr), ("server_port", Var::ServerPort), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
             ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
-            ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr),
+            ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("pid", Var::Pid),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -140,6 +141,7 @@ impl Var {
             Var::RequestUri => r.target.clone(),
             Var::RequestPort => request_port(r).to_string(),
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
+            Var::Pid => std::process::id().to_string(),
             Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
             Var::Args => r.target.split_once('?').map_or("", |(_, a)| a).to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
@@ -372,6 +374,15 @@ mod tests {
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"127.0.0.1:1234:127.0.0.1:8080|\\x7F\\x00\\x00\\x01|\\x22\\x5C\\x0A\\x01\\xC3\\xA9");
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Json), b"127.0.0.1:1234:127.0.0.1:8080|\x7F\\u0000\\u0000\\u0001|\\\"\\\\\\n\\u0001\xC3\xA9".as_slice());
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::None), b"127.0.0.1:1234:127.0.0.1:8080|\x7F\x00\x00\x01|\"\\\n\x01\xC3\xA9");
+    }
+
+    #[test]
+    fn pid_and_upstream_addr() {
+        let mut r = request();
+        r.upstream_addr = Some("a".into());
+        let t = Template::parse("$pid|$upstream_addr").unwrap();
+        assert_eq!(t.render(&r, &Sent::default()), format!("{}|a", std::process::id()));
+        assert_eq!(t.render(&r, &Sent { upstream_addr: Some("b".into()), ..Sent::default() }), format!("{}|b", std::process::id()));
     }
 
     #[test]
