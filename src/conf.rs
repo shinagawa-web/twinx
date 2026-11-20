@@ -6,10 +6,12 @@ use std::fs::{File, OpenOptions};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::Directive;
+use crate::log::{AccessLog, Cache, Format, Target};
 use crate::upstream::{Peer, Upstream};
-use crate::vars::Template;
+use crate::vars::{Escape, Part, Template};
 
 const MAIN: u8 = 1;
 const EVENTS: u8 = 2;
@@ -37,6 +39,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("root", HTTP | SRV | LOC, 1, 1, false),
     ("log_format", HTTP, 2, usize::MAX, false),
     ("access_log", HTTP | SRV | LOC, 1, usize::MAX, false),
+    ("open_log_file_cache", HSL, 1, 4, false),
     ("client_body_temp_path", HTTP | SRV | LOC, 1, 4, false),
     ("proxy_temp_path", HTTP | SRV | LOC, 1, 4, false),
     ("client_header_buffer_size", HTTP | SRV, 1, 1, false),
@@ -55,16 +58,17 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("server_name_in_redirect", HSL, 1, 1, false),
     ("port_in_redirect", HSL, 1, 1, false),
     ("rewrite", SRV | LOC, 2, 3, false),
+    ("default_type", HSL, 1, 1, false),
+    ("proxy_set_header", HSL, 2, 2, false),
+    ("gzip_static", HSL, 1, 1, false),
+    ("gunzip", HSL, 1, 1, false),
+    ("gzip_vary", HSL, 1, 1, false),
+    ("gzip_http_version", HSL, 1, 1, false),
+    ("gzip_types", HSL, 1, usize::MAX, false),
 ];
 
 const COMBINED: &str =
     "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\"";
-
-#[derive(Debug)]
-pub struct AccessLog {
-    pub file: Arc<File>,
-    pub format: Arc<Template>,
-}
 
 /// Where proxy_pass sends requests: the servers in the order they are tried
 /// (backup servers last), the Host to send, and the URI that replaces the
@@ -86,14 +90,16 @@ pub struct ErrorPage {
 }
 
 /// rewrite regex replacement [flag], where the replacement is a URL the
-/// client is redirected to: with 301 for "permanent", 302 otherwise. A
-/// replacement ending with "?" does not get the request's arguments.
+/// client is redirected to: with 301 for "permanent", 302 otherwise; or, with
+/// "break", the URI the location goes on with. A replacement ending with "?"
+/// does not get the request's arguments.
 #[derive(Debug, Clone)]
 pub struct Rewrite {
     pub regex: regex::Regex,
     pub url: Template,
     pub status: u16,
     pub add_args: bool,
+    pub internal: bool,
 }
 
 /// The settings of one level (http, server or location) after inheriting from the one above.
@@ -103,6 +109,8 @@ pub struct Level {
     /// rewrite directives, in order: the regular expression and the redirect it makes.
     pub rewrite: Vec<Rewrite>,
     pub access_log: Vec<Arc<AccessLog>>,
+    /// open_log_file_cache, for the access logs whose paths have variables.
+    pub log_cache: Option<Arc<Cache>>,
     pub root: PathBuf,
     /// add_header: name, value, and whether it is added whatever the status ("always").
     pub add_header: Vec<(String, Template, bool)>,
@@ -123,6 +131,16 @@ pub struct Level {
     pub absolute_redirect: bool,
     pub server_name_in_redirect: bool,
     pub port_in_redirect: bool,
+    /// default_type: the Content-Type of files whose extension has no type.
+    pub default_type: String,
+    /// proxy_set_header: the headers sent to the proxied server instead of the client's.
+    pub proxy_set_header: Vec<(String, Template)>,
+    /// gzip_static: None when off, Some(true) for "always".
+    pub gzip_static: Option<bool>,
+    pub gunzip: bool,
+    pub gzip_vary: bool,
+    /// gzip_http_version 1.1 (the default): HTTP/1.0 requests are not given gzip.
+    pub gzip_http_11: bool,
 }
 
 /// How a location matches the URI: "=", a prefix, "^~" (a prefix that stops
@@ -133,6 +151,8 @@ pub enum Match {
     Prefix,
     NoRegex,
     Regex(regex::Regex),
+    /// "@name": only error_page goes there, never a URI.
+    Named,
 }
 
 #[derive(Debug)]
@@ -161,14 +181,14 @@ pub struct Config {
 
 struct Builder<'a> {
     prefix: &'a Path,
-    formats: HashMap<String, Arc<Template>>,
+    formats: HashMap<String, Arc<Format>>,
     logs: HashMap<PathBuf, Arc<File>>,
     upstreams: HashMap<String, Arc<Upstream>>,
 }
 
 /// Interprets the main block. Errors are nginx's messages, with the place.
 pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
-    let combined = Arc::new(Template::parse(COMBINED)?);
+    let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new() };
     let mut config = Config { pid: prefix.join("logs/nginx.pid"), servers: Vec::new() };
@@ -213,7 +233,7 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { max_body: 1 << 20, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true, ..Level::default() };
+        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -261,6 +281,7 @@ impl Builder<'_> {
         let mut logs: Option<Vec<Arc<AccessLog>>> = None;
         let mut headers: Option<Vec<(String, Template, bool)>> = None;
         let mut pages: Option<Vec<ErrorPage>> = None;
+        let mut proxy_headers: Option<Vec<(String, Template)>> = None;
         for d in block {
             self.check(d, ctx)?;
             let at = |e: String| format!("{e} in {}", d.at);
@@ -273,9 +294,11 @@ impl Builder<'_> {
                 "server_name_in_redirect" => level.server_name_in_redirect = flag(d).map_err(at)?,
                 "port_in_redirect" => level.port_in_redirect = flag(d).map_err(at)?,
                 "log_format" => {
-                    let t = Template::parse(&d.args[1..].concat()).map_err(at)?;
-                    self.formats.insert(d.args[0].clone(), Arc::new(t));
+                    let escape = d.args[1].strip_prefix("escape=").map(|e| log_escape(e).map_err(at)).transpose()?;
+                    let line = Template::parse(&d.args[1 + escape.is_some() as usize..].concat()).map_err(at)?;
+                    self.formats.insert(d.args[0].clone(), Arc::new(Format { line, escape: escape.unwrap_or(Escape::Default) }));
                 }
+                "open_log_file_cache" => level.log_cache = log_cache(&d.args).map_err(at)?,
                 "access_log" => logs.get_or_insert_default().extend(self.access_log(&d.args).map_err(at)?),
                 "add_header" => headers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
                 "error_page" => pages.get_or_insert_default().push(error_page(&d.args).map_err(at)?),
@@ -289,6 +312,12 @@ impl Builder<'_> {
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
+                "default_type" => level.default_type = d.args[0].clone(),
+                "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
+                "gzip_static" => level.gzip_static = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\"", d.args[0])))?.1,
+                "gunzip" => level.gunzip = flag(d).map_err(at)?,
+                "gzip_vary" => level.gzip_vary = flag(d).map_err(at)?,
+                "gzip_http_version" => level.gzip_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))? == 1,
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
                 _ => {}
             }
@@ -296,15 +325,31 @@ impl Builder<'_> {
         if let Some(logs) = logs { level.access_log = logs; }
         if let Some(headers) = headers { level.add_header = headers; }
         if let Some(pages) = pages { level.error_page = pages; }
+        if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
         Ok(())
     }
 
+    /// access_log path [format [buffer=size] [gzip[=level]] [flush=time] [if=condition]] | off.
+    /// Lines are written as soon as requests end, so buffer and flush are only checked.
     fn access_log(&mut self, args: &[String]) -> Result<Option<Arc<AccessLog>>, String> {
         if args[0] == "off" { return Ok(None); }
         let name = args.get(1).map_or("combined", |n| n.as_str());
         let format = self.formats.get(name).cloned().ok_or_else(|| format!("unknown log format \"{name}\""))?;
-        let file = self.open(&args[0])?;
-        Ok(Some(Arc::new(AccessLog { file, format })))
+        let (mut buffer, mut flush, mut gzip, mut condition) = (false, false, None, None);
+        for a in args.iter().skip(2) {
+            match a.split_once('=').unwrap_or((a, "")) {
+                ("buffer", v) => buffer = size(v).map_err(|_| format!("invalid buffer size \"{v}\""))? > 0,
+                ("flush", v) => flush = crate::expires::parse_time(v.strip_suffix("ms").unwrap_or(v)).ok_or_else(|| format!("invalid flush time \"{v}\""))? >= 0,
+                ("gzip", v) => gzip = Some(if v.is_empty() { 1 } else { v.parse().ok().filter(|l| (1..=9).contains(l)).ok_or_else(|| format!("invalid compression level \"{v}\""))? }),
+                ("if", v) => condition = Some(Template::parse(v)?),
+                _ => return Err(format!("invalid parameter \"{a}\"")),
+            }
+        }
+        if flush && !buffer && gzip.is_none() { return Err(format!("no buffer is defined for access_log \"{}\"", args[0])); }
+        let path = Template::parse(&self.path(&args[0]).to_string_lossy())?;
+        let literal = path.0.iter().all(|p| matches!(p, Part::Text(_)));
+        let target = if literal { Target::File(self.open(&args[0])?) } else { Target::Path(path) };
+        Ok(Some(Arc::new(AccessLog { target, format, condition, gzip })))
     }
 
     /// proxy_pass http://host[:port][/uri], where host may name an upstream block.
@@ -318,6 +363,28 @@ impl Builder<'_> {
     }
 }
 
+/// escape=default|json|none of log_format.
+fn log_escape(e: &str) -> Result<Escape, String> {
+    let modes = [("default", Escape::Default), ("json", Escape::Json), ("none", Escape::None)];
+    modes.into_iter().find(|m| m.0 == e).map(|m| m.1).ok_or_else(|| format!("unknown log format escaping \"{e}\""))
+}
+
+/// open_log_file_cache max=N [inactive=time] [min_uses=N] [valid=time] | off
+fn log_cache(args: &[String]) -> Result<Option<Arc<Cache>>, String> {
+    if args[0] == "off" { return Ok(None); }
+    let mut values = [("max", 0), ("inactive", 10), ("min_uses", 1), ("valid", 60)];
+    for a in args {
+        let invalid = format!("invalid \"open_log_file_cache\" parameter \"{a}\"");
+        let (name, value) = a.split_once('=').ok_or(invalid.clone())?;
+        let slot = values.iter_mut().find(|v| v.0 == name).ok_or(invalid.clone())?;
+        slot.1 = if ["max", "min_uses"].contains(&name) { value.parse().ok() } else { crate::expires::parse_time(value) }.filter(|v| *v >= 0).ok_or(invalid)?;
+    }
+    let [max, inactive, min_uses, valid] = values.map(|v| v.1);
+    if max == 0 { return Err("\"open_log_file_cache\" must have \"max\" parameter".into()); }
+    let secs = |s: i64| Duration::from_secs(s as u64);
+    Ok(Some(Arc::new(Cache::new(max as usize, secs(inactive), min_uses as u32, secs(valid)))))
+}
+
 /// location [ = | ^~ | ~ | ~* ] uri
 fn location(args: &[String]) -> Result<(Match, String), String> {
     let (modifier, path) = if args.len() == 2 { (args[0].as_str(), &args[1]) } else { ("", &args[0]) };
@@ -326,7 +393,8 @@ fn location(args: &[String]) -> Result<(Match, String), String> {
         "~" | "~*" => regex(if modifier == "~*" { format!("(?i){path}") } else { path.clone() })?,
         _ => {
             let plain = [("", Match::Prefix), ("=", Match::Exact), ("^~", Match::NoRegex)].into_iter().find(|k| k.0 == modifier);
-            plain.ok_or_else(|| format!("invalid location modifier \"{modifier}\""))?.1
+            let kind = plain.ok_or_else(|| format!("invalid location modifier \"{modifier}\""))?.1;
+            if modifier.is_empty() && path.starts_with('@') { Match::Named } else { kind }
         }
     };
     Ok((kind, path.clone()))
@@ -384,7 +452,6 @@ fn error_page(args: &[String]) -> Result<ErrorPage, String> {
     };
     let codes = codes.iter().map(|c| c.parse::<u16>().ok().filter(|c| (300..=599).contains(c)).ok_or_else(|| format!("value \"{c}\" must be between 300 and 599")));
     let codes = codes.collect::<Result<Vec<u16>, String>>()?;
-    if url.starts_with('@') { return Err(format!("twinx does not support redirecting errors to \"{url}\" yet")); }
     Ok(ErrorPage { codes, status, url: Template::parse(url)? })
 }
 
@@ -394,8 +461,8 @@ fn rewrite(args: &[String]) -> Result<Rewrite, String> {
     if !["", "last", "break", "redirect", "permanent"].contains(&flag) { return Err(format!("invalid parameter \"{flag}\"")); }
     let (url, add_args) = args[1].strip_suffix('?').map_or((args[1].as_str(), true), |u| (u, false));
     let is_url = ["http://", "https://", "$scheme"].iter().any(|p| url.starts_with(p)) || ["redirect", "permanent"].contains(&flag);
-    if !is_url { return Err(format!("twinx does not support rewriting to \"{url}\" yet")); }
-    Ok(Rewrite { regex, url: Template::parse(url)?, status: if flag == "permanent" { 301 } else { 302 }, add_args })
+    if !is_url && flag != "break" { return Err(format!("twinx does not support rewriting to \"{url}\" yet")); }
+    Ok(Rewrite { regex, url: Template::parse(url)?, status: if flag == "permanent" { 301 } else { 302 }, add_args, internal: !is_url })
 }
 
 fn ret(args: &[String]) -> Result<(u16, Template), String> {
@@ -431,9 +498,9 @@ mod tests {
         .unwrap();
         let s = &c.servers[0];
         assert_eq!(s.listen, vec!["127.0.0.1:8080".parse().unwrap()]);
-        assert_eq!(s.locations[0].level.access_log[0].format.0.len(), 3);
+        assert_eq!(s.locations[0].level.access_log[0].format.line.0.len(), 3);
         assert_eq!(s.locations[0].level.ret.as_ref().unwrap().0, 200);
-        assert_eq!(s.locations[1].level.access_log[0].format.0.len(), 16);
+        assert_eq!(s.locations[1].level.access_log[0].format.line.0.len(), 16);
     }
 
     #[test]
@@ -482,7 +549,10 @@ mod tests {
         assert_eq!(size("10"), Ok(10));
         assert_eq!(size("1x"), Err("\"1x\" is invalid".into()));
         assert_eq!(error_page(&["200".into(), "http://e/".into()]).unwrap_err(), "value \"200\" must be between 300 and 599");
-        assert!(error_page(&["404".into(), "@named".into()]).is_err());
+        assert!(error_page(&["404".into(), "@named".into()]).is_ok());
+        assert!(matches!(location(&["@named".into()]).unwrap().0, Match::Named));
+        let r = rewrite(&["^".into(), "/x?".into(), "break".into()]).unwrap();
+        assert_eq!((r.internal, r.add_args), (true, false));
         assert_eq!(error_page(&["404".into(), "/local".into()]).unwrap().status, None);
         assert_eq!(error_page(&["404".into(), "500".into(), "http://e/".into()]).unwrap().codes, vec![404, 500]);
     }
@@ -515,6 +585,53 @@ mod tests {
         assert!(rewrite(&["(".into(), "http://e/".into()]).is_err());
         let c = build_text("http { server { rewrite ^/s http://s/; location / { rewrite ^/l http://l/; } } }").unwrap();
         assert_eq!(c.servers[0].locations[0].level.rewrite.len(), 2);
+    }
+
+    #[test]
+    fn access_log_parameters_and_cache() {
+        let c = build_text(
+            "http { log_format j escape=json $uri; open_log_file_cache max=3 inactive=20s min_uses=2 valid=1m; server { \
+             access_log l_$arg_n j gzip=9 buffer=1k flush=100ms if=$arg_x; location / { open_log_file_cache off; access_log a.log j gzip; } } }",
+        )
+        .unwrap();
+        let (s, l) = (&c.servers[0].level, &c.servers[0].locations[0].level);
+        let log = &s.access_log[0];
+        assert_eq!((log.format.escape, log.gzip, log.condition.is_some()), (Escape::Json, Some(9), true));
+        assert!(matches!(log.target, Target::Path(_)) && matches!(l.access_log[0].target, Target::File(_)));
+        let cache = s.log_cache.as_ref().unwrap();
+        assert_eq!((cache.max, cache.inactive, cache.min_uses, cache.valid), (3, Duration::from_secs(20), 2, Duration::from_secs(60)));
+        assert!(l.log_cache.is_none() && l.access_log[0].gzip == Some(1));
+        for (text, e) in [
+            ("log_format x escape=html $uri;", "unknown log format escaping \"html\""),
+            ("access_log a.log combined flush=1s;", "no buffer is defined for access_log \"a.log\""),
+            ("access_log a.log combined gzip=10;", "invalid compression level \"10\""),
+            ("access_log a.log combined buffer=x;", "invalid buffer size \"x\""),
+            ("access_log a.log combined flush=x;", "invalid flush time \"x\""),
+            ("access_log a.log combined bad;", "invalid parameter \"bad\""),
+            ("open_log_file_cache inactive=1s;", "\"open_log_file_cache\" must have \"max\" parameter"),
+            ("open_log_file_cache max=x;", "invalid \"open_log_file_cache\" parameter \"max=x\""),
+            ("open_log_file_cache max;", "invalid \"open_log_file_cache\" parameter \"max\""),
+        ] {
+            assert_eq!(build_text(&format!("http {{ {text} }}")).unwrap_err(), format!("{e} in t.conf:1"));
+        }
+    }
+
+    #[test]
+    fn gzip_and_proxy_headers() {
+        let c = build_text(
+            "http { proxy_set_header X $uri; gzip_http_version 1.0; server { default_type a/b; gunzip on; gzip_vary on; gzip_types text/plain; \
+             location /a { gzip_static always; proxy_set_header Y 1; proxy_set_header Z ''; } location /b { gzip_static on; } } }",
+        )
+        .unwrap();
+        let s = &c.servers[0];
+        let (a, b) = (&s.locations[0].level, &s.locations[1].level);
+        assert_eq!((s.level.default_type.as_str(), s.level.gunzip, s.level.gzip_vary, s.level.gzip_http_11), ("a/b", true, true, false));
+        assert_eq!((a.gzip_static, b.gzip_static, s.level.gzip_static), (Some(true), Some(false), None));
+        let names = |l: &Level| l.proxy_set_header.iter().map(|h| h.0.clone()).collect::<Vec<_>>();
+        assert_eq!((names(a), names(b)), (vec!["Y".to_string(), "Z".to_string()], vec!["X".to_string()]));
+        let e = build_text("http { gzip_static yes; }").unwrap_err();
+        assert_eq!(e, "invalid value \"yes\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\" in t.conf:1");
+        assert_eq!(build_text("http { gzip_http_version 2; }").unwrap_err(), "invalid value \"2\" in t.conf:1");
     }
 
     #[test]

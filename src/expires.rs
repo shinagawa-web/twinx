@@ -16,7 +16,7 @@ pub enum Expires {
 }
 
 /// A time such as "2048", "1h30m" or "10s", in seconds, as ngx_parse_time() reads it.
-fn parse_time(s: &str) -> Option<i64> {
+pub fn parse_time(s: &str) -> Option<i64> {
     const UNITS: &[(char, i64)] = &[('y', 31_536_000), ('M', 2_592_000), ('w', 604_800), ('d', 86_400), ('h', 3600), ('m', 60), ('s', 1)];
     let (mut total, mut number) = (0i64, String::new());
     for c in s.chars() {

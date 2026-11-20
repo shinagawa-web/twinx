@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::conf::{Config, Level, Match, Proxy, Server};
+use crate::conf::{Config, Level, Match, Proxy, Rewrite, Server};
+use crate::vars::Template;
 use crate::expires;
 use crate::vars::{Request, Sent};
 
@@ -72,6 +73,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             host: None,
             server_name: String::new(),
             peer,
+            local,
             started,
             pipelined,
             length: head.len(),
@@ -182,12 +184,14 @@ struct Response {
     ctype: Option<String>,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// Whether "Vary: Accept-Encoding" is sent when gzip_vary is on.
+    vary: bool,
 }
 
 /// The page nginx generates for an error status.
 fn special(status: u16) -> Response {
     let ctype = Some("text/html".to_string());
-    Response { status, ctype, headers: Vec::new(), body: page(status).into_bytes() }
+    Response { status, ctype, body: page(status).into_bytes(), ..Response::default() }
 }
 
 const REDIRECTS: &[u16] = &[301, 302, 303, 307, 308];
@@ -201,22 +205,38 @@ fn redirect(status: u16, location: String) -> Response {
 
 /// The answer the location gives, before error_page and the headers every answer gets.
 fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -> Response {
-    match (parsed, &level.ret, &level.proxy) {
-        (Err(status), _, _) => special(status),
-        (Ok(()), _, _) if auto => redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
-        (Ok(()), _, _) if let Some(rw) = level.rewrite.iter().find(|rw| rw.regex.is_match(&r.uri)) => {
-            let (url, args) = (rw.url.render(r, &Sent::default()), args(r));
-            let sep = if url.contains('?') { "&" } else { "?" };
-            redirect(rw.status, if rw.add_args && !args.is_empty() { format!("{url}{sep}{}", &args[1..]) } else { url })
+    let rewrite = level.rewrite.iter().find(|rw| rw.regex.is_match(&r.uri));
+    let url = rewrite.map(|rw| (rw, rw.url.render(r, &Sent::default()), args(r)));
+    let with_args = |(rw, url, args): (&Rewrite, String, &str)| {
+        let sep = if url.contains('?') { "&" } else { "?" };
+        if rw.add_args && !args.is_empty() { format!("{url}{sep}{}", &args[1..]) } else { url }
+    };
+    match (parsed, url) {
+        (Err(status), _) => special(status),
+        (Ok(()), _) if auto => redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
+        // "break": the location goes on with the new URI, without the rewrite module's directives.
+        (Ok(()), Some(u)) if u.0.internal => {
+            let mut to = r.clone();
+            to.target = with_args(u);
+            to.uri = to.target.split('?').next().unwrap_or_default().to_string();
+            serve(&to, level, prefix, None)
         }
-        (Ok(()), Some((code, text)), _) if REDIRECTS.contains(code) => redirect(*code, text.render(r, &Sent::default())),
-        (Ok(()), Some((code, text)), _) if text.0.is_empty() && *code >= 400 => special(*code),
-        (Ok(()), Some((code, text)), _) => {
+        (Ok(()), Some(u)) => redirect(u.0.status, with_args(u)),
+        (Ok(()), None) => serve(r, level, prefix, level.ret.as_ref()),
+    }
+}
+
+/// The answer of return, else of proxy_pass, else of the static module.
+fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<&(u16, Template)>) -> Response {
+    match (ret, &level.proxy) {
+        (Some((code, text)), _) if REDIRECTS.contains(code) => redirect(*code, text.render(r, &Sent::default())),
+        (Some((code, text)), _) if text.0.is_empty() && *code >= 400 => special(*code),
+        (Some((code, text)), _) => {
             let ctype = Some("text/plain".to_string());
-            Response { status: *code, ctype, headers: Vec::new(), body: text.render(r, &Sent::default()).into_bytes() }
+            Response { status: *code, ctype, body: text.render(r, &Sent::default()).into_bytes(), ..Response::default() }
         }
-        (Ok(()), None, Some(p)) => proxy(p, r, prefix),
-        (Ok(()), None, None) => file(level, r, prefix),
+        (None, Some(p)) => proxy(p, level, r, prefix),
+        (None, None) => file(level, r, prefix),
     }
 }
 
@@ -231,26 +251,36 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let mut resp = respond(r, parsed, found);
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)) {
         let url = ep.url.render(r, &Sent::default());
-        if url.starts_with('/') {
+        let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == url);
+        if url.starts_with('/') || named.is_some() {
             // An internal redirect: the URI is answered as a GET (or HEAD) request
             // by its location, with the error's status unless that answer has its own.
+            // A named location answers the request as it is.
             let mut to = r.clone();
-            to.uri = url.split('?').next().unwrap_or_default().to_string();
-            to.target = url;
-            to.method = if r.method == "HEAD" { "HEAD" } else { "GET" }.to_string();
+            if named.is_none() {
+                to.uri = url.split('?').next().unwrap_or_default().to_string();
+                to.target = url;
+                to.method = if r.method == "HEAD" { "HEAD" } else { "GET" }.to_string();
+            }
             let status = ep.status.unwrap_or(resp.status);
-            let found = location(server, &to.uri);
+            let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
             level = found.1;
             resp = respond(&to, Ok(()), found);
             if resp.status == 200 { resp.status = status; }
         } else {
-            resp = redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url);
+            // A named location that does not exist is an error.
+            resp = if url.starts_with('@') { special(500) } else { redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url) };
         }
     }
     if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| level.absolute_redirect) {
         let host = if level.server_name_in_redirect { r.server_name.clone() } else { r.host.clone().unwrap_or_else(|| local.ip().to_string()) };
         let port = if level.port_in_redirect && local.port() != 80 { format!(":{}", local.port()) } else { String::new() };
         h.1 = format!("http://{host}{port}{}", h.1);
+    }
+    let gzipped = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && h.1.eq_ignore_ascii_case("gzip"));
+    if level.gunzip && gzipped {
+        resp.vary = true;
+        if !gzip_ok(r, level) { gunzip(&mut resp); }
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
     let added = ADDED.contains(&resp.status);
@@ -276,7 +306,8 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         let ctype = resp.ctype.map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
         let connection = if keepalive { "keep-alive" } else { "close" };
         let len = resp.body.len();
-        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}Content-Length: {len}\r\nConnection: {connection}\r\n");
+        let vary = if resp.vary && level.gzip_vary { "Vary: Accept-Encoding\r\n" } else { "" };
+        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}Content-Length: {len}\r\nConnection: {connection}\r\n{vary}");
         resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
         out = (head + "\r\n").into_bytes();
     }
@@ -284,10 +315,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     out.extend_from_slice(&resp.body[..body_len]);
     let written = stream.write_all(&out).is_ok();
     let sent = Sent { status, bytes: out.len(), body: body_len };
-    for log in &level.access_log {
-        let line = log.format.log_line(r, &sent) + "\n";
-        let _ = (&*log.file).write_all(line.as_bytes());
-    }
+    level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     written && keepalive && status != 444
 }
 
@@ -300,32 +328,64 @@ fn file(level: &Level, r: &Request, prefix: &str) -> Response {
         None => level.root.join(r.uri.trim_start_matches('/')),
     };
     if !r.uri.ends_with('/') && path.is_dir() { return redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))); }
-    let found = std::fs::metadata(&path).ok().filter(|m| m.is_file()).zip(std::fs::read(&path).ok());
-    let Some((meta, body)) = found else { return special(404) };
+    let read = |p: &std::path::Path| std::fs::metadata(p).ok().filter(|m| m.is_file()).zip(std::fs::read(p).ok());
+    // gzip_static: the file with ".gz" added, for clients that take gzip ("always": for all).
+    let gz = level.gzip_static.filter(|_| r.method != "POST" && !r.uri.ends_with('/')).and_then(|always| read(&path.with_added_extension("gz")).map(|f| (always, f)));
+    let vary = gz.is_some();
+    let gz = gz.filter(|(always, _)| *always || gzip_ok(r, level)).map(|g| g.1);
+    let Some((meta, body)) = gz.as_ref().cloned().or_else(|| read(&path)) else { return special(404) };
     if r.method == "POST" { return special(405); }
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
     let modified = expires::http_date(mtime as i64);
     const TYPES: &[(&str, &str)] = &[("html", "text/html"), ("gif", "image/gif"), ("jpg", "image/jpeg")];
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
-    let ctype = TYPES.iter().find(|t| t.0 == ext).map_or("text/plain", |t| t.1);
-    let headers = vec![
-        ("Last-Modified".to_string(), modified),
-        ("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", body.len())),
-        ("Accept-Ranges".to_string(), "bytes".to_string()),
-    ];
-    Response { status: 200, ctype: Some(ctype.to_string()), headers, body }
+    let ctype = TYPES.iter().find(|t| t.0 == ext).map_or(level.default_type.as_str(), |t| t.1);
+    let mut headers = vec![("Last-Modified".to_string(), modified)];
+    headers.extend(gz.map(|_| ("Content-Encoding".to_string(), "gzip".to_string())));
+    headers.push(("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", body.len())));
+    headers.push(("Accept-Ranges".to_string(), "bytes".to_string()));
+    Response { status: 200, ctype: Some(ctype.to_string()), headers, body, vary }
+}
+
+/// Whether the client takes gzip, as ngx_http_gzip_ok() decides: it accepts the
+/// gzip coding, its HTTP version is at least gzip_http_version, and the request
+/// did not come through a proxy (a Via header).
+fn gzip_ok(r: &Request, level: &Level) -> bool {
+    // A coding is "name" or "name;q=value"; q=0 refuses it.
+    let gzip = |c: &str| {
+        let (name, q) = c.split_once(';').unwrap_or((c, ""));
+        name.trim().eq_ignore_ascii_case("gzip") && q.trim().strip_prefix("q=").is_none_or(|q| q.parse::<f64>() != Ok(0.0))
+    };
+    let accepts = header(r, "accept-encoding").is_some_and(|v| v.split(',').any(gzip));
+    accepts && (r.line.ends_with("HTTP/1.1") || !level.gzip_http_11) && header(r, "via").is_none()
+}
+
+/// gunzip: decompresses a gzip answer for a client that does not take gzip,
+/// without its Content-Encoding and Accept-Ranges, and with a weak ETag.
+fn gunzip(resp: &mut Response) {
+    resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("content-encoding") && !h.0.eq_ignore_ascii_case("accept-ranges"));
+    resp.headers.retain_mut(|h| !h.0.eq_ignore_ascii_case("etag") || h.1.starts_with("W/") || h.1.starts_with('"') && { h.1.insert_str(0, "W/"); true });
+    let mut body = Vec::new();
+    let _ = flate2::read::MultiGzDecoder::new(resp.body.as_slice()).read_to_end(&mut body);
+    resp.body = body;
 }
 
 /// Passes the request to the proxied servers in turn, as HTTP/1.0 with
 /// "Connection: close", until one answers with a response head.
-fn proxy(p: &Proxy, r: &Request, prefix: &str) -> Response {
+fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let rest = escape_uri(r.uri.get(prefix.len()..).unwrap_or_default());
     let uri = p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{rest}{}", args(r)));
     let body = r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default());
-    let mut req = format!("{} {uri} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n", r.method, p.host);
+    // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
+    let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &Sent::default()))).collect();
+    let is_set = |name: &str| set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
+    let mut req = format!("{} {uri} HTTP/1.0\r\n", r.method);
+    set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
+    if !is_set("host") { req += &format!("Host: {}\r\n", p.host); }
+    if !is_set("connection") { req += "Connection: close\r\n"; }
     if framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len()); }
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
-    let passed = r.headers.iter().filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()));
+    let passed = r.headers.iter().filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()) && !is_set(n));
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     let mut req = (req + "\r\n").into_bytes();
     req.extend_from_slice(&body);
@@ -482,6 +542,7 @@ mod tests {
             host: None,
             server_name: "localhost".into(),
             peer: "127.0.0.1:1".parse().unwrap(),
+            local: "127.0.0.1:8080".parse().unwrap(),
             started: Instant::now(),
             pipelined: false,
             length: 0,
@@ -600,6 +661,39 @@ mod tests {
         assert_eq!(answer("/b?x=1"), (302, "http://e/?y=1&x=1".to_string()));
         assert_eq!(answer("/b"), (302, "http://e/?y=1".to_string()));
         assert_eq!(answer("/c?x=1"), (301, "http://e/".to_string()));
+    }
+
+    #[test]
+    fn rewrites_with_break_and_named_locations() {
+        let text = "http { server { location /a { rewrite ^/a(.*) /b break; return 403; } location @n { return 200 n$uri; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        assert!(location(s, "@n").0.is_empty());
+        let (_, r) = request("GET /a?x=1 HTTP/1.0\n\n");
+        // break skips return; the new URI keeps the arguments and is looked for under root.
+        assert_eq!(respond(&r, Ok(()), location(s, &r.uri)).status, 404);
+        let named = (s.locations[1].path.as_str(), &s.locations[1].level, false);
+        assert_eq!(respond(&r, Ok(()), named).body, b"n/a");
+    }
+
+    #[test]
+    fn gzip_ok_and_gunzip() {
+        let level = Level { gzip_http_11: true, ..Level::default() };
+        let ok = |head: &str, level: &Level| gzip_ok(&request(head).1, level);
+        assert!(ok("GET / HTTP/1.1\nHost: a\nAccept-Encoding: deflate, GZIP;q=0.5\n\n", &level));
+        assert!(!ok("GET / HTTP/1.1\nHost: a\nAccept-Encoding: gzip;q=0\n\n", &level));
+        assert!(!ok("GET / HTTP/1.1\nHost: a\nAccept-Encoding: gzip\nVia: x\n\n", &level));
+        assert!(!ok("GET / HTTP/1.0\nAccept-Encoding: gzip\n\n", &level));
+        assert!(ok("GET / HTTP/1.0\nAccept-Encoding: gzip\n\n", &Level::default()));
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(b"abc").unwrap();
+        let member = gz.finish().unwrap();
+        let headers = [("Content-Encoding", "gzip"), ("ETag", "\"1-2\""), ("Accept-Ranges", "bytes"), ("X", "y")];
+        let mut resp = Response { body: [member.clone(), member].concat(), ..Response::default() };
+        resp.headers = headers.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        gunzip(&mut resp);
+        assert_eq!(resp.body, b"abcabc");
+        assert_eq!(resp.headers, vec![("ETag".to_string(), "W/\"1-2\"".to_string()), ("X".to_string(), "y".to_string())]);
     }
 
     #[test]
