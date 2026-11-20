@@ -47,6 +47,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("add_header", HSL, 2, 3, false),
     ("error_page", HSL, 2, usize::MAX, false),
     ("proxy_pass", LOC, 1, 1, false),
+    ("expires", HSL, 1, 2, false),
 ];
 
 const COMBINED: &str =
@@ -91,6 +92,8 @@ pub struct Level {
     pub body_buffer: u64,
     pub body_in_file_only: bool,
     pub body_temp_path: PathBuf,
+    /// expires, as written ("modified 1h", "$arg_e"): parsed for each response.
+    pub expires: Option<Template>,
 }
 
 /// How a location matches the URI: "=", a prefix, "^~" (a prefix that stops
@@ -243,6 +246,7 @@ impl Builder<'_> {
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
+                "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
                 _ => {}
             }
         }
@@ -298,6 +302,14 @@ fn peer(args: &[String]) -> Result<Peer, String> {
     }
     let [weight, max_fails, fail_timeout] = values.map(|v| v.1);
     Ok(Peer { addr, weight: weight as i64, max_fails, fail_timeout, backup })
+}
+
+/// expires [modified] time | epoch | max | off; a value without variables must be valid.
+fn expires(args: &[String]) -> Result<Template, String> {
+    let (value, t) = (args.join(" "), Template::parse(&args.join(" "))?);
+    let literal = t.0.iter().all(|p| matches!(p, crate::vars::Part::Text(_)));
+    if literal && crate::expires::parse(&value).is_none() { return Err(format!("invalid value \"{value}\"")); }
+    Ok(t)
 }
 
 /// A size such as "512", "8k" or "1m".
@@ -383,6 +395,10 @@ mod tests {
         assert_eq!(b.proxy.as_ref().unwrap().host, "127.0.0.1:8083");
         assert_eq!((b.error_page[0].codes.clone(), b.error_page[0].status), (vec![404], Some(301)));
         assert_eq!(b.body_buffer, 16384);
+        let e = build_text("http { server { expires modified 1h; location / { expires $arg_e; } } }").unwrap();
+        assert!(e.servers[0].level.expires.is_some() && e.servers[0].locations[0].level.expires.is_some());
+        let e = build_text("http { expires bad; }").unwrap_err();
+        assert_eq!(e, "invalid value \"bad\" in t.conf:1");
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::conf::{Config, Level, Match, Proxy, Server};
+use crate::expires;
 use crate::vars::{Request, Sent};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
@@ -204,9 +205,19 @@ fn exchange(stream: &mut TcpStream, r: &Request, parsed: Result<(), u16>, prefix
         resp.headers.push(("Location".to_string(), location));
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
-    for (name, value, always) in &level.add_header {
+    let added = ADDED.contains(&resp.status);
+    let expires = level.expires.as_ref().filter(|_| added).and_then(|e| expires::parse(&e.render(r, &Sent::default())));
+    let modified = resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case("last-modified"));
+    let modified = modified.and_then(|h| chrono::DateTime::parse_from_rfc2822(&h.1).ok()).map(|t| t.timestamp());
+    if let Some((e, cc)) = expires.and_then(|e| expires::headers(e, modified)) {
+        resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("expires") && !h.0.eq_ignore_ascii_case("cache-control"));
+        resp.headers.extend([("Expires".to_string(), e), ("Cache-Control".to_string(), cc)]);
+    }
+    for (name, value, _) in level.add_header.iter().filter(|h| h.2 || added) {
         let value = value.render(r, &Sent::default());
-        if !value.is_empty() && (*always || ADDED.contains(&resp.status)) { resp.headers.push((name.clone(), value)); }
+        // These replace what the response has, and an empty value removes it.
+        if ["etag", "last-modified"].contains(&name.to_ascii_lowercase().as_str()) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case(name)); }
+        if !value.is_empty() { resp.headers.push((name.clone(), value)); }
     }
     let status = resp.status;
     let keepalive = parsed.is_ok() && keepalive(r) && ![400, 413, 414, 500, 501].contains(&status);
@@ -240,12 +251,12 @@ fn file(level: &Level, r: &Request) -> Response {
     let Some((meta, body)) = found else { return special(404) };
     if r.method == "POST" { return special(405); }
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-    let modified = chrono::DateTime::from_timestamp(mtime as i64, 0).unwrap_or_default().format("%a, %d %b %Y %H:%M:%S GMT");
+    let modified = expires::http_date(mtime as i64);
     const TYPES: &[(&str, &str)] = &[("html", "text/html"), ("gif", "image/gif"), ("jpg", "image/jpeg")];
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
     let ctype = TYPES.iter().find(|t| t.0 == ext).map_or("text/plain", |t| t.1);
     let headers = vec![
-        ("Last-Modified".to_string(), modified.to_string()),
+        ("Last-Modified".to_string(), modified),
         ("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", body.len())),
         ("Accept-Ranges".to_string(), "bytes".to_string()),
     ];
