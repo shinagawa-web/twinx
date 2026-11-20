@@ -51,6 +51,10 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("client_max_body_size", HSL, 1, 1, false),
     ("add_header", HSL, 2, 3, false),
     ("add_trailer", HSL, 2, 3, false),
+    ("keepalive_requests", HSL, 1, 1, false),
+    ("keepalive_timeout", HSL, 1, 2, false),
+    ("keepalive_time", HSL, 1, 1, false),
+    ("keepalive_disable", HSL, 1, usize::MAX, false),
     ("error_page", HSL, 2, usize::MAX, false),
     ("proxy_pass", LOC, 1, 1, false),
     ("expires", HSL, 1, 2, false),
@@ -135,6 +139,17 @@ pub struct Level {
     pub absolute_redirect: bool,
     pub server_name_in_redirect: bool,
     pub port_in_redirect: bool,
+    /// keepalive_requests: the requests a connection may serve.
+    pub keepalive_requests: u64,
+    /// keepalive_timeout: how long a kept-alive connection waits for the next
+    /// request (zero: no keepalive), and the timeout of the Keep-Alive header.
+    pub keepalive_timeout: Duration,
+    pub keepalive_header: Option<u64>,
+    /// keepalive_time: how long a connection may serve requests.
+    pub keepalive_time: Duration,
+    /// keepalive_disable: no keepalive for POST from MSIE 6 and older, and for Safari.
+    pub keepalive_disable_msie6: bool,
+    pub keepalive_disable_safari: bool,
     /// default_type: the Content-Type of files whose extension has no type.
     pub default_type: String,
     /// proxy_set_header: the headers sent to the proxied server instead of the client's.
@@ -241,7 +256,8 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true, ..Level::default() };
+        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
+            keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -326,6 +342,19 @@ impl Builder<'_> {
                 "gzip_static" => level.gzip_static = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\"", d.args[0])))?.1,
                 "gunzip" => level.gunzip = flag(d).map_err(at)?,
                 "gzip" => level.gzip = flag(d).map_err(at)?,
+                "keepalive_requests" => level.keepalive_requests = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
+                "keepalive_timeout" | "keepalive_time" => {
+                    let secs = d.args.iter().map(|a| crate::expires::parse_time(a).filter(|s| *s >= 0)).collect::<Option<Vec<_>>>();
+                    let secs = secs.ok_or_else(|| at(format!("\"{}\" directive invalid value", d.name)))?;
+                    let time = Duration::from_secs(secs[0] as u64);
+                    if d.name == "keepalive_time" { level.keepalive_time = time } else { level.keepalive_timeout = time }
+                    if let Some(&header) = secs.get(1) { level.keepalive_header = Some(header as u64); }
+                }
+                "keepalive_disable" => {
+                    let unknown = d.args.iter().find(|a| !["none", "msie6", "safari"].contains(&a.as_str()));
+                    if let Some(a) = unknown { return Err(at(format!("invalid value \"{a}\""))); }
+                    (level.keepalive_disable_msie6, level.keepalive_disable_safari) = (d.args.iter().any(|a| a == "msie6"), d.args.iter().any(|a| a == "safari"));
+                }
                 "gzip_types" => level.gzip_types = d.args.iter().map(|t| t.to_ascii_lowercase()).collect(),
                 "gzip_vary" => level.gzip_vary = flag(d).map_err(at)?,
                 "gzip_http_version" => level.gzip_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))? == 1,
@@ -646,6 +675,20 @@ mod tests {
         let e = build_text("http { gzip_static yes; }").unwrap_err();
         assert_eq!(e, "invalid value \"yes\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\" in t.conf:1");
         assert_eq!(build_text("http { gzip_http_version 2; }").unwrap_err(), "invalid value \"2\" in t.conf:1");
+    }
+
+    #[test]
+    fn keepalive_settings() {
+        let c = build_text("http { server { keepalive_requests 2; keepalive_timeout 1 9; location /a { keepalive_timeout 30s; keepalive_time 1s; keepalive_disable none; } location /b { keepalive_disable safari msie6; } } }").unwrap();
+        let s = &c.servers[0];
+        let (a, b) = (&s.locations[0].level, &s.locations[1].level);
+        assert_eq!((s.level.keepalive_requests, s.level.keepalive_timeout, s.level.keepalive_header), (2, Duration::from_secs(1), Some(9)));
+        assert_eq!((a.keepalive_requests, a.keepalive_timeout, a.keepalive_header, a.keepalive_time), (2, Duration::from_secs(30), Some(9), Duration::from_secs(1)));
+        assert_eq!((a.keepalive_disable_msie6, a.keepalive_disable_safari, b.keepalive_disable_msie6, b.keepalive_disable_safari), (false, false, true, true));
+        assert_eq!((s.level.keepalive_time, s.level.keepalive_disable_msie6), (Duration::from_secs(3600), true));
+        assert_eq!(build_text("http { keepalive_requests x; }").unwrap_err(), "invalid number in t.conf:1");
+        assert_eq!(build_text("http { keepalive_timeout 1x; }").unwrap_err(), "\"keepalive_timeout\" directive invalid value in t.conf:1");
+        assert_eq!(build_text("http { keepalive_disable opera; }").unwrap_err(), "invalid value \"opera\" in t.conf:1");
     }
 
     #[test]

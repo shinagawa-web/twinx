@@ -55,14 +55,19 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
     let local = stream.local_addr().unwrap_or(listen);
     let peer = stream.peer_addr().unwrap_or(local);
     let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+    // After a kept-alive answer: how long the connection waits for the next request.
+    let (connected, mut requests, mut idle) = (Instant::now(), 0, None);
     loop {
         let (pipelined, started) = (!buf.is_empty(), Instant::now());
+        requests += 1;
         let end = loop {
             if let Some(end) = head_end(&buf) { break end; }
+            let _ = stream.set_read_timeout(idle.filter(|_| buf.is_empty()));
             let n = stream.read(&mut chunk).unwrap_or(0);
             if n == 0 { return; }
             buf.extend_from_slice(&chunk[..n]);
         };
+        let _ = stream.set_read_timeout(None);
         let head: Vec<u8> = buf.drain(..end).collect();
         let mut r = Request {
             method: String::new(),
@@ -76,6 +81,8 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             local,
             started,
             pipelined,
+            connected,
+            requests,
             length: head.len(),
             body: Vec::new(),
             body_file: None,
@@ -106,9 +113,9 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
                 buf.extend_from_slice(&chunk[..read]);
             },
         };
-        let open = exchange(&mut stream, server, &r, parsed, found, local);
+        idle = exchange(&mut stream, server, &r, parsed, found, local);
         if !level.body_in_file_only { r.body_file.map(std::fs::remove_file); }
-        if !open { return linger(&mut stream); }
+        if idle.is_none() { return linger(&mut stream); }
     }
 }
 
@@ -252,8 +259,9 @@ fn args(r: &Request) -> &str {
     r.target.find('?').map_or("", |i| &r.target[i..])
 }
 
-/// Answers one request; true when the connection stays open for the next one.
-fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr) -> bool {
+/// Answers one request; when the connection stays open for the next one, how
+/// long it waits for it (keepalive_timeout).
+fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr) -> Option<Duration> {
     let (mut resp, mut level) = answer(server, r, parsed, found);
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)) {
         let url = ep.url.render(r, &Sent::default());
@@ -316,7 +324,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let unknown = resp.unknown_length && r.method != "HEAD";
     let trailing = level.add_trailer.iter().any(|t| t.2 || added) && r.method != "HEAD" && ![204, 304].contains(&status);
     let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1");
-    let keepalive = parsed.is_ok() && keepalive(r) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown);
+    let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown);
     let mut out = Vec::new();
     if status != 444 {
         let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
@@ -325,8 +333,9 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         let connection = if keepalive { "keep-alive" } else { "close" };
         let len = resp.body.len();
         let length = if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else if !resp.unknown_length { format!("Content-Length: {len}\r\n") } else { String::new() };
+        let header = level.keepalive_header.filter(|_| keepalive).map(|t| format!("Keep-Alive: timeout={t}\r\n")).unwrap_or_default();
         let vary = if resp.vary && level.gzip_vary { "Vary: Accept-Encoding\r\n" } else { "" };
-        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{vary}");
+        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{header}{vary}");
         resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
         out = (head + "\r\n").into_bytes();
     }
@@ -347,7 +356,29 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let written = stream.write_all(&out).is_ok();
     let sent = Sent { bytes: out.len(), body: body_len, ..so_far(&resp, &trailers) };
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
-    written && keepalive && status != 444
+    (written && keepalive && status != 444).then_some(level.keepalive_timeout)
+}
+
+/// Whether the location lets the connection serve another request, as
+/// ngx_http_update_location_config() decides: keepalive_timeout is not zero,
+/// keepalive_requests and keepalive_time are not reached, and keepalive_disable
+/// does not name the browser.
+fn keeps_alive(r: &Request, level: &Level) -> bool {
+    let (msie6, safari) = browser(header(r, "user-agent").unwrap_or_default());
+    let limits = !level.keepalive_timeout.is_zero() && r.requests < level.keepalive_requests && r.connected.elapsed() <= level.keepalive_time;
+    limits && !(msie6 && r.method == "POST" && level.keepalive_disable_msie6) && !(safari && level.keepalive_disable_safari)
+}
+
+/// Whether a User-Agent is MSIE 6 or older, and whether it is Safari on Mac OS X,
+/// as ngx_http_process_user_agent() tells them (Opera is neither).
+fn browser(ua: &str) -> (bool, bool) {
+    let b = ua.as_bytes();
+    let has = |h: &[u8], n: &[u8]| h.windows(n.len()).any(|w| w == n);
+    let msie = b.windows(5).position(|w| w == b"MSIE ").filter(|i| i + 7 < b.len());
+    let opera = has(b, b"Opera");
+    let msie6 = !opera && msie.is_some_and(|i| b[i + 6] == b'.' && (matches!(b[i + 5], b'4' | b'5') || b[i + 5] == b'6' && !has(&b[i + 8..], b"SV1")));
+    let other = has(b, b"Gecko/") || has(b, b"Chrome/");
+    (msie6, msie.is_none() && !opera && !other && has(b, b"Safari/") && has(b, b"Mac OS X"))
 }
 
 /// The answer of the location found, after the internal redirects of the
@@ -635,6 +666,8 @@ mod tests {
             local: "127.0.0.1:8080".parse().unwrap(),
             started: Instant::now(),
             pipelined: false,
+            connected: Instant::now(),
+            requests: 1,
             length: 0,
             body: Vec::new(),
             body_file: None,
@@ -833,6 +866,26 @@ mod tests {
         assert_eq!(status("/a/?x"), (200, "i/a/index.html".to_string()));
         assert_eq!(status("/a/empty/").0, 403);
         assert_eq!(status("/a/none/").0, 404);
+    }
+
+    #[test]
+    fn keepalive_limits_and_browsers() {
+        assert_eq!(browser("Mozilla/4.0 (compatible; MSIE 5.0; Windows)"), (true, false));
+        assert_eq!(browser("MSIE 6.0; SV1"), (false, false));
+        assert_eq!(browser("MSIE 6.0; X"), (true, false));
+        assert_eq!(browser("MSIE 7.0"), (false, false));
+        assert_eq!(browser("MSIE 5.0 Opera"), (false, false));
+        assert_eq!(browser("Mac OS X Safari/7534.48.3"), (false, true));
+        assert_eq!(browser("Mac OS X Chrome/1 Safari/1"), (false, false));
+        let level = Level { keepalive_requests: 2, keepalive_timeout: Duration::from_secs(1), keepalive_time: Duration::from_secs(60), keepalive_disable_msie6: true, ..Level::default() };
+        let (_, mut r) = request("POST / HTTP/1.1\nHost: a\nUser-Agent: MSIE 5.0\n\n");
+        assert!(!keeps_alive(&r, &level));
+        r.method = "GET".into();
+        assert!(keeps_alive(&r, &level));
+        r.requests = 2;
+        assert!(!keeps_alive(&r, &level));
+        r.requests = 1;
+        assert!(!keeps_alive(&r, &Level { keepalive_timeout: Duration::ZERO, ..level }));
     }
 
     #[test]
