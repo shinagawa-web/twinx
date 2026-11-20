@@ -50,6 +50,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("client_body_in_single_buffer", HSL, 1, 1, false),
     ("client_max_body_size", HSL, 1, 1, false),
     ("add_header", HSL, 2, 3, false),
+    ("add_trailer", HSL, 2, 3, false),
     ("error_page", HSL, 2, usize::MAX, false),
     ("proxy_pass", LOC, 1, 1, false),
     ("expires", HSL, 1, 2, false),
@@ -115,6 +116,8 @@ pub struct Level {
     pub root: PathBuf,
     /// add_header: name, value, and whether it is added whatever the status ("always").
     pub add_header: Vec<(String, Template, bool)>,
+    /// add_trailer: the same, sent as trailers of a chunked answer.
+    pub add_trailer: Vec<(String, Template, bool)>,
     pub error_page: Vec<ErrorPage>,
     pub proxy: Option<Arc<Proxy>>,
     pub max_body: u64,
@@ -284,7 +287,7 @@ impl Builder<'_> {
     /// access_log replaces what the level above set as a whole.
     fn level(&mut self, block: &[Directive], ctx: u8, level: &mut Level) -> Result<(), String> {
         let mut logs: Option<Vec<Arc<AccessLog>>> = None;
-        let mut headers: Option<Vec<(String, Template, bool)>> = None;
+        let (mut headers, mut trailers): (Option<Vec<(String, Template, bool)>>, Option<Vec<_>>) = (None, None);
         let mut pages: Option<Vec<ErrorPage>> = None;
         let mut proxy_headers: Option<Vec<(String, Template)>> = None;
         for d in block {
@@ -306,6 +309,7 @@ impl Builder<'_> {
                 "open_log_file_cache" => level.log_cache = log_cache(&d.args).map_err(at)?,
                 "access_log" => logs.get_or_insert_default().extend(self.access_log(&d.args).map_err(at)?),
                 "add_header" => headers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
+                "add_trailer" => trailers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
                 "error_page" => pages.get_or_insert_default().push(error_page(&d.args).map_err(at)?),
                 "proxy_pass" => level.proxy = Some(Arc::new(self.proxy(&d.args[0]).map_err(at)?)),
                 "client_max_body_size" => level.max_body = size(&d.args[0]).map_err(at)?,
@@ -331,6 +335,7 @@ impl Builder<'_> {
         }
         if let Some(logs) = logs { level.access_log = logs; }
         if let Some(headers) = headers { level.add_header = headers; }
+        if let Some(trailers) = trailers { level.add_trailer = trailers; }
         if let Some(pages) = pages { level.error_page = pages; }
         if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
         Ok(())
@@ -514,8 +519,8 @@ mod tests {
     fn proxy_upstream_and_body_settings() {
         let c = build_text(
             "http { upstream u { server 127.0.0.1:8082 backup; server 127.0.0.1:8081 weight=2; } \
-             client_max_body_size 1k; server { listen 127.0.0.1:8080; add_header X a; \
-             location /a { proxy_pass http://u/x; client_body_buffer_size 2k; client_body_in_file_only on; } \
+             client_max_body_size 1k; server { listen 127.0.0.1:8080; add_header X a; add_trailer T b; \
+             location /a { add_trailer U c always; proxy_pass http://u/x; client_body_buffer_size 2k; client_body_in_file_only on; } \
              location /b { proxy_pass http://127.0.0.1:8083; error_page 404 =301 http://e/; } } }",
         )
         .unwrap();
@@ -526,6 +531,7 @@ mod tests {
         assert_eq!(addrs, vec!["127.0.0.1:8082 1 true", "127.0.0.1:8081 2 false"]);
         assert_eq!((a.max_body, a.body_buffer, a.body_in_file_only), (1024, 2048, true));
         assert_eq!(a.add_header[0].0, "X");
+        assert_eq!((a.add_trailer[0].0.as_str(), a.add_trailer[0].2, b.add_trailer[0].0.as_str()), ("U", true, "T"));
         assert_eq!(b.proxy.as_ref().unwrap().host, "127.0.0.1:8083");
         assert_eq!((b.error_page[0].codes.clone(), b.error_page[0].status), (vec![404], Some(301)));
         assert_eq!(b.body_buffer, 16384);

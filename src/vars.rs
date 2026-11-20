@@ -37,6 +37,12 @@ pub struct Sent {
     pub status: u16,
     pub bytes: usize,
     pub body: usize,
+    /// The headers of the answer so far ($sent_http_*).
+    pub headers: Vec<(String, String)>,
+    /// The headers of the proxied server's answer ($upstream_http_*, $upstream_cookie_*).
+    pub upstream: Vec<(String, String)>,
+    /// The trailers so far ($sent_trailer_*).
+    pub trailers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +71,11 @@ pub enum Var {
     RequestBodyFile,
     Arg(String),
     Http(String),
+    Cookie(String),
+    SentHttp(String),
+    SentTrailer(String),
+    UpstreamHttp(String),
+    UpstreamCookie(String),
 }
 
 impl Var {
@@ -77,10 +88,16 @@ impl Var {
             ("remote_addr", Var::RemoteAddr), ("remote_port", Var::RemotePort), ("binary_remote_addr", Var::BinaryRemoteAddr),
             ("server_addr", Var::ServerAddr), ("server_port", Var::ServerPort), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
+            ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
-        let header = name.strip_prefix("http_").map(|h| Var::Http(h.replace('_', "-")));
-        let arg = || name.strip_prefix("arg_").map(|a| Var::Arg(a.to_string()));
-        header.or_else(arg).or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v))
+        // Header names have "-" where the variable has "_"; cookie names are as they are.
+        let prefixed: [(&str, fn(String) -> Var, bool); 7] = [
+            ("http_", Var::Http, true), ("sent_http_", Var::SentHttp, true), ("sent_trailer_", Var::SentTrailer, true),
+            ("upstream_http_", Var::UpstreamHttp, true), ("arg_", Var::Arg, false), ("cookie_", Var::Cookie, false),
+            ("upstream_cookie_", Var::UpstreamCookie, false),
+        ];
+        let found = prefixed.into_iter().find_map(|(p, var, dashes)| name.strip_prefix(p).map(|n| var(if dashes { n.replace('_', "-") } else { n.to_string() })));
+        found.or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v))
     }
 
     /// The value, or None when the variable is "not found" (no such header, no user).
@@ -101,7 +118,7 @@ impl Var {
             Var::BinaryRemoteAddr => return Some(match r.peer.ip() { IpAddr::V4(a) => a.octets().to_vec(), IpAddr::V6(a) => a.octets().to_vec() }),
             Var::ServerAddr => r.local.ip().to_string(),
             Var::ServerPort => r.local.port().to_string(),
-            Var::RemoteUser => return None,
+            Var::RemoteUser => basic_user(r)?,
             Var::Request => r.line.clone(),
             Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
             Var::RequestUri => r.target.clone(),
@@ -112,9 +129,80 @@ impl Var {
                 let args = r.target.split_once('?').map_or("", |(_, a)| a).split('&');
                 args.filter_map(|a| a.split_once('=')).find(|(n, _)| n.eq_ignore_ascii_case(name))?.1.to_string()
             }
-            Var::Http(name) => r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))?.1.clone(),
+            // Cookie headers are joined with "; ", the others with ", ".
+            Var::Http(name) => joined(&r.headers, name, if name.eq_ignore_ascii_case("cookie") { "; " } else { ", " })?,
+            Var::Cookie(name) => cookie(&r.headers, name)?,
+            Var::SentHttp(name) => joined(&s.headers, name, ", ")?,
+            Var::SentTrailer(name) => joined(&s.trailers, name, ", ")?,
+            Var::UpstreamHttp(name) => joined(&s.upstream, name, ", ")?,
+            Var::UpstreamCookie(name) => set_cookie(&s.upstream, name)?,
         }.into_bytes())
     }
+}
+
+/// The values of every header with the name, joined; None when there is none.
+fn joined(headers: &[(String, String)], name: &str, sep: &str) -> Option<String> {
+    let values: Vec<&str> = headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).collect();
+    (!values.is_empty()).then(|| values.join(sep))
+}
+
+/// A cookie of the Cookie headers, as nginx 1.30 finds it: pairs are separated
+/// by ";", and the value runs to the next ";". As in nginx, a pair that starts
+/// with the name but has no "=" after it hides the pair that follows.
+fn cookie(headers: &[(String, String)], name: &str) -> Option<String> {
+    for (_, line) in headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("cookie")) {
+        let (b, mut at) = (line.as_bytes(), 0);
+        while at < b.len() {
+            if b[at..].len() >= name.len() && b[at..at + name.len()].eq_ignore_ascii_case(name.as_bytes()) {
+                at += name.len();
+                while b.get(at) == Some(&b' ') { at += 1; }
+                if b.get(at) == Some(&b'=') {
+                    at += 1;
+                    while b.get(at) == Some(&b' ') { at += 1; }
+                    let end = b[at..].iter().position(|&c| c == b';').map_or(b.len(), |i| at + i);
+                    return Some(String::from_utf8_lossy(&b[at..end]).into_owned());
+                }
+                at += 1;
+            }
+            while at < b.len() && { at += 1; b[at - 1] != b';' } {}
+            while b.get(at) == Some(&b' ') { at += 1; }
+        }
+    }
+    None
+}
+
+/// A cookie the proxied server sets: the first Set-Cookie that starts with
+/// "name=", its value up to ";".
+fn set_cookie(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("set-cookie")).find_map(|(_, v)| {
+        let starts = v.len() > name.len() && v.as_bytes()[..name.len()].eq_ignore_ascii_case(name.as_bytes());
+        let value = v.get(name.len()..).filter(|_| starts)?.trim_start_matches(' ').strip_prefix('=')?.trim_start_matches(' ');
+        Some(value.split(';').next().unwrap_or_default().to_string())
+    })
+}
+
+/// The user of "Authorization: Basic <base64 of user:password>"; None when the
+/// header is not that or the user is empty, as ngx_http_auth_basic_user() decides.
+fn basic_user(r: &Request) -> Option<String> {
+    let auth = r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("authorization"))?.1.as_str();
+    let credentials = auth.get(..6).filter(|s| s.eq_ignore_ascii_case("basic ")).and(auth.get(6..))?.trim_start_matches(' ');
+    let decoded = decode_base64(credentials).filter(|_| !credentials.is_empty())?;
+    let user = &decoded[..decoded.iter().position(|&c| c == b':')?];
+    (!user.is_empty()).then(|| String::from_utf8_lossy(user).into_owned())
+}
+
+/// Base64 as ngx_decode_base64() reads it: up to the first "=", None for any
+/// other character outside the alphabet or a length that cannot be decoded.
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let digits: Option<Vec<u32>> = s.bytes().take_while(|&c| c != b'=').map(|c| ALPHABET.iter().position(|&a| a == c).map(|p| p as u32)).collect();
+    let digits = digits.filter(|d| d.len() % 4 != 1)?;
+    let mut out = Vec::new();
+    for group in digits.chunks(4) {
+        let n = group.iter().enumerate().fold(0u32, |n, (i, d)| n | d << (18 - 6 * i));
+        out.extend_from_slice(&n.to_be_bytes()[1..group.len()]);
+    }
+    Some(out)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,7 +313,7 @@ mod tests {
     #[test]
     fn compiles_and_renders() {
         let t = Template::parse("$uri ${status}x $pipe $request_length $http_user_agent").unwrap();
-        let s = Sent { status: 200, bytes: 10, body: 2 };
+        let s = Sent { status: 200, bytes: 10, body: 2, ..Sent::default() };
         assert_eq!(t.render(&request(), &s), "/a 200x p 39 x\"y");
         assert_eq!(t.log_line(&request(), &s, Escape::Default), b"/a 200x p 39 x\\x22y");
     }
@@ -259,6 +347,21 @@ mod tests {
         assert_eq!(Template::parse("$nope").unwrap_err(), "unknown \"nope\" variable");
         assert_eq!(Template::parse("a $").unwrap_err(), "invalid variable name in \"a $\"");
         assert_eq!(Template::parse("${uri").unwrap_err(), "invalid variable name in \"${uri\"");
+    }
+
+    #[test]
+    fn headers_cookies_and_users() {
+        let mut r = request();
+        let h = |n: &str, v: &str| (n.to_string(), v.to_string());
+        r.headers = vec![h("Cookie", "foo=1, qux=0; bar = 2"), h("cookie", "a; a=1; x=3"), h("X", "a"), h("x", "b"), h("Authorization", "basic dXNlcjpzZWNyZXQ=")];
+        let s = Sent { headers: vec![h("L", "1"), h("L", "2")], upstream: vec![h("Set-Cookie", "s = 5; path=/"), h("Set-Cookie", "t")], trailers: vec![h("T", "x")], ..Sent::default() };
+        let t = Template::parse("$http_cookie|$http_x|$cookie_foo|$cookie_bar|[$cookie_qux]|[$cookie_a]|$cookie_x|$sent_http_l|$sent_trailer_t|$upstream_cookie_s|[$upstream_cookie_t]|$remote_user").unwrap();
+        assert_eq!(t.render(&r, &s), "foo=1, qux=0; bar = 2; a; a=1; x=3|a, b|1, qux=0|2|[]|[]|3|1, 2|x|5|[]|user");
+        assert_eq!(Template::parse("$upstream_http_set_cookie").unwrap().render(&r, &s), "s = 5; path=/, t");
+        for (auth, user) in [("Basic dXNlcg==", None), ("Basic OnB3", None), ("Basic a", None), ("Basic !!!!", None), ("Basic ", None), ("Digest x", None), ("Basic dTpw", Some("u"))] {
+            r.headers = vec![h("Authorization", auth)];
+            assert_eq!(basic_user(&r).as_deref(), user, "{auth}");
+        }
     }
 
     #[test]
