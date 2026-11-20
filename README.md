@@ -6,7 +6,7 @@ An experiment to find out how far an agent loop can take an HTTP server that beh
 
 | Question | Records that answer it |
 |---|---|
-| How much can be automated? | The number of cases made to pass automatically, and the number that got stuck and waited for a human |
+| How much can be automated? | The number of cases made to pass automatically, and the number of blocked issues the loop opened for a human |
 | Where does a human have to step in? | The intervention log (`docs/interventions.md`) |
 | What quality do we get, in how much time and at what cost? | The differential test pass rate over elapsed time, the number of nginx-tests passed, and the time and tokens spent per iteration |
 
@@ -32,7 +32,7 @@ A stage is done when every item of its checklist (`harness/checklist.toml`, from
 
 ## The automated loop
 
-The work queue is the set of cases that fail on main: each failing case holds the configuration, the requests and what nginx answered. There are no separate issue files.
+The work queue is the set of cases that fail on main: each failing case holds the configuration, the requests and what nginx answered.
 
 Claude Code works in two roles. Neither decides whether its own change is good; the judge does:
 
@@ -60,7 +60,9 @@ pull request into main
 
 Cases that fail on main are allowed: they are the Fixer's work queue. A green `judge` on main means main did not get worse, not that every case passes.
 
-A case is stuck after three pull requests for it were closed without being merged, and waits for a human.
+A pull request the judge fails stays open, and its author pushes fixes to it.
+
+When the Fixer or the Finder judges that it cannot fix something within its role, it is blocked. It opens an issue labelled `blocked` saying what it was working on, why it cannot go on and what a human has to decide, links the issue from its pull request, leaves the pull request open and sends a push notification. A case with an open `blocked` issue is not picked again. A human decides how to fix it, fixes it and closes the issue. The next Fixer run first takes up the pull requests whose `blocked` issue was closed, updating them with main so the judge runs again.
 
 `scripts/run.sh` is the one way to run a command: in place on Linux, inside the Lima VM on macOS.
 
@@ -68,9 +70,19 @@ A case is stuck after three pull requests for it were closed without being merge
 
 Only through what the judge enforces: the harness, the judging rules, the cases and these documents, changed by pull requests that pass the same `judge` check.
 
-- Stuck cases
+- Blocked issues: deciding how to fix what the loop could not, and fixing it
 - Whether to move on to the next stage (`status/stage.txt`)
 - Changes to the judging rules, such as adding a header that is excluded from comparison
+
+## Issues
+
+| Kind | Opened by | Closed by |
+|---|---|---|
+| Plan (label `plan`): what the human follows, such as finishing a stage | the human | the human |
+| Harness work: a change to the harness, the judging rules, the cases or the documents | the human | the pull request that makes the change, when it merges |
+| Blocked (label `blocked`): something the loop cannot fix within its role | the Fixer or the Finder | the human, after fixing it |
+
+The human includes the Claude Code session the human instructs; the loop is the scheduled Fixer and Finder.
 
 Every intervention adds one row to `docs/interventions.md`. Decisions made before the experiment starts are recorded there too, as human decisions.
 
