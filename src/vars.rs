@@ -125,6 +125,10 @@ pub struct Sent {
     /// response head and to send the whole answer, None when it did not
     /// ($upstream_connect_time, $upstream_header_time, $upstream_response_time).
     pub upstream_time: Option<Vec<[Option<u128>; 3]>>,
+    /// For each of them, the bytes of the body and of the whole answer read,
+    /// and of the request sent ($upstream_response_length,
+    /// $upstream_bytes_received, $upstream_bytes_sent).
+    pub upstream_bytes: Option<Vec<[u64; 3]>>,
     /// The host of the proxy_pass URL ($proxy_host, $proxy_port).
     pub proxy_host: Option<String>,
 }
@@ -162,6 +166,7 @@ pub enum Var {
     UpstreamStatus,
     /// $upstream_connect_time (0), $upstream_header_time (1), $upstream_response_time (2).
     UpstreamTime(usize),
+    UpstreamBytes(usize),
     ProxyHost,
     ProxyPort,
     ProxyAddXForwardedFor,
@@ -194,6 +199,7 @@ impl Var {
             ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
             ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("upstream_status", Var::UpstreamStatus), ("pid", Var::Pid),
             ("upstream_connect_time", Var::UpstreamTime(0)), ("upstream_header_time", Var::UpstreamTime(1)), ("upstream_response_time", Var::UpstreamTime(2)),
+            ("upstream_response_length", Var::UpstreamBytes(0)), ("upstream_bytes_received", Var::UpstreamBytes(1)), ("upstream_bytes_sent", Var::UpstreamBytes(2)),
             ("proxy_host", Var::ProxyHost), ("proxy_port", Var::ProxyPort), ("proxy_add_x_forwarded_for", Var::ProxyAddXForwardedFor),
             ("server_name", Var::ServerName), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
@@ -244,6 +250,7 @@ impl Var {
             Var::User(name) => r.vars.lock().unwrap().iter().find(|v| v.0 == *name)?.1.clone(),
             Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
             Var::UpstreamStatus => s.upstream_status.clone().or_else(|| r.upstream_status.clone())?,
+            Var::UpstreamBytes(i) => s.upstream_bytes.as_ref()?.iter().map(|b| b[*i].to_string()).collect::<Vec<_>>().join(", "),
             Var::UpstreamTime(i) => {
                 let time = |t: &[Option<u128>; 3]| t[*i].map_or("-".to_string(), |ms| format!("{}.{:03}", ms / 1000, ms % 1000));
                 s.upstream_time.as_ref()?.iter().map(time).collect::<Vec<_>>().join(", ")
@@ -519,6 +526,8 @@ mod tests {
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"-|0");
         r.limit_rate.set(5);
         assert_eq!(t.render(&r, &Sent { upstream_time: Some(vec![[Some(1), None, Some(1)], [None, None, Some(2040)]]), ..Sent::default() }), "0.001, 2.040|5");
+        let t = Template::parse("$upstream_response_length:$upstream_bytes_received:$upstream_bytes_sent").unwrap();
+        assert_eq!(t.render(&r, &Sent { upstream_bytes: Some(vec![[0, 0, 0], [23, 68, 45]]), ..Sent::default() }), "0, 23:0, 68:0, 45");
     }
 
     #[test]
