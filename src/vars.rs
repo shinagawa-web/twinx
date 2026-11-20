@@ -34,6 +34,8 @@ pub struct Request {
     pub body_file: Option<PathBuf>,
     /// The proxied servers tried before an internal redirect ($upstream_addr).
     pub upstream_addr: Option<String>,
+    /// The statuses they answered with ($upstream_status).
+    pub upstream_status: Option<String>,
     /// The headers of the proxied server's answer that redirected with
     /// X-Accel-Redirect, for $upstream_http_* after the redirect.
     pub upstream: Vec<(String, String)>,
@@ -113,6 +115,8 @@ pub struct Sent {
     pub trailers: Vec<(String, String)>,
     /// The proxied servers tried, as $upstream_addr gives them.
     pub upstream_addr: Option<String>,
+    /// The status each of them answered with, as $upstream_status gives them.
+    pub upstream_status: Option<String>,
     /// For each of them, the milliseconds it took to connect, to send the
     /// response head and to send the whole answer, None when it did not
     /// ($upstream_connect_time, $upstream_header_time, $upstream_response_time).
@@ -151,6 +155,7 @@ pub enum Var {
     RequestPort,
     IsRequestPort,
     UpstreamAddr,
+    UpstreamStatus,
     /// $upstream_connect_time (0), $upstream_header_time (1), $upstream_response_time (2).
     UpstreamTime(usize),
     ProxyHost,
@@ -183,7 +188,7 @@ impl Var {
             ("server_addr", Var::ServerAddr), ("server_port", Var::ServerPort), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
             ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
-            ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("pid", Var::Pid),
+            ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("upstream_status", Var::UpstreamStatus), ("pid", Var::Pid),
             ("upstream_connect_time", Var::UpstreamTime(0)), ("upstream_header_time", Var::UpstreamTime(1)), ("upstream_response_time", Var::UpstreamTime(2)),
             ("proxy_host", Var::ProxyHost), ("proxy_port", Var::ProxyPort), ("proxy_add_x_forwarded_for", Var::ProxyAddXForwardedFor),
             ("server_name", Var::ServerName), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
@@ -234,6 +239,7 @@ impl Var {
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
             Var::User(name) => r.vars.lock().unwrap().iter().find(|v| v.0 == *name)?.1.clone(),
             Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
+            Var::UpstreamStatus => s.upstream_status.clone().or_else(|| r.upstream_status.clone())?,
             Var::UpstreamTime(i) => {
                 let time = |t: &[Option<u128>; 3]| t[*i].map_or("-".to_string(), |ms| format!("{}.{:03}", ms / 1000, ms % 1000));
                 s.upstream_time.as_ref()?.iter().map(time).collect::<Vec<_>>().join(", ")
@@ -440,6 +446,7 @@ mod tests {
             body: b"xy".to_vec(),
             body_file: None,
             upstream_addr: None,
+            upstream_status: None,
             upstream: Vec::new(),
             captures: Vec::new(),
             limit_rate: Default::default(),
@@ -500,6 +507,9 @@ mod tests {
         r.method = "PUT".into();
         assert_eq!(Template::parse("$request_method").unwrap().render(&r, &Sent::default()), "PUT");
         assert_eq!(t.render(&r, &Sent { upstream_addr: Some("b".into()), ..Sent::default() }), format!("{}|b", std::process::id()));
+        r.upstream_status = Some("404, 404".into());
+        assert_eq!(Template::parse("x${upstream_status}x").unwrap().render(&r, &Sent::default()), "x404, 404x");
+        assert_eq!(Template::parse("$upstream_status").unwrap().render(&r, &Sent { upstream_status: Some("200".into()), ..Sent::default() }), "200");
         let t = Template::parse("$upstream_response_time|$limit_rate").unwrap();
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"-|0");
         r.limit_rate.set(5);

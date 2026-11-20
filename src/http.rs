@@ -94,6 +94,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             body: Vec::new(),
             body_file: None,
             upstream_addr: None,
+            upstream_status: None,
             upstream: Vec::new(),
             captures: Vec::new(),
             limit_rate: Default::default(),
@@ -217,6 +218,8 @@ struct Response {
     internal: Option<String>,
     /// The proxied servers tried ($upstream_addr), and how long each took ($upstream_response_time).
     upstream_addr: Option<String>,
+    /// The status each of them answered with ($upstream_status).
+    upstream_status: Option<String>,
     upstream_time: Option<Vec<[Option<u128>; 3]>>,
     /// The host of the proxy_pass URL ($proxy_host).
     proxy_host: Option<String>,
@@ -362,7 +365,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
             // by its location, with the error's status unless that answer has its own.
             // A named location answers the request as it is.
             let mut to = r.clone();
-            to.upstream_addr = resp.upstream_addr.take();
+            (to.upstream_addr, to.upstream_status) = (resp.upstream_addr.take(), resp.upstream_status.take());
             if named.is_none() {
                 to.uri = url.split('?').next().unwrap_or_default().to_string();
                 to.target = url;
@@ -405,7 +408,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let so_far = |resp: &Response, trailers: &[(String, String)]| {
         let ctype = resp.ctype.iter().map(|t| ("Content-Type".to_string(), t.clone()));
         let headers = ctype.chain(resp.headers.iter().cloned()).collect();
-        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), upstream_addr: resp.upstream_addr.clone(), upstream_time: resp.upstream_time.clone(), proxy_host: resp.proxy_host.clone(), ..Sent::default() }
+        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), upstream_addr: resp.upstream_addr.clone(), upstream_status: resp.upstream_status.clone(), upstream_time: resp.upstream_time.clone(), proxy_host: resp.proxy_host.clone(), ..Sent::default() }
     };
     // While the head is made, the last proxied server is still sending ($upstream_response_time).
     let at_head = |resp: &Response| {
@@ -767,7 +770,8 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     // proxy_limit_rate, which may have the answer's headers ($upstream_http_*).
     let rate = |resp: &Response| crate::conf::size(&level.proxy_limit_rate.render(r, &Sent { upstream: resp.upstream.clone(), ..Sent::default() })).unwrap_or(0);
     let (mut tried, mut answer, mut addrs, mut times) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new());
-    let (mut tries, next) = (up.tries(), |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
+    let (mut statuses, limit, first) = (Vec::new(), level.proxy_next_upstream_tries, Instant::now());
+    let (mut tries, next) = (if limit > 0 { up.tries().min(limit) } else { up.tries() }, |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
     while let Some(i) = up.pick(&mut tried) {
         addrs.push(up.peers[i].addr.to_string());
         // A socket that cannot be bound fails the request without trying the next server.
@@ -781,14 +785,17 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
         // left to try, goes on to the next server; 403 and 404 are no failures.
         tries -= 1;
         let status = answer.as_ref().map(|a| a.status);
-        let again = status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}")));
+        statuses.push(status.unwrap_or(502).to_string());
+        // proxy_next_upstream_tries and proxy_next_upstream_timeout end the tries too.
+        let timeout = level.proxy_next_upstream_timeout;
+        let again = status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) && (timeout.is_zero() || first.elapsed() < timeout);
         up.done(i, answer.is_none() || again && !matches!(status, Some(403 | 404)));
         if !again || tries == 0 { break; }
         answer = None;
     }
-    let (upstream_addr, upstream_time, proxy_host) = (Some(addrs.join(", ")), Some(times), Some(host));
-    let Some(mut resp) = answer else { return Response { upstream_addr, upstream_time, proxy_host, ..special(502) } };
-    (resp.upstream_addr, resp.upstream_time, resp.proxy_host) = (upstream_addr, upstream_time, proxy_host);
+    let (upstream_addr, upstream_status, upstream_time, proxy_host) = (Some(addrs.join(", ")), Some(statuses.join(", ")), Some(times), Some(host));
+    let Some(mut resp) = answer else { return Response { upstream_addr, upstream_status, upstream_time, proxy_host, ..special(502) } };
+    (resp.upstream_addr, resp.upstream_status, resp.upstream_time, resp.proxy_host) = (upstream_addr, upstream_status, upstream_time, proxy_host);
     // X-Accel-Limit-Rate sets the rate the answer is sent at; X-Accel-Redirect
     // replaces the answer with an internal redirect to its URI.
     let accel = |name: &str| resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
@@ -1208,6 +1215,7 @@ mod tests {
             body: Vec::new(),
             body_file: None,
             upstream_addr: None,
+            upstream_status: None,
             upstream: Vec::new(),
             captures: Vec::new(),
             limit_rate: Default::default(),
