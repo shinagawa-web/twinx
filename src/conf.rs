@@ -55,6 +55,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("max_headers", HTTP | SRV, 1, 1, false),
     ("ignore_invalid_headers", HTTP | SRV, 1, 1, false),
     ("underscores_in_headers", HTTP | SRV, 1, 1, false),
+    ("merge_slashes", HTTP | SRV, 1, 1, false),
     ("client_body_buffer_size", HSL, 1, 1, false),
     ("client_body_in_file_only", HSL, 1, 1, false),
     ("client_body_in_single_buffer", HSL, 1, 1, false),
@@ -161,6 +162,8 @@ pub struct Level {
     /// than letters, digits and "-" (and "_" with underscores_in_headers) are dropped.
     pub ignore_invalid_headers: bool,
     pub underscores_in_headers: bool,
+    /// merge_slashes: two or more slashes in a row in the URI are one.
+    pub merge_slashes: bool,
     pub body_buffer: u64,
     pub body_in_file_only: bool,
     pub body_temp_path: PathBuf,
@@ -336,7 +339,7 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
+        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -435,6 +438,7 @@ impl Builder<'_> {
                 }
                 "ignore_invalid_headers" => level.ignore_invalid_headers = flag(d).map_err(at)?,
                 "underscores_in_headers" => level.underscores_in_headers = flag(d).map_err(at)?,
+                "merge_slashes" => level.merge_slashes = flag(d).map_err(at)?,
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
                 "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
                 "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
