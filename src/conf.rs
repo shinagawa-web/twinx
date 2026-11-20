@@ -73,6 +73,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("error_page", HSL | LIF, 2, usize::MAX, false),
     ("proxy_pass", LOC | LIF, 1, 1, false),
     ("proxy_method", HSL, 1, 1, false),
+    ("proxy_set_body", HSL, 1, 1, false),
     ("expires", HSL | LIF, 1, 2, false),
     ("post_action", HSL, 1, 1, false),
     ("alias", LOC, 1, 1, false),
@@ -327,6 +328,9 @@ pub struct Level {
     /// proxy_method: the method, which may have variables, sent to proxied
     /// servers instead of the request's.
     pub proxy_method: Option<Template>,
+    /// proxy_set_body: the body, which may have variables, sent to proxied
+    /// servers instead of the client's.
+    pub proxy_set_body: Option<Template>,
     /// proxy_limit_rate: the rate a proxied answer is read at, a size that may
     /// have variables, evaluated once its head has come; 0 or none is no limit.
     pub proxy_limit_rate: Template,
@@ -655,6 +659,7 @@ impl Builder<'_> {
                 "limit_rate" => level.limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "limit_rate_after" => level.limit_rate_after = size_value(&d.args[0]).map_err(at)?,
                 "proxy_method" => level.proxy_method = Some(Template::parse(&d.args[0]).map_err(at)?),
+                "proxy_set_body" => level.proxy_set_body = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_limit_rate" => level.proxy_limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "if_modified_since" => level.if_modified_since = [("off", None), ("exact", Some(false)), ("before", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"if_modified_since\" directive, it must be \"off\", \"exact\" or \"before\"", d.args[0])))?.1,
                 _ => {}
@@ -1223,6 +1228,8 @@ mod tests {
         assert_eq!(build_text("http { limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
         let c = build_text("http { proxy_method POST; server { location / { } } }").unwrap();
         assert_eq!(c.servers[0].locations[0].level.proxy_method.as_ref().map(|m| m.0.len()), Some(1));
+        let c = build_text("http { proxy_set_body \"a $arg_b\"; server { location / { } } }").unwrap();
+        assert_eq!(c.servers[0].locations[0].level.proxy_set_body.as_ref().map(|b| b.0.len()), Some(2));
         let c = build_text("http { proxy_limit_rate $upstream_http_x_rate; server { proxy_limit_rate 8k; } }").unwrap();
         assert_eq!(c.servers[0].level.proxy_limit_rate.0.len(), 1);
         assert_eq!(build_text("http { proxy_limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
