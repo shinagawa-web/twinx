@@ -15,7 +15,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use libc::{SIGINT, SIGQUIT, SIGTERM, c_int, pid_t, sigset_t};
+use libc::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, c_int, pid_t, sigset_t};
 
 /// What `-V` prints: Test::Nginx reads it to tell which modules twinx has.
 const CONFIGURE: &str = "--without-http_fastcgi_module --without-http_uwsgi_module \
@@ -59,7 +59,7 @@ fn signal_set() -> sigset_t {
     unsafe {
         let mut set = std::mem::zeroed();
         libc::sigemptyset(&mut set);
-        for s in [SIGQUIT, SIGTERM, SIGINT] { libc::sigaddset(&mut set, s); }
+        for s in [SIGQUIT, SIGTERM, SIGINT, SIGHUP] { libc::sigaddset(&mut set, s); }
         set
     }
 }
@@ -76,14 +76,25 @@ fn wait_signal(set: &sigset_t) -> c_int {
 /// ends only the worker, and the master and its pid file stay.
 fn run(a: &Args) -> Result<(), String> {
     let config = Arc::new(load(a)?);
-    let listeners = http::bind(&config)?;
+    let mut listeners = http::bind(&config, &[])?;
     let set = signal_set();
     // SAFETY: the master is single-threaded here; blocking signals has no other effect on it.
     unsafe { libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
     let pid = &config.pid;
     std::fs::write(pid, format!("{}\n", std::process::id())).map_err(|e| format!("open() \"{}\" failed ({e})", pid.display()))?;
-    let worker = spawn(&config, &listeners, &set)?;
-    let sig = wait_signal(&set);
+    let mut worker = spawn(&config, &listeners, &set)?;
+    // HUP reloads the configuration: a worker starts with the new one, on the sockets it shares with the
+    // old configuration, and the old worker is shut down. A configuration that cannot be loaded leaves the
+    // old worker serving, as in nginx.
+    let sig = loop {
+        let sig = wait_signal(&set);
+        if sig != SIGHUP { break sig }
+        let Ok((config, open)) = load(a).map(Arc::new).and_then(|c| Ok((c.clone(), http::bind(&c, &listeners)?))).map_err(|e| emerg(&e, Some(&a.prefix.join(&a.error_log)))) else { continue };
+        let old = std::mem::replace(&mut worker, spawn(&config, &open, &set)?);
+        listeners = open;
+        // SAFETY: plain system calls on the old worker's process id: shut it down and wait for it.
+        unsafe { libc::kill(old, SIGQUIT); libc::waitpid(old, std::ptr::null_mut(), 0) };
+    };
     // SAFETY: plain system calls on the worker's process id: pass the signal on and wait for the worker.
     unsafe { libc::kill(worker, sig); libc::waitpid(worker, std::ptr::null_mut(), 0) };
     let _ = std::fs::remove_file(pid);
@@ -111,7 +122,11 @@ fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], s
     // SAFETY: setrlimit() only reads the structure it is given.
     if let Some(l) = limit { unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &l) }; }
     if let Err(e) = http::accept(config.clone(), listeners) { fail(&e, None) }
-    wait_signal(set);
+    // A worker ignores HUP, which only the master acts on. QUIT shuts it down
+    // gracefully; TERM and INT end it at once.
+    let mut sig = SIGHUP;
+    while sig == SIGHUP { sig = wait_signal(set) }
+    if sig == SIGQUIT { http::shut_down(config.shutdown_timeout) }
     std::process::exit(0)
 }
 
@@ -127,12 +142,17 @@ fn main() {
 
 /// Reports an error as nginx does, on standard error and in the error log, and exits.
 fn fail(msg: &str, log: Option<&Path>) -> ! {
+    emerg(msg, log);
+    std::process::exit(1)
+}
+
+/// Reports an error on standard error and in the error log.
+fn emerg(msg: &str, log: Option<&Path>) {
     eprintln!("twinx: [emerg] {msg}");
     let time = chrono::Local::now().format("%Y/%m/%d %H:%M:%S");
     let line = format!("{time} [emerg] {}#0: {msg}\n", std::process::id());
     let file = log.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
     let _ = file.map(|mut f| f.write_all(line.as_bytes()));
-    std::process::exit(1)
 }
 
 #[cfg(test)]
