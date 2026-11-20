@@ -232,6 +232,9 @@ struct Response {
     /// Whether this is the answer of a proxied server, which error_page
     /// replaces only with proxy_intercept_errors on.
     proxied: bool,
+    /// Whether a Location that starts with "/" is sent as it is: one a proxied
+    /// server sent and proxy_redirect did not rewrite.
+    relative: bool,
     /// What is left to read of a proxied answer's body that proxy_limit_rate
     /// paces: it is read once the head is made, as nginx sends the head first.
     rest: Option<Rest>,
@@ -384,7 +387,8 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     // The headers and the log see the request as the last internal redirect left it ($uri).
     let r = &last;
     not_modified(r, level, &mut resp);
-    if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| level.absolute_redirect) {
+    let absolute = level.absolute_redirect && !resp.relative;
+    if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| absolute) {
         let host = if level.server_name_in_redirect { r.server_name.clone() } else { r.host.clone().unwrap_or_else(|| local.ip().to_string()) };
         let port = if level.port_in_redirect && local.port() != 80 { format!(":{}", local.port()) } else { String::new() };
         h.1 = format!("http://{host}{port}{}", h.1);
@@ -817,7 +821,25 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     for h in resp.headers.iter_mut().filter(|h| h.0.eq_ignore_ascii_case("set-cookie")) {
         if let Some(cookie) = rewrite_cookie(r, &h.1, level) { h.1 = cookie; }
     }
+    resp.relative = !rewrite_redirect(r, level, &mut resp.headers);
     resp
+}
+
+/// proxy_redirect: the first rule that matches the Location, or what follows
+/// "url=" in a Refresh, replaces what it matched; true when a Location changed.
+fn rewrite_redirect(r: &Request, level: &Level, headers: &mut [(String, String)]) -> bool {
+    let rules = level.proxy_redirect.as_deref().unwrap_or_default();
+    let mut changed = false;
+    for (name, value) in headers.iter_mut() {
+        let location = name.eq_ignore_ascii_case("location");
+        let start = if location { Some(0) } else if name.eq_ignore_ascii_case("refresh") { value.to_ascii_lowercase().find("url=").map(|i| i + 4) } else { None };
+        let Some(start) = start else { continue };
+        if let Some(new) = rules.iter().find_map(|rw| cookie_value(r, rw, &value[start..], false)) {
+            *value = format!("{}{new}", &value[..start]);
+            changed |= location;
+        }
+    }
+    changed
 }
 
 /// proxy_cookie_domain and proxy_cookie_path: the Domain and Path attributes of
@@ -865,7 +887,8 @@ fn cookie_flags(r: &Request, rules: &[CookieFlags], level: &Level, attrs: &mut V
     bits != 0
 }
 
-/// The value one rewrite makes of a Domain or Path, None when it does not match.
+/// The value one rewrite makes of a Domain or Path (or, for proxy_redirect, of
+/// a Location as of a Path), None when it does not match.
 fn cookie_value(r: &Request, rw: &CookieRewrite, value: &str, domain: bool) -> Option<String> {
     let replacement = || rw.replacement.render(r, &Sent::default());
     match &rw.pattern {
@@ -1683,6 +1706,38 @@ mod tests {
         let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { proxy_cookie_path off; proxy_cookie_path /a /b; }"), "\"proxy_cookie_path\" directive is duplicate in t:1");
         assert_eq!(refused("http { proxy_cookie_path on; }"), "invalid parameter \"on\" in t:1");
+    }
+
+    #[test]
+    fn rewrites_redirects() {
+        let text = "http { server { location /d/ { proxy_pass http://127.0.0.1:1/u/; } location /n/ { proxy_pass http://127.0.0.1:1; \
+                    proxy_redirect http://a/$server_name/ /x/; proxy_redirect ~*^(.+)/RE/ $1/y/; location /n/i/ { proxy_pass http://127.0.0.1:2; } } \
+                    location /o/ { proxy_pass http://127.0.0.1:1; proxy_redirect off; location /o/i/ { } } location /p/ { proxy_pass http://127.0.0.1:1; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let level = |i: usize| &config.servers[0].locations[i].level;
+        let (_, r) = request("GET / HTTP/1.0\n\n");
+        let rw = |i: usize, name: &str, value: &str| {
+            let mut headers = vec![(name.to_string(), value.to_string())];
+            (rewrite_redirect(&r, level(i), &mut headers), headers.remove(0).1)
+        };
+        // The implicit default: the URL with its URI becomes the location's name, one without it "/".
+        assert_eq!(rw(0, "Location", "http://127.0.0.1:1/u/a"), (true, "/d/a".into()));
+        assert_eq!(rw(5, "location", "http://127.0.0.1:1/a"), (true, "/a".into()));
+        // The first rule that matches, which may have variables or be a regular expression replacing all.
+        assert_eq!(rw(1, "Location", "http://a/localhost/b"), (true, "/x/b".into()));
+        assert_eq!(rw(1, "Location", "http://b/re/c"), (true, "http://b/y/".into()));
+        assert_eq!(rw(1, "Refresh", "7; URL=http://a/localhost/b"), (false, "7; URL=/x/b".into()));
+        // A nested location inherits the rules; nothing matching, off, or a Refresh without a URL leaves it.
+        assert_eq!(rw(2, "Location", "http://a/localhost/"), (true, "/x/".into()));
+        assert_eq!(rw(1, "Location", "/c"), (false, "/c".into()));
+        assert_eq!(rw(1, "Refresh", "7"), (false, "7".into()));
+        assert_eq!(rw(3, "Location", "http://127.0.0.1:1/a"), (false, "http://127.0.0.1:1/a".into()));
+        assert_eq!(level(4).proxy_redirect.as_ref().map(Vec::len), None);
+        let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        assert_eq!(refused("http { server { location / { proxy_redirect default; } } }"), "\"proxy_redirect default\" should be placed after the \"proxy_pass\" directive in t:1");
+        assert_eq!(refused("http { server { location / { proxy_pass http://$host; proxy_redirect default; } } }"), "\"proxy_redirect default\" cannot be used with \"proxy_pass\" directive with variables in t:1");
+        assert_eq!(refused("http { proxy_redirect off; proxy_redirect /a /b; }"), "\"proxy_redirect\" directive is duplicate in t:1");
+        assert_eq!(refused("http { proxy_redirect on; }"), "invalid parameter \"on\" in t:1");
     }
 
     #[test]

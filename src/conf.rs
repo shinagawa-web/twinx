@@ -98,6 +98,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("proxy_max_temp_file_size", HSL, 1, 1, false),
     ("proxy_cookie_domain", HSL, 1, 2, false),
     ("proxy_cookie_path", HSL, 1, 2, false),
+    ("proxy_redirect", HSL, 1, 2, false),
     ("proxy_cookie_flags", HSL, 1, 4, false),
     ("resolver", HSL, 1, usize::MAX, false),
     ("resolver_timeout", HSL, 1, 1, false),
@@ -208,6 +209,10 @@ pub struct Level {
     pub proxy_cookie_path: Option<Vec<CookieRewrite>>,
     /// proxy_cookie_flags, the first whose cookie matches applying; None when off.
     pub proxy_cookie_flags: Option<Vec<CookieFlags>>,
+    /// proxy_redirect: what replaces the start of a Location or of the URL of
+    /// a Refresh the proxied server sends (a pattern as proxy_cookie_path's
+    /// is), the first rule that matches applying; None when off.
+    pub proxy_redirect: Option<Vec<CookieRewrite>>,
     pub access_log: Vec<Arc<AccessLog>>,
     /// open_log_file_cache, for the access logs whose paths have variables.
     pub log_cache: Option<Arc<Cache>>,
@@ -390,13 +395,16 @@ struct Builder<'a> {
     formats: HashMap<String, Arc<Format>>,
     logs: HashMap<PathBuf, Arc<File>>,
     upstreams: HashMap<String, Arc<Upstream>>,
+    /// The name of the location whose directives are being read, which
+    /// "proxy_redirect default" puts in place of the proxy_pass URL.
+    location: String,
 }
 
 /// Interprets the main block. Errors are nginx's messages, with the place.
 pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
-    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new() };
+    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), location: String::new() };
     let mut config = Config { pid: prefix.join("logs/nginx.pid"), servers: Vec::new() };
     for d in main {
         b.check(d, MAIN)?;
@@ -441,7 +449,7 @@ impl Builder<'_> {
         let temp = self.path("client_body_temp");
         let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_redirect: Some(Vec::new()), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -488,8 +496,9 @@ impl Builder<'_> {
         for d in block.iter().filter(|d| d.name == "location") {
             let mut level = Level { proxy: None, try_files: None, script: Vec::new(), ..parent.clone() };
             let inner = d.block.as_deref().unwrap_or_default();
-            self.level(inner, LOC, &mut level)?;
             let (kind, path) = location(&d.args).map_err(|e| format!("{e} in {}", d.at))?;
+            self.location = d.args.last().cloned().unwrap_or_default();
+            self.level(inner, LOC, &mut level)?;
             let auto_redirect = level.proxy.is_some() && path.ends_with('/') && !matches!(kind, Match::Regex(_));
             if inner.iter().any(|d| d.name == "alias") { level.alias_len = (!matches!(kind, Match::Regex(_))).then_some(path.len()); }
             out.push(Location { kind, path, level: level.clone(), auto_redirect });
@@ -509,6 +518,8 @@ impl Builder<'_> {
         // proxy_cookie_domain and proxy_cookie_path of this level: Some(None) once "off".
         let mut cookies: [Option<Option<Vec<CookieRewrite>>>; 2] = [None, None];
         let mut flags: Option<Option<Vec<CookieFlags>>> = None;
+        // proxy_redirect of this level, Some(None) once "off"; and whether proxy_pass is here.
+        let (mut redirects, mut own_proxy): (Option<Option<Vec<CookieRewrite>>>, bool) = (None, false);
         let mut ifs = Vec::new();
         for d in block {
             self.check(d, ctx)?;
@@ -552,7 +563,20 @@ impl Builder<'_> {
                 "add_header" => headers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
                 "add_trailer" => trailers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
                 "error_page" => pages.get_or_insert_default().push(error_page(&d.args).map_err(at)?),
-                "proxy_pass" => level.proxy = Some(Arc::new(self.proxy(&d.args[0]).map_err(at)?)),
+                "proxy_pass" => (level.proxy, own_proxy) = (Some(Arc::new(self.proxy(&d.args[0]).map_err(at)?)), true),
+                "proxy_redirect" => {
+                    let rule = if d.args == ["default"] {
+                        let proxy = level.proxy.as_ref().filter(|_| own_proxy).ok_or_else(|| at("\"proxy_redirect default\" should be placed after the \"proxy_pass\" directive".into()))?;
+                        Some(self.default_redirect(proxy).ok_or_else(|| at("\"proxy_redirect default\" cannot be used with \"proxy_pass\" directive with variables".into()))?)
+                    } else {
+                        cookie_rewrite(&d.args, false).map_err(at)?
+                    };
+                    // As with proxy_cookie_path, "off" goes with nothing else at a level.
+                    match (&mut redirects, rule) {
+                        (None, rule) => redirects = Some(rule.map(|r| vec![r])),
+                        (Some(Some(list)), Some(rule)) => list.push(rule), _ => return Err(at("\"proxy_redirect\" directive is duplicate".into())),
+                    }
+                }
                 "client_max_body_size" => level.max_body = size(&d.args[0]).map_err(at)?,
                 // Headers are read whole whatever the buffers, so these are only checked.
                 "large_client_header_buffers" | "connection_pool_size" => {
@@ -636,6 +660,11 @@ impl Builder<'_> {
         if let Some(domain) = domain { level.proxy_cookie_domain = domain; }
         if let Some(path) = path { level.proxy_cookie_path = path; }
         if let Some(flags) = flags { level.proxy_cookie_flags = flags; }
+        if let Some(redirects) = redirects { level.proxy_redirect = redirects; }
+        // Without rules of its own or inherited, a location with proxy_pass has "proxy_redirect default".
+        if level.proxy_redirect.as_ref().is_some_and(Vec::is_empty) && own_proxy {
+            level.proxy_redirect = level.proxy.as_ref().and_then(|p| self.default_redirect(p)).map(|r| vec![r]).or(Some(Vec::new()));
+        }
         // An if block inherits everything its level has, wherever it is written there.
         // One in a server block gives a level only to return, which answers at once.
         for (i, d) in ifs {
@@ -668,6 +697,16 @@ impl Builder<'_> {
         let literal = path.0.iter().all(|p| matches!(p, Part::Text(_)));
         let target = if literal { Target::File(self.open(&args[0])?) } else { Target::Path(path) };
         Ok(Some(Arc::new(AccessLog { target, format, condition, gzip })))
+    }
+
+    /// "proxy_redirect default": the proxy_pass URL is replaced by the
+    /// location's name, or, when the URL has no URI, the URL and "/" by "/".
+    /// None for a URL with variables.
+    fn default_redirect(&self, p: &Proxy) -> Option<CookieRewrite> {
+        let text = |s: String| Template(vec![Part::Text(s)]);
+        let url = format!("http://{}{}", p.host, p.uri.as_deref().unwrap_or("/"));
+        let replacement = if p.uri.is_some() { self.location.clone() } else { "/".to_string() };
+        p.url.is_none().then(|| CookieRewrite { pattern: CookiePattern::Text(text(url)), replacement: text(replacement) })
     }
 
     /// proxy_pass http://host[:port][/uri], where host may name an upstream block.
@@ -907,7 +946,11 @@ fn rewrite(args: &[String]) -> Result<Rewrite, String> {
     Ok(Rewrite { regex, url: Template::parse(url)?, status: if flag == "permanent" { 301 } else { 302 }, add_args, internal: !is_url })
 }
 
+/// return code [text] | code URL | URL: a URL alone (http://, https:// or
+/// $scheme first) is redirected to with 302.
 fn ret(args: &[String]) -> Result<(u16, Template), String> {
+    let url = |p: &str| args[0].len() > p.len() && args[0].starts_with(p) || p == "$scheme" && args[0].starts_with(p);
+    if args.len() == 1 && ["http://", "https://", "$scheme"].into_iter().any(url) { return Ok((302, Template::parse(&args[0])?)); }
     let code = args[0].parse::<u16>().ok().filter(|c| *c <= 999);
     let code = code.ok_or_else(|| format!("invalid return code \"{}\"", args[0]))?;
     Ok((code, Template::parse(args.get(1).map_or("", |t| t.as_str()))?))
@@ -929,6 +972,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         build(&parse(text, Path::new("t.conf")).unwrap(), &dir)
+    }
+
+    #[test]
+    fn return_with_a_url_alone() {
+        let c = build_text("http { server { location /a { return http://e/$uri; } location /b { return https://e; } } }").unwrap();
+        let ret: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.ret.as_ref().unwrap().0).collect();
+        assert_eq!(ret, [302, 302]);
+        assert!(build_text("http { server { location /a { return http://; } } }").unwrap_err().starts_with("invalid return code \"http://\""));
     }
 
     #[test]
