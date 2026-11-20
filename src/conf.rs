@@ -79,6 +79,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("post_action", HSL, 1, 1, false),
     ("alias", LOC, 1, 1, false),
     ("absolute_redirect", HSL, 1, 1, false),
+    ("server_tokens", HSL, 1, 1, false),
     ("server_name_in_redirect", HSL, 1, 1, false),
     ("port_in_redirect", HSL, 1, 1, false),
     ("rewrite", SRV | LOC | SIF | LIF, 2, 3, false),
@@ -297,6 +298,9 @@ pub struct Level {
     /// name rather than the request's (server_name_in_redirect), and the port
     /// left out when port_in_redirect is off.
     pub absolute_redirect: bool,
+    /// server_tokens: whether the Server header and the pages twinx generates
+    /// give its version ("on" and "build", as there is no build name) or only its name.
+    pub server_tokens: bool,
     pub server_name_in_redirect: bool,
     pub port_in_redirect: bool,
     /// keepalive_requests: the requests a connection may serve.
@@ -493,7 +497,7 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
+        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -598,6 +602,7 @@ impl Builder<'_> {
                 "alias" => level.alias = Some(self.path(&d.args[0])),
                 "try_files" => level.try_files = Some(Arc::new(try_files(&d.args).map_err(at)?)),
                 "absolute_redirect" => level.absolute_redirect = flag(d).map_err(at)?,
+                "server_tokens" => level.server_tokens = d.args[0] == "build" || flag(d).map_err(|_| at(format!("invalid value \"{}\" in \"server_tokens\" directive, it must be \"on\", \"off\" or \"build\"", d.args[0])))?,
                 "server_name_in_redirect" => level.server_name_in_redirect = flag(d).map_err(at)?,
                 "port_in_redirect" => level.port_in_redirect = flag(d).map_err(at)?,
                 "log_format" => {
