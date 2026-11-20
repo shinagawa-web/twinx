@@ -767,7 +767,8 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     // proxy_limit_rate, which may have the answer's headers ($upstream_http_*).
     let rate = |resp: &Response| crate::conf::size(&level.proxy_limit_rate.render(r, &Sent { upstream: resp.upstream.clone(), ..Sent::default() })).unwrap_or(0);
     let (mut tried, mut answer, mut addrs, mut times) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new());
-    while answer.is_none() && let Some(i) = up.pick(&mut tried) {
+    let (mut tries, next) = (up.tries(), |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
+    while let Some(i) = up.pick(&mut tried) {
         addrs.push(up.peers[i].addr.to_string());
         // A socket that cannot be bound fails the request without trying the next server.
         let socket = bind.map(|b| bound(&up.peers[i].addr, b));
@@ -776,7 +777,14 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
         answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, &mut time, &rate);
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
-        up.done(i, answer.is_none());
+        // An error, or a status proxy_next_upstream names while servers are
+        // left to try, goes on to the next server; 403 and 404 are no failures.
+        tries -= 1;
+        let status = answer.as_ref().map(|a| a.status);
+        let again = status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}")));
+        up.done(i, answer.is_none() || again && !matches!(status, Some(403 | 404)));
+        if !again || tries == 0 { break; }
+        answer = None;
     }
     let (upstream_addr, upstream_time, proxy_host) = (Some(addrs.join(", ")), Some(times), Some(host));
     let Some(mut resp) = answer else { return Response { upstream_addr, upstream_time, proxy_host, ..special(502) } };

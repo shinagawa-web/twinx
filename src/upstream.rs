@@ -12,12 +12,14 @@ pub struct Peer {
     pub max_fails: u64,
     pub fail_timeout: u64,
     pub backup: bool,
+    /// down: the server is never tried.
+    pub down: bool,
 }
 
 impl Peer {
     /// A server with nginx's defaults: weight=1 max_fails=1 fail_timeout=10s.
     pub fn new(addr: SocketAddr) -> Peer {
-        Peer { addr, weight: 1, max_fails: 1, fail_timeout: 10, backup: false }
+        Peer { addr, weight: 1, max_fails: 1, fail_timeout: 10, backup: false, down: false }
     }
 }
 
@@ -46,6 +48,12 @@ impl Upstream {
         Upstream { peers, state: Mutex::new(state) }
     }
 
+    /// How many servers a request may try: those not marked down, as
+    /// ngx_http_upstream_tries() counts them.
+    pub fn tries(&self) -> usize {
+        self.peers.iter().filter(|p| !p.down).count()
+    }
+
     /// The next server to try, given those already tried for this request:
     /// the primary servers first, then the backup ones, as
     /// ngx_http_upstream_get_peer() chooses them.
@@ -55,7 +63,7 @@ impl Upstream {
         let now = now();
         [false, true].into_iter().find_map(|backup| {
             let (mut best, mut total): (Option<(usize, i64)>, i64) = (None, 0);
-            for (i, p) in self.peers.iter().enumerate().filter(|(i, p)| p.backup == backup && !tried[*i]) {
+            for (i, p) in self.peers.iter().enumerate().filter(|(i, p)| p.backup == backup && !p.down && !tried[*i]) {
                 let s = &mut state[i];
                 if !single && p.max_fails > 0 && s.fails >= p.max_fails && now - s.checked <= p.fail_timeout { continue; }
                 s.current += s.effective;
@@ -113,5 +121,15 @@ mod tests {
         assert_eq!(u.pick(&mut tried), None);
         assert_eq!(u.pick(&mut [false, false]), Some(1));
         u.done(1, false);
+    }
+
+    #[test]
+    fn down_servers_are_never_tried() {
+        let mut u = peers(2, 1);
+        u.peers[0].down = true;
+        let u = Upstream::new(u.peers.clone());
+        assert_eq!(u.tries(), 1);
+        assert_eq!(u.pick(&mut [false, false]), Some(1));
+        assert_eq!(u.pick(&mut [false, true]), None);
     }
 }

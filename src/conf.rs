@@ -273,6 +273,8 @@ pub struct Level {
     pub proxy_hide_header: Vec<String>,
     /// proxy_intercept_errors: error_page replaces the answers of proxied servers too.
     pub proxy_intercept_errors: bool,
+    /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
+    pub proxy_next_upstream: Vec<String>,
     /// gzip_static: None when off, Some(true) for "always".
     pub gzip_static: Option<bool>,
     /// gzip: compress answers for clients that take gzip.
@@ -427,7 +429,7 @@ impl Builder<'_> {
         let temp = self.path("client_body_temp");
         let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -575,6 +577,8 @@ impl Builder<'_> {
                 "proxy_next_upstream" => {
                     const VALUES: &[&str] = &["error", "timeout", "invalid_header", "http_500", "http_502", "http_503", "http_504", "http_403", "http_404", "http_429", "non_idempotent", "updating", "off"];
                     if let Some(a) = d.args.iter().find(|a| !VALUES.contains(&a.as_str())) { return Err(at(format!("invalid value \"{a}\""))); }
+                    // "off" turns every other condition off.
+                    level.proxy_next_upstream = if d.args.iter().any(|a| a == "off") { Vec::new() } else { d.args.clone() };
                 }
                 "proxy_hide_header" => hidden.get_or_insert_default().push(d.args[0].to_ascii_lowercase()),
                 "gzip_static" => level.gzip_static = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\"", d.args[0])))?.1,
@@ -733,19 +737,20 @@ fn location(args: &[String]) -> Result<(Match, String), String> {
     Ok((kind, path.clone()))
 }
 
-/// server address [weight=n] [max_fails=n] [fail_timeout=time] [backup] in an upstream block.
+/// server address [weight=n] [max_fails=n] [fail_timeout=time] [backup] [down] in an upstream block.
 fn peer(args: &[String]) -> Result<Peer, String> {
     let addr = listen(&args[0]).map_err(|_| format!("host not found in upstream \"{}\"", args[0]))?;
-    let (mut values, mut backup) = ([("weight", 1u64), ("max_fails", 1), ("fail_timeout", 10)], false);
+    let (mut values, mut backup, mut down) = ([("weight", 1u64), ("max_fails", 1), ("fail_timeout", 10)], false, false);
     for a in &args[1..] {
         if a == "backup" { backup = true; continue; }
+        if a == "down" { down = true; continue; }
         let invalid = || format!("invalid parameter \"{a}\"");
         let (name, value) = a.split_once('=').ok_or_else(invalid)?;
         let slot = values.iter_mut().find(|v| v.0 == name).ok_or_else(invalid)?;
         slot.1 = value.trim_end_matches('s').parse().map_err(|_| invalid())?;
     }
     let [weight, max_fails, fail_timeout] = values.map(|v| v.1);
-    Ok(Peer { addr, weight: weight as i64, max_fails, fail_timeout, backup })
+    Ok(Peer { addr, weight: weight as i64, max_fails, fail_timeout, backup, down })
 }
 
 /// expires [modified] time | epoch | max | off; a value without variables must be valid.
@@ -978,7 +983,8 @@ mod tests {
         assert!(location(&["~".into(), "(".into()]).is_err());
         let p = peer(&["127.0.0.1:1".into(), "max_fails=3".into(), "fail_timeout=5s".into()]).unwrap();
         assert_eq!((p.max_fails, p.fail_timeout, p.weight, p.backup), (3, 5, 1, false));
-        assert_eq!(peer(&["127.0.0.1:1".into(), "down".into()]).unwrap_err(), "invalid parameter \"down\"");
+        assert!(peer(&["127.0.0.1:1".into(), "down".into()]).unwrap().down);
+        assert_eq!(peer(&["127.0.0.1:1".into(), "up".into()]).unwrap_err(), "invalid parameter \"up\"");
     }
 
     #[test]
@@ -1126,6 +1132,8 @@ mod tests {
         let c = build_text("http { proxy_limit_rate $upstream_http_x_rate; server { proxy_limit_rate 8k; } }").unwrap();
         assert_eq!(c.servers[0].level.proxy_limit_rate.0.len(), 1);
         assert_eq!(build_text("http { proxy_limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
+        let c = build_text("http { proxy_next_upstream http_404; server { proxy_next_upstream error off; } server { } }").unwrap();
+        assert_eq!((c.servers[0].level.proxy_next_upstream.len(), c.servers[1].level.proxy_next_upstream.as_slice()), (0, &["http_404".to_string()][..]));
         let c = build_text("http { if_modified_since before; server { location / { if_modified_since off; } } }").unwrap();
         assert_eq!((c.servers[0].level.if_modified_since, c.servers[0].locations[0].level.if_modified_since), (Some(true), None));
         assert!(build_text("http { if_modified_since x; }").unwrap_err().starts_with("invalid value \"x\""));
