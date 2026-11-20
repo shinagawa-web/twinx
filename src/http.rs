@@ -225,6 +225,9 @@ struct Response {
     /// Whether the length is not known when the head is sent (the gzip filter
     /// compresses as it goes): the body is chunked, or the connection closed after it.
     unknown_length: bool,
+    /// Whether this is the answer of a proxied server, which error_page
+    /// replaces only with proxy_intercept_errors on.
+    proxied: bool,
 }
 
 /// The page nginx generates for an error status.
@@ -331,7 +334,10 @@ fn args(r: &Request) -> &str {
 /// long it waits for it (keepalive_timeout).
 fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr) -> Option<Duration> {
     let (mut resp, mut level, mut last) = answer(server, r, parsed, found);
-    if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)) {
+    let intercepted = !resp.proxied || level.proxy_intercept_errors;
+    if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)).filter(|_| intercepted) {
+        // An intercepted 401 keeps the proxied server's WWW-Authenticate headers.
+        let auth: Vec<_> = resp.headers.iter().filter(|h| resp.proxied && resp.status == 401 && h.0.eq_ignore_ascii_case("www-authenticate")).cloned().collect();
         let url = ep.url.render(r, &Sent::default());
         let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == url);
         if url.starts_with('/') || named.is_some() {
@@ -349,6 +355,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
             let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
             (resp, level, last) = answer(server, &to, Ok(()), found);
             if resp.status == 200 { resp.status = status; }
+            resp.headers.splice(0..0, auth);
         } else {
             // A named location that does not exist is an error.
             resp = if url.starts_with('@') { special(500) } else { redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url) };
@@ -852,7 +859,7 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
     let head = String::from_utf8_lossy(&answer[..end]).into_owned();
     let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
     let status = lines.next()?.strip_prefix("HTTP/1.")?.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()?;
-    let mut resp = Response { status, ..Response::default() };
+    let mut resp = Response { status, proxied: true, ..Response::default() };
     const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
     for (name, value) in lines.filter_map(|l| l.split_once(':')) {
         let (lower, value) = (name.to_ascii_lowercase(), value.trim().to_string());
@@ -1206,6 +1213,39 @@ mod tests {
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
         assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
+    }
+
+    #[test]
+    fn intercepts_errors_of_proxied_servers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for s in listener.incoming() {
+                let mut s = s.unwrap();
+                let _ = s.read(&mut [0u8; 1024]).unwrap();
+                s.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: a\r\nX-A: 1\r\nWWW-Authenticate: b\r\n\r\nupstream").unwrap();
+            }
+        });
+        let text = format!("http {{ server {{ error_page 401 /e; location /on {{ proxy_pass http://{addr}; proxy_intercept_errors on; }} \
+                            location /off {{ proxy_pass http://{addr}; }} location /e {{ return 200 e; }} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let answer = |target: &str| {
+            let client = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
+            let (mut stream, _) = client.accept().unwrap();
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            drop(stream);
+            let mut text = String::new();
+            out.read_to_string(&mut text).unwrap();
+            text
+        };
+        let on = answer("/on");
+        assert!(on.starts_with("HTTP/1.1 401 ") && on.ends_with("\r\n\r\ne"), "{on}");
+        assert!(on.contains("WWW-Authenticate: a\r\nWWW-Authenticate: b\r\n") && !on.contains("X-A"), "{on}");
+        let off = answer("/off");
+        assert!(off.starts_with("HTTP/1.1 401 ") && off.contains("X-A: 1") && off.ends_with("upstream"), "{off}");
     }
 
     #[test]
