@@ -268,6 +268,8 @@ pub struct Level {
     /// proxy_hide_header: the headers of the proxied server's answer not passed
     /// to the client besides those nginx never passes, lowercased.
     pub proxy_hide_header: Vec<String>,
+    /// proxy_intercept_errors: error_page replaces the answers of proxied servers too.
+    pub proxy_intercept_errors: bool,
     /// gzip_static: None when off, Some(true) for "always".
     pub gzip_static: Option<bool>,
     /// gzip: compress answers for clients that take gzip.
@@ -559,7 +561,7 @@ impl Builder<'_> {
                 "resolver_timeout" => level.resolver_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_connect_timeout" => level.proxy_connect_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_read_timeout" => level.proxy_read_timeout = seconds(&d.args[0]).map_err(at)?,
-                "proxy_intercept_errors" => drop(flag(d).map_err(at)?),
+                "proxy_intercept_errors" => level.proxy_intercept_errors = flag(d).map_err(at)?,
                 "proxy_next_upstream" => {
                     const VALUES: &[&str] = &["error", "timeout", "invalid_header", "http_500", "http_502", "http_503", "http_504", "http_403", "http_404", "http_429", "non_idempotent", "updating", "off"];
                     if let Some(a) = d.args.iter().find(|a| !VALUES.contains(&a.as_str())) { return Err(at(format!("invalid value \"{a}\""))); }
