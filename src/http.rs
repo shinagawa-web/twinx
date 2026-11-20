@@ -336,6 +336,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     }
     // The headers and the log see the request as the last internal redirect left it ($uri).
     let r = &last;
+    not_modified(r, level, &mut resp);
     if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| level.absolute_redirect) {
         let host = if level.server_name_in_redirect { r.server_name.clone() } else { r.host.clone().unwrap_or_else(|| local.ip().to_string()) };
         let port = if level.port_in_redirect && local.port() != 80 { format!(":{}", local.port()) } else { String::new() };
@@ -383,7 +384,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         let ctype = resp.ctype.as_ref().map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
         let connection = if keepalive { "keep-alive" } else { "close" };
         let len = resp.body.len();
-        let length = if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else if !resp.unknown_length { format!("Content-Length: {len}\r\n") } else { String::new() };
+        let length = if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else if !resp.unknown_length && status != 304 { format!("Content-Length: {len}\r\n") } else { String::new() };
         let header = level.keepalive_header.filter(|_| keepalive).map(|t| format!("Keep-Alive: timeout={t}\r\n")).unwrap_or_default();
         let vary = if resp.vary && level.gzip_vary { "Vary: Accept-Encoding\r\n" } else { "" };
         let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{header}{vary}");
@@ -411,6 +412,35 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let sent = Sent { bytes: out.len(), body: body_len, ..so_far(&resp, &trailers) };
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     (written && keepalive && status != 444).then_some(level.keepalive_timeout)
+}
+
+/// The not modified filter, as ngx_http_not_modified_filter() is: a 200
+/// answer is 412 when If-Unmodified-Since or If-Match fails, and 304, with no
+/// body, Content-Type, Accept-Ranges or Content-Encoding, when the
+/// If-Modified-Since (as if_modified_since says) and If-None-Match it has hold.
+fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
+    if resp.status != 200 { return; }
+    let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
+    let (modified, etag) = (sent("last-modified").and_then(|t| expires::http_time(&t)), sent("etag"));
+    let unmodified = |t: &str| modified.is_some_and(|m| expires::http_time(t).is_some_and(|t| t >= m));
+    if header(r, "if-unmodified-since").is_some_and(|t| !unmodified(t)) || header(r, "if-match").is_some_and(|v| !etag_match(v, etag.as_deref(), false)) {
+        return *resp = special(412);
+    }
+    let (ims, inm) = (header(r, "if-modified-since"), header(r, "if-none-match"));
+    let same = |t: &str| level.if_modified_since.zip(modified).is_some_and(|(before, m)| expires::http_time(t).is_some_and(|t| t == m || before && t > m));
+    if (ims.is_none() && inm.is_none()) || ims.is_some_and(|t| !same(t)) || inm.is_some_and(|v| !etag_match(v, etag.as_deref(), true)) { return; }
+    (resp.status, resp.ctype, resp.body) = (304, None, Vec::new());
+    resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges") && !h.0.eq_ignore_ascii_case("content-encoding"));
+}
+
+/// Whether an If-Match (or, weak, If-None-Match) list has the ETag, as
+/// ngx_http_test_if_match() reads it: "*" or one of its entries, a weak
+/// comparison ignoring "W/".
+fn etag_match(list: &str, etag: Option<&str>, weak: bool) -> bool {
+    let Some(etag) = etag else { return false };
+    if list == "*" { return true; }
+    let etag = etag.strip_prefix("W/").filter(|e| weak && !e.is_empty()).unwrap_or(etag);
+    list.split(',').map(|e| e.trim_matches([' ', '\t'])).any(|e| (if weak { e.strip_prefix("W/").unwrap_or(e) } else { e }) == etag)
 }
 
 /// Writes an answer, paced as ngx_http_write_filter() paces it with a rate:
@@ -978,6 +1008,32 @@ mod tests {
         let resp = proxy(&p, &level, &r, "");
         assert_eq!((resp.internal.as_deref(), resp.as_get, r.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
         assert!(resp.upstream_time.unwrap().starts_with("0."));
+    }
+
+    #[test]
+    fn not_modified_filter() {
+        let level = Level { if_modified_since: Some(false), ..Level::default() };
+        let before = Level { if_modified_since: Some(true), ..Level::default() };
+        let ok = || Response { status: 200, ctype: Some("t/p".into()), body: b"x".to_vec(), headers: vec![
+            ("Last-Modified".into(), "Sun, 06 Nov 1994 08:49:37 GMT".into()), ("ETag".into(), "\"e\"".into()), ("Accept-Ranges".into(), "bytes".into())], ..Response::default() };
+        let status = |h: &str, level: &Level| {
+            let mut resp = ok();
+            not_modified(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, level, &mut resp);
+            resp.status
+        };
+        assert_eq!(status("If-Modified-Since: Sunday, 06-Nov-94 08:49:37 GMT", &level), 304);
+        assert_eq!(status("If-Modified-Since: Sun Nov  6 08:49:38 1994", &level), 200);
+        assert_eq!(status("If-Modified-Since: Sun Nov  6 08:49:38 1994", &before), 304);
+        assert_eq!(status("If-Modified-Since: x", &before), 200);
+        assert_eq!(status("If-Unmodified-Since: Sun, 06 Nov 1994 08:49:36 GMT", &level), 412);
+        assert_eq!(status("If-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT", &level), 200);
+        assert_eq!(status("If-None-Match: \"a\",\tW/\"e\"", &level), 304);
+        assert_eq!(status("If-Match: W/\"e\"", &level), 412);
+        assert_eq!(status("If-Match: *", &level), 200);
+        let mut resp = ok();
+        not_modified(&request("GET / HTTP/1.0\nIf-None-Match: *\n\n").1, &level, &mut resp);
+        assert_eq!((resp.ctype, resp.body.len(), resp.headers.len()), (None, 0, 2));
+        assert!(!etag_match("*", None, true));
     }
 
     #[test]

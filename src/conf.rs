@@ -89,6 +89,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("gzip_types", HSL, 1, usize::MAX, false),
     ("limit_rate", HSL, 1, 1, false),
     ("limit_rate_after", HSL, 1, 1, false),
+    ("if_modified_since", HSL, 1, 1, false),
 ];
 
 const COMBINED: &str =
@@ -217,6 +218,9 @@ pub struct Level {
     /// evaluated when the answer is sent.
     pub limit_rate: Template,
     pub limit_rate_after: Template,
+    /// if_modified_since: None when off; Some(true) for "before", where an
+    /// If-Modified-Since time after Last-Modified holds too, not only an equal one.
+    pub if_modified_since: Option<bool>,
 }
 
 /// try_files: the files tried in order, each a directory when its parameter
@@ -336,7 +340,7 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
+        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -471,6 +475,7 @@ impl Builder<'_> {
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
                 "limit_rate" => level.limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "limit_rate_after" => level.limit_rate_after = size_value(&d.args[0]).map_err(at)?,
+                "if_modified_since" => level.if_modified_since = [("off", None), ("exact", Some(false)), ("before", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"if_modified_since\" directive, it must be \"off\", \"exact\" or \"before\"", d.args[0])))?.1,
                 _ => {}
             }
         }
@@ -899,6 +904,9 @@ mod tests {
         let level = &c.servers[0].level;
         assert_eq!((level.limit_rate.0.len(), level.limit_rate_after.0.len()), (1, 1));
         assert_eq!(build_text("http { limit_rate 1x; }").unwrap_err(), "\"1x\" is invalid in t.conf:1");
+        let c = build_text("http { if_modified_since before; server { location / { if_modified_since off; } } }").unwrap();
+        assert_eq!((c.servers[0].level.if_modified_since, c.servers[0].locations[0].level.if_modified_since), (Some(true), None));
+        assert!(build_text("http { if_modified_since x; }").unwrap_err().starts_with("invalid value \"x\""));
     }
 
     #[test]
