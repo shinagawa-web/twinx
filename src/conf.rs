@@ -45,6 +45,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("location", SRV | LOC, 1, 2, true),
     ("try_files", SRV | LOC, 2, usize::MAX, false),
     ("return", SRV | LOC | SIF | LIF, 1, 2, false),
+    ("break", SRV | LOC | SIF | LIF, 0, 0, false),
     ("set", SRV | LOC | SIF | LIF, 2, 2, false),
     ("if", SRV | LOC, 1, usize::MAX, true),
     ("root", HSL | LIF, 1, 1, false),
@@ -124,7 +125,7 @@ const COMBINED: &str =
 /// (backup servers last), the Host to send, and the URI that replaces the
 /// location's prefix, if the directive has one. A URL with variables is made
 /// for each request instead, and its host resolved then.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Proxy {
     pub host: String,
     pub upstream: Arc<Upstream>,
@@ -144,16 +145,37 @@ pub struct ErrorPage {
 }
 
 /// rewrite regex replacement [flag], where the replacement is a URL the
-/// client is redirected to: with 301 for "permanent", 302 otherwise; or, with
-/// "break", the URI the location goes on with. A replacement ending with "?"
-/// does not get the request's arguments.
+/// client is redirected to (with 301 for "permanent", 302 otherwise), or the
+/// URI the request goes on with. A replacement ending with "?" does not get
+/// the request's arguments.
 #[derive(Debug, Clone)]
 pub struct Rewrite {
     pub regex: regex::Regex,
     pub url: Template,
     pub status: u16,
     pub add_args: bool,
-    pub internal: bool,
+    pub redirect: bool,
+    pub flag: Flag,
+}
+
+/// What follows a rewrite to a URI: the next directive of the rewrite module
+/// (no flag), the search for the location of the new URI ("last"), or the
+/// rest of the location, without the rewrite module's directives ("break").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Flag {
+    Next,
+    Last,
+    Break,
+}
+
+/// The directives of the rewrite module that a level runs in order, after set and if.
+#[derive(Debug, Clone)]
+pub enum Step {
+    Rewrite(Rewrite),
+    /// return code [text] | code URL | URL.
+    Return(u16, Template),
+    /// break: the rewrite module's directives after it are not run.
+    Break,
 }
 
 /// What set and if do, in the order they are written.
@@ -200,9 +222,8 @@ pub const COOKIE_FLAGS: [&str; 8] = ["secure", "httponly", "nosecure", "nohttpon
 /// The settings of one level (http, server or location) after inheriting from the one above.
 #[derive(Debug, Clone, Default)]
 pub struct Level {
-    pub ret: Option<(u16, Template)>,
-    /// rewrite directives, in order: the regular expression and the redirect it makes.
-    pub rewrite: Vec<Rewrite>,
+    /// rewrite, return and break, in order, those of the server first.
+    pub rewrite: Vec<Step>,
     /// set and if of the server, run before those of the location.
     pub server_script: Vec<Op>,
     /// set and if of the location, which nested locations do not inherit.
@@ -537,8 +558,9 @@ impl Builder<'_> {
             self.check(d, ctx)?;
             let at = |e: String| format!("{e} in {}", d.at);
             match d.name.as_str() {
-                "return" => level.ret = Some(ret(&d.args).map_err(at)?),
-                "rewrite" => level.rewrite.push(rewrite(&d.args).map_err(at)?),
+                "return" => level.rewrite.push(ret(&d.args).map(|(code, text)| Step::Return(code, text)).map_err(at)?),
+                "rewrite" => level.rewrite.push(rewrite(&d.args).map(Step::Rewrite).map_err(at)?),
+                "break" => level.rewrite.push(Step::Break),
                 "set" | "if" => {
                     let op = if d.name == "set" { set(&d.args) } else { condition(&d.args).map(|c| Op::If(c, Vec::new(), None)) }.map_err(at)?;
                     let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
@@ -686,7 +708,7 @@ impl Builder<'_> {
             let mut inner = Level { script: Vec::new(), server_script: Vec::new(), ..level.clone() };
             self.level(d.block.as_deref().unwrap_or_default(), if ctx == SRV { SIF } else { LIF }, &mut inner)?;
             let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
-            if let Op::If(_, body, to) = &mut script[i] { (*body, *to) = (std::mem::take(&mut inner.script), (ctx != SRV || inner.ret.is_some()).then(|| Arc::new(inner))); }
+            if let Op::If(_, body, to) = &mut script[i] { (*body, *to) = (std::mem::take(&mut inner.script), (ctx != SRV || inner.rewrite.iter().any(|s| matches!(s, Step::Return(..)))).then(|| Arc::new(inner))); }
         }
         Ok(())
     }
@@ -943,7 +965,8 @@ fn add_header(args: &[String]) -> Result<(String, Template, bool), String> {
 fn error_page(args: &[String]) -> Result<ErrorPage, String> {
     let (url, rest) = args.split_last().unwrap();
     let (status, codes) = match rest.split_last() {
-        Some((last, codes)) if last.starts_with('=') => (Some(last[1..].parse::<u16>().unwrap_or(302)), codes),
+        // "=" alone (0) keeps the status of the answer the URI gives.
+        Some((last, codes)) if last.starts_with('=') => (Some(if last.len() == 1 { 0 } else { last[1..].parse::<u16>().unwrap_or(302) }), codes),
         _ => (None, rest),
     };
     let codes = codes.iter().map(|c| c.parse::<u16>().ok().filter(|c| (300..=599).contains(c)).ok_or_else(|| format!("value \"{c}\" must be between 300 and 599")));
@@ -956,9 +979,9 @@ fn rewrite(args: &[String]) -> Result<Rewrite, String> {
     let flag = args.get(2).map_or("", |f| f.as_str());
     if !["", "last", "break", "redirect", "permanent"].contains(&flag) { return Err(format!("invalid parameter \"{flag}\"")); }
     let (url, add_args) = args[1].strip_suffix('?').map_or((args[1].as_str(), true), |u| (u, false));
-    let is_url = ["http://", "https://", "$scheme"].iter().any(|p| url.starts_with(p)) || ["redirect", "permanent"].contains(&flag);
-    if !is_url && flag != "break" { return Err(format!("twinx does not support rewriting to \"{url}\" yet")); }
-    Ok(Rewrite { regex, url: Template::parse(url)?, status: if flag == "permanent" { 301 } else { 302 }, add_args, internal: !is_url })
+    let redirect = ["http://", "https://", "$scheme"].iter().any(|p| url.starts_with(p)) || ["redirect", "permanent"].contains(&flag);
+    let flag = match flag { "last" => Flag::Last, "break" => Flag::Break, _ => Flag::Next };
+    Ok(Rewrite { regex, url: Template::parse(url)?, status: if args.get(2).is_some_and(|f| f == "permanent") { 301 } else { 302 }, add_args, redirect, flag })
 }
 
 /// return code [text] | code URL | URL: a URL alone (http://, https:// or
@@ -983,6 +1006,10 @@ mod tests {
     use super::*;
     use crate::config::parse;
 
+    fn return_code(level: &Level) -> u16 {
+        level.rewrite.iter().find_map(|s| if let Step::Return(code, _) = s { Some(*code) } else { None }).unwrap()
+    }
+
     fn build_text(text: &str) -> Result<Config, String> {
         let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1004,7 +1031,7 @@ mod tests {
     #[test]
     fn return_with_a_url_alone() {
         let c = build_text("http { server { location /a { return http://e/$uri; } location /b { return https://e; } } }").unwrap();
-        let ret: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.ret.as_ref().unwrap().0).collect();
+        let ret: Vec<_> = c.servers[0].locations.iter().map(|l| return_code(&l.level)).collect();
         assert_eq!(ret, [302, 302]);
         assert!(build_text("http { server { location /a { return http://; } } }").unwrap_err().starts_with("invalid return code \"http://\""));
     }
@@ -1026,7 +1053,7 @@ mod tests {
         let s = &c.servers[0];
         assert_eq!(s.listen, vec!["127.0.0.1:8080".parse().unwrap()]);
         assert_eq!(s.locations[0].level.access_log[0].format.line.0.len(), 3);
-        assert_eq!(s.locations[0].level.ret.as_ref().unwrap().0, 200);
+        assert_eq!(return_code(&s.locations[0].level), 200);
         assert_eq!(s.locations[1].level.access_log[0].format.line.0.len(), 16);
     }
 
@@ -1113,8 +1140,9 @@ mod tests {
         assert!(error_page(&["404".into(), "@named".into()]).is_ok());
         assert!(matches!(location(&["@named".into()]).unwrap().0, Match::Named));
         let r = rewrite(&["^".into(), "/x?".into(), "break".into()]).unwrap();
-        assert_eq!((r.internal, r.add_args), (true, false));
+        assert_eq!((r.redirect, r.add_args, r.flag), (false, false, Flag::Break));
         assert_eq!(error_page(&["404".into(), "/local".into()]).unwrap().status, None);
+        assert_eq!(error_page(&["404".into(), "=".into(), "/local".into()]).unwrap().status, Some(0));
         assert_eq!(error_page(&["404".into(), "500".into(), "http://e/".into()]).unwrap().codes, vec![404, 500]);
     }
 
@@ -1151,11 +1179,15 @@ mod tests {
         assert_eq!((r.status, r.add_args, r.regex.is_match("/ab")), (301, false, true));
         let r = rewrite(&["^".into(), "/x".into(), "redirect".into()]).unwrap();
         assert_eq!((r.status, r.add_args), (302, true));
-        assert_eq!(rewrite(&["^".into(), "/x".into()]).unwrap_err(), "twinx does not support rewriting to \"/x\" yet");
+        let r = rewrite(&["^".into(), "/x".into()]).unwrap();
+        assert_eq!((r.redirect, r.flag), (false, Flag::Next));
+        assert_eq!(rewrite(&["^".into(), "/x".into(), "last".into()]).unwrap().flag, Flag::Last);
         assert_eq!(rewrite(&["^".into(), "http://e/".into(), "x".into()]).unwrap_err(), "invalid parameter \"x\"");
         assert!(rewrite(&["(".into(), "http://e/".into()]).is_err());
-        let c = build_text("http { server { rewrite ^/s http://s/; location / { rewrite ^/l http://l/; } } }").unwrap();
-        assert_eq!(c.servers[0].locations[0].level.rewrite.len(), 2);
+        let c = build_text("http { server { rewrite ^/s http://s/; location / { rewrite ^/l http://l/; break; return 204; } } }").unwrap();
+        let steps = &c.servers[0].locations[0].level.rewrite;
+        assert!(matches!(steps[..], [Step::Rewrite(_), Step::Rewrite(_), Step::Break, Step::Return(204, _)]));
+        assert_eq!(build_text("http { server { break 1; } }").unwrap_err(), "invalid number of arguments in \"break\" directive in t.conf:1");
     }
 
     #[test]

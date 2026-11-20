@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::conf::{Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Level, Match, Op, Proxy, Rewrite, Server, ServerName, TryFiles};
-use crate::vars::Template;
+use crate::conf::{Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, Step, TryFiles};
+use crate::vars::{Part, Template};
 use crate::expires;
 use crate::upstream::{Peer, Upstream};
 use crate::vars::{Request, Sent};
@@ -238,6 +238,10 @@ struct Response {
     body: Vec<u8>,
     /// Whether "Vary: Accept-Encoding" is sent when gzip_vary is on.
     vary: bool,
+    /// Whether this is a page nginx generates for an error or a redirect
+    /// (ngx_http_special_response_handler()), which keeps its own status
+    /// after an error_page redirect.
+    generated: bool,
     /// Every header of the proxied server's answer, for $upstream_http_*.
     upstream: Vec<(String, String)>,
     /// The URI and arguments to redirect to internally: the index module's, with
@@ -288,7 +292,7 @@ fn finish(resp: &mut Response) {
 /// The page nginx generates for an error status.
 fn special(status: u16) -> Response {
     let ctype = Some("text/html".to_string());
-    Response { status, ctype, body: page(status).into_bytes(), ..Response::default() }
+    Response { status, ctype, body: page(status).into_bytes(), generated: true, ..Response::default() }
 }
 
 const REDIRECTS: &[u16] = &[301, 302, 303, 307, 308];
@@ -302,36 +306,84 @@ fn redirect(status: u16, location: String) -> Response {
 
 /// The answer the location gives, before error_page and the headers every answer gets.
 fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -> Response {
-    let rewrite = level.rewrite.iter().find(|rw| rw.regex.is_match(&r.uri));
-    let url = rewrite.map(|rw| (rw, rw.url.render(r, &Sent::default()), args(r)));
-    let with_args = |(rw, url, args): (&Rewrite, String, &str)| {
-        // "&" when the replacement as written has a "?", whatever its variables give.
-        let sep = if rw.url.0.iter().any(|p| matches!(p, crate::vars::Part::Text(t) if t.contains('?'))) { "&" } else { "?" };
-        if rw.add_args && !args.is_empty() { format!("{url}{sep}{}", &args[1..]) } else { url }
-    };
-    match (parsed, url) {
-        (Err(status), _) => special(status),
-        (Ok(()), _) if auto => redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
-        // "break": the location goes on with the new URI, without the rewrite module's directives.
-        (Ok(()), Some(u)) if u.0.internal => {
-            let mut to = r.clone();
-            to.target = with_args(u);
-            to.uri = to.target.split('?').next().unwrap_or_default().to_string();
-            serve(&to, level, prefix, None)
-        }
-        (Ok(()), Some((rw, url, a))) => redirect(rw.status, with_args((rw, unescape_redirect(&url), a))),
-        (Ok(()), None) => serve(r, level, prefix, level.ret.as_ref()),
+    match parsed {
+        Err(status) => return special(status),
+        Ok(()) if auto => return redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
+        Ok(()) => {}
+    }
+    // The rewrite module's directives, in order, as ngx_http_rewrite_handler() runs them.
+    let (mut to, mut changed, mut moved) = (r.clone(), false, false);
+    for step in &level.rewrite {
+        let rw = match step {
+            Step::Return(code, text) => return serve(&to, level, prefix, Some((*code, text))),
+            Step::Break => { changed = false; break }
+            Step::Rewrite(rw) => rw,
+        };
+        let Some(caps) = rw.regex.captures(&to.uri) else { continue };
+        to.set_captures(&caps);
+        let (uri, new_args) = replacement(rw, &to);
+        let uri = if rw.redirect { unescape_redirect(&uri) } else { uri };
+        // The request's arguments follow those of the replacement, "&" between them.
+        let old = &args(&to).get(1..).unwrap_or_default().to_string();
+        let args = match new_args {
+            Some(a) if rw.add_args && !old.is_empty() => format!("?{a}&{old}"),
+            Some(a) => format!("?{a}"),
+            None if rw.add_args && !old.is_empty() => format!("?{old}"),
+            None => String::new(),
+        };
+        if rw.redirect { return redirect(rw.status, format!("{uri}{args}")); }
+        to.target = format!("{uri}{args}");
+        to.uri = uri;
+        (changed, moved) = (rw.flag != Flag::Break, true);
+        if rw.flag != Flag::Next { break; }
+    }
+    // A URI changed without "break" is looked for again among the locations.
+    if changed { return Response { internal: Some(to.target), ..Response::default() }; }
+    // Stopped by break, the location goes on with the new URI, and proxy_pass
+    // passes it whole, without the URI it has (r->valid_location is 0).
+    match level.proxy.as_deref().filter(|p| moved && p.uri.is_some() && level.try_files.is_none()) {
+        Some(p) => proxy(&Proxy { uri: None, ..p.clone() }, level, &to, prefix),
+        None => serve(&to, level, prefix, None),
     }
 }
 
+/// The replacement of a rewrite, as the URI and the arguments after its "?".
+/// When the request's URI had "%" or "+", a capture is escaped as
+/// NGX_ESCAPE_ARGS does in the arguments and in a redirect
+/// (ngx_http_script_copy_capture_code()).
+fn replacement(rw: &Rewrite, r: &Request) -> (String, Option<String>) {
+    let quoted = r.target.split('?').next().unwrap_or_default().contains(['%', '+']);
+    let (mut uri, mut args) = (String::new(), None::<String>);
+    for part in &rw.url.0 {
+        let value = match part {
+            Part::Text(t) => match t.split_once('?').filter(|_| args.is_none()) {
+                Some((u, a)) => { uri += u; args = Some(a.to_string()); continue }
+                None => t.clone(),
+            },
+            Part::Var(v) => {
+                let value = Template(vec![part.clone()]).render(r, &Sent::default());
+                let capture = matches!(v, crate::vars::Var::User(n) if n.bytes().all(|c| c.is_ascii_digit()));
+                if capture && quoted && (args.is_some() || rw.redirect) { escape_args(&value) } else { value }
+            }
+        };
+        args.as_mut().unwrap_or(&mut uri).push_str(&value);
+    }
+    (uri, args)
+}
+
+/// Escapes what NGX_ESCAPE_ARGS does: control characters, space, "#%&+;?" and bytes above 0x7e.
+fn escape_args(s: &str) -> String {
+    s.bytes().map(|c| if c > 0x20 && c < 0x7f && !b"#%&+;?".contains(&c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
+}
+
 /// The answer of return, else of proxy_pass, else of the static module.
-fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<&(u16, Template)>) -> Response {
+fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Template)>) -> Response {
     match (ret, &level.proxy, level.try_files.as_deref()) {
-        (Some((code, text)), _, _) if REDIRECTS.contains(code) => redirect(*code, text.render(r, &Sent::default())),
-        (Some((code, text)), _, _) if text.0.is_empty() && *code >= 400 => special(*code),
+        (Some((code, text)), _, _) if REDIRECTS.contains(&code) => redirect(code, text.render(r, &Sent::default())),
+        (Some((code, text)), _, _) if text.0.is_empty() && code >= 400 => special(code),
         (Some((code, text)), _, _) => {
             let ctype = Some("text/plain".to_string());
-            Response { status: *code, ctype, body: text.render(r, &Sent::default()).into_bytes(), ..Response::default() }
+            Response { status: code, ctype, body: text.render(r, &Sent::default()).into_bytes(), ..Response::default() }
         }
         (None, _, Some(tf)) => try_files(tf, level, r, prefix),
         (None, Some(p), None) => proxy(p, level, r, prefix),
@@ -391,8 +443,10 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let (mut resp, mut level, mut last) = answer(server, r, parsed, found);
     let intercepted = !resp.proxied || level.proxy_intercept_errors;
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)).filter(|_| intercepted) {
-        // An intercepted 401 keeps the proxied server's WWW-Authenticate headers.
-        let auth: Vec<_> = resp.headers.iter().filter(|h| resp.proxied && resp.status == 401 && h.0.eq_ignore_ascii_case("www-authenticate")).cloned().collect();
+        // An intercepted 401 keeps the proxied server's WWW-Authenticate headers,
+        // and a redirect twinx made its Location.
+        let auth = |h: &&(String, String)| resp.proxied && resp.status == 401 && h.0.eq_ignore_ascii_case("www-authenticate");
+        let kept: Vec<_> = resp.headers.iter().filter(|h| auth(h) || !resp.proxied && h.0.eq_ignore_ascii_case("location")).cloned().collect();
         let url = ep.url.render(r, &Sent::default());
         let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == url);
         if url.starts_with('/') || named.is_some() {
@@ -406,11 +460,15 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
                 to.target = url;
                 to.method = if r.method == "HEAD" { "HEAD" } else { "GET" }.to_string();
             }
+            // The answer is sent with the error's status ("=code" replaces it, "=" leaves the
+            // answer's own), unless it is a page generated for its own error or redirect.
             let status = ep.status.unwrap_or(resp.status);
             let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
             (resp, level, last) = answer(server, &to, Ok(()), found);
-            if resp.status == 200 { resp.status = status; }
-            resp.headers.splice(0..0, auth);
+            if !resp.generated && status != 0 { resp.status = status; }
+            // A redirect the new answer makes replaces the Location kept.
+            let own = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("location"));
+            resp.headers.splice(0..0, kept.into_iter().filter(|h| !own || !h.0.eq_ignore_ascii_case("location")));
         } else {
             // A named location that does not exist is an error.
             resp = if url.starts_with('@') { special(500) } else { redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url) };
@@ -1455,6 +1513,33 @@ mod tests {
     }
 
     #[test]
+    fn error_pages_keep_the_status_and_location() {
+        let text = "http { server { location /a { error_page 405 /n; return 405; } location /b { error_page 302 /t; return 302 x; } \
+                    location /c { error_page 302 /r; return 302 x; } location /d { error_page 405 = /n; return 405; } \
+                    location /n { return 204; } location /t { return 200 t; } location /r { return 302 y; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let client = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
+            let (mut stream, _) = client.accept().unwrap();
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            drop(stream);
+            let mut text = String::new();
+            out.read_to_string(&mut text).unwrap();
+            text
+        };
+        // The answer takes the error's status, unless it is a page of its own, or "=" is given.
+        assert!(get("/a").starts_with("HTTP/1.1 405 "));
+        assert!(get("/d").starts_with("HTTP/1.1 204 "));
+        let b = get("/b");
+        assert!(b.starts_with("HTTP/1.1 302 ") && b.contains("Location: x\r\n") && b.ends_with("\r\n\r\nt"), "{b}");
+        let c = get("/c");
+        assert!(c.contains("Location: y\r\n") && !c.contains("Location: x"), "{c}");
+    }
+
+    #[test]
     fn connects_from_the_bound_address() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1722,6 +1807,30 @@ mod tests {
         assert_eq!(answer("/a?x=%2Fa%0D%3Fb%3D?c%3D"), (302, "http://e//a%0D?b%3D?c%3D?x=%2Fa%0D%3Fb%3D?c%3D".to_string()));
         assert_eq!(unescape_redirect("/%zz/%4z/%41%3d?%41"), "/zz//A=?%41");
         assert_eq!(unescape_redirect("/%4"), "/");
+    }
+
+    #[test]
+    fn rewrites_to_uris() {
+        let text = "http { server { location /a { rewrite ^/a(.*) /b$1?c=$1; rewrite ^/b /c; return 200 $uri:$args; } \
+                    location /l { rewrite ^ /n last; return 403; } location /n { return 200 n$uri; } \
+                    location /k { break; return 403; } location /r { rewrite ^/r(.*) http://e$1?$1 redirect; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            let resp = answer(s, &r, Ok(()), location(s, &r.uri)).0;
+            (resp.status, String::from_utf8(resp.body).unwrap(), resp.headers.first().map(|h| h.1.clone()))
+        };
+        // Without a flag the next rewrite and return see the new URI; a capture in the
+        // arguments is escaped when the request's URI had "%".
+        assert_eq!(get("/a/%25?x=1").1, "/c:c=/%25&x=1");
+        assert_eq!(get("/a/x").1, "/c:c=/x");
+        // "last" looks for the location of the new URI; break stops before return.
+        assert_eq!(get("/l?x=1").1, "n/n");
+        assert_eq!(get("/k").0, 404);
+        // In a redirect, the URL is unescaped again as far as its "?".
+        assert_eq!(get("/r/a+b").2.unwrap(), "http://e/a+b?/a%2Bb");
+        assert_eq!(escape_args("a b#%&+;?\x7f"), "a%20b%23%25%26%2B%3B%3F%7F");
     }
 
     #[test]
