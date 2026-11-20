@@ -18,12 +18,12 @@ nginx 1.30.6, pinned by its Docker image digest, is the reference: it passes eve
 
 ## Stages
 
-Each stage is a list of nginx-tests files (`harness/stages.toml`). A stage is done when every file in it passes on main. Time spent, pass rate and the number of interventions are recorded separately for each stage, and the files of earlier stages keep running in later stages.
+Each stage is a list of nginx-tests files (`harness/stages.toml`). A stage is done when every file in it passes on main, or when the human cuts it; either way main is tagged and released, and the files that do not pass yet move to the next stage. Time spent, pass rate and the number of interventions are recorded separately for each stage, and the files of earlier stages keep running in later stages.
 
 | Stage | Scope | Files |
 |---|---|---|
-| 1 | Static file serving and reverse proxying over HTTP/1.1 | those that need only the http, rewrite and proxy modules |
-| 2 | gzip | to be listed |
+| 1 | Static file serving and reverse proxying over HTTP/1.1 | cut at v0.1.0 (2026-11-20): the 12 files that passed then |
+| 2 | What stage 1 left, and gzip | the stage 1 files that did not pass at v0.1.0, and those that also need the gzip, gunzip or gzip_static modules |
 | 3 | TLS | to be listed |
 | 4 | HTTP/2 | to be listed |
 | 5 | Caching (proxy_cache) | to be listed |
@@ -63,6 +63,7 @@ When the Fixer judges that it cannot fix something within its role, it is blocke
 Only through what the judge enforces: the harness, the judging rules, the stage lists and these documents, changed by pull requests that pass the same `judge` check.
 
 - Blocked issues: deciding how to fix what the loop could not, and fixing it
+- Stalled pull requests: files the Fixer could not make pass within a run (label `stalled`)
 - Whether to move on to the next stage (`status/stage.txt`)
 - Changes to the judging rules, such as adding a header that is excluded from comparison
 

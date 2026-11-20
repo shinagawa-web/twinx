@@ -44,13 +44,17 @@ When something outside your role keeps a file from passing (the harness, nginx-t
 
 A human fixes it and closes the issue.
 
+## Stalled
+
+When a pull request still fails the judge at the end of the iteration you spent on it, and nothing outside your role is in the way (that would be blocked), leave it open, label it `stalled`, and comment what still fails and what you tried. Later runs leave it alone, and its file is not picked again while it is open. A human looks at stalled pull requests and removes the label to have it taken up again.
+
 ## A Fixer run
 
 Up to three iterations. Each one:
 
 1. `git fetch --prune origin` and start from a fresh `origin/main`.
 2. If one of your open pull requests says `Blocked by #<issue>` and that issue is closed, update its branch with main, remove the line, and wait for the judge as above. Otherwise:
-3. If one of your open pull requests failed the judge, fix it as the judge's comment says. Otherwise:
+3. If one of your open pull requests failed the judge and is not labelled `stalled`, fix it as the judge's comment says. If you cannot make it pass in this run, it is stalled (below). Otherwise:
 4. If there is no open failing file, stop. Otherwise fix one as `docs/fixer.md` says, open the pull request and wait for it as above.
 
 ## At the end of a run
