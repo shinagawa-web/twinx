@@ -19,4 +19,6 @@ COPY tap.pl /nginx-tests/tap.pl
 
 FROM nginx AS twinx
 RUN rm -rf /usr/sbin/nginx /usr/sbin/nginx-debug /usr/lib/nginx /etc/nginx /docker-entrypoint.sh /docker-entrypoint.d
+COPY rename.pl /tmp/rename.pl
+RUN perl /tmp/rename.pl && rm /tmp/rename.pl
 ENTRYPOINT []
