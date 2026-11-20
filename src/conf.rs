@@ -40,6 +40,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("location", SRV | LOC, 1, 2, true),
     ("try_files", SRV | LOC, 2, usize::MAX, false),
     ("return", SRV | LOC, 1, 2, false),
+    ("set", SRV | LOC, 2, 2, false),
     ("root", HTTP | SRV | LOC, 1, 1, false),
     ("log_format", HTTP, 2, usize::MAX, false),
     ("access_log", HTTP | SRV | LOC, 1, usize::MAX, false),
@@ -127,6 +128,8 @@ pub struct Level {
     pub ret: Option<(u16, Template)>,
     /// rewrite directives, in order: the regular expression and the redirect it makes.
     pub rewrite: Vec<Rewrite>,
+    /// set $limit_rate: the values given to $limit_rate, in order.
+    pub set: Vec<Template>,
     pub access_log: Vec<Arc<AccessLog>>,
     /// open_log_file_cache, for the access logs whose paths have variables.
     pub log_cache: Option<Arc<Cache>>,
@@ -376,6 +379,7 @@ impl Builder<'_> {
             match d.name.as_str() {
                 "return" => level.ret = Some(ret(&d.args).map_err(at)?),
                 "rewrite" => level.rewrite.push(rewrite(&d.args).map_err(at)?),
+                "set" => level.set.push(set(&d.args).map_err(at)?),
                 "root" => (level.root, level.alias) = (self.path(&d.args[0]), None),
                 "alias" => level.alias = Some(self.path(&d.args[0])),
                 "try_files" => level.try_files = Some(Arc::new(try_files(&d.args).map_err(at)?)),
@@ -597,8 +601,15 @@ fn flag(d: &Directive) -> Result<bool, String> {
     found.ok_or_else(|| format!("invalid value \"{value}\" in \"{name}\" directive, it must be \"on\" or \"off\""))
 }
 
+/// set $variable value. Of the variables that can be set, twinx has only $limit_rate.
+fn set(args: &[String]) -> Result<Template, String> {
+    let name = args[0].strip_prefix('$').ok_or_else(|| format!("invalid variable name \"{}\"", args[0]))?;
+    if name != "limit_rate" { return Err(format!("setting the \"{name}\" variable is not supported")); }
+    Template::parse(&args[1])
+}
+
 /// A size such as "512", "8k" or "1m".
-fn size(s: &str) -> Result<u64, String> {
+pub fn size(s: &str) -> Result<u64, String> {
     let (digits, unit) = s.find(|c: char| !c.is_ascii_digit()).map_or((s, ""), |i| s.split_at(i));
     let scale = [("", 1), ("k", 1 << 10), ("K", 1 << 10), ("m", 1 << 20), ("M", 1 << 20)].into_iter().find(|u| u.0 == unit);
     digits.parse::<u64>().ok().zip(scale).map(|(n, (_, scale))| n * scale).ok_or_else(|| format!("\"{s}\" is invalid"))
@@ -868,6 +879,10 @@ mod tests {
         assert_eq!(e, "invalid URL prefix in \"ftp://x\" in t.conf:1");
         let e = build_text("http { server { listen 80; } upstream u { listen 80; } }").unwrap_err();
         assert_eq!(e, "\"listen\" directive is not allowed here in t.conf:1");
+        let e = build_text("http { server { set limit_rate 1; } }").unwrap_err();
+        assert_eq!(e, "invalid variable name \"limit_rate\" in t.conf:1");
+        let e = build_text("http { server { set $x 1; } }").unwrap_err();
+        assert_eq!(e, "setting the \"x\" variable is not supported in t.conf:1");
         let e = build_text("http { access_log a.log nope; }").unwrap_err();
         assert_eq!(e, "unknown log format \"nope\" in t.conf:1");
     }

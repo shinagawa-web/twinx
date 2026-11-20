@@ -95,6 +95,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             body_file: None,
             upstream_addr: None,
             captures: Vec::new(),
+            limit_rate: Default::default(),
         };
         let parsed = parse(&mut r, &head);
         let (server, captures) = server(config, listen, r.host.as_deref());
@@ -233,6 +234,10 @@ fn redirect(status: u16, location: String) -> Response {
 
 /// The answer the location gives, before error_page and the headers every answer gets.
 fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -> Response {
+    // set $limit_rate: a value that is not a size leaves it as it was.
+    for value in level.set.iter().filter(|_| parsed.is_ok()) {
+        if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.limit_rate.store(rate, std::sync::atomic::Ordering::Relaxed); }
+    }
     let rewrite = level.rewrite.iter().find(|rw| rw.regex.is_match(&r.uri));
     let url = rewrite.map(|rw| (rw, rw.url.render(r, &Sent::default()), args(r)));
     let with_args = |(rw, url, args): (&Rewrite, String, &str)| {
@@ -779,6 +784,7 @@ mod tests {
             body_file: None,
             upstream_addr: None,
             captures: Vec::new(),
+            limit_rate: Default::default(),
         };
         (parse(&mut r, head.as_bytes()), r)
     }
@@ -958,6 +964,22 @@ mod tests {
         assert_eq!(respond(&r, Ok(()), location(s, &r.uri)).status, 404);
         let named = (s.locations[1].path.as_str(), &s.locations[1].level, false);
         assert_eq!(respond(&r, Ok(()), named).body, b"n/a");
+    }
+
+    #[test]
+    fn sets_limit_rate() {
+        let text = "http { server { set $limit_rate 1k; location /a { set $limit_rate $arg_l; return 200 $limit_rate; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let rate = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            String::from_utf8(respond(&r, Ok(()), location(s, &r.uri)).body).unwrap()
+        };
+        assert_eq!(rate("/a?l=40k"), "40960");
+        assert_eq!(rate("/a?l=2M"), "2097152");
+        // A value that is not a size keeps what the server level set.
+        assert_eq!(rate("/a?l=x"), "1024");
+        assert_eq!(rate("/a"), "1024");
     }
 
     #[test]
