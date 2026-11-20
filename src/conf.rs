@@ -923,11 +923,11 @@ fn set(args: &[String]) -> Result<Op, String> {
 /// twinx has only a variable alone, true when not empty and not "0".
 fn condition(args: &[String]) -> Result<Condition, String> {
     // As ngx_http_rewrite_if_condition() reads it: "(" and ")" may be arguments of their own.
-    let invalid = || format!("invalid condition \"{}\"", args[0]);
+    let invalid = format!("invalid condition \"{}\"", args[0]);
     let mut words: Vec<&str> = args.iter().map(String::as_str).collect();
     let last = words.len() - 1;
-    words[0] = words[0].strip_prefix('(').ok_or_else(invalid)?;
-    words[last] = words[last].strip_suffix(')').ok_or_else(invalid)?;
+    words[0] = words[0].strip_prefix('(').ok_or(invalid.clone())?;
+    words[last] = words[last].strip_suffix(')').ok_or(invalid.clone())?;
     words.retain(|w| !w.is_empty());
     match words[..] {
         [var] if var.starts_with('$') => Ok(Condition::Var(Template::parse(var)?)),
@@ -936,7 +936,7 @@ fn condition(args: &[String]) -> Result<Condition, String> {
             let regex = regex::Regex::new(&format!("{}{}", if op.ends_with('*') { "(?i)" } else { "" }, pcre(re))).map_err(|e| format!("invalid regular expression \"{re}\": {e}"))?;
             Ok(Condition::Match(Template::parse(var)?, regex, op.starts_with('!')))
         }
-        [op @ ("-f" | "-d" | "-e" | "-x" | "!-f" | "!-d" | "!-e" | "!-x"), path] => Ok(Condition::File(Template::parse(path)?, op.chars().last().unwrap_or_default(), op.starts_with('!'))), _ => Err(invalid()),
+        [op @ ("-f" | "-d" | "-e" | "-x" | "!-f" | "!-d" | "!-e" | "!-x"), path] => Ok(Condition::File(Template::parse(path)?, op.chars().last().unwrap_or_default(), op.starts_with('!'))), _ => Err(invalid),
     }
 }
 
