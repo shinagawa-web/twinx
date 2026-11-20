@@ -510,7 +510,11 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
         answer = fetch(&up.peers[i].addr, &req);
         up.done(i, answer.is_none());
     }
-    answer.unwrap_or_else(|| special(502))
+    let Some(mut resp) = answer else { return special(502) };
+    let hidden = |name: &str| level.proxy_hide_header.iter().any(|h| h.eq_ignore_ascii_case(name));
+    resp.headers.retain(|h| !hidden(&h.0));
+    if hidden("content-type") { resp.ctype = None; }
+    resp
 }
 
 /// Sends a request to one server and reads its whole answer.
@@ -728,6 +732,24 @@ mod tests {
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
         assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
+    }
+
+    #[test]
+    fn hides_proxied_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf).unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: a/b\r\nX-Location: 1\r\nX-B: 2\r\n\r\n").unwrap();
+        });
+        let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
+        let p = Proxy { host: "h".into(), upstream, uri: None };
+        let level = Level { proxy_hide_header: vec!["x-location".into(), "content-type".into()], ..Level::default() };
+        let (_, r) = request("GET / HTTP/1.0\n\n");
+        let resp = proxy(&p, &level, &r, "/");
+        assert_eq!((resp.ctype, resp.headers), (None, vec![("X-B".to_string(), "2".to_string())]));
     }
 
     #[test]
