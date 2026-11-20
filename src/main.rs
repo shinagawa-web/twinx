@@ -15,7 +15,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use libc::{SIGCHLD, SIGINT, SIGQUIT, SIGTERM, c_int, pid_t, sigset_t};
+use libc::{SIGINT, SIGQUIT, SIGTERM, c_int, pid_t, sigset_t};
 
 /// What `-V` prints: Test::Nginx reads it to tell which modules twinx has.
 const CONFIGURE: &str = "--without-http_fastcgi_module --without-http_uwsgi_module \
@@ -59,7 +59,7 @@ fn signal_set() -> sigset_t {
     unsafe {
         let mut set = std::mem::zeroed();
         libc::sigemptyset(&mut set);
-        for s in [SIGQUIT, SIGTERM, SIGINT, SIGCHLD] { libc::sigaddset(&mut set, s); }
+        for s in [SIGQUIT, SIGTERM, SIGINT] { libc::sigaddset(&mut set, s); }
         set
     }
 }
@@ -72,7 +72,8 @@ fn wait_signal(set: &sigset_t) -> c_int {
 }
 
 /// Runs as nginx does with `master_process on`: the master opens the sockets, writes the pid file and
-/// handles the signals; a worker process serves the requests. A worker that ends is started again.
+/// handles the signals; a worker process serves the requests, so a signal sent to the worker alone
+/// ends only the worker, and the master and its pid file stay.
 fn run(a: &Args) -> Result<(), String> {
     let config = Arc::new(load(a)?);
     let listeners = http::bind(&config)?;
@@ -81,19 +82,10 @@ fn run(a: &Args) -> Result<(), String> {
     unsafe { libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
     let pid = &config.pid;
     std::fs::write(pid, format!("{}\n", std::process::id())).map_err(|e| format!("open() \"{}\" failed ({e})", pid.display()))?;
-    let mut worker = spawn(&config, &listeners, &set)?;
-    loop {
-        let sig = wait_signal(&set);
-        if sig != SIGCHLD {
-            // SAFETY: plain system calls on the worker's process id.
-            unsafe { libc::kill(worker, sig); libc::waitpid(worker, std::ptr::null_mut(), 0) };
-            break;
-        }
-        // SAFETY: reaps any ended child without blocking.
-        while let ended @ 1.. = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } {
-            if ended == worker { worker = spawn(&config, &listeners, &set)?; }
-        }
-    }
+    let worker = spawn(&config, &listeners, &set)?;
+    let sig = wait_signal(&set);
+    // SAFETY: plain system calls on the worker's process id: pass the signal on and wait for the worker.
+    unsafe { libc::kill(worker, sig); libc::waitpid(worker, std::ptr::null_mut(), 0) };
     let _ = std::fs::remove_file(pid);
     Ok(())
 }
@@ -101,15 +93,22 @@ fn run(a: &Args) -> Result<(), String> {
 /// Starts a worker process. It serves until it gets QUIT, TERM or INT, then exits.
 fn spawn(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> Result<pid_t, String> {
     // SAFETY: the master has no other threads, so the child starts in a consistent state.
-    match unsafe { libc::fork() } {
-        -1 => Err(format!("fork() failed ({})", std::io::Error::last_os_error())),
-        0 => {
-            if let Err(e) = http::accept(config.clone(), listeners) { fail(&e, None) }
-            while wait_signal(set) == SIGCHLD {}
-            std::process::exit(0)
-        }
-        child => Ok(child),
-    }
+    let child = unsafe { libc::fork() };
+    forked(child, config, listeners, set)
+}
+
+/// Goes on in both processes after fork(). It is a function of its own, not inlined, so that each
+/// process counts what it runs here in its own coverage profile.
+#[inline(never)]
+fn forked(child: pid_t, config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> Result<pid_t, String> {
+    if child == 0 { worker(config, listeners, set) }
+    (child > 0).then_some(child).ok_or_else(|| format!("fork() failed ({})", std::io::Error::last_os_error()))
+}
+
+fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> ! {
+    if let Err(e) = http::accept(config.clone(), listeners) { fail(&e, None) }
+    wait_signal(set);
+    std::process::exit(0)
 }
 
 fn main() {
@@ -152,9 +151,9 @@ mod tests {
     #[test]
     fn takes_blocked_signals() {
         let set = signal_set();
-        assert!([SIGQUIT, SIGTERM, SIGINT, SIGCHLD].iter().all(|&s| unsafe { libc::sigismember(&set, s) } == 1));
+        assert!([SIGQUIT, SIGTERM, SIGINT].iter().all(|&s| unsafe { libc::sigismember(&set, s) } == 1));
         // Blocked in this thread only, and raised for this thread, so other tests do not see it.
-        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()); libc::raise(SIGCHLD) };
-        assert_eq!(wait_signal(&set), SIGCHLD);
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()); libc::raise(SIGINT) };
+        assert_eq!(wait_signal(&set), SIGINT);
     }
 }
