@@ -517,6 +517,10 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         if !value.is_empty() { resp.headers.push((name.clone(), value)); }
     }
     finish(&mut resp);
+    // server_tokens off: the pages twinx generates give its name without the version.
+    if resp.generated && !level.server_tokens {
+        resp.body = String::from_utf8_lossy(&resp.body).replace(&format!("<hr><center>{NAME}</center>"), "<hr><center>twinx</center>").into_bytes();
+    }
     gzip(r, level, &mut resp);
     let status = resp.status;
     // A body of unknown length is chunked for HTTP/1.1; otherwise the connection
@@ -538,7 +542,8 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         let length = if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else if !resp.unknown_length && status != 304 { format!("Content-Length: {len}\r\n") } else { String::new() };
         let header = level.keepalive_header.filter(|_| keepalive).map(|t| format!("Keep-Alive: timeout={t}\r\n")).unwrap_or_default();
         let vary = if resp.vary && level.gzip_vary { "Vary: Accept-Encoding\r\n" } else { "" };
-        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{header}{vary}");
+        let server = if level.server_tokens { NAME } else { "twinx" };
+        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {server}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{header}{vary}");
         resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
         out = (head + "\r\n").into_bytes();
     }
@@ -1524,6 +1529,30 @@ mod tests {
         assert!(on.contains("WWW-Authenticate: a\r\nWWW-Authenticate: b\r\n") && !on.contains("X-A"), "{on}");
         let off = answer("/off");
         assert!(off.starts_with("HTTP/1.1 401 ") && off.contains("X-A: 1") && off.ends_with("upstream"), "{off}");
+    }
+
+    #[test]
+    fn server_tokens() {
+        let text = "http { server { location /a { return 404; } location /b { server_tokens off; return 404; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let client = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
+            let (mut stream, _) = client.accept().unwrap();
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            drop(stream);
+            let mut text = String::new();
+            out.read_to_string(&mut text).unwrap();
+            text
+        };
+        let a = get("/a");
+        assert!(a.contains(&format!("Server: {NAME}\r\n")) && a.contains(&format!("<center>{NAME}</center>")), "{a}");
+        let b = get("/b");
+        assert!(b.contains("Server: twinx\r\n") && b.contains("<center>twinx</center>"), "{b}");
+        let refused = crate::conf::build(&crate::config::parse("http { server_tokens x; }", std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        assert_eq!(refused, "invalid value \"x\" in \"server_tokens\" directive, it must be \"on\", \"off\" or \"build\" in t:1");
     }
 
     #[test]
