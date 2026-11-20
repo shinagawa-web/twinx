@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::conf::{Config, Level, Match, Proxy, Server};
+use crate::conf::{Config, Level, Match, Proxy, Rewrite, Server};
+use crate::vars::Template;
 use crate::expires;
 use crate::vars::{Request, Sent};
 
@@ -204,22 +205,38 @@ fn redirect(status: u16, location: String) -> Response {
 
 /// The answer the location gives, before error_page and the headers every answer gets.
 fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -> Response {
-    match (parsed, &level.ret, &level.proxy) {
-        (Err(status), _, _) => special(status),
-        (Ok(()), _, _) if auto => redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
-        (Ok(()), _, _) if let Some(rw) = level.rewrite.iter().find(|rw| rw.regex.is_match(&r.uri)) => {
-            let (url, args) = (rw.url.render(r, &Sent::default()), args(r));
-            let sep = if url.contains('?') { "&" } else { "?" };
-            redirect(rw.status, if rw.add_args && !args.is_empty() { format!("{url}{sep}{}", &args[1..]) } else { url })
+    let rewrite = level.rewrite.iter().find(|rw| rw.regex.is_match(&r.uri));
+    let url = rewrite.map(|rw| (rw, rw.url.render(r, &Sent::default()), args(r)));
+    let with_args = |(rw, url, args): (&Rewrite, String, &str)| {
+        let sep = if url.contains('?') { "&" } else { "?" };
+        if rw.add_args && !args.is_empty() { format!("{url}{sep}{}", &args[1..]) } else { url }
+    };
+    match (parsed, url) {
+        (Err(status), _) => special(status),
+        (Ok(()), _) if auto => redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
+        // "break": the location goes on with the new URI, without the rewrite module's directives.
+        (Ok(()), Some(u)) if u.0.internal => {
+            let mut to = r.clone();
+            to.target = with_args(u);
+            to.uri = to.target.split('?').next().unwrap_or_default().to_string();
+            serve(&to, level, prefix, None)
         }
-        (Ok(()), Some((code, text)), _) if REDIRECTS.contains(code) => redirect(*code, text.render(r, &Sent::default())),
-        (Ok(()), Some((code, text)), _) if text.0.is_empty() && *code >= 400 => special(*code),
-        (Ok(()), Some((code, text)), _) => {
+        (Ok(()), Some(u)) => redirect(u.0.status, with_args(u)),
+        (Ok(()), None) => serve(r, level, prefix, level.ret.as_ref()),
+    }
+}
+
+/// The answer of return, else of proxy_pass, else of the static module.
+fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<&(u16, Template)>) -> Response {
+    match (ret, &level.proxy) {
+        (Some((code, text)), _) if REDIRECTS.contains(code) => redirect(*code, text.render(r, &Sent::default())),
+        (Some((code, text)), _) if text.0.is_empty() && *code >= 400 => special(*code),
+        (Some((code, text)), _) => {
             let ctype = Some("text/plain".to_string());
             Response { status: *code, ctype, body: text.render(r, &Sent::default()).into_bytes(), ..Response::default() }
         }
-        (Ok(()), None, Some(p)) => proxy(p, level, r, prefix),
-        (Ok(()), None, None) => file(level, r, prefix),
+        (None, Some(p)) => proxy(p, level, r, prefix),
+        (None, None) => file(level, r, prefix),
     }
 }
 
@@ -234,20 +251,25 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let mut resp = respond(r, parsed, found);
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)) {
         let url = ep.url.render(r, &Sent::default());
-        if url.starts_with('/') {
+        let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == url);
+        if url.starts_with('/') || named.is_some() {
             // An internal redirect: the URI is answered as a GET (or HEAD) request
             // by its location, with the error's status unless that answer has its own.
+            // A named location answers the request as it is.
             let mut to = r.clone();
-            to.uri = url.split('?').next().unwrap_or_default().to_string();
-            to.target = url;
-            to.method = if r.method == "HEAD" { "HEAD" } else { "GET" }.to_string();
+            if named.is_none() {
+                to.uri = url.split('?').next().unwrap_or_default().to_string();
+                to.target = url;
+                to.method = if r.method == "HEAD" { "HEAD" } else { "GET" }.to_string();
+            }
             let status = ep.status.unwrap_or(resp.status);
-            let found = location(server, &to.uri);
+            let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
             level = found.1;
             resp = respond(&to, Ok(()), found);
             if resp.status == 200 { resp.status = status; }
         } else {
-            resp = redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url);
+            // A named location that does not exist is an error.
+            resp = if url.starts_with('@') { special(500) } else { redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url) };
         }
     }
     if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| level.absolute_redirect) {
@@ -639,6 +661,19 @@ mod tests {
         assert_eq!(answer("/b?x=1"), (302, "http://e/?y=1&x=1".to_string()));
         assert_eq!(answer("/b"), (302, "http://e/?y=1".to_string()));
         assert_eq!(answer("/c?x=1"), (301, "http://e/".to_string()));
+    }
+
+    #[test]
+    fn rewrites_with_break_and_named_locations() {
+        let text = "http { server { location /a { rewrite ^/a(.*) /b break; return 403; } location @n { return 200 n$uri; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        assert!(location(s, "@n").0.is_empty());
+        let (_, r) = request("GET /a?x=1 HTTP/1.0\n\n");
+        // break skips return; the new URI keeps the arguments and is looked for under root.
+        assert_eq!(respond(&r, Ok(()), location(s, &r.uri)).status, 404);
+        let named = (s.locations[1].path.as_str(), &s.locations[1].level, false);
+        assert_eq!(respond(&r, Ok(()), named).body, b"n/a");
     }
 
     #[test]
