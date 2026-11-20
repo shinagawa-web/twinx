@@ -6,4 +6,5 @@ publish = false
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+regex = { version = "1.13.2", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 signal-hook = "0.4.6"

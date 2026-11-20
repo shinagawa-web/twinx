@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::Directive;
+use crate::upstream::{Peer, Upstream};
 use crate::vars::Template;
 
 const MAIN: u8 = 1;
@@ -60,10 +61,10 @@ pub struct AccessLog {
 /// Where proxy_pass sends requests: the servers in the order they are tried
 /// (backup servers last), the Host to send, and the URI that replaces the
 /// location's prefix, if the directive has one.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct Proxy {
     pub host: String,
-    pub peers: Vec<SocketAddr>,
+    pub upstream: Arc<Upstream>,
     pub uri: Option<String>,
 }
 
@@ -92,12 +93,29 @@ pub struct Level {
     pub body_temp_path: PathBuf,
 }
 
+/// How a location matches the URI: "=", a prefix, "^~" (a prefix that stops
+/// the regular expressions from being checked), or "~" / "~*".
+#[derive(Debug)]
+pub enum Match {
+    Exact,
+    Prefix,
+    NoRegex,
+    Regex(regex::Regex),
+}
+
+#[derive(Debug)]
+pub struct Location {
+    pub kind: Match,
+    pub path: String,
+    pub level: Level,
+}
+
 #[derive(Debug)]
 pub struct Server {
     pub listen: Vec<SocketAddr>,
     pub names: Vec<String>,
     pub level: Level,
-    pub locations: Vec<(String, Level)>,
+    pub locations: Vec<Location>,
 }
 
 #[derive(Debug)]
@@ -110,7 +128,7 @@ struct Builder<'a> {
     prefix: &'a Path,
     formats: HashMap<String, Arc<Template>>,
     logs: HashMap<PathBuf, Arc<File>>,
-    upstreams: HashMap<String, Vec<SocketAddr>>,
+    upstreams: HashMap<String, Arc<Upstream>>,
 }
 
 /// Interprets the main block. Errors are nginx's messages, with the place.
@@ -164,13 +182,9 @@ impl Builder<'_> {
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
-            let mut peers: Vec<(bool, SocketAddr)> = Vec::new();
-            for s in servers {
-                let addr = listen(&s.args[0]).map_err(|_| format!("host not found in upstream \"{}\" in {}", s.args[0], s.at))?;
-                peers.push((s.args[1..].iter().any(|a| a == "backup"), addr));
-            }
-            peers.sort_by_key(|p| p.0);
-            self.upstreams.insert(d.args[0].clone(), peers.into_iter().map(|p| p.1).collect());
+            let peers = servers.iter().map(|s| peer(&s.args).map_err(|e| format!("{e} in {}", s.at)));
+            let upstream = Upstream::new(peers.collect::<Result<_, _>>()?);
+            self.upstreams.insert(d.args[0].clone(), Arc::new(upstream));
         }
         self.level(block, HTTP, &mut level)?;
         let servers = block.iter().filter(|d| d.name == "server");
@@ -193,12 +207,13 @@ impl Builder<'_> {
         Ok(s)
     }
 
-    fn locations(&mut self, block: &[Directive], parent: &Level, out: &mut Vec<(String, Level)>) -> Result<(), String> {
+    fn locations(&mut self, block: &[Directive], parent: &Level, out: &mut Vec<Location>) -> Result<(), String> {
         for d in block.iter().filter(|d| d.name == "location") {
             let mut level = Level { proxy: None, ..parent.clone() };
             let inner = d.block.as_deref().unwrap_or_default();
             self.level(inner, LOC, &mut level)?;
-            out.push((d.args[0].clone(), level.clone()));
+            let (kind, path) = location(&d.args).map_err(|e| format!("{e} in {}", d.at))?;
+            out.push(Location { kind, path, level: level.clone() });
             self.locations(inner, &level, out)?;
         }
         Ok(())
@@ -249,10 +264,40 @@ impl Builder<'_> {
     fn proxy(&self, url: &str) -> Result<Proxy, String> {
         let rest = url.strip_prefix("http://").ok_or_else(|| format!("invalid URL prefix in \"{url}\""))?;
         let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
-        let peers = self.upstreams.get(host).cloned().map_or_else(|| listen(host).map(|a| vec![a]), Ok);
-        let peers = peers.map_err(|_| format!("host not found in upstream \"{host}\""))?;
-        Ok(Proxy { host: host.to_string(), peers, uri })
+        let single = || listen(host).map(|a| Arc::new(Upstream::new(vec![Peer::new(a)])));
+        let upstream = self.upstreams.get(host).cloned().map_or_else(single, Ok);
+        let upstream = upstream.map_err(|_| format!("host not found in upstream \"{host}\""))?;
+        Ok(Proxy { host: host.to_string(), upstream, uri })
     }
+}
+
+/// location [ = | ^~ | ~ | ~* ] uri
+fn location(args: &[String]) -> Result<(Match, String), String> {
+    let (modifier, path) = if args.len() == 2 { (args[0].as_str(), &args[1]) } else { ("", &args[0]) };
+    let regex = |p: String| regex::Regex::new(&p).map(Match::Regex).map_err(|e| format!("invalid regular expression \"{path}\": {e}"));
+    let kind = match modifier {
+        "~" | "~*" => regex(if modifier == "~*" { format!("(?i){path}") } else { path.clone() })?,
+        _ => {
+            let plain = [("", Match::Prefix), ("=", Match::Exact), ("^~", Match::NoRegex)].into_iter().find(|k| k.0 == modifier);
+            plain.ok_or_else(|| format!("invalid location modifier \"{modifier}\""))?.1
+        }
+    };
+    Ok((kind, path.clone()))
+}
+
+/// server address [weight=n] [max_fails=n] [fail_timeout=time] [backup] in an upstream block.
+fn peer(args: &[String]) -> Result<Peer, String> {
+    let addr = listen(&args[0]).map_err(|_| format!("host not found in upstream \"{}\"", args[0]))?;
+    let (mut values, mut backup) = ([("weight", 1u64), ("max_fails", 1), ("fail_timeout", 10)], false);
+    for a in &args[1..] {
+        if a == "backup" { backup = true; continue; }
+        let invalid = || format!("invalid parameter \"{a}\"");
+        let (name, value) = a.split_once('=').ok_or_else(invalid)?;
+        let slot = values.iter_mut().find(|v| v.0 == name).ok_or_else(invalid)?;
+        slot.1 = value.trim_end_matches('s').parse().map_err(|_| invalid())?;
+    }
+    let [weight, max_fails, fail_timeout] = values.map(|v| v.1);
+    Ok(Peer { addr, weight: weight as i64, max_fails, fail_timeout, backup })
 }
 
 /// A size such as "512", "8k" or "1m".
@@ -314,9 +359,9 @@ mod tests {
         .unwrap();
         let s = &c.servers[0];
         assert_eq!(s.listen, vec!["127.0.0.1:8080".parse().unwrap()]);
-        assert_eq!(s.locations[0].1.access_log[0].format.0.len(), 3);
-        assert_eq!(s.locations[0].1.ret.as_ref().unwrap().0, 200);
-        assert_eq!(s.locations[1].1.access_log[0].format.0.len(), 16);
+        assert_eq!(s.locations[0].level.access_log[0].format.0.len(), 3);
+        assert_eq!(s.locations[0].level.ret.as_ref().unwrap().0, 200);
+        assert_eq!(s.locations[1].level.access_log[0].format.0.len(), 16);
     }
 
     #[test]
@@ -328,14 +373,30 @@ mod tests {
              location /b { proxy_pass http://127.0.0.1:8083; error_page 404 =301 http://e/; } } }",
         )
         .unwrap();
-        let (a, b) = (&c.servers[0].locations[0].1, &c.servers[0].locations[1].1);
-        let peers = vec!["127.0.0.1:8081".parse().unwrap(), "127.0.0.1:8082".parse().unwrap()];
-        assert_eq!(**a.proxy.as_ref().unwrap(), Proxy { host: "u".into(), peers, uri: Some("/x".into()) });
+        let (a, b) = (&c.servers[0].locations[0].level, &c.servers[0].locations[1].level);
+        let p = a.proxy.as_ref().unwrap();
+        assert_eq!((p.host.as_str(), p.uri.as_deref()), ("u", Some("/x")));
+        let addrs: Vec<String> = p.upstream.peers.iter().map(|p| format!("{} {} {}", p.addr, p.weight, p.backup)).collect();
+        assert_eq!(addrs, vec!["127.0.0.1:8082 1 true", "127.0.0.1:8081 2 false"]);
         assert_eq!((a.max_body, a.body_buffer, a.body_in_file_only), (1024, 2048, true));
         assert_eq!(a.add_header[0].0, "X");
         assert_eq!(b.proxy.as_ref().unwrap().host, "127.0.0.1:8083");
         assert_eq!((b.error_page[0].codes.clone(), b.error_page[0].status), (vec![404], Some(301)));
         assert_eq!(b.body_buffer, 16384);
+    }
+
+    #[test]
+    fn locations_and_peers() {
+        assert!(matches!(location(&["=".into(), "/".into()]).unwrap().0, Match::Exact));
+        assert!(matches!(location(&["^~".into(), "/i/".into()]).unwrap().0, Match::NoRegex));
+        assert!(matches!(location(&["/".into()]).unwrap().0, Match::Prefix));
+        let Match::Regex(re) = location(&["~*".into(), "\\.GIF$".into()]).unwrap().0 else { panic!() };
+        assert!(re.is_match("/a.gif"));
+        assert_eq!(location(&["!".into(), "/".into()]).unwrap_err(), "invalid location modifier \"!\"");
+        assert!(location(&["~".into(), "(".into()]).is_err());
+        let p = peer(&["127.0.0.1:1".into(), "max_fails=3".into(), "fail_timeout=5s".into()]).unwrap();
+        assert_eq!((p.max_fails, p.fail_timeout, p.weight, p.backup), (3, 5, 1, false));
+        assert_eq!(peer(&["127.0.0.1:1".into(), "down".into()]).unwrap_err(), "invalid parameter \"down\"");
     }
 
     #[test]

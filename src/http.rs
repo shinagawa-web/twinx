@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::conf::{Config, Level, Proxy, Server};
+use crate::conf::{Config, Level, Match, Proxy, Server};
 use crate::vars::{Request, Sent};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
@@ -79,20 +79,71 @@ fn connection(config: &Config, mut stream: TcpStream, local: SocketAddr) {
         };
         let parsed = parse(&mut r, &head);
         let (prefix, level) = location(server, &r.uri);
-        let length = header(&r, "content-length").map_or(Ok(0), |v| v.parse::<u64>().map_err(|_| 400u16));
-        let parsed = parsed.and(length).and_then(|n| if n > level.max_body { Err(413) } else { Ok(n as usize) });
-        if let Ok(n) = parsed {
-            while buf.len() < n {
+        let framing = parsed.and_then(|()| framing(&r)).and_then(|n| if n.unwrap_or(0) > level.max_body { Err(413) } else { Ok(n) });
+        let expect = header(&r, "expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue"));
+        if framing.is_ok() && expect && r.line.ends_with("HTTP/1.1") { let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n"); }
+        let parsed = match framing {
+            Err(status) => Err(status),
+            Ok(length) => loop {
+                match take_body(&buf, length, level.max_body) {
+                    Ok(None) => {}
+                    Ok(Some((body, used))) => {
+                        r.length += used;
+                        buf.drain(..used);
+                        keep_body(&mut r, level, body);
+                        break Ok(());
+                    }
+                    Err(status) => break Err(status),
+                }
                 let read = stream.read(&mut chunk).unwrap_or(0);
                 if read == 0 { return; }
                 buf.extend_from_slice(&chunk[..read]);
-            }
-            r.length += n;
-            keep_body(&mut r, level, buf.drain(..n).collect());
-        }
-        let open = exchange(&mut stream, &r, parsed.map(drop), prefix, level);
+            },
+        };
+        let open = exchange(&mut stream, &r, parsed, prefix, level);
         if !level.body_in_file_only { r.body_file.map(std::fs::remove_file); }
         if !open { return linger(&mut stream); }
+    }
+}
+
+/// How the request body is framed: Some(length), or None when it is chunked.
+fn framing(r: &Request) -> Result<Option<u64>, u16> {
+    let te: Vec<&String> = r.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("transfer-encoding")).map(|(_, v)| v).collect();
+    let length = header(r, "content-length");
+    if te.is_empty() { return length.map_or(Ok(Some(0)), |v| v.parse().map(Some).map_err(|_| 400)); }
+    if te.len() > 1 || length.is_some() || !r.line.ends_with("HTTP/1.1") { return Err(400); }
+    if te[0].eq_ignore_ascii_case("chunked") { Ok(None) } else { Err(501) }
+}
+
+/// The whole body and the bytes it took in the buffer, None while more has to be read.
+fn take_body(buf: &[u8], length: Option<u64>, max: u64) -> Result<Option<(Vec<u8>, usize)>, u16> {
+    match length {
+        Some(n) => Ok((buf.len() as u64 >= n).then(|| (buf[..n as usize].to_vec(), n as usize))),
+        None => dechunk(buf, max),
+    }
+}
+
+/// Decodes a chunked body; 400 for malformed chunks, 413 past client_max_body_size.
+fn dechunk(buf: &[u8], max: u64) -> Result<Option<(Vec<u8>, usize)>, u16> {
+    let (mut body, mut at) = (Vec::new(), 0);
+    let line = |at: usize| buf[at..].iter().position(|&c| c == b'\n').map(|n| (String::from_utf8_lossy(&buf[at..at + n]).trim_end_matches('\r').to_string(), at + n + 1));
+    loop {
+        let Some((size, next)) = line(at) else { return Ok(None) };
+        let size = u64::from_str_radix(size.split(';').next().unwrap_or_default().trim(), 16).map_err(|_| 400u16)?;
+        at = next;
+        if size == 0 { break; }
+        if body.len() as u64 + size > max { return Err(413); }
+        let end = at + size as usize;
+        let after = buf.get(end..).unwrap_or_default();
+        if after.is_empty() || after == b"\r" { return Ok(None); }
+        let skip = if after.starts_with(b"\r\n") { 2 } else if after.starts_with(b"\n") { 1 } else { return Err(400) };
+        body.extend_from_slice(&buf[at..end]);
+        at = end + skip;
+    }
+    loop {
+        let Some((trailer, next)) = line(at) else { return Ok(None) };
+        at = next;
+        if trailer.is_empty() { return Ok(Some((body, at))); }
     }
 }
 
@@ -145,7 +196,7 @@ fn exchange(stream: &mut TcpStream, r: &Request, parsed: Result<(), u16>, prefix
             Response { status: *code, ctype, headers: Vec::new(), body: text.render(r, &Sent::default()).into_bytes() }
         }
         (Ok(()), None, Some(p)) => proxy(p, r, prefix),
-        (Ok(()), None, None) => special(404),
+        (Ok(()), None, None) => file(level, r),
     };
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)) {
         let location = ep.url.render(r, &Sent::default());
@@ -181,6 +232,26 @@ fn exchange(stream: &mut TcpStream, r: &Request, parsed: Result<(), u16>, prefix
     written && keepalive && status != 444
 }
 
+/// Serves a file under root, as nginx's static module does.
+fn file(level: &Level, r: &Request) -> Response {
+    if !matches!(r.method.as_str(), "GET" | "HEAD" | "POST") { return special(405); }
+    let path = level.root.join(r.uri.trim_start_matches('/'));
+    let found = std::fs::metadata(&path).ok().filter(|m| m.is_file()).zip(std::fs::read(&path).ok());
+    let Some((meta, body)) = found else { return special(404) };
+    if r.method == "POST" { return special(405); }
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    let modified = chrono::DateTime::from_timestamp(mtime as i64, 0).unwrap_or_default().format("%a, %d %b %Y %H:%M:%S GMT");
+    const TYPES: &[(&str, &str)] = &[("html", "text/html"), ("gif", "image/gif"), ("jpg", "image/jpeg")];
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let ctype = TYPES.iter().find(|t| t.0 == ext).map_or("text/plain", |t| t.1);
+    let headers = vec![
+        ("Last-Modified".to_string(), modified.to_string()),
+        ("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", body.len())),
+        ("Accept-Ranges".to_string(), "bytes".to_string()),
+    ];
+    Response { status: 200, ctype: Some(ctype.to_string()), headers, body }
+}
+
 /// Passes the request to the proxied servers in turn, as HTTP/1.0 with
 /// "Connection: close", until one answers with a response head.
 fn proxy(p: &Proxy, r: &Request, prefix: &str) -> Response {
@@ -188,13 +259,19 @@ fn proxy(p: &Proxy, r: &Request, prefix: &str) -> Response {
     let uri = p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{}{args}", &r.uri[prefix.len()..]));
     let body = r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default());
     let mut req = format!("{} {uri} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n", r.method, p.host);
-    if header(r, "content-length").is_some() { req += &format!("Content-Length: {}\r\n", body.len()); }
+    if framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len()); }
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
     let passed = r.headers.iter().filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()));
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     let mut req = (req + "\r\n").into_bytes();
     req.extend_from_slice(&body);
-    p.peers.iter().find_map(|peer| fetch(peer, &req)).unwrap_or_else(|| special(502))
+    let up = &p.upstream;
+    let (mut tried, mut answer) = (vec![false; up.peers.len()], None);
+    while answer.is_none() && let Some(i) = up.pick(&mut tried) {
+        answer = fetch(&up.peers[i].addr, &req);
+        up.done(i, answer.is_none());
+    }
+    answer.unwrap_or_else(|| special(502))
 }
 
 /// Sends a request to one server and reads its whole answer.
@@ -272,9 +349,17 @@ fn keepalive(r: &Request) -> bool {
 }
 
 /// The location whose prefix is the longest one matching the URI, or the server's own settings.
+/// The location for a URI as nginx finds it: an exact match, else the longest
+/// prefix if it is "^~", else the first regular expression that matches, else
+/// the longest prefix; the server's own settings when nothing matches.
 fn location<'a>(server: &'a Server, uri: &str) -> (&'a str, &'a Level) {
-    let matching = server.locations.iter().filter(|(prefix, _)| uri.starts_with(prefix.as_str()));
-    matching.max_by_key(|(prefix, _)| prefix.len()).map_or(("", &server.level), |(prefix, level)| (prefix, level))
+    let locs = &server.locations;
+    let exact = locs.iter().find(|l| matches!(l.kind, Match::Exact) && l.path == uri);
+    let prefixes = locs.iter().filter(|l| matches!(l.kind, Match::Prefix | Match::NoRegex) && uri.starts_with(l.path.as_str()));
+    let longest = prefixes.max_by_key(|l| l.path.len());
+    let regex = || locs.iter().find(|l| matches!(&l.kind, Match::Regex(re) if re.is_match(uri)));
+    let found = exact.or(longest.filter(|l| matches!(l.kind, Match::NoRegex))).or_else(regex).or(longest);
+    found.map_or(("", &server.level), |l| (l.path.as_str(), &l.level))
 }
 
 /// The page nginx generates for an error status.
