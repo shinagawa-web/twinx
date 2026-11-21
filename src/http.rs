@@ -1132,9 +1132,10 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
     let rest = url.strip_prefix("http://")?;
     let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
     if let Some(up) = p.groups.get(host) { return Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), up.clone())); }
-    let (name, port) = host.rsplit_once(':').map_or(Some((host, 80)), |(h, p)| p.parse().ok().map(|p| (h, p)))?;
-    // An IPv6 address is written in brackets.
-    let name = name.strip_prefix('[').and_then(|n| n.strip_suffix(']')).unwrap_or(name);
+    let (name, port) = crate::conf::host_port(host)?;
+    // As in nginx, the implicit upstream of a proxy_pass with this host and port comes before the resolver.
+    let implicit = p.implicit.lock().unwrap().get(&format!("{}:{port}", name.to_ascii_lowercase())).cloned();
+    if let Some(up) = implicit { return Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), up)); }
     let resolve = || level.resolver.as_ref()?.resolve(name, level.resolver_timeout);
     let addrs = name.parse::<IpAddr>().map(|a| vec![a]).ok().or_else(resolve)?;
     let peers = addrs.into_iter().map(|a| Peer::new(SocketAddr::new(a, port))).collect();
@@ -1837,7 +1838,7 @@ mod tests {
             thread::sleep(Duration::from_secs(5));
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
-        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default() };
+        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("POST /a HTTP/1.0\n\n");
         let resp = proxy(&p, &level, &r, "");
@@ -1921,7 +1922,7 @@ mod tests {
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: a/b\r\nX-Location: 1\r\nX-B: 2\r\n\r\n").unwrap();
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
-        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default() };
+        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
         let level = Level { proxy_hide_header: vec!["x-location".into(), "content-type".into()], proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("GET / HTTP/1.0\n\n");
         let resp = proxy(&p, &level, &r, "/");
@@ -1933,7 +1934,7 @@ mod tests {
     fn urls_with_variables() {
         let (_, r) = request("GET /a?b HTTP/1.0\n\n");
         let group = Arc::new(Upstream::new(Vec::new()));
-        let p = Proxy { host: String::new(), upstream: group.clone(), uri: None, url: None, groups: [("u".to_string(), group)].into() };
+        let p = Proxy { host: String::new(), upstream: group.clone(), uri: None, url: None, groups: [("u".to_string(), group)].into(), implicit: Default::default() };
         assert_eq!(resolved("http://u/y", &p, &Level::default(), &r).map(|t| (t.0, t.1)), Some(("u".into(), "/y".into())));
         let (host, uri, up) = resolved("http://127.0.0.2:81/x", &p, &Level::default(), &r).unwrap();
         assert_eq!((host.as_str(), uri.as_str(), up.peers[0].addr.to_string()), ("127.0.0.2:81", "/x", "127.0.0.2:81".to_string()));
@@ -2176,7 +2177,7 @@ mod tests {
             String::from_utf8_lossy(&buf[..n]).into_owned()
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
-        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default() };
+        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
         let set = Some(Template::parse("b=$arg_a").unwrap());
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), proxy_set_body: set, ..Level::default() };
         let (_, mut r) = request("POST /a?a=1 HTTP/1.0\nContent-Length: 3\n\n");
