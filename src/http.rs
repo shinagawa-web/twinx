@@ -1133,6 +1133,8 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
     let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
     if let Some(up) = p.groups.get(host) { return Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), up.clone())); }
     let (name, port) = host.rsplit_once(':').map_or(Some((host, 80)), |(h, p)| p.parse().ok().map(|p| (h, p)))?;
+    // An IPv6 address is written in brackets.
+    let name = name.strip_prefix('[').and_then(|n| n.strip_suffix(']')).unwrap_or(name);
     let resolve = || level.resolver.as_ref()?.resolve(name, level.resolver_timeout);
     let addrs = name.parse::<IpAddr>().map(|a| vec![a]).ok().or_else(resolve)?;
     let peers = addrs.into_iter().map(|a| Peer::new(SocketAddr::new(a, port))).collect();
@@ -1937,6 +1939,8 @@ mod tests {
         assert_eq!((host.as_str(), uri.as_str(), up.peers[0].addr.to_string()), ("127.0.0.2:81", "/x", "127.0.0.2:81".to_string()));
         assert_eq!(resolved("http://127.0.0.2", &p, &Level::default(), &r).map(|t| (t.0, t.1)), Some(("127.0.0.2".into(), "/a?b".into())));
         assert!(resolved("http://example.net/x", &p, &Level::default(), &r).is_none());
+        let (_, _, up) = resolved("http://[::1]:82/x", &p, &Level::default(), &r).unwrap();
+        assert_eq!(up.peers[0].addr.to_string(), "[::1]:82");
     }
 
     #[test]

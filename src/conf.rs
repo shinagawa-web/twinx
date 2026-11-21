@@ -552,7 +552,7 @@ impl Builder<'_> {
         self.level(block, SRV, &mut s.level)?;
         for d in block {
             match d.name.as_str() {
-                "listen" => s.listen.push(listen(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?),
+                "listen" => s.listen.extend(listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?),
                 "server_name" => {
                     if s.names.is_empty() { s.name = d.args[0].strip_prefix('.').unwrap_or(&d.args[0]).to_string(); }
                     for n in &d.args { s.names.extend(server_name(n).map_err(|e| format!("{e} in {}", d.at))?); }
@@ -1049,6 +1049,17 @@ fn ret(args: &[String]) -> Result<(u16, Template), String> {
 }
 
 /// "addr:port", "addr" (port 80) or "port" (all addresses).
+/// The addresses of a listen directive: a port range, port-port, stands for every port in it.
+fn listen_ports(arg: &str) -> Result<Vec<SocketAddr>, String> {
+    let at = arg.rfind([':', ']']).map_or(0, |i| i + 1);
+    let Some((from, to)) = arg[at..].split_once('-').filter(|_| arg[at..].bytes().all(|b| b.is_ascii_digit() || b == b'-')) else { return listen(arg).map(|a| vec![a]) };
+    let port = |p: &str| p.parse::<u16>().ok().filter(|p| *p > 0);
+    let (from, to) = port(from).zip(port(to)).ok_or_else(|| format!("invalid port in \"{arg}\" of the \"listen\" directive"))?;
+    let host = arg[..at].strip_suffix(':').unwrap_or(&arg[..at]);
+    (from <= to).then_some(()).ok_or_else(|| format!("invalid port range in \"{arg}\" of the \"listen\" directive"))?;
+    (from..=to).map(|p| listen(&if host.is_empty() { p.to_string() } else { format!("{host}:{p}") })).collect()
+}
+
 fn listen(arg: &str) -> Result<SocketAddr, String> {
     let with_port = if arg.contains(':') { arg.to_string() } else if arg.parse::<u16>().is_ok() { format!("0.0.0.0:{arg}") } else { format!("{arg}:80") };
     let addr = with_port.to_socket_addrs().ok().and_then(|mut a| a.next());
@@ -1068,6 +1079,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         build(&parse(text, Path::new("t.conf")).unwrap(), &dir)
+    }
+
+    #[test]
+    fn listen_port_ranges() {
+        let addrs = |a: &str| listen_ports(a).map(|v| v.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        assert_eq!(addrs("127.0.0.1:81-83").unwrap(), ["127.0.0.1:81", "127.0.0.1:82", "127.0.0.1:83"]);
+        assert_eq!(addrs("[::1]:81-82").unwrap(), ["[::1]:81", "[::1]:82"]);
+        assert_eq!(addrs("81-81").unwrap(), ["0.0.0.0:81"]);
+        assert_eq!(addrs("[::1]:81").unwrap(), ["[::1]:81"]);
+        assert_eq!(addrs("127.0.0.1:0-1").unwrap_err(), "invalid port in \"127.0.0.1:0-1\" of the \"listen\" directive");
+        assert_eq!(addrs("127.0.0.1:82-81").unwrap_err(), "invalid port range in \"127.0.0.1:82-81\" of the \"listen\" directive");
     }
 
     #[test]
