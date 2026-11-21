@@ -47,6 +47,8 @@ const ACCEPT_WAIT: Duration = Duration::from_millis(100);
 /// Whether the worker is shutting down gracefully, and how many requests it is answering.
 static SHUTTING: AtomicBool = AtomicBool::new(false);
 static BUSY: AtomicUsize = AtomicUsize::new(0);
+/// How many threads are still accepting connections.
+static ACCEPTING: AtomicUsize = AtomicUsize::new(0);
 
 /// A request being answered, counted in BUSY while it lives.
 struct Busy;
@@ -67,10 +69,12 @@ impl Drop for Busy {
 /// Shuts the worker down gracefully, as QUIT does: it stops accepting, closes
 /// each connection once its request is answered, and returns when no request
 /// is left, or once worker_shutdown_timeout has passed. Idle connections are
-/// closed when the worker exits.
+/// closed when the worker exits. A connection accepted while it began to shut
+/// down is counted from its accept on, so its request is answered, not dropped.
 pub fn shut_down(timeout: Option<Duration>) {
     let start = Instant::now();
     SHUTTING.store(true, Ordering::SeqCst);
+    while ACCEPTING.load(Ordering::SeqCst) > 0 { thread::sleep(Duration::from_millis(10)); }
     while BUSY.load(Ordering::SeqCst) > 0 && timeout.is_none_or(|t| start.elapsed() < t) { thread::sleep(Duration::from_millis(10)); }
 }
 
@@ -78,12 +82,15 @@ pub fn shut_down(timeout: Option<Duration>) {
 pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> Result<(), String> {
     for (listener, addr) in listeners {
         let (listener, addr, config) = (listener.try_clone().map_err(|e| e.to_string())?, *addr, config.clone());
+        ACCEPTING.fetch_add(1, Ordering::SeqCst);
         thread::spawn(move || {
             while !SHUTTING.load(Ordering::SeqCst) {
                 let Ok((stream, _)) = listener.accept() else { continue };
-                let config = config.clone();
-                thread::spawn(move || connection(&config, stream, addr));
+                // Until its first request has arrived, a new connection is busy too.
+                let (config, fresh) = (config.clone(), Busy::new());
+                thread::spawn(move || connection(&config, stream, addr, fresh));
             }
+            ACCEPTING.fetch_sub(1, Ordering::SeqCst);
         });
     }
     Ok(())
@@ -96,7 +103,8 @@ fn head_end(buf: &[u8]) -> Option<usize> {
     lf.into_iter().chain(crlf).min()
 }
 
-fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
+fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr, fresh: Busy) {
+    let mut fresh = Some(fresh);
     let local = stream.local_addr().unwrap_or(listen);
     let peer = stream.peer_addr().unwrap_or(local);
     let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
@@ -185,6 +193,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             },
         };
         let busy = Busy::new();
+        drop(fresh.take());
         idle = exchange(&mut stream, server, &r, parsed, found, local);
         drop(busy);
         // What of an unbuffered body was not passed on is read and dropped.
@@ -1514,6 +1523,27 @@ mod tests {
         assert!(bind(&config, &[]).unwrap_err().starts_with(&format!("bind() to {addr} failed")));
         let open = vec![(open.into_iter().next().unwrap().0, addr)];
         assert_eq!(bind(&config, &open).unwrap()[0].0.local_addr().unwrap(), addr);
+    }
+
+    #[test]
+    fn shutting_down_answers_connections_already_accepted() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        socket2::SockRef::from(&l).set_read_timeout(Some(ACCEPT_WAIT)).unwrap();
+        let addr = l.local_addr().unwrap();
+        let text = format!("http {{ server {{ listen {addr}; location / {{ return 200 done; }} }} }}");
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        let mut client = TcpStream::connect(addr).unwrap();
+        accept(config, &[(l, addr)]).unwrap();
+        while BUSY.load(Ordering::SeqCst) == 0 { thread::sleep(Duration::from_millis(1)); }
+        // The connection was accepted before its request came: shutting down waits for it.
+        let shut = thread::spawn(|| shut_down(None));
+        thread::sleep(Duration::from_millis(300));
+        assert!(!shut.is_finished());
+        client.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+        shut.join().unwrap();
+        let mut text = String::new();
+        client.read_to_string(&mut text).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 ") && text.ends_with("done"), "{text}");
     }
 
     fn request(head: &str) -> (Result<(), u16>, Request) {
