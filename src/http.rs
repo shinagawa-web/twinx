@@ -309,6 +309,9 @@ struct Response {
     /// Whether this is the answer of a proxied server, which error_page
     /// replaces only with proxy_intercept_errors on.
     proxied: bool,
+    /// Whether the range filter may answer a Range with a part of it: a
+    /// static file's answer (r->allow_ranges).
+    ranges: bool,
     /// Whether a Location that starts with "/" is sent as it is: one a proxied
     /// server sent and proxy_redirect did not rewrite.
     relative: bool,
@@ -565,6 +568,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         resp.body = String::from_utf8_lossy(&resp.body).replace(&format!("<hr><center>{NAME}</center>"), "<hr><center>twinx</center>").into_bytes();
     }
     gzip(r, level, &mut resp);
+    range(r, &mut resp);
     let status = resp.status;
     // A body of unknown length is chunked for HTTP/1.1; otherwise the connection
     // closes after it. A HEAD answer has neither.
@@ -658,6 +662,32 @@ fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
     if (ims.is_none() && inm.is_none()) || ims.is_some_and(|t| !same(t)) || inm.is_some_and(|v| !etag_match(v, etag.as_deref(), true)) { return; }
     (resp.status, resp.ctype, resp.body, resp.rest) = (304, None, Vec::new(), None);
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges") && !h.0.eq_ignore_ascii_case("content-encoding"));
+}
+
+/// The range filter, as ngx_http_range_header_filter() is: a 200 answer of a
+/// known length that allows ranges, to a request with a "bytes=" Range, is
+/// 206 with the part the range asks for ("start-end", "start-" or "-suffix"),
+/// unless an If-Range differs from its ETag (a quoted value, compared exactly)
+/// or its Last-Modified time. A range that starts past the end is 416.
+/// Several ranges (multipart), which no test needs, are not done yet.
+fn range(r: &Request, resp: &mut Response) {
+    let ok = resp.status == 200 && resp.ranges && !resp.unknown_length && !r.line.ends_with("HTTP/0.9");
+    let Some(spec) = header(r, "range").filter(|v| ok && v.len() > 6 && v[..6].eq_ignore_ascii_case("bytes=")).map(|v| v[6..].trim()) else { return };
+    let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
+    let same = |v: &str| if v.len() >= 2 && v.ends_with('"') { sent("etag").as_deref() == Some(v) } else { sent("last-modified").and_then(|t| expires::http_time(&t)).is_some_and(|t| expires::http_time(v) == Some(t)) };
+    if !header(r, "if-range").is_none_or(same) || spec.contains(',') { return; }
+    let len = resp.body.len() as u64;
+    let num = |s: &str| Some(s).filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).and_then(|s| s.parse::<u64>().ok());
+    let Some((from, to)) = spec.split_once('-').map(|(f, t)| (f.trim(), t.trim())) else { return };
+    // "-suffix" is the last bytes; "start-end" and "start-" start at start.
+    let suffix = from.is_empty();
+    let (Some(n), true) = (num(if suffix { to } else { from }), suffix || to.is_empty() || num(to).is_some()) else { return };
+    let (start, end) = if suffix { (len.saturating_sub(n), len) } else { (n, num(to).map_or(len, |e| e.saturating_add(1).min(len))) };
+    if start >= end { if start > 0 { *resp = Response { headers: vec![("Content-Range".into(), format!("bytes */{len}"))], ..special(416) }; } return; }
+    resp.status = 206;
+    resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
+    resp.headers.push(("Content-Range".into(), format!("bytes {start}-{}/{len}", end - 1)));
+    resp.body = resp.body[start as usize..end as usize].to_vec();
 }
 
 /// Whether an If-Match (or, weak, If-None-Match) list has the ETag, as
@@ -853,7 +883,7 @@ fn file_at(level: &Level, r: &Request, path: PathBuf) -> Response {
     headers.extend(gz.map(|_| ("Content-Encoding".to_string(), "gzip".to_string())));
     headers.push(("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", body.len())));
     headers.push(("Accept-Ranges".to_string(), "bytes".to_string()));
-    Response { status: 200, ctype: Some(ctype.to_string()), headers, body, vary, ..Response::default() }
+    Response { status: 200, ctype: Some(ctype.to_string()), headers, body, vary, ranges: true, ..Response::default() }
 }
 
 /// Whether the client takes gzip, as ngx_http_gzip_ok() decides: it accepts the
@@ -1781,6 +1811,30 @@ mod tests {
         let resp = proxy(&p, &level, &r, "");
         assert_eq!((resp.internal.as_deref(), resp.as_get, r.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
         assert!(resp.upstream_time.unwrap()[0][2].unwrap() < 1000);
+    }
+
+    #[test]
+    fn range_filter() {
+        let file = || Response { status: 200, body: b"0123456789".to_vec(), ranges: true, headers: vec![
+            ("Last-Modified".into(), "Sun, 06 Nov 1994 08:49:37 GMT".into()), ("ETag".into(), "\"e\"".into()), ("Accept-Ranges".into(), "bytes".into())], ..Response::default() };
+        let ranged = |h: &str| { let mut resp = file(); range(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, &mut resp); resp };
+        let part = |resp: Response| (resp.status, String::from_utf8_lossy(&resp.body).into_owned(), resp.headers.last().map(|h| h.1.clone()).unwrap_or_default());
+        assert_eq!(part(ranged("Range: bytes=2-4")), (206, "234".into(), "bytes 2-4/10".into()));
+        assert_eq!(part(ranged("Range: BYTES=7-")), (206, "789".into(), "bytes 7-9/10".into()));
+        assert_eq!(part(ranged("Range: bytes=-3")), (206, "789".into(), "bytes 7-9/10".into()));
+        assert_eq!(part(ranged("Range: bytes=8-20\nIf-Range: \"e\"")), (206, "89".into(), "bytes 8-9/10".into()));
+        assert_eq!(part(ranged("Range: bytes=0-0\nIf-Range: Sun, 06 Nov 1994 08:49:37 GMT")).0, 206);
+        // Past the end, or backwards, is 416; a 206 has no Accept-Ranges.
+        assert_eq!(part(ranged("Range: bytes=10-")).2, "bytes */10");
+        assert_eq!(ranged("Range: bytes=5-3").status, 416);
+        assert!(!ranged("Range: bytes=1-2").headers.iter().any(|h| h.0 == "Accept-Ranges"));
+        // Not ranged: an If-Range that differs, an invalid or multiple range, no "bytes=".
+        for h in ["Range: bytes=1-2\nIf-Range: \"x\"", "Range: bytes=1-2\nIf-Range: wrong", "Range: bytes=a-2", "Range: bytes=1-2,4-5", "Range: bytes=12", "Range: items=1-2", "X: y"] {
+            assert_eq!(ranged(h).status, 200, "{h}");
+        }
+        let mut resp = Response { ranges: false, ..file() };
+        range(&request("GET / HTTP/1.0\nRange: bytes=1-2\n\n").1, &mut resp);
+        assert_eq!(resp.status, 200);
     }
 
     #[test]
