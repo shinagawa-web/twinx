@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::Directive;
@@ -141,7 +141,13 @@ pub struct Proxy {
     pub url: Option<Template>,
     /// The upstream groups a URL with variables may name.
     pub groups: HashMap<String, Arc<Upstream>>,
+    /// The upstreams proxy_pass URLs without variables made, by "host:port",
+    /// which a URL with variables also uses when its host and port are theirs.
+    pub implicit: Implicit,
 }
+
+/// The implicit upstreams of a configuration, filled while it is read.
+pub type Implicit = Arc<Mutex<HashMap<String, Arc<Upstream>>>>;
 
 /// An error_page: the statuses, the status to answer with instead (None keeps
 /// the status, as nginx does for redirects it turns into 302), and the URL.
@@ -463,6 +469,7 @@ struct Builder<'a> {
     formats: HashMap<String, Arc<Format>>,
     logs: HashMap<PathBuf, Arc<File>>,
     upstreams: HashMap<String, Arc<Upstream>>,
+    implicit: Implicit,
     /// The name of the location whose directives are being read, which
     /// "proxy_redirect default" puts in place of the proxy_pass URL.
     location: String,
@@ -472,7 +479,7 @@ struct Builder<'a> {
 pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
-    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), location: String::new() };
+    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), implicit: Implicit::default(), location: String::new() };
     let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), servers: Vec::new() };
     for d in main {
         b.check(d, MAIN)?;
@@ -793,14 +800,56 @@ impl Builder<'_> {
         let rest = url.strip_prefix("http://").ok_or_else(|| format!("invalid URL prefix in \"{url}\""))?;
         let template = Template::parse(url)?;
         if template.0.iter().any(|p| matches!(p, Part::Var(_))) {
-            return Ok(Proxy { host: String::new(), upstream: Arc::new(Upstream::new(Vec::new())), uri: None, url: Some(template), groups: self.upstreams.clone() });
+            return Ok(Proxy { host: String::new(), upstream: Arc::new(Upstream::new(Vec::new())), uri: None, url: Some(template), groups: self.upstreams.clone(), implicit: self.implicit.clone() });
         }
         let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
-        let single = || listen(host).map(|a| Arc::new(Upstream::new(vec![Peer::new(a)])));
-        let upstream = self.upstreams.get(host).cloned().map_or_else(single, Ok);
+        // Any other host is an implicit upstream of all its addresses, one for each host and port.
+        let implicit = || {
+            let (name, port) = host_port(host).ok_or(())?;
+            let key = format!("{}:{port}", name.to_ascii_lowercase());
+            let mut implicit = self.implicit.lock().unwrap();
+            if let Some(up) = implicit.get(&key) { return Ok(up.clone()); }
+            let up = Arc::new(Upstream::new(addresses(name, port).into_iter().map(Peer::new).collect()));
+            if up.peers.is_empty() { return Err(()); }
+            implicit.insert(key, up.clone());
+            Ok(up)
+        };
+        let upstream = self.upstreams.get(host).cloned().map_or_else(implicit, Ok);
         let upstream = upstream.map_err(|_| format!("host not found in upstream \"{host}\""))?;
-        Ok(Proxy { host: host.to_string(), upstream, uri, url: None, groups: HashMap::new() })
+        Ok(Proxy { host: host.to_string(), upstream, uri, url: None, groups: HashMap::new(), implicit: Implicit::default() })
     }
+}
+
+/// The name and port of host[:port], port 80 when it has none; an IPv6
+/// address is written in brackets, which are left out.
+pub fn host_port(host: &str) -> Option<(&str, u16)> {
+    let (name, port) = match host.rsplit_once(':') { Some((n, p)) if !p.contains(']') => (n, p.parse().ok()?), _ => (host, 80) };
+    Some((name.strip_prefix('[').and_then(|n| n.strip_suffix(']')).unwrap_or(name), port))
+}
+
+/// The addresses of a name as nginx's ngx_inet_resolve_host() finds them:
+/// an address as it is, else those getaddrinfo() gives with AI_ADDRCONFIG,
+/// the IPv4 ones first.
+pub fn addresses(name: &str, port: u16) -> Vec<SocketAddr> {
+    if let Ok(ip) = name.parse::<IpAddr>() { return vec![SocketAddr::new(ip, port)]; }
+    let Ok(c) = std::ffi::CString::new(name) else { return Vec::new() };
+    // SAFETY: the hints are zeroed but for the fields set, the list getaddrinfo()
+    // returns is read only before it is freed, and each address is read as
+    // the structure its family says it is.
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    (hints.ai_family, hints.ai_socktype, hints.ai_flags) = (libc::AF_UNSPEC, libc::SOCK_STREAM, libc::AI_ADDRCONFIG);
+    let (mut list, mut ips) = (std::ptr::null_mut(), Vec::<IpAddr>::new());
+    if unsafe { libc::getaddrinfo(c.as_ptr(), std::ptr::null(), &hints, &mut list) } != 0 { return Vec::new(); }
+    let mut at = list;
+    while let Some(ai) = unsafe { at.as_ref() } {
+        let v4 = || IpAddr::from(unsafe { *(ai.ai_addr as *const libc::sockaddr_in) }.sin_addr.s_addr.to_ne_bytes());
+        let v6 = || IpAddr::from(unsafe { *(ai.ai_addr as *const libc::sockaddr_in6) }.sin6_addr.s6_addr);
+        ips.extend(if ai.ai_family == libc::AF_INET { Some(v4()) } else { (ai.ai_family == libc::AF_INET6).then(v6) });
+        at = ai.ai_next;
+    }
+    unsafe { libc::freeaddrinfo(list) };
+    ips.sort_by_key(|ip| ip.is_ipv6());
+    ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()
 }
 
 /// proxy_bind address [transparent] | off. An address without variables is
@@ -1079,6 +1128,36 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         build(&parse(text, Path::new("t.conf")).unwrap(), &dir)
+    }
+
+    #[test]
+    fn hosts_and_ports() {
+        assert_eq!(host_port("a:81"), Some(("a", 81)));
+        assert_eq!(host_port("a"), Some(("a", 80)));
+        assert_eq!(host_port("[::1]:81"), Some(("::1", 81)));
+        assert_eq!(host_port("[::1]"), Some(("::1", 80)));
+        assert_eq!(host_port("a:x"), None);
+    }
+
+    #[test]
+    fn resolves_names_ipv4_first() {
+        assert_eq!(addresses("127.0.0.2", 81), ["127.0.0.2:81".parse().unwrap()]);
+        assert_eq!(addresses("::1", 81), ["[::1]:81".parse().unwrap()]);
+        let local = addresses("localhost", 82);
+        assert!(local.contains(&"127.0.0.1:82".parse().unwrap()));
+        assert!(local.windows(2).all(|w| w[0].is_ipv4() || w[1].is_ipv6()));
+        assert_eq!(addresses("a\0b", 80), []);
+        assert_eq!(addresses("no-such-host.invalid", 80), []);
+    }
+
+    #[test]
+    fn implicit_upstreams() {
+        let conf = build_text("http { server { listen 127.0.0.1:8080; location /a { proxy_pass http://$arg_h/; } location /b { proxy_pass http://LocalHost:8081/b; } location /c { proxy_pass http://localhost:8081/c; } } }").unwrap();
+        let proxy = |i: usize| conf.servers[0].locations[i].level.proxy.clone().unwrap();
+        // A URL with variables sees the implicit upstreams of locations after it, and one is made for each host and port.
+        assert!(Arc::ptr_eq(&proxy(1).upstream, &proxy(2).upstream));
+        assert!(Arc::ptr_eq(&proxy(0).implicit.lock().unwrap()["localhost:8081"], &proxy(1).upstream));
+        assert!(build_text("http { server { location / { proxy_pass http://no-such-host.invalid; } } }").unwrap_err().starts_with("host not found in upstream \"no-such-host.invalid\""));
     }
 
     #[test]
