@@ -27,9 +27,15 @@ const HSL: u8 = HTTP | SRV | LOC;
 
 /// Every directive twinx knows: where it may appear, its argument counts, and
 /// whether it takes a block.
+/// The levels of error_log, from the lowest.
+const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
+
 const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("daemon", MAIN, 1, 1, false),
     ("pid", MAIN, 1, 1, false),
+    ("worker_rlimit_nofile", MAIN, 1, 1, false),
+    ("working_directory", MAIN, 1, 1, false),
+    ("worker_shutdown_timeout", MAIN, 1, 1, false),
     ("error_log", MAIN | HSL, 1, usize::MAX, false),
     ("log_not_found", HSL, 1, 1, false),
     ("index", HSL, 1, usize::MAX, false),
@@ -45,6 +51,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("location", SRV | LOC, 1, 2, true),
     ("try_files", SRV | LOC, 2, usize::MAX, false),
     ("return", SRV | LOC | SIF | LIF, 1, 2, false),
+    ("break", SRV | LOC | SIF | LIF, 0, 0, false),
     ("set", SRV | LOC | SIF | LIF, 2, 2, false),
     ("if", SRV | LOC, 1, usize::MAX, true),
     ("root", HSL | LIF, 1, 1, false),
@@ -66,6 +73,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("client_max_body_size", HSL, 1, 1, false),
     ("add_header", HSL | LIF, 2, 3, false),
     ("add_trailer", HSL | LIF, 2, 3, false),
+    ("chunked_transfer_encoding", HSL, 1, 1, false),
     ("keepalive_requests", HSL, 1, 1, false),
     ("keepalive_timeout", HSL, 1, 2, false),
     ("keepalive_time", HSL, 1, 1, false),
@@ -78,6 +86,7 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("post_action", HSL, 1, 1, false),
     ("alias", LOC, 1, 1, false),
     ("absolute_redirect", HSL, 1, 1, false),
+    ("server_tokens", HSL, 1, 1, false),
     ("server_name_in_redirect", HSL, 1, 1, false),
     ("port_in_redirect", HSL, 1, 1, false),
     ("rewrite", SRV | LOC | SIF | LIF, 2, 3, false),
@@ -124,7 +133,7 @@ const COMBINED: &str =
 /// (backup servers last), the Host to send, and the URI that replaces the
 /// location's prefix, if the directive has one. A URL with variables is made
 /// for each request instead, and its host resolved then.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Proxy {
     pub host: String,
     pub upstream: Arc<Upstream>,
@@ -144,16 +153,37 @@ pub struct ErrorPage {
 }
 
 /// rewrite regex replacement [flag], where the replacement is a URL the
-/// client is redirected to: with 301 for "permanent", 302 otherwise; or, with
-/// "break", the URI the location goes on with. A replacement ending with "?"
-/// does not get the request's arguments.
+/// client is redirected to (with 301 for "permanent", 302 otherwise), or the
+/// URI the request goes on with. A replacement ending with "?" does not get
+/// the request's arguments.
 #[derive(Debug, Clone)]
 pub struct Rewrite {
     pub regex: regex::Regex,
     pub url: Template,
     pub status: u16,
     pub add_args: bool,
-    pub internal: bool,
+    pub redirect: bool,
+    pub flag: Flag,
+}
+
+/// What follows a rewrite to a URI: the next directive of the rewrite module
+/// (no flag), the search for the location of the new URI ("last"), or the
+/// rest of the location, without the rewrite module's directives ("break").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Flag {
+    Next,
+    Last,
+    Break,
+}
+
+/// The directives of the rewrite module that a level runs in order, after set and if.
+#[derive(Debug, Clone)]
+pub enum Step {
+    Rewrite(Rewrite),
+    /// return code [text] | code URL | URL.
+    Return(u16, Template),
+    /// break: the rewrite module's directives after it are not run.
+    Break,
 }
 
 /// What set and if do, in the order they are written.
@@ -164,7 +194,20 @@ pub enum Op {
     /// if ($variable) { ... }: when the value is neither empty nor "0", the
     /// directives of the block, and from then on the settings of the block
     /// (None for a block in a server, whose settings the location replaces).
-    If(Template, Vec<Op>, Option<Arc<Level>>),
+    If(Condition, Vec<Op>, Option<Arc<Level>>),
+}
+
+/// The condition of if, the last field of each saying whether it is negated ("!").
+#[derive(Debug, Clone)]
+pub enum Condition {
+    /// $variable: true when neither empty nor "0".
+    Var(Template),
+    /// $variable = value, $variable != value.
+    Equal(Template, Template, bool),
+    /// $variable ~ regex, ~* (caseless), !~, !~*: the captures become $1, $2, ...
+    Match(Template, regex::Regex, bool),
+    /// -f, -d, -e or -x (the letter) and the path.
+    File(Template, char, bool),
 }
 
 /// proxy_cookie_domain and proxy_cookie_path: what a Domain or Path attribute
@@ -200,9 +243,8 @@ pub const COOKIE_FLAGS: [&str; 8] = ["secure", "httponly", "nosecure", "nohttpon
 /// The settings of one level (http, server or location) after inheriting from the one above.
 #[derive(Debug, Clone, Default)]
 pub struct Level {
-    pub ret: Option<(u16, Template)>,
-    /// rewrite directives, in order: the regular expression and the redirect it makes.
-    pub rewrite: Vec<Rewrite>,
+    /// rewrite, return and break, in order, those of the server first.
+    pub rewrite: Vec<Step>,
     /// set and if of the server, run before those of the location.
     pub server_script: Vec<Op>,
     /// set and if of the location, which nested locations do not inherit.
@@ -263,6 +305,12 @@ pub struct Level {
     /// name rather than the request's (server_name_in_redirect), and the port
     /// left out when port_in_redirect is off.
     pub absolute_redirect: bool,
+    /// server_tokens: whether the Server header and the pages twinx generates
+    /// give its version ("on" and "build", as there is no build name) or only its name.
+    pub server_tokens: bool,
+    /// chunked_transfer_encoding: whether an HTTP/1.1 answer of unknown length
+    /// (or with trailers) may be chunked; off, it ends when the connection closes.
+    pub chunked: bool,
     pub server_name_in_redirect: bool,
     pub port_in_redirect: bool,
     /// keepalive_requests: the requests a connection may serve.
@@ -399,6 +447,14 @@ pub struct Server {
 #[derive(Debug)]
 pub struct Config {
     pub pid: PathBuf,
+    /// worker_rlimit_nofile: the limit on open files the worker sets for itself.
+    pub rlimit_nofile: Option<u64>,
+    /// worker_shutdown_timeout: how long a worker shutting down gracefully waits for its requests.
+    pub shutdown_timeout: Option<Duration>,
+    /// working_directory: where a worker changes to when it starts, as given, not relative to the prefix.
+    pub working_directory: Option<PathBuf>,
+    /// The error_log files of the main block that take alerts.
+    pub alert_logs: Vec<Arc<File>>,
     pub servers: Vec<Server>,
 }
 
@@ -417,12 +473,18 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), location: String::new() };
-    let mut config = Config { pid: prefix.join("logs/nginx.pid"), servers: Vec::new() };
+    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), servers: Vec::new() };
     for d in main {
         b.check(d, MAIN)?;
         match d.name.as_str() {
             "pid" => config.pid = b.path(&d.args[0]),
-            "error_log" => b.open(&d.args[0]).map(drop).map_err(|e| format!("{e} in {}", d.at))?,
+            "worker_rlimit_nofile" => config.rlimit_nofile = Some(d.args[0].parse().map_err(|_| format!("invalid number in {}", d.at))?),
+            "worker_shutdown_timeout" => config.shutdown_timeout = Some(millis(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?),
+            "working_directory" => config.working_directory = Some(d.args[0].clone().into()),
+            "error_log" => {
+                let file = b.open(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
+                if d.args.get(1).is_none_or(|l| LEVELS.iter().position(|v| v == l) <= Some(6)) { config.alert_logs.push(file) }
+            }
             "events" => d.block.iter().flatten().try_for_each(|e| b.check(e, EVENTS))?,
             "http" => config.servers = b.http(d.block.as_deref().unwrap_or_default())?,
             _ => {}
@@ -459,7 +521,7 @@ impl Builder<'_> {
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
-        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, port_in_redirect: true,
+        let mut level = Level { default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -537,8 +599,9 @@ impl Builder<'_> {
             self.check(d, ctx)?;
             let at = |e: String| format!("{e} in {}", d.at);
             match d.name.as_str() {
-                "return" => level.ret = Some(ret(&d.args).map_err(at)?),
-                "rewrite" => level.rewrite.push(rewrite(&d.args).map_err(at)?),
+                "return" => level.rewrite.push(ret(&d.args).map(|(code, text)| Step::Return(code, text)).map_err(at)?),
+                "rewrite" => level.rewrite.push(rewrite(&d.args).map(Step::Rewrite).map_err(at)?),
+                "break" => level.rewrite.push(Step::Break),
                 "set" | "if" => {
                     let op = if d.name == "set" { set(&d.args) } else { condition(&d.args).map(|c| Op::If(c, Vec::new(), None)) }.map_err(at)?;
                     let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
@@ -563,6 +626,7 @@ impl Builder<'_> {
                 "alias" => level.alias = Some(self.path(&d.args[0])),
                 "try_files" => level.try_files = Some(Arc::new(try_files(&d.args).map_err(at)?)),
                 "absolute_redirect" => level.absolute_redirect = flag(d).map_err(at)?,
+                "server_tokens" => level.server_tokens = d.args[0] == "build" || flag(d).map_err(|_| at(format!("invalid value \"{}\" in \"server_tokens\" directive, it must be \"on\", \"off\" or \"build\"", d.args[0])))?,
                 "server_name_in_redirect" => level.server_name_in_redirect = flag(d).map_err(at)?,
                 "port_in_redirect" => level.port_in_redirect = flag(d).map_err(at)?,
                 "log_format" => {
@@ -599,13 +663,13 @@ impl Builder<'_> {
                 "index" => level.index = d.args.iter().map(|a| Template::parse(a)).collect::<Result<_, _>>().map_err(at)?,
                 "log_not_found" => level.log_not_found = flag(d).map_err(at)?,
                 "error_log" => {
-                    const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
                     let file = self.open(&d.args[0]).map_err(at)?;
                     level.error_log = d.args.get(1).is_none_or(|l| LEVELS.iter().position(|v| v == l) <= Some(4)).then_some(file);
                 }
                 "ignore_invalid_headers" => level.ignore_invalid_headers = flag(d).map_err(at)?,
                 "underscores_in_headers" => level.underscores_in_headers = flag(d).map_err(at)?,
                 "merge_slashes" => level.merge_slashes = flag(d).map_err(at)?,
+                "chunked_transfer_encoding" => level.chunked = flag(d).map_err(at)?,
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
                 // How the proxied answer is read changes nothing that is sent: the values are only checked.
                 "proxy_buffer_size" => { size(&d.args[0]).map_err(at)?; }
@@ -686,7 +750,7 @@ impl Builder<'_> {
             let mut inner = Level { script: Vec::new(), server_script: Vec::new(), ..level.clone() };
             self.level(d.block.as_deref().unwrap_or_default(), if ctx == SRV { SIF } else { LIF }, &mut inner)?;
             let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
-            if let Op::If(_, body, to) = &mut script[i] { (*body, *to) = (std::mem::take(&mut inner.script), (ctx != SRV || inner.ret.is_some()).then(|| Arc::new(inner))); }
+            if let Op::If(_, body, to) = &mut script[i] { (*body, *to) = (std::mem::take(&mut inner.script), (ctx != SRV || inner.rewrite.iter().any(|s| matches!(s, Step::Return(..)))).then(|| Arc::new(inner))); }
         }
         Ok(())
     }
@@ -886,11 +950,23 @@ fn set(args: &[String]) -> Result<Op, String> {
 
 /// The condition of if, "(" and ")" around it. Of the conditions nginx has,
 /// twinx has only a variable alone, true when not empty and not "0".
-fn condition(args: &[String]) -> Result<Template, String> {
-    let all = args.join(" ");
-    let inner = all.strip_prefix('(').and_then(|c| c.strip_suffix(')')).ok_or_else(|| format!("invalid condition \"{}\"", args[0]))?;
-    if !inner.starts_with('$') || inner.contains(' ') { return Err(format!("twinx does not support the condition \"{inner}\" yet")); }
-    Template::parse(inner)
+fn condition(args: &[String]) -> Result<Condition, String> {
+    // As ngx_http_rewrite_if_condition() reads it: "(" and ")" may be arguments of their own.
+    let invalid = format!("invalid condition \"{}\"", args[0]);
+    let mut words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let last = words.len() - 1;
+    words[0] = words[0].strip_prefix('(').ok_or(invalid.clone())?;
+    words[last] = words[last].strip_suffix(')').ok_or(invalid.clone())?;
+    words.retain(|w| !w.is_empty());
+    match words[..] {
+        [var] if var.starts_with('$') => Ok(Condition::Var(Template::parse(var)?)),
+        [var, op @ ("=" | "!="), value] if var.starts_with('$') => Ok(Condition::Equal(Template::parse(var)?, Template::parse(value)?, op == "!=")),
+        [var, op @ ("~" | "~*" | "!~" | "!~*"), re] if var.starts_with('$') => {
+            let regex = regex::Regex::new(&format!("{}{}", if op.ends_with('*') { "(?i)" } else { "" }, pcre(re))).map_err(|e| format!("invalid regular expression \"{re}\": {e}"))?;
+            Ok(Condition::Match(Template::parse(var)?, regex, op.starts_with('!')))
+        }
+        [op @ ("-f" | "-d" | "-e" | "-x" | "!-f" | "!-d" | "!-e" | "!-x"), path] => Ok(Condition::File(Template::parse(path)?, op.chars().last().unwrap_or_default(), op.starts_with('!'))), _ => Err(invalid),
+    }
 }
 
 /// proxy_cookie_flags off | cookie [flag ...]: the cookie is a name, which may
@@ -943,7 +1019,8 @@ fn add_header(args: &[String]) -> Result<(String, Template, bool), String> {
 fn error_page(args: &[String]) -> Result<ErrorPage, String> {
     let (url, rest) = args.split_last().unwrap();
     let (status, codes) = match rest.split_last() {
-        Some((last, codes)) if last.starts_with('=') => (Some(last[1..].parse::<u16>().unwrap_or(302)), codes),
+        // "=" alone (0) keeps the status of the answer the URI gives.
+        Some((last, codes)) if last.starts_with('=') => (Some(if last.len() == 1 { 0 } else { last[1..].parse::<u16>().unwrap_or(302) }), codes),
         _ => (None, rest),
     };
     let codes = codes.iter().map(|c| c.parse::<u16>().ok().filter(|c| (300..=599).contains(c)).ok_or_else(|| format!("value \"{c}\" must be between 300 and 599")));
@@ -956,9 +1033,9 @@ fn rewrite(args: &[String]) -> Result<Rewrite, String> {
     let flag = args.get(2).map_or("", |f| f.as_str());
     if !["", "last", "break", "redirect", "permanent"].contains(&flag) { return Err(format!("invalid parameter \"{flag}\"")); }
     let (url, add_args) = args[1].strip_suffix('?').map_or((args[1].as_str(), true), |u| (u, false));
-    let is_url = ["http://", "https://", "$scheme"].iter().any(|p| url.starts_with(p)) || ["redirect", "permanent"].contains(&flag);
-    if !is_url && flag != "break" { return Err(format!("twinx does not support rewriting to \"{url}\" yet")); }
-    Ok(Rewrite { regex, url: Template::parse(url)?, status: if flag == "permanent" { 301 } else { 302 }, add_args, internal: !is_url })
+    let redirect = ["http://", "https://", "$scheme"].iter().any(|p| url.starts_with(p)) || ["redirect", "permanent"].contains(&flag);
+    let flag = match flag { "last" => Flag::Last, "break" => Flag::Break, _ => Flag::Next };
+    Ok(Rewrite { regex, url: Template::parse(url)?, status: if args.get(2).is_some_and(|f| f == "permanent") { 301 } else { 302 }, add_args, redirect, flag })
 }
 
 /// return code [text] | code URL | URL: a URL alone (http://, https:// or
@@ -983,6 +1060,10 @@ mod tests {
     use super::*;
     use crate::config::parse;
 
+    fn return_code(level: &Level) -> u16 {
+        level.rewrite.iter().find_map(|s| if let Step::Return(code, _) = s { Some(*code) } else { None }).unwrap()
+    }
+
     fn build_text(text: &str) -> Result<Config, String> {
         let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1004,7 +1085,7 @@ mod tests {
     #[test]
     fn return_with_a_url_alone() {
         let c = build_text("http { server { location /a { return http://e/$uri; } location /b { return https://e; } } }").unwrap();
-        let ret: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.ret.as_ref().unwrap().0).collect();
+        let ret: Vec<_> = c.servers[0].locations.iter().map(|l| return_code(&l.level)).collect();
         assert_eq!(ret, [302, 302]);
         assert!(build_text("http { server { location /a { return http://; } } }").unwrap_err().starts_with("invalid return code \"http://\""));
     }
@@ -1026,8 +1107,39 @@ mod tests {
         let s = &c.servers[0];
         assert_eq!(s.listen, vec!["127.0.0.1:8080".parse().unwrap()]);
         assert_eq!(s.locations[0].level.access_log[0].format.line.0.len(), 3);
-        assert_eq!(s.locations[0].level.ret.as_ref().unwrap().0, 200);
+        assert_eq!(return_code(&s.locations[0].level), 200);
         assert_eq!(s.locations[1].level.access_log[0].format.line.0.len(), 16);
+    }
+
+    #[test]
+    fn chunked_transfer_encoding() {
+        let c = build_text("http { server { location /a { chunked_transfer_encoding off; } location /b { } } }").unwrap();
+        let l = &c.servers[0].locations;
+        assert_eq!((l[0].level.chunked, l[1].level.chunked), (false, true));
+        assert!(build_text("http { chunked_transfer_encoding x; }").is_err());
+    }
+
+    #[test]
+    fn working_directory_and_alert_logs() {
+        let c = build_text("working_directory wd; error_log a.log; error_log b.log emerg; error_log c.log alert; http { }").unwrap();
+        assert_eq!(c.working_directory, Some(PathBuf::from("wd")));
+        assert_eq!(c.alert_logs.len(), 2);
+        assert_eq!(build_text("http { }").unwrap().working_directory, None);
+        assert!(build_text("working_directory;").is_err());
+        assert!(build_text("http { working_directory wd; }").is_err());
+    }
+
+    #[test]
+    fn worker_rlimit_nofile() {
+        assert_eq!(build_text("worker_rlimit_nofile 32; http { }").unwrap().rlimit_nofile, Some(32));
+        assert_eq!(build_text("http { }").unwrap().rlimit_nofile, None);
+        assert_eq!(build_text("worker_rlimit_nofile x;").unwrap_err(), "invalid number in t.conf:1");
+    }
+
+    #[test]
+    fn worker_shutdown_timeout() {
+        assert_eq!(build_text("worker_shutdown_timeout 10ms; http { }").unwrap().shutdown_timeout, Some(Duration::from_millis(10)));
+        assert_eq!(build_text("worker_shutdown_timeout x;").unwrap_err(), "invalid value in t.conf:1");
     }
 
     #[test]
@@ -1113,8 +1225,9 @@ mod tests {
         assert!(error_page(&["404".into(), "@named".into()]).is_ok());
         assert!(matches!(location(&["@named".into()]).unwrap().0, Match::Named));
         let r = rewrite(&["^".into(), "/x?".into(), "break".into()]).unwrap();
-        assert_eq!((r.internal, r.add_args), (true, false));
+        assert_eq!((r.redirect, r.add_args, r.flag), (false, false, Flag::Break));
         assert_eq!(error_page(&["404".into(), "/local".into()]).unwrap().status, None);
+        assert_eq!(error_page(&["404".into(), "=".into(), "/local".into()]).unwrap().status, Some(0));
         assert_eq!(error_page(&["404".into(), "500".into(), "http://e/".into()]).unwrap().codes, vec![404, 500]);
     }
 
@@ -1151,11 +1264,15 @@ mod tests {
         assert_eq!((r.status, r.add_args, r.regex.is_match("/ab")), (301, false, true));
         let r = rewrite(&["^".into(), "/x".into(), "redirect".into()]).unwrap();
         assert_eq!((r.status, r.add_args), (302, true));
-        assert_eq!(rewrite(&["^".into(), "/x".into()]).unwrap_err(), "twinx does not support rewriting to \"/x\" yet");
+        let r = rewrite(&["^".into(), "/x".into()]).unwrap();
+        assert_eq!((r.redirect, r.flag), (false, Flag::Next));
+        assert_eq!(rewrite(&["^".into(), "/x".into(), "last".into()]).unwrap().flag, Flag::Last);
         assert_eq!(rewrite(&["^".into(), "http://e/".into(), "x".into()]).unwrap_err(), "invalid parameter \"x\"");
         assert!(rewrite(&["(".into(), "http://e/".into()]).is_err());
-        let c = build_text("http { server { rewrite ^/s http://s/; location / { rewrite ^/l http://l/; } } }").unwrap();
-        assert_eq!(c.servers[0].locations[0].level.rewrite.len(), 2);
+        let c = build_text("http { server { rewrite ^/s http://s/; location / { rewrite ^/l http://l/; break; return 204; } } }").unwrap();
+        let steps = &c.servers[0].locations[0].level.rewrite;
+        assert!(matches!(steps[..], [Step::Rewrite(_), Step::Rewrite(_), Step::Break, Step::Return(204, _)]));
+        assert_eq!(build_text("http { server { break 1; } }").unwrap_err(), "invalid number of arguments in \"break\" directive in t.conf:1");
     }
 
     #[test]

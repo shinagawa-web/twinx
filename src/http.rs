@@ -5,12 +5,12 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::conf::{Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Level, Match, Op, Proxy, Rewrite, Server, ServerName, TryFiles};
-use crate::vars::Template;
+use crate::conf::{Condition, Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, Step, TryFiles};
+use crate::vars::{Part, Template};
 use crate::expires;
 use crate::upstream::{Peer, Upstream};
 use crate::vars::{Request, Sent};
@@ -31,10 +31,47 @@ const REASONS: &[(u16, &str)] = &[
 
 /// Binds every address the servers listen on and accepts connections on each in a thread.
 /// Opens the listening sockets: the master does this, so that bind errors stop it and every worker shares them.
-pub fn bind(config: &Config) -> Result<Vec<(TcpListener, SocketAddr)>, String> {
+pub fn bind(config: &Config, open: &[(TcpListener, SocketAddr)]) -> Result<Vec<(TcpListener, SocketAddr)>, String> {
     let mut addrs: Vec<SocketAddr> = config.servers.iter().flat_map(|s| s.listen.clone()).collect();
     addrs.dedup();
-    addrs.into_iter().map(|addr| TcpListener::bind(addr).map(|l| (l, addr)).map_err(|e| format!("bind() to {addr} failed ({e})"))).collect()
+    // On a reload, a socket already open on the address is kept. accept() on
+    // it gives up after a while, so that a worker shutting down stops accepting.
+    let get = |addr| open.iter().find(|o| o.1 == addr).map_or_else(|| TcpListener::bind(addr), |o| o.0.try_clone());
+    let timeout = |l: TcpListener| socket2::SockRef::from(&l).set_read_timeout(Some(ACCEPT_WAIT)).map(|()| l);
+    addrs.into_iter().map(|addr| get(addr).and_then(timeout).map(|l| (l, addr)).map_err(|e| format!("bind() to {addr} failed ({e})"))).collect()
+}
+
+/// How long accept() waits before it looks again whether the worker is shutting down.
+const ACCEPT_WAIT: Duration = Duration::from_millis(100);
+
+/// Whether the worker is shutting down gracefully, and how many requests it is answering.
+static SHUTTING: AtomicBool = AtomicBool::new(false);
+static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+/// A request being answered, counted in BUSY while it lives.
+struct Busy;
+
+impl Busy {
+    fn new() -> Busy {
+        BUSY.fetch_add(1, Ordering::SeqCst);
+        Busy
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Shuts the worker down gracefully, as QUIT does: it stops accepting, closes
+/// each connection once its request is answered, and returns when no request
+/// is left, or once worker_shutdown_timeout has passed. Idle connections are
+/// closed when the worker exits.
+pub fn shut_down(timeout: Option<Duration>) {
+    let start = Instant::now();
+    SHUTTING.store(true, Ordering::SeqCst);
+    while BUSY.load(Ordering::SeqCst) > 0 && timeout.is_none_or(|t| start.elapsed() < t) { thread::sleep(Duration::from_millis(10)); }
 }
 
 /// Accepts connections on the listening sockets, in a worker process.
@@ -42,7 +79,8 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
     for (listener, addr) in listeners {
         let (listener, addr, config) = (listener.try_clone().map_err(|e| e.to_string())?, *addr, config.clone());
         thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
+            while !SHUTTING.load(Ordering::SeqCst) {
+                let Ok((stream, _)) = listener.accept() else { continue };
                 let config = config.clone();
                 thread::spawn(move || connection(&config, stream, addr));
             }
@@ -146,7 +184,9 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
                 buf.extend_from_slice(&chunk[..read]);
             },
         };
+        let busy = Busy::new();
         idle = exchange(&mut stream, server, &r, parsed, found, local);
+        drop(busy);
         // What of an unbuffered body was not passed on is read and dropped.
         // What came after a chunked one is the next request.
         if let Some(mut u) = r.unread.lock().unwrap().take() {
@@ -154,7 +194,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr) {
             buf = u.rest;
         }
         if !level.body_in_file_only { r.body_file.map(std::fs::remove_file); }
-        if idle.is_none() { return linger(&mut stream); }
+        if idle.is_none() || SHUTTING.load(Ordering::SeqCst) { return linger(&mut stream); }
     }
 }
 
@@ -238,6 +278,13 @@ struct Response {
     body: Vec<u8>,
     /// Whether "Vary: Accept-Encoding" is sent when gzip_vary is on.
     vary: bool,
+    /// The connection to a proxied server that switched protocols (101) for a
+    /// request with Upgrade: once the head is sent, data is passed both ways.
+    tunnel: Option<TcpStream>,
+    /// Whether this is a page nginx generates for an error or a redirect
+    /// (ngx_http_special_response_handler()), which keeps its own status
+    /// after an error_page redirect.
+    generated: bool,
     /// Every header of the proxied server's answer, for $upstream_http_*.
     upstream: Vec<(String, String)>,
     /// The URI and arguments to redirect to internally: the index module's, with
@@ -291,7 +338,7 @@ fn finish(resp: &mut Response) {
 /// The page nginx generates for an error status.
 fn special(status: u16) -> Response {
     let ctype = Some("text/html".to_string());
-    Response { status, ctype, body: page(status).into_bytes(), ..Response::default() }
+    Response { status, ctype, body: page(status).into_bytes(), generated: true, ..Response::default() }
 }
 
 const REDIRECTS: &[u16] = &[301, 302, 303, 307, 308];
@@ -305,36 +352,84 @@ fn redirect(status: u16, location: String) -> Response {
 
 /// The answer the location gives, before error_page and the headers every answer gets.
 fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -> Response {
-    let rewrite = level.rewrite.iter().find(|rw| rw.regex.is_match(&r.uri));
-    let url = rewrite.map(|rw| (rw, rw.url.render(r, &Sent::default()), args(r)));
-    let with_args = |(rw, url, args): (&Rewrite, String, &str)| {
-        // "&" when the replacement as written has a "?", whatever its variables give.
-        let sep = if rw.url.0.iter().any(|p| matches!(p, crate::vars::Part::Text(t) if t.contains('?'))) { "&" } else { "?" };
-        if rw.add_args && !args.is_empty() { format!("{url}{sep}{}", &args[1..]) } else { url }
-    };
-    match (parsed, url) {
-        (Err(status), _) => special(status),
-        (Ok(()), _) if auto => redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
-        // "break": the location goes on with the new URI, without the rewrite module's directives.
-        (Ok(()), Some(u)) if u.0.internal => {
-            let mut to = r.clone();
-            to.target = with_args(u);
-            to.uri = to.target.split('?').next().unwrap_or_default().to_string();
-            serve(&to, level, prefix, None)
-        }
-        (Ok(()), Some((rw, url, a))) => redirect(rw.status, with_args((rw, unescape_redirect(&url), a))),
-        (Ok(()), None) => serve(r, level, prefix, level.ret.as_ref()),
+    match parsed {
+        Err(status) => return special(status),
+        Ok(()) if auto => return redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
+        Ok(()) => {}
+    }
+    // The rewrite module's directives, in order, as ngx_http_rewrite_handler() runs them.
+    let (mut to, mut changed, mut moved) = (r.clone(), false, false);
+    for step in &level.rewrite {
+        let rw = match step {
+            Step::Return(code, text) => return serve(&to, level, prefix, Some((*code, text))),
+            Step::Break => { changed = false; break }
+            Step::Rewrite(rw) => rw,
+        };
+        let Some(caps) = rw.regex.captures(&to.uri) else { continue };
+        to.set_captures(&caps);
+        let (uri, new_args) = replacement(rw, &to);
+        let uri = if rw.redirect { unescape_redirect(&uri) } else { uri };
+        // The request's arguments follow those of the replacement, "&" between them.
+        let old = &args(&to).get(1..).unwrap_or_default().to_string();
+        let args = match new_args {
+            Some(a) if rw.add_args && !old.is_empty() => format!("?{a}&{old}"),
+            Some(a) => format!("?{a}"),
+            None if rw.add_args && !old.is_empty() => format!("?{old}"),
+            None => String::new(),
+        };
+        if rw.redirect { return redirect(rw.status, format!("{uri}{args}")); }
+        to.target = format!("{uri}{args}");
+        to.uri = uri;
+        (changed, moved) = (rw.flag != Flag::Break, true);
+        if rw.flag != Flag::Next { break; }
+    }
+    // A URI changed without "break" is looked for again among the locations.
+    if changed { return Response { internal: Some(to.target), ..Response::default() }; }
+    // Stopped by break, the location goes on with the new URI, and proxy_pass
+    // passes it whole, without the URI it has (r->valid_location is 0).
+    match level.proxy.as_deref().filter(|p| moved && p.uri.is_some() && level.try_files.is_none()) {
+        Some(p) => proxy(&Proxy { uri: None, ..p.clone() }, level, &to, prefix),
+        None => serve(&to, level, prefix, None),
     }
 }
 
+/// The replacement of a rewrite, as the URI and the arguments after its "?".
+/// When the request's URI had "%" or "+", a capture is escaped as
+/// NGX_ESCAPE_ARGS does in the arguments and in a redirect
+/// (ngx_http_script_copy_capture_code()).
+fn replacement(rw: &Rewrite, r: &Request) -> (String, Option<String>) {
+    let quoted = r.target.split('?').next().unwrap_or_default().contains(['%', '+']);
+    let (mut uri, mut args) = (String::new(), None::<String>);
+    for part in &rw.url.0 {
+        let value = match part {
+            Part::Text(t) => match t.split_once('?').filter(|_| args.is_none()) {
+                Some((u, a)) => { uri += u; args = Some(a.to_string()); continue }
+                None => t.clone(),
+            },
+            Part::Var(v) => {
+                let value = Template(vec![part.clone()]).render(r, &Sent::default());
+                let capture = matches!(v, crate::vars::Var::User(n) if n.bytes().all(|c| c.is_ascii_digit()));
+                if capture && quoted && (args.is_some() || rw.redirect) { escape_args(&value) } else { value }
+            }
+        };
+        args.as_mut().unwrap_or(&mut uri).push_str(&value);
+    }
+    (uri, args)
+}
+
+/// Escapes what NGX_ESCAPE_ARGS does: control characters, space, "#%&+;?" and bytes above 0x7e.
+fn escape_args(s: &str) -> String {
+    s.bytes().map(|c| if c > 0x20 && c < 0x7f && !b"#%&+;?".contains(&c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
+}
+
 /// The answer of return, else of proxy_pass, else of the static module.
-fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<&(u16, Template)>) -> Response {
+fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Template)>) -> Response {
     match (ret, &level.proxy, level.try_files.as_deref()) {
-        (Some((code, text)), _, _) if REDIRECTS.contains(code) => redirect(*code, text.render(r, &Sent::default())),
-        (Some((code, text)), _, _) if text.0.is_empty() && *code >= 400 => special(*code),
+        (Some((code, text)), _, _) if REDIRECTS.contains(&code) => redirect(code, text.render(r, &Sent::default())),
+        (Some((code, text)), _, _) if text.0.is_empty() && code >= 400 => special(code),
         (Some((code, text)), _, _) => {
             let ctype = Some("text/plain".to_string());
-            Response { status: *code, ctype, body: text.render(r, &Sent::default()).into_bytes(), ..Response::default() }
+            Response { status: code, ctype, body: text.render(r, &Sent::default()).into_bytes(), ..Response::default() }
         }
         (None, _, Some(tf)) => try_files(tf, level, r, prefix),
         (None, Some(p), None) => proxy(p, level, r, prefix),
@@ -394,8 +489,10 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let (mut resp, mut level, mut last) = answer(server, r, parsed, found);
     let intercepted = !resp.proxied || level.proxy_intercept_errors;
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)).filter(|_| intercepted) {
-        // An intercepted 401 keeps the proxied server's WWW-Authenticate headers.
-        let auth: Vec<_> = resp.headers.iter().filter(|h| resp.proxied && resp.status == 401 && h.0.eq_ignore_ascii_case("www-authenticate")).cloned().collect();
+        // An intercepted 401 keeps the proxied server's WWW-Authenticate headers,
+        // and a redirect twinx made its Location.
+        let auth = |h: &&(String, String)| resp.proxied && resp.status == 401 && h.0.eq_ignore_ascii_case("www-authenticate");
+        let kept: Vec<_> = resp.headers.iter().filter(|h| auth(h) || !resp.proxied && h.0.eq_ignore_ascii_case("location")).cloned().collect();
         let url = ep.url.render(r, &Sent::default());
         let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == url);
         if url.starts_with('/') || named.is_some() {
@@ -409,11 +506,15 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
                 to.target = url;
                 to.method = if r.method == "HEAD" { "HEAD" } else { "GET" }.to_string();
             }
+            // The answer is sent with the error's status ("=code" replaces it, "=" leaves the
+            // answer's own), unless it is a page generated for its own error or redirect.
             let status = ep.status.unwrap_or(resp.status);
             let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
             (resp, level, last) = answer(server, &to, Ok(()), found);
-            if resp.status == 200 { resp.status = status; }
-            resp.headers.splice(0..0, auth);
+            if !resp.generated && status != 0 { resp.status = status; }
+            // A redirect the new answer makes replaces the Location kept.
+            let own = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("location"));
+            resp.headers.splice(0..0, kept.into_iter().filter(|h| !own || !h.0.eq_ignore_ascii_case("location")));
         } else {
             // A named location that does not exist is an error.
             resp = if url.starts_with('@') { special(500) } else { redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url) };
@@ -462,16 +563,23 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         if !value.is_empty() { resp.headers.push((name.clone(), value)); }
     }
     finish(&mut resp);
+    // server_tokens off: the pages twinx generates give its name without the version.
+    if resp.generated && !level.server_tokens {
+        resp.body = String::from_utf8_lossy(&resp.body).replace(&format!("<hr><center>{NAME}</center>"), "<hr><center>twinx</center>").into_bytes();
+    }
     gzip(r, level, &mut resp);
     range(r, &mut resp);
     let status = resp.status;
     // A body of unknown length is chunked for HTTP/1.1; otherwise the connection
     // closes after it. A HEAD answer has neither.
     // add_trailer makes it chunked too, except for a status that has no body.
+    // chunked_transfer_encoding off leaves both unchunked.
     let unknown = resp.unknown_length && r.method != "HEAD";
     let trailing = level.add_trailer.iter().any(|t| t.2 || added) && r.method != "HEAD" && ![204, 304].contains(&status);
-    let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1");
-    let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown);
+    // An upgraded connection is neither chunked nor kept alive, and has no length.
+    let upgraded = resp.tunnel.is_some();
+    let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1") && level.chunked && !upgraded;
+    let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown) && !upgraded;
     let mut out = Vec::new();
     // 444 closes the connection without an answer; 499 is the status of a client that closed it.
     let silent = [444, 499].contains(&status);
@@ -479,12 +587,13 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
         let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
         let ctype = resp.ctype.as_ref().map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
-        let connection = if keepalive { "keep-alive" } else { "close" };
+        let connection = if upgraded { "upgrade" } else if keepalive { "keep-alive" } else { "close" };
         let len = resp.body.len();
-        let length = if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else if !resp.unknown_length && status != 304 { format!("Content-Length: {len}\r\n") } else { String::new() };
+        let length = if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else if !resp.unknown_length && status != 304 && !upgraded { format!("Content-Length: {len}\r\n") } else { String::new() };
         let header = level.keepalive_header.filter(|_| keepalive).map(|t| format!("Keep-Alive: timeout={t}\r\n")).unwrap_or_default();
         let vary = if resp.vary && level.gzip_vary { "Vary: Accept-Encoding\r\n" } else { "" };
-        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {NAME}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{header}{vary}");
+        let server = if level.server_tokens { NAME } else { "twinx" };
+        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {server}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{header}{vary}");
         resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
         out = (head + "\r\n").into_bytes();
     }
@@ -506,10 +615,23 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let size = |t: &Template| crate::conf::size(&t.render(r, &Sent::default())).unwrap_or(0);
     let rate = r.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
     let written = send(stream, &out, rate, size(&level.limit_rate_after), r.started);
+    if let Some(up) = resp.tunnel.take().filter(|_| written) { tunnel(stream, up); }
     let sent = Sent { bytes: out.len(), body: body_len, ..so_far(&resp, &trailers) };
     if written { post_action(server, r, level); }
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     (written && keepalive && !silent).then_some(level.keepalive_timeout)
+}
+
+/// Passes data both ways between a client and the proxied server its
+/// connection was upgraded to, until either closes it or sends nothing for
+/// proxy_read_timeout.
+fn tunnel(client: &TcpStream, up: TcpStream) {
+    let _ = client.set_read_timeout(up.read_timeout().ok().flatten());
+    let (Ok(mut from_client), Ok(mut to_up)) = (client.try_clone(), up.try_clone()) else { return };
+    let other = thread::spawn(move || { let _ = std::io::copy(&mut from_client, &mut to_up); let _ = to_up.shutdown(Shutdown::Both); });
+    let _ = std::io::copy(&mut &up, &mut &*client);
+    let _ = client.shutdown(Shutdown::Both);
+    let _ = other.join();
 }
 
 /// post_action: once the answer is sent, the request is redirected internally
@@ -660,13 +782,27 @@ fn run<'a>(r: &Request, ops: &'a [Op], mut level: &'a Level) -> &'a Level {
             // set $limit_rate: a value that is not a size leaves it as it was.
             Op::Set(name, value) if name == "limit_rate" => if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.limit_rate.set(rate); },
             Op::Set(name, value) => r.set_var(name, value.render(r, &Sent::default())),
-            Op::If(cond, body, to) => {
-                let value = cond.render(r, &Sent::default());
-                if !value.is_empty() && value != "0" { level = run(r, body, to.as_deref().unwrap_or(level)); }
-            }
+            Op::If(cond, body, to) => if holds(r, cond) { level = run(r, body, to.as_deref().unwrap_or(level)); },
         }
     }
     level
+}
+
+/// Whether the condition of an if holds; a regular expression that matches
+/// gives its captures.
+fn holds(r: &Request, cond: &Condition) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let value = |t: &Template| t.render(r, &Sent::default());
+    match cond {
+        Condition::Var(var) => !matches!(value(var).as_str(), "" | "0"),
+        Condition::Equal(var, to, not) => (value(var) == value(to)) != *not,
+        Condition::Match(var, re, not) => re.captures(&value(var)).map(|c| r.set_captures(&c)).is_some() != *not,
+        Condition::File(path, test, not) => {
+            let meta = std::fs::metadata(value(path));
+            let is = meta.is_ok_and(|m| match test { 'f' => m.is_file(), 'd' => m.is_dir(), 'x' => m.permissions().mode() & 0o111 != 0, _ => true });
+            is != *not
+        }
+    }
 }
 
 /// Serves a file under root (or alias), as nginx's static module does; a
@@ -853,13 +989,14 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let (mut tried, mut answer, mut addrs, mut times, mut bytes) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new(), Vec::new());
     let (mut statuses, limit, first) = (Vec::new(), level.proxy_next_upstream_tries, Instant::now());
     let (mut tries, next) = (if limit > 0 { up.tries().min(limit) } else { up.tries() }, |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
+    let upgrade = r.headers.iter().any(|h| h.0.eq_ignore_ascii_case("upgrade"));
     while let Some(i) = up.pick(&mut tried) {
         addrs.push(up.peers[i].addr.to_string());
         // A socket that cannot be bound fails the request without trying the next server.
         let socket = bind.map(|b| bound(&up.peers[i].addr, b));
         if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
         let (start, mut time, mut counted) = (Instant::now(), [None; 3], [0; 3]);
-        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body);
+        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade);
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
@@ -997,7 +1134,7 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
 /// it took to connect and to send the response head. While it waits for the
 /// head, the client closing the connection ends the request with 499, as
 /// proxy_ignore_client_abort off does.
-fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64) -> Option<Response> {
+fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
     let start = Instant::now();
     let mut s = match socket {
         Some(socket) => socket.connect_timeout(&(*peer).into(), level.proxy_connect_timeout).ok().map(|()| TcpStream::from(socket))?,
@@ -1031,6 +1168,8 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
         let again = lower == "expires" && resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("expires"));
         if !again && !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
     }
+    // 101 to a request with Upgrade: what came after the head goes to the client first.
+    if status == 101 && upgrade { return Some(Response { body: answer[end..].to_vec(), tunnel: Some(s), ..resp }); }
     // The body's length: one Content-Length of digits, or one "Transfer-Encoding:
     // chunked" without it; any other mix makes the answer invalid. A HEAD, 204
     // or 304 answer has no body.
@@ -1345,6 +1484,38 @@ fn page(status: u16) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tunnel_passes_data_both_ways() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let (mut client, accepted) = (TcpStream::connect(addr).unwrap(), l.accept().unwrap().0);
+        let (mut server, up) = (TcpStream::connect(addr).unwrap(), l.accept().unwrap().0);
+        let t = thread::spawn(move || tunnel(&accepted, up));
+        let mut buf = [0u8; 4];
+        client.write_all(b"ping").unwrap();
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+        server.write_all(b"pong").unwrap();
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
+        // The proxied server closing ends the client's connection too.
+        drop(server);
+        assert_eq!(client.read(&mut buf).unwrap(), 0);
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn bind_keeps_open_sockets() {
+        let open = vec![(TcpListener::bind("127.0.0.1:0").unwrap(), "0.0.0.0:0".parse::<SocketAddr>().unwrap())];
+        let addr = open[0].0.local_addr().unwrap();
+        let text = format!("http {{ server {{ listen {addr}; }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        // The address is taken already, so a socket of its own could not be bound.
+        assert!(bind(&config, &[]).unwrap_err().starts_with(&format!("bind() to {addr} failed")));
+        let open = vec![(open.into_iter().next().unwrap().0, addr)];
+        assert_eq!(bind(&config, &open).unwrap()[0].0.local_addr().unwrap(), addr);
+    }
+
     fn request(head: &str) -> (Result<(), u16>, Request) {
         let mut r = Request {
             method: String::new(),
@@ -1442,7 +1613,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (mut time, mut bytes) = ([None; 3], [0; 3]);
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0, false).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
         // The body, the whole answer and the request, in bytes.
         assert_eq!(bytes, [4, 80, 18]);
@@ -1485,6 +1656,57 @@ mod tests {
     }
 
     #[test]
+    fn server_tokens() {
+        let text = "http { server { location /a { return 404; } location /b { server_tokens off; return 404; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let client = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
+            let (mut stream, _) = client.accept().unwrap();
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            drop(stream);
+            let mut text = String::new();
+            out.read_to_string(&mut text).unwrap();
+            text
+        };
+        let a = get("/a");
+        assert!(a.contains(&format!("Server: {NAME}\r\n")) && a.contains(&format!("<center>{NAME}</center>")), "{a}");
+        let b = get("/b");
+        assert!(b.contains("Server: twinx\r\n") && b.contains("<center>twinx</center>"), "{b}");
+        let refused = crate::conf::build(&crate::config::parse("http { server_tokens x; }", std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        assert_eq!(refused, "invalid value \"x\" in \"server_tokens\" directive, it must be \"on\", \"off\" or \"build\" in t:1");
+    }
+
+    #[test]
+    fn error_pages_keep_the_status_and_location() {
+        let text = "http { server { location /a { error_page 405 /n; return 405; } location /b { error_page 302 /t; return 302 x; } \
+                    location /c { error_page 302 /r; return 302 x; } location /d { error_page 405 = /n; return 405; } \
+                    location /n { return 204; } location /t { return 200 t; } location /r { return 302 y; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let client = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
+            let (mut stream, _) = client.accept().unwrap();
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            drop(stream);
+            let mut text = String::new();
+            out.read_to_string(&mut text).unwrap();
+            text
+        };
+        // The answer takes the error's status, unless it is a page of its own, or "=" is given.
+        assert!(get("/a").starts_with("HTTP/1.1 405 "));
+        assert!(get("/d").starts_with("HTTP/1.1 204 "));
+        let b = get("/b");
+        assert!(b.starts_with("HTTP/1.1 302 ") && b.contains("Location: x\r\n") && b.ends_with("\r\n\r\nt"), "{b}");
+        let c = get("/c");
+        assert!(c.contains("Location: y\r\n") && !c.contains("Location: x"), "{c}");
+    }
+
+    #[test]
     fn connects_from_the_bound_address() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1496,7 +1718,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
-        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0).unwrap().status, 200);
+        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
@@ -1515,7 +1737,7 @@ mod tests {
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
-        let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0).unwrap();
+        let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).unwrap();
         // The body is read after the head, 4000 bytes (what came with the head too)
         // in each second of the clock: it ends in the third second.
         assert!(resp.body.is_empty() && resp.rest.is_some());
@@ -1556,10 +1778,10 @@ mod tests {
             }
         });
         let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0).unwrap();
+        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0).is_none());
+            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).is_none());
         }
     }
 
@@ -1779,6 +2001,30 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_to_uris() {
+        let text = "http { server { location /a { rewrite ^/a(.*) /b$1?c=$1; rewrite ^/b /c; return 200 $uri:$args; } \
+                    location /l { rewrite ^ /n last; return 403; } location /n { return 200 n$uri; } \
+                    location /k { break; return 403; } location /r { rewrite ^/r(.*) http://e$1?$1 redirect; } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            let resp = answer(s, &r, Ok(()), location(s, &r.uri)).0;
+            (resp.status, String::from_utf8(resp.body).unwrap(), resp.headers.first().map(|h| h.1.clone()))
+        };
+        // Without a flag the next rewrite and return see the new URI; a capture in the
+        // arguments is escaped when the request's URI had "%".
+        assert_eq!(get("/a/%25?x=1").1, "/c:c=/%25&x=1");
+        assert_eq!(get("/a/x").1, "/c:c=/x");
+        // "last" looks for the location of the new URI; break stops before return.
+        assert_eq!(get("/l?x=1").1, "n/n");
+        assert_eq!(get("/k").0, 404);
+        // In a redirect, the URL is unescaped again as far as its "?".
+        assert_eq!(get("/r/a+b").2.unwrap(), "http://e/a+b?/a%2Bb");
+        assert_eq!(escape_args("a b#%&+;?\x7f"), "a%20b%23%25%26%2B%3B%3F%7F");
+    }
+
+    #[test]
     fn rewrites_with_break_and_named_locations() {
         let text = "http { server { location /a { rewrite ^/a(.*) /b break; return 403; } location @n { return 200 n$uri; } } }";
         let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
@@ -1833,8 +2079,34 @@ mod tests {
         let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { server { set $uri x; } }"), "the duplicate \"uri\" variable in t:1");
         assert_eq!(refused("http { server { if $a { } } }"), "invalid condition \"$a\" in t:1");
-        assert!(refused("http { server { if ($a = b) { } } }").contains("does not support"));
+        assert_eq!(refused("http { server { if ($arg_a <> b) { } } }"), "invalid condition \"($arg_a\" in t:1");
+        assert_eq!(refused("http { server { if ($arg_a ~ a( ) { } } }").split(':').next().unwrap(), "invalid regular expression \"a(\"");
         assert_eq!(refused("http { server { location / { if ($arg_a) { listen 80; } } } }"), "\"listen\" directive is not allowed here in t:1");
+    }
+
+    #[test]
+    fn if_conditions() {
+        let dir = std::env::temp_dir().join(format!("twinx-if-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("f"), "").unwrap();
+        let text = format!("http {{ server {{ location /eq {{ if ( $arg_c != 1 ) {{ return 204; }} }} \
+                            location /re {{ if ($arg_c ~* ^F(o+)) {{ return 200 $1; }} }} \
+                            location /f {{ if (!-f {d}/$arg_c) {{ return 204; }} }} location /x {{ if (-x {d}/$arg_c) {{ return 204; }} }} \
+                            location /e {{ if (-e {d}/$arg_c) {{ return 204; }} }} location /d {{ if (-d {d}/$arg_c) {{ return 204; }} }} }} }}", d = dir.display());
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            let resp = answer(s, &r, Ok(()), location(s, &r.uri)).0;
+            (resp.status, String::from_utf8(resp.body).unwrap())
+        };
+        assert_eq!((get("/eq?c=2").0, get("/eq?c=1").0), (204, 404));
+        assert_eq!(get("/re?c=fOOd"), (200, "OO".to_string()));
+        assert_eq!(get("/re?c=bar").0, 404);
+        assert_eq!((get("/f?c=d").0, get("/f?c=f").0), (204, 404));
+        assert_eq!((get("/x?c=d").0, get("/x?c=f").0), (204, 404));
+        assert_eq!((get("/e?c=f").0, get("/e?c=n").0), (204, 404));
+        assert_eq!((get("/d?c=d").0, get("/d?c=f").0), (204, 404));
     }
 
     #[test]
