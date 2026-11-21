@@ -1,18 +1,23 @@
 //! The resolver directive: names in proxy_pass URLs with variables are looked
-//! up with DNS queries for A records sent to the resolver's servers, as nginx's
-//! resolver does: in turn for each new name, resent every 5 seconds to the next
-//! server until resolver_timeout, again over TCP when the answer is truncated,
-//! following CNAME records, and kept for the TTL of the answer (or "valid=").
+//! up with DNS queries for A and AAAA records sent to the resolver's servers, as
+//! nginx's resolver does: in turn for each new name, resent every 5 seconds to
+//! the next server until resolver_timeout, again over TCP when the answer is
+//! truncated, following CNAME records, and kept for the TTL of the answer (or
+//! "valid=").
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long nginx waits for an answer before it sends the query again.
 const RESEND: Duration = Duration::from_secs(5);
+
+/// The record types nginx asks for, in the order it asks.
+const A: u16 = 1;
+const AAAA: u16 = 28;
 
 #[derive(Debug)]
 pub struct Resolver {
@@ -31,9 +36,10 @@ enum Reply {
     Ignore,
     /// The answer did not fit in a UDP datagram: the query is sent again over TCP.
     Truncated,
-    /// An error code, or neither addresses nor a CNAME: the name is not found.
+    /// An error code: the name is not found.
     Failed,
-    /// The addresses, else the name they are an alias of, and the smallest TTL.
+    /// The addresses, else the name they are an alias of, and the smallest TTL;
+    /// neither when the name has no records of the type asked for.
     Found(Vec<IpAddr>, Option<String>, u32),
 }
 
@@ -63,38 +69,53 @@ impl Resolver {
         if let Some((addrs, until)) = self.cache.lock().unwrap().get(name).filter(|(_, until)| *until > Instant::now()) {
             return Some((addrs.clone(), *until));
         }
-        let Reply::Found(addrs, cname, ttl) = self.query(name, deadline) else { return None };
+        // As in nginx, an error in either answer fails the name; the addresses
+        // of both are taken together; and a CNAME without addresses is followed
+        // only when it is in the answer that came last and the other gave no
+        // addresses.
+        let first = self.next.fetch_add(1, Ordering::Relaxed);
+        let replies = self.query(name, first, deadline);
+        let (mut addrs, mut cname, mut ttl) = (Vec::new(), None, u32::MAX);
+        for reply in replies {
+            let Reply::Found(found, alias, t) = reply else { return None };
+            cname = alias.filter(|_| found.is_empty());
+            ttl = if found.is_empty() && cname.is_none() { ttl } else { ttl.min(t) };
+            addrs.extend(found);
+        }
         let until = Instant::now() + self.valid.unwrap_or(Duration::from_secs(ttl as u64));
         let (addrs, until) = match cname.filter(|_| addrs.is_empty()) {
             Some(alias) => self.lookup(&alias, deadline, depth + 1).map(|(a, u)| (a, u.min(until)))?,
+            None if addrs.is_empty() => return None,
             None => (addrs, until),
         };
         self.cache.lock().unwrap().insert(name.to_string(), (addrs.clone(), until));
         Some((addrs, until))
     }
 
-    /// Sends the query for the A records of a name and waits for its answer.
-    fn query(&self, name: &str, deadline: Instant) -> Reply {
-        let first = self.next.fetch_add(1, Ordering::Relaxed);
-        let id = (SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) ^ first as u32) as u16;
-        let query = encode(id, name);
-        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else { return Reply::Failed };
+    /// Sends the queries for the A and AAAA records of a name together, to the
+    /// servers from the first one on, and waits for their answers. They come in
+    /// the order they arrived; one not answered before the deadline has failed.
+    fn query(&self, name: &str, first: usize, deadline: Instant) -> Vec<Reply> {
+        let id = (SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) ^ (first as u32) << 5) as u16 & !1;
+        let queries = [A, AAAA].map(|qtype| (qtype, id | (qtype == AAAA) as u16, encode(id | (qtype == AAAA) as u16, name, qtype)));
+        let (mut replies, mut waiting) = (Vec::new(), vec![0, 1]);
+        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else { return replies };
         let mut buf = [0u8; 4096];
         for server in self.servers.iter().cycle().skip(first % self.servers.len()) {
-            let _ = socket.send_to(&query, server);
+            waiting.iter().for_each(|&i| { let _ = socket.send_to(&queries[i].2, server); });
             let resend = (Instant::now() + RESEND).min(deadline);
-            while let Some(left) = resend.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
+            while let Some(left) = resend.checked_duration_since(Instant::now()).filter(|d| !d.is_zero() && !waiting.is_empty()) {
                 let _ = socket.set_read_timeout(Some(left));
                 let Ok(n) = socket.recv(&mut buf) else { break };
-                match decode(&buf[..n], id, name) {
-                    Reply::Ignore => continue,
-                    Reply::Truncated => return tcp(server, &query, deadline).map_or(Reply::Failed, |a| decode(&a, id, name)),
-                    reply => return reply,
-                }
+                let Some((at, reply)) = waiting.iter().enumerate().map(|(at, &i)| (at, decode(&buf[..n], queries[i].1, name, queries[i].0))).find(|(_, r)| *r != Reply::Ignore) else { continue };
+                let (qtype, id, query) = &queries[waiting.remove(at)];
+                let tcp = || tcp(server, query, deadline).map_or(Reply::Failed, |a| decode(&a, *id, name, *qtype));
+                replies.push(if reply == Reply::Truncated { tcp() } else { reply });
             }
-            if Instant::now() >= deadline { break; }
+            if waiting.is_empty() || Instant::now() >= deadline { break; }
         }
-        Reply::Failed
+        replies.resize_with(2, || Reply::Failed);
+        replies
     }
 }
 
@@ -112,12 +133,14 @@ fn tcp(server: &SocketAddr, query: &[u8], deadline: Instant) -> Option<Vec<u8>> 
     Some(answer)
 }
 
-/// A query for the A records of a name, with recursion desired.
-fn encode(id: u16, name: &str) -> Vec<u8> {
+/// A query for the records of a type of a name, with recursion desired.
+fn encode(id: u16, name: &str, qtype: u16) -> Vec<u8> {
     let mut q = id.to_be_bytes().to_vec();
     q.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
     name.split('.').filter(|l| !l.is_empty()).for_each(|l| { q.push(l.len() as u8); q.extend_from_slice(l.as_bytes()); });
-    q.extend_from_slice(&[0, 0, 1, 0, 1]);
+    q.push(0);
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&[0, 1]);
     q
 }
 
@@ -141,11 +164,11 @@ fn name(msg: &[u8], mut at: usize) -> Option<(String, usize)> {
 }
 
 /// What an answer says, if it is the one to the query with this id and name.
-fn decode(msg: &[u8], id: u16, asked: &str) -> Reply {
-    answer(msg, id, asked).unwrap_or(Reply::Ignore)
+fn decode(msg: &[u8], id: u16, asked: &str, qtype: u16) -> Reply {
+    answer(msg, id, asked, qtype).unwrap_or(Reply::Ignore)
 }
 
-fn answer(msg: &[u8], id: u16, asked: &str) -> Option<Reply> {
+fn answer(msg: &[u8], id: u16, asked: &str, qtype: u16) -> Option<Reply> {
     let word = |at: usize| msg.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
     let flags = word(2)?;
     if word(0)? != id || flags & 0x8000 == 0 || word(4)? != 1 { return Some(Reply::Ignore); }
@@ -161,14 +184,15 @@ fn answer(msg: &[u8], id: u16, asked: &str) -> Option<Reply> {
         let rdata = msg.get(next + 10..next + 10 + len)?;
         let record_ttl = u32::from_be_bytes(msg.get(next + 4..next + 8)?.try_into().ok()?);
         match kind {
-            1 => addrs.push(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(rdata).ok()?))),
+            A if qtype == A => addrs.push(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(rdata).ok()?))),
+            AAAA if qtype == AAAA => addrs.push(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(rdata).ok()?))),
             5 => cname = Some(name(msg, next + 10)?.0),
             _ => {}
         }
-        ttl = if [1, 5].contains(&kind) { ttl.min(record_ttl) } else { ttl };
+        ttl = if [qtype, 5].contains(&kind) { ttl.min(record_ttl) } else { ttl };
         at = next + 10 + len;
     }
-    Some(if addrs.is_empty() && cname.is_none() { Reply::Failed } else { Reply::Found(addrs, cname, ttl) })
+    Some(Reply::Found(addrs, cname, ttl))
 }
 
 #[cfg(test)]
@@ -193,23 +217,26 @@ mod tests {
 
     #[test]
     fn encodes_queries() {
-        assert_eq!(encode(0x1234, "a.bc"), vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 2, b'b', b'c', 0, 0, 1, 0, 1]);
+        assert_eq!(encode(0x1234, "a.bc", A), vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 2, b'b', b'c', 0, 0, 1, 0, 1]);
+        assert_eq!(&encode(0x1234, "a.bc", AAAA)[18..], &[0, 28, 0, 1]);
     }
 
     #[test]
     fn decodes_answers() {
         let a = reply(0x8180, &[(1, 30, &[127, 0, 0, 1]), (1, 20, &[127, 0, 0, 2])]);
-        assert_eq!(decode(&a, 7, "a.b"), Reply::Found(vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()], None, 20));
+        assert_eq!(decode(&a, 7, "a.b", A), Reply::Found(vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()], None, 20));
+        assert_eq!(decode(&a, 7, "a.b", AAAA), Reply::Found(vec![], None, u32::MAX));
+        let six = reply(0x8180, &[(28, 5, &[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])]);
+        assert_eq!(decode(&six, 7, "a.b", AAAA), Reply::Found(vec!["fe80::1".parse().unwrap()], None, 5));
         let alias = reply(0x8180, &[(39, 1, &[0]), (5, 9, &[1, b'c', 0xc0, 14])]);
-        assert_eq!(decode(&alias, 7, "a.b"), Reply::Found(vec![], Some("c.b".into()), 9));
-        assert_eq!(decode(&a, 8, "a.b"), Reply::Ignore);
-        assert_eq!(decode(&a, 7, "x.b"), Reply::Ignore);
-        assert_eq!(decode(&a[..a.len() - 1], 7, "a.b"), Reply::Ignore);
-        assert_eq!(decode(&reply(0x8181, &[]), 7, "a.b"), Reply::Ignore);
-        assert_eq!(decode(&reply(0x8182, &[]), 7, "a.b"), Reply::Failed);
-        assert_eq!(decode(&reply(0x8180, &[]), 7, "a.b"), Reply::Failed);
-        assert_eq!(decode(&reply(0x8380, &[]), 7, "a.b"), Reply::Truncated);
-        assert_eq!(decode(&reply(0x8180, &[(1, 1, &[1, 2])]), 7, "a.b"), Reply::Ignore);
+        assert_eq!(decode(&alias, 7, "a.b", A), Reply::Found(vec![], Some("c.b".into()), 9));
+        assert_eq!(decode(&a, 8, "a.b", A), Reply::Ignore);
+        assert_eq!(decode(&a, 7, "x.b", A), Reply::Ignore);
+        assert_eq!(decode(&a[..a.len() - 1], 7, "a.b", A), Reply::Ignore);
+        assert_eq!(decode(&reply(0x8181, &[]), 7, "a.b", A), Reply::Ignore);
+        assert_eq!(decode(&reply(0x8182, &[]), 7, "a.b", A), Reply::Failed);
+        assert_eq!(decode(&reply(0x8380, &[]), 7, "a.b", A), Reply::Truncated);
+        assert_eq!(decode(&reply(0x8180, &[(1, 1, &[1, 2])]), 7, "a.b", A), Reply::Ignore);
     }
 
     #[test]
@@ -226,20 +253,42 @@ mod tests {
         assert_eq!(Resolver::parse(&["a b".into()]).unwrap_err(), "host not found in resolver \"a b\"");
     }
 
-    #[test]
-    fn resolves_from_a_server_and_keeps_the_answer() {
+    /// A server that answers each query it gets with what `answer` gives for its type (A or AAAA).
+    fn server(answer: fn(u16) -> Vec<u8>) -> Resolver {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         let r = Resolver::parse(&[server.local_addr().unwrap().to_string()]).unwrap();
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            let (n, from) = server.recv_from(&mut buf).unwrap();
-            let mut answer = reply(0x8180, &[(1, 60, &[127, 0, 0, 9])]);
-            answer[..2].copy_from_slice(&buf[..2]);
-            server.send_to(&answer[..], from).unwrap();
-            assert_eq!(&buf[12..n], &[1, b'a', 1, b'b', 0, 0, 1, 0, 1]);
+            while let Ok((n, from)) = server.recv_from(&mut buf) {
+                let mut reply = answer(u16::from_be_bytes([buf[n - 4], buf[n - 3]]));
+                reply[..2].copy_from_slice(&buf[..2]);
+                reply[17..19].copy_from_slice(&buf[n - 4..n - 2]);
+                server.send_to(&reply[..], from).unwrap();
+            }
         });
+        r
+    }
+
+    #[test]
+    fn resolves_from_a_server_and_keeps_the_answer() {
+        let r = server(|t| if t == A { reply(0x8180, &[(1, 60, &[127, 0, 0, 9])]) } else { reply(0x8180, &[]) });
         let found = r.resolve("A.b", Duration::from_secs(5));
         assert_eq!(found, Some(vec!["127.0.0.9".parse().unwrap()]));
         assert_eq!(r.resolve("a.b", Duration::from_millis(1)), found);
+    }
+
+    #[test]
+    fn takes_both_answers_together() {
+        let six: &[u8] = &[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let both = server(|t| if t == A { reply(0x8180, &[(1, 60, &[127, 0, 0, 9])]) } else { reply(0x8180, &[(28, 60, &[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])]) });
+        assert_eq!(both.resolve("a.b", Duration::from_secs(5)), Some(vec!["127.0.0.9".parse().unwrap(), IpAddr::from(<[u8; 16]>::try_from(six).unwrap())]));
+        // An error in either answer fails the name, and so do two empty answers.
+        let error = server(|t| if t == A { reply(0x8180, &[(1, 60, &[127, 0, 0, 9])]) } else { reply(0x8182, &[]) });
+        assert_eq!(error.resolve("a.b", Duration::from_secs(5)), None);
+        let empty = server(|_| reply(0x8180, &[]));
+        assert_eq!(empty.resolve("a.b", Duration::from_secs(5)), None);
+        // A CNAME only in the first answer is not followed when the last one is empty.
+        let alias = server(|t| if t == A { reply(0x8180, &[(5, 60, &[1, b'c', 0xc0, 14])]) } else { reply(0x8180, &[]) });
+        assert_eq!(alias.resolve("a.b", Duration::from_secs(5)), None);
     }
 }

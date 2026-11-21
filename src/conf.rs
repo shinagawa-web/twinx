@@ -685,7 +685,7 @@ impl Builder<'_> {
                 "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
                 "resolver" => level.resolver = Some(Arc::new(Resolver::parse(&d.args).map_err(at)?)),
                 "resolver_timeout" => level.resolver_timeout = seconds(&d.args[0]).map_err(at)?,
-                "proxy_connect_timeout" => level.proxy_connect_timeout = seconds(&d.args[0]).map_err(at)?,
+                "proxy_connect_timeout" => level.proxy_connect_timeout = millis(&d.args[0]).map_err(at)?,
                 "proxy_read_timeout" => level.proxy_read_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_intercept_errors" => level.proxy_intercept_errors = flag(d).map_err(at)?,
                 "proxy_pass_request_headers" => level.proxy_pass_request_headers = flag(d).map_err(at)?,
