@@ -3,7 +3,7 @@
 //! nginx's resolver does: in turn for each new name, resent every 5 seconds to
 //! the next server until resolver_timeout, again over TCP when the answer is
 //! truncated, following CNAME records, and kept for the TTL of the answer (or
-//! "valid=").
+//! "valid="). ipv4=off or ipv6=off leaves out the query for A or AAAA records.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -24,6 +24,8 @@ pub struct Resolver {
     servers: Vec<SocketAddr>,
     /// valid=: how long answers are kept instead of their TTL.
     valid: Option<Duration>,
+    /// The record types asked for: A unless ipv4=off, AAAA unless ipv6=off.
+    types: Vec<u16>,
     next: AtomicUsize,
     /// The addresses of the names looked up, and until when they hold.
     cache: Mutex<HashMap<String, (Vec<IpAddr>, Instant)>>,
@@ -44,10 +46,16 @@ enum Reply {
 }
 
 impl Resolver {
-    /// resolver address[:port] ... [valid=time]
+    /// resolver address[:port] ... [valid=time] [ipv4=on|off] [ipv6=on|off]
     pub fn parse(args: &[String]) -> Result<Resolver, String> {
-        let (mut servers, mut valid) = (Vec::new(), None);
+        let (mut servers, mut valid, mut types) = (Vec::new(), None, vec![A, AAAA]);
         for a in args {
+            if let Some((qtype, on)) = a.strip_prefix("ipv4=").map(|v| (A, v)).or_else(|| a.strip_prefix("ipv6=").map(|v| (AAAA, v))) {
+                types.retain(|t| *t != qtype);
+                match on { "on" => types.push(qtype), "off" => {}, _ => return Err(format!("invalid parameter: {a}")) }
+                types.sort();
+                continue;
+            }
             if let Some(v) = a.strip_prefix("valid=") {
                 let secs = crate::expires::parse_time(v).filter(|s| *s >= 0).ok_or_else(|| format!("invalid parameter: {a}"))?;
                 valid = Some(Duration::from_secs(secs as u64));
@@ -56,7 +64,8 @@ impl Resolver {
             let addr = a.parse().or_else(|_| format!("{a}:53").parse()).map_err(|_| format!("host not found in resolver \"{a}\""))?;
             servers.push(addr);
         }
-        Ok(Resolver { servers, valid, next: AtomicUsize::new(0), cache: Mutex::new(HashMap::new()) })
+        if types.is_empty() { return Err("\"ipv4\" and \"ipv6\" cannot both be \"off\"".into()); }
+        Ok(Resolver { servers, valid, types, next: AtomicUsize::new(0), cache: Mutex::new(HashMap::new()) })
     }
 
     /// The addresses of a name, None when it cannot be resolved within the timeout.
@@ -92,13 +101,13 @@ impl Resolver {
         Some((addrs, until))
     }
 
-    /// Sends the queries for the A and AAAA records of a name together, to the
+    /// Sends the queries for the A and AAAA records (those asked for) of a name together, to the
     /// servers from the first one on, and waits for their answers. They come in
     /// the order they arrived; one not answered before the deadline has failed.
     fn query(&self, name: &str, first: usize, deadline: Instant) -> Vec<Reply> {
         let id = (SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) ^ (first as u32) << 5) as u16 & !1;
-        let queries = [A, AAAA].map(|qtype| (qtype, id | (qtype == AAAA) as u16, encode(id | (qtype == AAAA) as u16, name, qtype)));
-        let (mut replies, mut waiting) = (Vec::new(), vec![0, 1]);
+        let queries: Vec<_> = self.types.iter().map(|&qtype| (qtype, id | (qtype == AAAA) as u16, encode(id | (qtype == AAAA) as u16, name, qtype))).collect();
+        let (mut replies, mut waiting) = (Vec::new(), (0..queries.len()).collect::<Vec<_>>());
         let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else { return replies };
         let mut buf = [0u8; 4096];
         for server in self.servers.iter().cycle().skip(first % self.servers.len()) {
@@ -114,7 +123,7 @@ impl Resolver {
             }
             if waiting.is_empty() || Instant::now() >= deadline { break; }
         }
-        replies.resize_with(2, || Reply::Failed);
+        replies.resize_with(queries.len(), || Reply::Failed);
         replies
     }
 }
@@ -251,12 +260,24 @@ mod tests {
         assert_eq!((r.servers[1].port(), r.valid), (53, Some(Duration::from_secs(5))));
         assert_eq!(Resolver::parse(&["valid=x".into()]).unwrap_err(), "invalid parameter: valid=x");
         assert_eq!(Resolver::parse(&["a b".into()]).unwrap_err(), "host not found in resolver \"a b\"");
+        assert_eq!(r.types, vec![A, AAAA]);
+        let parse = |a: &[&str]| Resolver::parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>()).map(|r| r.types);
+        assert_eq!(parse(&["ipv4=off"]), Ok(vec![AAAA]));
+        assert_eq!(parse(&["ipv6=off"]), Ok(vec![A]));
+        assert_eq!(parse(&["ipv6=on", "ipv4=on"]), Ok(vec![A, AAAA]));
+        assert_eq!(parse(&["ipv4=off", "ipv4=on"]), Ok(vec![A, AAAA]));
+        assert_eq!(parse(&["ipv6=x"]), Err("invalid parameter: ipv6=x".into()));
+        assert_eq!(parse(&["ipv4=off", "ipv6=off"]), Err("\"ipv4\" and \"ipv6\" cannot both be \"off\"".into()));
     }
 
     /// A server that answers each query it gets with what `answer` gives for its type (A or AAAA).
-    fn server(answer: fn(u16) -> Vec<u8>) -> Resolver {
+    fn server(answer: fn(u16) -> Vec<u8>) -> Resolver { server_with(answer, &[]) }
+
+    fn server_with(answer: fn(u16) -> Vec<u8>, params: &[&str]) -> Resolver {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let r = Resolver::parse(&[server.local_addr().unwrap().to_string()]).unwrap();
+        let mut args = vec![server.local_addr().unwrap().to_string()];
+        args.extend(params.iter().map(|p| p.to_string()));
+        let r = Resolver::parse(&args).unwrap();
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             while let Ok((n, from)) = server.recv_from(&mut buf) {
@@ -290,5 +311,15 @@ mod tests {
         // A CNAME only in the first answer is not followed when the last one is empty.
         let alias = server(|t| if t == A { reply(0x8180, &[(5, 60, &[1, b'c', 0xc0, 14])]) } else { reply(0x8180, &[]) });
         assert_eq!(alias.resolve("a.b", Duration::from_secs(5)), None);
+    }
+
+    #[test]
+    fn asks_only_for_the_types_turned_on() {
+        let answer = |t| if t == A { reply(0x8180, &[(1, 60, &[127, 0, 0, 9])]) } else { reply(0x8180, &[(28, 60, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])]) };
+        assert_eq!(server_with(answer, &["ipv6=off"]).resolve("a.b", Duration::from_secs(5)), Some(vec!["127.0.0.9".parse().unwrap()]));
+        assert_eq!(server_with(answer, &["ipv4=off"]).resolve("a.b", Duration::from_secs(5)), Some(vec!["::1".parse().unwrap()]));
+        // An error in the only answer asked for fails the name.
+        let error = server_with(|t| if t == A { reply(0x8182, &[]) } else { reply(0x8180, &[(28, 60, &[0; 16])]) }, &["ipv6=off"]);
+        assert_eq!(error.resolve("a.b", Duration::from_secs(5)), None);
     }
 }
