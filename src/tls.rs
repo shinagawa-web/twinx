@@ -175,10 +175,12 @@ pub fn server(cert: &Path, key: &Path, passwords: Option<&Path>, verify: bool, t
 /// What the variables tell of a TLS connection: the protocol ($ssl_protocol,
 /// "TLSv1.3"), whether its session was reused ($ssl_session_reused), how the
 /// client's certificate was verified ($ssl_client_verify: NONE, SUCCESS or
-/// FAILED:reason) and its subject ($ssl_client_s_dn).
+/// FAILED:reason), its subject ($ssl_client_s_dn) and the name the client
+/// asked for with SNI ($ssl_server_name, empty without one).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     pub protocol: String,
+    pub server_name: String,
     pub reused: bool,
     pub verify: String,
     pub subject: Option<String>,
@@ -194,10 +196,11 @@ pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option
         if acceptor.read_tls(&mut tcp).ok().filter(|n| *n > 0).is_none() { return None }
         if let Some(hello) = acceptor.accept().ok()? { break hello }
     };
+    let name = hello.client_hello().server_name().unwrap_or_default().to_string();
     let tls = crate::http::server(config, listen, hello.client_hello().server_name()).0.tls.as_ref()?;
     let conn = hello.into_connection(tls.config.clone()).ok()?;
     let (stream, mut session, chain) = pipe(tcp, conn.into(), HANDSHAKE).ok()?;
-    (session.verify, session.subject) = (verified(&chain, &tls.trusted), chain.first().and_then(|c| subject(c)));
+    (session.server_name, session.verify, session.subject) = (name, verified(&chain, &tls.trusted), chain.first().and_then(|c| subject(c)));
     Some((stream, session))
 }
 
@@ -346,17 +349,17 @@ fn for_name(cert: &X509Certificate, name: &str) -> bool {
     dns.iter().any(|p| p.eq_ignore_ascii_case(name))
 }
 
-/// What connections to proxied servers are made with: without SNI, as
-/// proxy_ssl_server_name off does; reusing the sessions of earlier
+/// What connections to proxied servers are made with: with SNI when
+/// proxy_ssl_server_name is on (sni), for the name connect gives; reusing the sessions of earlier
 /// connections when proxy_ssl_session_reuse is on; with the certificate of
 /// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file, if any;
 /// verifying their certificates with verify, if any (proxy_ssl_verify on).
-pub fn client(reuse: bool, cert: Option<(&Path, &Path, Option<&Path>)>, verify: Option<Verify>) -> Result<Arc<ClientConfig>, String> {
+pub fn client((reuse, sni): (bool, bool), cert: Option<(&Path, &Path, Option<&Path>)>, verify: Option<Verify>) -> Result<Arc<ClientConfig>, String> {
     let mut c = match cert.map(|(c, k, p)| load(c, k, p)).transpose()? {
         Some((chain, key)) => proxied(verify).with_client_auth_cert(chain, key).map_err(|e| e.to_string())?,
         None => proxied(verify).with_no_client_auth(),
     };
-    c.enable_sni = false;
+    c.enable_sni = sni;
     if !reuse { c.resumption = rustls::client::Resumption::disabled(); }
     Ok(Arc::new(c))
 }
@@ -386,7 +389,7 @@ pub fn client_cert(base: &Arc<ClientConfig>, (cert, key, passwords): (&Path, &Pa
 }
 
 /// Connects to a proxied server over TLS, to the name its certificate is
-/// verified for, if any (one that is no name fails); the plain end of the
+/// verified for and SNI sends, if any (one that is no name fails; an address is not sent); the plain end of the
 /// connection, or the error the handshake failed with (WouldBlock once the timeout passed).
 pub fn connect(tcp: TcpStream, (peer, name): (IpAddr, Option<&str>), timeout: Duration, config: &Arc<ClientConfig>) -> std::io::Result<TcpStream> {
     let name = name.map_or(Ok(ServerName::from(peer)), |n| ServerName::try_from(n.to_string()).map_err(std::io::Error::other))?;
@@ -403,7 +406,7 @@ fn pipe(mut tcp: TcpStream, mut tls: Connection, timeout: Duration) -> std::io::
     while tls.is_handshaking() { tls.complete_io(&mut tcp)?; }
     let _ = tcp.set_read_timeout(None);
     let protocol = tls.protocol_version().map(|v| format!("{v:?}").replace('_', ".")).unwrap_or_default();
-    let session = Session { protocol, reused: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed), verify: String::new(), subject: None };
+    let session = Session { protocol, server_name: String::new(), reused: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed), verify: String::new(), subject: None };
     let chain = tls.peer_certificates().map(<[_]>::to_vec).unwrap_or_default();
     let (ours, theirs) = UnixStream::pair()?;
     std::thread::spawn(move || pump(tcp, tls, theirs));
@@ -615,9 +618,9 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert_eq!(config.servers[0].ssl, [addr]);
         let accepted = std::thread::spawn(move || accept(l.accept().unwrap().0, &config, addr).unwrap());
         let c = dir.join("c.pem");
-        let mut client = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), None), Duration::from_secs(5), &client(false, Some((&c, &dir.join("k.pem"), None)), None).unwrap()).unwrap();
+        let mut client = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), Some("localhost")), Duration::from_secs(5), &client((false, true), Some((&c, &dir.join("k.pem"), None)), None).unwrap()).unwrap();
         let (mut server, session) = accepted.join().unwrap();
-        assert_eq!(session, Session { protocol: "TLSv1.3".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()) });
+        assert_eq!(session, Session { protocol: "TLSv1.3".into(), server_name: "localhost".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()) });
         let mut buf = [0u8; 4];
         client.write_all(b"ping").unwrap();
         server.read_exact(&mut buf).unwrap();
@@ -636,7 +639,7 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
     fn a_handshake_that_does_not_end_in_time_times_out() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        let e = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), None), Duration::from_millis(100), &client(true, None, None).unwrap()).unwrap_err();
+        let e = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), None), Duration::from_millis(100), &client((true, false), None, None).unwrap()).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
         drop(l);
     }
@@ -646,7 +649,7 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let peer = std::thread::spawn(move || { let mut s = l.accept().unwrap().0; s.write_all(b"HTTP/1.0 400\r\n\r\n").unwrap(); });
-        assert!(connect(TcpStream::connect(addr).unwrap(), (addr.ip(), None), Duration::from_secs(5), &client(true, None, None).unwrap()).is_err());
+        assert!(connect(TcpStream::connect(addr).unwrap(), (addr.ip(), None), Duration::from_secs(5), &client((true, false), None, None).unwrap()).is_err());
         peer.join().unwrap();
     }
 
@@ -684,7 +687,7 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         let dir = dir();
         // A key that is not the certificate's.
         std::fs::write(dir.join("other.pem"), "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwQWPnC2Jx/3u3hdA\njGUmqcD72PuhGmag3j4c7dVV64OhRANCAATANLzVnsMiRvhgpGBwTwrnsEsESgL3\nwQJBCIlLunPAFCk9taxLVaqjkHBX5E7184ZLnPSc8ZVLhpB/saEm9hMD\n-----END PRIVATE KEY-----\n").unwrap();
-        let (base, cache) = (client(true, None, None).unwrap(), CertCache::new(4, 60, 10));
+        let (base, cache) = (client((true, false), None, None).unwrap(), CertCache::new(4, 60, 10));
         let (cert, key, other) = (dir.join("c.pem"), dir.join("k.pem"), dir.join("other.pem"));
         assert!(client_cert(&base, (&cert, &key, None), Some(&cache)).is_ok());
         assert!(client_cert(&base, (&cert, &key, None), None).is_ok());

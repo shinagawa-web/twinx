@@ -177,6 +177,7 @@ pub enum Var {
     /// The scheme of the request: https on a TLS connection, else http.
     Scheme,
     SslProtocol,
+    SslServerName,
     SslSessionReused,
     SslClientVerify,
     SslClientSDn,
@@ -210,7 +211,7 @@ impl Var {
             ("upstream_response_length", Var::UpstreamBytes(0)), ("upstream_bytes_received", Var::UpstreamBytes(1)), ("upstream_bytes_sent", Var::UpstreamBytes(2)),
             ("proxy_host", Var::ProxyHost), ("proxy_port", Var::ProxyPort), ("proxy_add_x_forwarded_for", Var::ProxyAddXForwardedFor),
             ("server_name", Var::ServerName), ("scheme", Var::Scheme), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
-            ("ssl_protocol", Var::SslProtocol), ("ssl_session_reused", Var::SslSessionReused),
+            ("ssl_protocol", Var::SslProtocol), ("ssl_server_name", Var::SslServerName), ("ssl_session_reused", Var::SslSessionReused),
             ("ssl_client_verify", Var::SslClientVerify), ("ssl_client_s_dn", Var::SslClientSDn),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
@@ -257,6 +258,7 @@ impl Var {
             Var::ServerName => r.server_name.clone(),
             Var::Scheme => (if r.ssl.is_some() { "https" } else { "http" }).to_string(),
             Var::SslProtocol => r.ssl.as_ref()?.protocol.clone(),
+            Var::SslServerName => r.ssl.as_ref()?.server_name.clone(),
             Var::SslSessionReused => (if r.ssl.as_ref()?.reused { "r" } else { "." }).to_string(),
             Var::SslClientVerify => r.ssl.as_ref()?.verify.clone(),
             Var::SslClientSDn => r.ssl.as_ref()?.subject.clone()?,
