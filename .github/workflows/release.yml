@@ -45,6 +45,11 @@ jobs:
           path: main
           persist-credentials: false
 
+      # ssl_ktls.t runs only where the kernel's TLS module is loaded, and runners
+      # differ in that; loading it here makes nginx run the file on every runner.
+      - name: Load the kernel's TLS module
+        run: sudo modprobe tls && test -r /proc/net/tls_stat
+
       - name: Build twinx in the judge's Rust image
         run: |
           image=$(python3 -c "import sys; sys.path.insert(0, 'harness'); import run_tests; print(run_tests.RUST_IMAGE)")

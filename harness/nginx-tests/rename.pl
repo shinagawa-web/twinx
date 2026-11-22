@@ -1,31 +1,47 @@
 #!/usr/bin/perl
 
-# twinx names itself twinx, not nginx. server_tokens.t checks the name in the
-# Server header and in error pages, so for twinx it expects "twinx" in exactly
-# these places, and nothing else in nginx-tests changes.
+# twinx names itself twinx, not nginx. Two places in nginx-tests read the name,
+# so for twinx they change, and nothing else in nginx-tests does:
+#
+# - server_tokens.t checks the name in the Server header and in error pages;
+#   for twinx it expects "twinx" in exactly these places.
+# - Test::Nginx's has_version reads "nginx version: nginx/x.y.z" from -V to
+#   decide whether a file or subtest runs; for twinx it answers as for the
+#   reference nginx (NGINX_VERSION of the nginx image), so twinx is expected
+#   to pass what nginx runs.
 
 use warnings;
 use strict;
 
-my $file = '/nginx-tests/server_tokens.t';
-my @renames = (
-	[ 'qr/nginx\/\d+\.\d+\.\d+/', 'qr/twinx\/\d+\.\d+\.\d+/' ],
-	[ "'nginx', 'tokens off 200'", "'twinx', 'tokens off 200'" ],
-	[ "'nginx', 'tokens off 404'", "'twinx', 'tokens off 404'" ],
-	[ 'qr/nginx(?!\/)/', 'qr/twinx(?!\/)/' ],
+my $version = $ENV{NGINX_VERSION};
+die "NGINX_VERSION is not set\n" unless defined $version && $version =~ /^\d+\.\d+\.\d+$/;
+
+my %renames = (
+	'/nginx-tests/server_tokens.t' => [
+		[ 'qr/nginx\/\d+\.\d+\.\d+/', 'qr/twinx\/\d+\.\d+\.\d+/' ],
+		[ "'nginx', 'tokens off 200'", "'twinx', 'tokens off 200'" ],
+		[ "'nginx', 'tokens off 404'", "'twinx', 'tokens off 404'" ],
+		[ 'qr/nginx(?!\/)/', 'qr/twinx(?!\/)/' ],
+	],
+	'/nginx-tests/lib/Test/Nginx.pm' => [
+		[ "\t\$self->{_configure_args} =~ m!nginx version: nginx/([0-9.]+)!;\n\n\tmy \@v = split(/\\./, \$1);",
+		  "\tmy \@v = split(/\\./, '$version');" ],
+	],
 );
 
-open(my $in, '<', $file) or die "$file: $!\n";
-my $text = do { local $/; <$in> };
-close $in;
+for my $file (sort keys %renames) {
+	open(my $in, '<', $file) or die "$file: $!\n";
+	my $text = do { local $/; <$in> };
+	close $in;
 
-for my $rename (@renames) {
-	my ($from, $to) = @$rename;
-	my $count = () = $text =~ /\Q$from\E/g;
-	die "$file: expected \"$from\" once, found it $count times\n" unless $count == 1;
-	$text =~ s/\Q$from\E/$to/;
+	for my $rename (@{$renames{$file}}) {
+		my ($from, $to) = @$rename;
+		my $count = () = $text =~ /\Q$from\E/g;
+		die "$file: expected \"$from\" once, found it $count times\n" unless $count == 1;
+		$text =~ s/\Q$from\E/$to/;
+	}
+
+	open(my $out, '>', $file) or die "$file: $!\n";
+	print $out $text;
+	close $out;
 }
-
-open(my $out, '>', $file) or die "$file: $!\n";
-print $out $text;
-close $out;
