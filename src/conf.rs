@@ -100,6 +100,8 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_verify_client", HTTP | SRV, 1, 1, false),
     ("ssl_trusted_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_client_certificate", HTTP | SRV, 1, 1, false),
+    ("ssl_crl", HTTP | SRV, 1, 1, false),
+    ("ssl_verify_depth", HTTP | SRV, 1, 1, false),
     ("proxy_ssl_certificate", HSL, 1, 1, false),
     ("proxy_ssl_certificate_key", HSL, 1, 1, false),
     ("proxy_ssl_password_file", HSL, 1, 1, false),
@@ -473,6 +475,10 @@ pub struct Level {
     /// clients' certificates are verified with.
     pub ssl_trusted_certificate: Option<PathBuf>,
     pub ssl_client_certificate: Option<PathBuf>,
+    /// ssl_crl and ssl_verify_depth: the CRLs clients' certificates are
+    /// checked against, and how many issuers their chains may have (1).
+    pub ssl_crl: Option<PathBuf>,
+    pub ssl_verify_depth: usize,
     /// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file:
     /// the certificate twinx presents to proxied servers.
     /// The certificate and key may have variables in their names.
@@ -648,7 +654,7 @@ impl Builder<'_> {
         // Without root, files come from html under the prefix, as nginx's default root is.
         let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -692,7 +698,7 @@ impl Builder<'_> {
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
         let l = &s.level;
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
-        let mut options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers };
+        let mut options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth };
         let extra = conf_commands(&l.ssl_conf_command, &mut options)?;
         let pairs = l.ssl_certificate.iter().zip(&l.ssl_certificate_key).chain(extra[0].iter().zip(&extra[1]));
         let files: Vec<(&Path, &Path)> = pairs.map(|(cert, key)| (cert.as_path(), key.as_path())).collect();
@@ -809,6 +815,8 @@ impl Builder<'_> {
                 "ssl_verify_client" => level.ssl_verify_client = ["off", "on", "optional", "optional_no_ca"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_verify_client\" directive, it must be \"on\", \"off\", \"optional\" or \"optional_no_ca\"", d.args[0])))? > 0,
                 "ssl_trusted_certificate" => level.ssl_trusted_certificate = Some(self.path(&d.args[0])),
                 "ssl_client_certificate" => level.ssl_client_certificate = Some(self.path(&d.args[0])),
+                "ssl_crl" => level.ssl_crl = Some(self.path(&d.args[0])),
+                "ssl_verify_depth" => level.ssl_verify_depth = d.args[0].parse().map_err(|_| at(format!("invalid value \"{}\" in \"ssl_verify_depth\" directive", d.args[0])))?,
                 "proxy_ssl_certificate" => (level.proxy_ssl_certificate, own_tls) = (Some(Template::parse(&d.args[0]).map_err(at)?), true),
                 "proxy_ssl_certificate_key" => (level.proxy_ssl_certificate_key, own_tls) = (Some(Template::parse(&d.args[0]).map_err(at)?), true),
                 "proxy_ssl_certificate_cache" | "ssl_certificate_cache" => *if d.name == "ssl_certificate_cache" { &mut level.ssl_certificate_cache } else { &mut level.proxy_ssl_certificate_cache } = cert_cache(&d.name, &d.args).map_err(at)?,
@@ -1861,7 +1869,7 @@ mod tests {
 
     #[test]
     fn ssl_conf_commands() {
-        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true };
+        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, crl: None, depth: 1 };
         let commands = |c: &[(&str, &str)]| c.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
         let files = conf_commands(&commands(&[("Options", "-SessionTicket, -ServerPreference"), ("Certificate", "/c.crt"), ("PrivateKey", "/c.key")]), &mut options).unwrap();
         assert!(!options.sessions.tickets && !options.prefer);
