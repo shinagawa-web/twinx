@@ -87,6 +87,13 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_certificate_key", HTTP | SRV, 1, 1, false),
     ("ssl_session_cache", HTTP | SRV, 1, 2, false),
     ("proxy_ssl_session_reuse", HSL, 1, 1, false),
+    ("ssl_password_file", HTTP | SRV, 1, 1, false),
+    ("ssl_verify_client", HTTP | SRV, 1, 1, false),
+    ("ssl_trusted_certificate", HTTP | SRV, 1, 1, false),
+    ("ssl_client_certificate", HTTP | SRV, 1, 1, false),
+    ("proxy_ssl_certificate", HSL, 1, 1, false),
+    ("proxy_ssl_certificate_key", HSL, 1, 1, false),
+    ("proxy_ssl_password_file", HSL, 1, 1, false),
     ("proxy_method", HSL, 1, 1, false),
     ("proxy_set_body", HSL, 1, 1, false),
     ("expires", HSL | LIF, 1, 2, false),
@@ -423,6 +430,22 @@ pub struct Level {
     pub limit_except: Option<(Vec<String>, Arc<Level>)>,
     /// proxy_ssl_session_reuse: TLS sessions to proxied servers are reused.
     pub proxy_ssl_session_reuse: bool,
+    /// ssl_password_file: the passwords an encrypted ssl_certificate_key is tried with.
+    pub ssl_password_file: Option<PathBuf>,
+    /// ssl_verify_client: whether clients are asked for a certificate (not "off").
+    pub ssl_verify_client: bool,
+    /// ssl_trusted_certificate and ssl_client_certificate: the certificates
+    /// clients' certificates are verified with.
+    pub ssl_trusted_certificate: Option<PathBuf>,
+    pub ssl_client_certificate: Option<PathBuf>,
+    /// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file:
+    /// the certificate twinx presents to proxied servers.
+    pub proxy_ssl_certificate: Option<PathBuf>,
+    pub proxy_ssl_certificate_key: Option<PathBuf>,
+    pub proxy_ssl_password_file: Option<PathBuf>,
+    /// What connections to proxied servers over TLS are made with, made again
+    /// at a level that sets one of the proxy_ssl_* directives above.
+    pub proxy_tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 /// try_files: the files tried in order, each a directory when its parameter
@@ -480,9 +503,10 @@ pub struct Server {
     pub name: String,
     pub level: Level,
     pub locations: Vec<Location>,
-    /// The addresses it listens on with "ssl", and the certificate it presents there.
+    /// The addresses it listens on with "ssl", and what it takes TLS
+    /// connections with, when it has a certificate.
     pub ssl: Vec<SocketAddr>,
-    pub certificate: Option<Arc<rustls::sign::CertifiedKey>>,
+    pub tls: Option<crate::tls::ServerTls>,
 }
 
 #[derive(Debug)]
@@ -566,7 +590,7 @@ impl Builder<'_> {
         // Without root, files come from html under the prefix, as nginx's default root is.
         let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_tls: Some(crate::tls::client(true, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -591,7 +615,7 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), certificate: None };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None };
         self.level(block, SRV, &mut s.level)?;
         for d in block {
             match d.name.as_str() {
@@ -608,8 +632,10 @@ impl Builder<'_> {
             }
         }
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
-        let files = s.level.ssl_certificate.as_deref().zip(s.level.ssl_certificate_key.as_deref());
-        s.certificate = files.map(|(cert, key)| crate::tls::certificate(cert, key)).transpose()?;
+        let l = &s.level;
+        let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
+        let files = l.ssl_certificate.as_deref().zip(l.ssl_certificate_key.as_deref());
+        s.tls = files.map(|(cert, key)| crate::tls::server(cert, key, l.ssl_password_file.as_deref(), l.ssl_verify_client, &trust)).transpose()?;
         let level = s.level.clone();
         self.locations(block, &level, &mut s.locations)?;
         Ok(s)
@@ -643,7 +669,7 @@ impl Builder<'_> {
         let mut flags: Option<Option<Vec<CookieFlags>>> = None;
         // proxy_redirect of this level, Some(None) once "off"; and whether proxy_pass is here.
         let (mut redirects, mut own_proxy): (Option<Option<Vec<CookieRewrite>>>, bool) = (None, false);
-        let (mut ifs, mut limit) = (Vec::new(), None);
+        let (mut ifs, mut limit, mut own_tls) = (Vec::new(), None, false);
         for d in block {
             self.check(d, ctx)?;
             let at = |e: String| format!("{e} in {}", d.at);
@@ -703,7 +729,14 @@ impl Builder<'_> {
                 "ssl_certificate_key" => level.ssl_certificate_key = Some(self.path(&d.args[0])),
                 // Sessions are kept in memory whatever the cache: the value is only checked.
                 "ssl_session_cache" => if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
-                "proxy_ssl_session_reuse" => level.proxy_ssl_session_reuse = flag(d).map_err(at)?,
+                "proxy_ssl_session_reuse" => (level.proxy_ssl_session_reuse, own_tls) = (flag(d).map_err(at)?, true),
+                "ssl_password_file" => level.ssl_password_file = Some(self.path(&d.args[0])),
+                "ssl_verify_client" => level.ssl_verify_client = ["off", "on", "optional", "optional_no_ca"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_verify_client\" directive, it must be \"on\", \"off\", \"optional\" or \"optional_no_ca\"", d.args[0])))? > 0,
+                "ssl_trusted_certificate" => level.ssl_trusted_certificate = Some(self.path(&d.args[0])),
+                "ssl_client_certificate" => level.ssl_client_certificate = Some(self.path(&d.args[0])),
+                "proxy_ssl_certificate" => (level.proxy_ssl_certificate, own_tls) = (Some(self.path(&d.args[0])), true),
+                "proxy_ssl_certificate_key" => (level.proxy_ssl_certificate_key, own_tls) = (Some(self.path(&d.args[0])), true),
+                "proxy_ssl_password_file" => (level.proxy_ssl_password_file, own_tls) = (Some(self.path(&d.args[0])), true),
                 "proxy_redirect" => {
                     let rule = if d.args == ["default"] {
                         let proxy = level.proxy.as_ref().filter(|_| own_proxy).ok_or_else(|| at("\"proxy_redirect default\" should be placed after the \"proxy_pass\" directive".into()))?;
@@ -816,6 +849,10 @@ impl Builder<'_> {
         if let Some(path) = path { level.proxy_cookie_path = path; }
         if let Some(flags) = flags { level.proxy_cookie_flags = flags; }
         if let Some(redirects) = redirects { level.proxy_redirect = redirects; }
+        if own_tls {
+            let cert = level.proxy_ssl_certificate.as_deref().zip(level.proxy_ssl_certificate_key.as_deref()).map(|(c, k)| (c, k, level.proxy_ssl_password_file.as_deref()));
+            level.proxy_tls = Some(crate::tls::client(level.proxy_ssl_session_reuse, cert)?);
+        }
         // Without rules of its own or inherited, a location with proxy_pass has "proxy_redirect default".
         if level.proxy_redirect.as_ref().is_some_and(Vec::is_empty) && own_proxy {
             level.proxy_redirect = level.proxy.as_ref().and_then(|p| self.default_redirect(p)).map(|r| vec![r]).or(Some(Vec::new()));

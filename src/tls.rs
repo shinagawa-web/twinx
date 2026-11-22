@@ -8,63 +8,147 @@ use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::server::{ClientHello, ResolvesServerCert};
-use rustls::sign::CertifiedKey;
-use rustls::{ClientConfig, ClientConnection, Connection, DigitallySignedStruct, ServerConfig, ServerConnection, SignatureScheme};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{ClientConfig, ClientConnection, Connection, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
 
 use crate::conf::Config;
 
 /// How long a client has to finish its handshake, as client_header_timeout's default.
 const HANDSHAKE: Duration = Duration::from_secs(60);
 
-/// The certificate chain and the private key of ssl_certificate and ssl_certificate_key, in PEM.
-pub fn certificate(cert: &Path, key: &Path) -> Result<Arc<CertifiedKey>, String> {
+/// A certificate chain and its private key, in PEM. An encrypted key (PKCS #8)
+/// is decrypted with the first of the passwords that works, as
+/// ssl_password_file has them, one on each line.
+fn load(cert: &Path, key: &Path, passwords: Option<&Path>) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
     let chain = CertificateDer::pem_file_iter(cert).and_then(|certs| certs.collect::<Result<Vec<_>, _>>()).ok().filter(|c| !c.is_empty());
     let chain = chain.ok_or_else(|| format!("cannot load certificate \"{}\"", cert.display()))?;
-    let signing = PrivateKeyDer::from_pem_file(key).ok().and_then(|k| provider().key_provider.load_private_key(k).ok());
-    let signing = signing.ok_or_else(|| format!("cannot load certificate key \"{}\"", key.display()))?;
-    Ok(Arc::new(CertifiedKey::new(chain, signing)))
+    let text = std::fs::read_to_string(key).unwrap_or_default();
+    let passwords = passwords.map(|p| std::fs::read_to_string(p).map_err(|e| format!("open() \"{}\" failed ({e})", p.display()))).transpose()?.unwrap_or_default();
+    let encrypted = pkcs8::der::Document::from_pem(&text).ok().filter(|(label, _)| *label == "ENCRYPTED PRIVATE KEY").map(|(_, doc)| doc);
+    let decrypt = |doc: &pkcs8::der::Document| passwords.lines().find_map(|p| pkcs8::EncryptedPrivateKeyInfoRef::try_from(doc.as_bytes()).ok()?.decrypt(p).ok());
+    let found = match encrypted { Some(doc) => decrypt(&doc).map(|d| PrivateKeyDer::Pkcs8(d.as_bytes().to_vec().into())), None => PrivateKeyDer::from_pem_slice(text.as_bytes()).ok() };
+    let found = found.filter(|k| provider().key_provider.load_private_key(k.clone_key()).is_ok());
+    Ok((chain, found.ok_or_else(|| format!("cannot load certificate key \"{}\"", key.display()))?))
+}
+
+/// The certificates of a file, in PEM, that clients' certificates are verified with.
+fn trusted(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
+    let certs = CertificateDer::pem_file_iter(path).and_then(|certs| certs.collect::<Result<Vec<_>, _>>());
+    certs.map_err(|_| format!("SSL_CTX_load_verify_locations(\"{}\") failed", path.display()))
 }
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// The certificate a client gets on a listening address: that of the server
-/// its SNI name selects, as the Host header selects one.
+/// What a server takes TLS connections with: its certificate, and when
+/// ssl_verify_client is not off, the certificates clients' certificates are
+/// verified with (ssl_trusted_certificate, ssl_client_certificate).
 #[derive(Debug)]
-struct Sni(Arc<Config>, SocketAddr);
-
-impl ResolvesServerCert for Sni {
-    fn resolve(&self, hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        crate::http::server(&self.0, self.1, hello.server_name()).0.certificate.clone()
-    }
+pub struct ServerTls {
+    config: Arc<ServerConfig>,
+    trusted: Vec<CertificateDer<'static>>,
 }
 
-/// What a listening address with "ssl" accepts connections with.
-pub fn server(config: Arc<Config>, listen: SocketAddr) -> Arc<ServerConfig> {
-    Arc::new(ServerConfig::builder().with_no_client_auth().with_cert_resolver(Arc::new(Sni(config, listen))))
+/// The files of ssl_certificate, ssl_certificate_key and ssl_password_file;
+/// whether clients are asked for a certificate (ssl_verify_client not off),
+/// and the files of the certificates theirs are verified with.
+pub fn server(cert: &Path, key: &Path, passwords: Option<&Path>, verify: bool, trust: &[&Path]) -> Result<ServerTls, String> {
+    let (chain, key) = load(cert, key, passwords)?;
+    let trusted = trust.iter().map(|p| trusted(p)).collect::<Result<Vec<_>, _>>()?.concat();
+    let builder = ServerConfig::builder();
+    let builder = if verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
+    let config = Arc::new(builder.with_single_cert(chain, key).map_err(|e| format!("cannot load certificate \"{}\" ({e})", cert.display()))?);
+    Ok(ServerTls { config, trusted })
 }
 
 /// What the variables tell of a TLS connection: the protocol ($ssl_protocol,
-/// "TLSv1.3") and whether its session was reused ($ssl_session_reused).
+/// "TLSv1.3"), whether its session was reused ($ssl_session_reused), how the
+/// client's certificate was verified ($ssl_client_verify: NONE, SUCCESS or
+/// FAILED:reason) and its subject ($ssl_client_s_dn).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     pub protocol: String,
     pub reused: bool,
+    pub verify: String,
+    pub subject: Option<String>,
 }
 
-/// Takes a TLS connection from a client: the handshake, then the plain end of it.
-pub fn accept(tcp: TcpStream, config: &Arc<ServerConfig>) -> Option<(TcpStream, Session)> {
-    let conn = ServerConnection::new(config.clone()).ok()?;
-    pipe(tcp, conn.into(), HANDSHAKE).ok()
+/// Takes a TLS connection from a client on a listening address: the server
+/// its SNI name selects (as the Host header selects one) does the handshake;
+/// then the plain end of the connection.
+pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option<(TcpStream, Session)> {
+    let _ = tcp.set_read_timeout(Some(HANDSHAKE));
+    let mut acceptor = rustls::server::Acceptor::default();
+    let hello = loop {
+        if acceptor.read_tls(&mut tcp).ok().filter(|n| *n > 0).is_none() { return None }
+        if let Some(hello) = acceptor.accept().ok()? { break hello }
+    };
+    let tls = crate::http::server(config, listen, hello.client_hello().server_name()).0.tls.as_ref()?;
+    let conn = hello.into_connection(tls.config.clone()).ok()?;
+    let (stream, mut session, chain) = pipe(tcp, conn.into(), HANDSHAKE).ok()?;
+    (session.verify, session.subject) = (verified(&chain, &tls.trusted), chain.first().and_then(|c| subject(c)));
+    Some((stream, session))
+}
+
+/// Clients may send a certificate, which the handshake takes whatever it is;
+/// whether it verifies is told by $ssl_client_verify.
+#[derive(Debug)]
+struct AnyClient(WebPkiSupportedAlgorithms);
+
+impl ClientCertVerifier for AnyClient {
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(&self, _: &CertificateDer, _: &[CertificateDer], _: UnixTime) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    // Only a client that does not take TLS 1.3 has this called.
+    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> { rustls::crypto::verify_tls12_signature(m, c, d, &self.0) }
+
+    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
+    }
+}
+
+/// How a client's certificate chain verifies against the trusted
+/// certificates, as $ssl_client_verify tells it. A trusted certificate is
+/// taken as it is, as OpenSSL takes a self-signed one in its store.
+fn verified(chain: &[CertificateDer<'static>], trusted: &[CertificateDer<'static>]) -> String {
+    let Some(leaf) = chain.first() else { return "NONE".to_string() };
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(trusted.iter().cloned());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider()).build();
+    let ok = trusted.contains(leaf) || verifier.is_ok_and(|v| v.verify_client_cert(leaf, &chain[1..], UnixTime::now()).is_ok());
+    let self_signed = x509_parser::parse_x509_certificate(leaf).is_ok_and(|(_, c)| c.subject().as_raw() == c.issuer().as_raw());
+    if ok { "SUCCESS".to_string() } else { format!("FAILED:{}", if self_signed { "self-signed certificate" } else { "unable to get local issuer certificate" }) }
+}
+
+/// The subject of a certificate as RFC 2253 writes it, as $ssl_client_s_dn
+/// gives it: the last attribute first, "CN=name,O=organization".
+fn subject(der: &[u8]) -> Option<String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+    let registry = x509_parser::objects::oid_registry();
+    let attr = |a: &x509_parser::x509::AttributeTypeAndValue| format!("{}={}", x509_parser::objects::oid2abbrev(a.attr_type(), registry).map_or_else(|_| a.attr_type().to_id_string(), str::to_string), a.as_str().unwrap_or_default());
+    let rdns: Vec<String> = cert.subject().iter_rdn().map(|rdn| rdn.iter().map(attr).collect::<Vec<_>>().join("+")).collect();
+    Some(rdns.into_iter().rev().collect::<Vec<_>>().join(","))
 }
 
 /// A proxied server's certificate is not verified, as with proxy_ssl_verify
@@ -89,37 +173,45 @@ impl ServerCertVerifier for Unverified {
     }
 }
 
-/// Connects to a proxied server over TLS without SNI, as proxy_ssl_server_name
-/// off does, reusing the sessions of earlier connections to it when
-/// proxy_ssl_session_reuse is on; the plain end of the connection, or the
-/// error the handshake failed with (WouldBlock once the timeout passed).
-pub fn connect(tcp: TcpStream, peer: IpAddr, timeout: Duration, reuse: bool) -> std::io::Result<TcpStream> {
-    static CLIENTS: [OnceLock<Arc<ClientConfig>>; 2] = [OnceLock::new(), OnceLock::new()];
-    let config = CLIENTS[reuse as usize].get_or_init(|| {
-        let verifier = Arc::new(Unverified(provider().signature_verification_algorithms));
-        let mut c = ClientConfig::builder().dangerous().with_custom_certificate_verifier(verifier).with_no_client_auth();
-        c.enable_sni = false;
-        if !reuse { c.resumption = rustls::client::Resumption::disabled(); }
-        Arc::new(c)
-    });
+/// What connections to proxied servers are made with: without SNI, as
+/// proxy_ssl_server_name off does; reusing the sessions of earlier
+/// connections when proxy_ssl_session_reuse is on; with the certificate of
+/// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file, if any.
+pub fn client(reuse: bool, cert: Option<(&Path, &Path, Option<&Path>)>) -> Result<Arc<ClientConfig>, String> {
+    let verifier = Arc::new(Unverified(provider().signature_verification_algorithms));
+    let builder = ClientConfig::builder().dangerous().with_custom_certificate_verifier(verifier);
+    let mut c = match cert.map(|(c, k, p)| load(c, k, p)).transpose()? {
+        Some((chain, key)) => builder.with_client_auth_cert(chain, key).map_err(|e| e.to_string())?,
+        None => builder.with_no_client_auth(),
+    };
+    c.enable_sni = false;
+    if !reuse { c.resumption = rustls::client::Resumption::disabled(); }
+    Ok(Arc::new(c))
+}
+
+/// Connects to a proxied server over TLS; the plain end of the connection,
+/// or the error the handshake failed with (WouldBlock once the timeout passed).
+pub fn connect(tcp: TcpStream, peer: IpAddr, timeout: Duration, config: &Arc<ClientConfig>) -> std::io::Result<TcpStream> {
     let conn = ClientConnection::new(config.clone(), ServerName::from(peer)).map_err(std::io::Error::other)?;
-    pipe(tcp, conn.into(), timeout).map(|(s, _)| s)
+    pipe(tcp, conn.into(), timeout).map(|(s, ..)| s)
 }
 
 /// Completes the handshake, then passes data between the TLS connection and
 /// one end of a socket pair in a thread of its own, and gives the other end,
 /// on which twinx reads and writes as on a TCP connection.
-fn pipe(mut tcp: TcpStream, mut tls: Connection, timeout: Duration) -> std::io::Result<(TcpStream, Session)> {
+/// Also gives the certificates the peer sent.
+fn pipe(mut tcp: TcpStream, mut tls: Connection, timeout: Duration) -> std::io::Result<(TcpStream, Session, Vec<CertificateDer<'static>>)> {
     let _ = tcp.set_read_timeout(Some(timeout));
     while tls.is_handshaking() { tls.complete_io(&mut tcp)?; }
     let _ = tcp.set_read_timeout(None);
     let protocol = tls.protocol_version().map(|v| format!("{v:?}").replace('_', ".")).unwrap_or_default();
-    let session = Session { protocol, reused: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed) };
+    let session = Session { protocol, reused: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed), verify: String::new(), subject: None };
+    let chain = tls.peer_certificates().map(<[_]>::to_vec).unwrap_or_default();
     let (ours, theirs) = UnixStream::pair()?;
     std::thread::spawn(move || pump(tcp, tls, theirs));
     // SAFETY: the descriptor is a connected stream socket that nothing else owns; the
     // calls twinx makes on a TcpStream (read, write, shutdown, timeouts, poll) work on it.
-    Ok((unsafe { TcpStream::from_raw_fd(ours.into_raw_fd()) }, session))
+    Ok((unsafe { TcpStream::from_raw_fd(ours.into_raw_fd()) }, session, chain))
 }
 
 /// Decrypts what the peer sends into the socket pair, and encrypts what twinx
@@ -186,9 +278,32 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
     #[test]
     fn loads_certificates() {
         let dir = dir();
-        assert_eq!(certificate(&dir.join("c.pem"), &dir.join("k.pem")).unwrap().cert.len(), 1);
-        assert_eq!(certificate(&dir.join("none"), &dir.join("k.pem")).unwrap_err(), format!("cannot load certificate \"{}\"", dir.join("none").display()));
-        assert_eq!(certificate(&dir.join("c.pem"), &dir.join("c.pem")).unwrap_err(), format!("cannot load certificate key \"{}\"", dir.join("c.pem").display()));
+        assert_eq!(load(&dir.join("c.pem"), &dir.join("k.pem"), None).unwrap().0.len(), 1);
+        assert_eq!(load(&dir.join("none"), &dir.join("k.pem"), None).unwrap_err(), format!("cannot load certificate \"{}\"", dir.join("none").display()));
+        assert_eq!(load(&dir.join("c.pem"), &dir.join("c.pem"), None).unwrap_err(), format!("cannot load certificate key \"{}\"", dir.join("c.pem").display()));
+        assert!(load(&dir.join("c.pem"), &dir.join("k.pem"), Some(&dir.join("none"))).unwrap_err().starts_with("open() "));
+        assert_eq!(trusted(&dir.join("c.pem")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn decrypts_keys_with_the_password_that_works() {
+        let dir = dir();
+        // The key above, encrypted as openssl does (PBES2, AES-128-CBC) with the password "right".
+        let encrypted = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIHsMFcGCSqGSIb3DQEFDTBKMCkGCSqGSIb3DQEFDDAcBAjFTCshcGXqRQICCAAw\nDAYIKoZIhvcNAgkFADAdBglghkgBZQMEAQIEEE4Q9tYczPUHfCtbunvgXjcEgZCF\nZEkeGhOhIcDghmEGcasLrWUT9mM7JCtGch9N9XhIdxCtpRVi7y7BdDoJx3qbbuL/\ns13ZM5I8hD8DXSitMu7hbJGEg332YbZ/h8qknf0owJaNNWwj2t2tiOT4gR6Ei9C4\n6HZM+qGHgPRfZoSlQpEBrlAJmGaXPXcBu3LZ1K5KmJbzaz9kp+jdx9GbkrYbH8g=\n-----END ENCRYPTED PRIVATE KEY-----\n";
+        std::fs::write(dir.join("e.pem"), encrypted).unwrap();
+        std::fs::write(dir.join("passwords"), "wrong\nright\n").unwrap();
+        std::fs::write(dir.join("wrong"), "wrong").unwrap();
+        assert!(load(&dir.join("c.pem"), &dir.join("e.pem"), Some(&dir.join("passwords"))).is_ok());
+        assert!(load(&dir.join("c.pem"), &dir.join("e.pem"), Some(&dir.join("wrong"))).is_err());
+    }
+
+    #[test]
+    fn verifies_and_names_client_certificates() {
+        let cert = CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap();
+        assert_eq!(verified(&[], &[]), "NONE");
+        assert_eq!(verified(std::slice::from_ref(&cert), std::slice::from_ref(&cert)), "SUCCESS");
+        assert_eq!(verified(std::slice::from_ref(&cert), &[]), "FAILED:self-signed certificate");
+        assert_eq!(subject(&cert).as_deref(), Some("CN=localhost"));
     }
 
     #[test]
@@ -196,14 +311,14 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
         let dir = dir();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        let text = format!("http {{ server {{ listen {addr} ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; }} }}");
+        let text = format!("http {{ server {{ listen {addr} ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; ssl_verify_client optional_no_ca; ssl_trusted_certificate c.pem; }} }}");
         let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
         assert_eq!(config.servers[0].ssl, [addr]);
-        let tls = server(config, addr);
-        let accepted = std::thread::spawn(move || accept(l.accept().unwrap().0, &tls).unwrap());
-        let mut client = connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5), false).unwrap();
+        let accepted = std::thread::spawn(move || accept(l.accept().unwrap().0, &config, addr).unwrap());
+        let c = dir.join("c.pem");
+        let mut client = connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5), &client(false, Some((&c, &dir.join("k.pem"), None))).unwrap()).unwrap();
         let (mut server, session) = accepted.join().unwrap();
-        assert_eq!(session, Session { protocol: "TLSv1.3".into(), reused: false });
+        assert_eq!(session, Session { protocol: "TLSv1.3".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()) });
         let mut buf = [0u8; 4];
         client.write_all(b"ping").unwrap();
         server.read_exact(&mut buf).unwrap();
@@ -222,7 +337,7 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
     fn a_handshake_that_does_not_end_in_time_times_out() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        let e = connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_millis(100), true).unwrap_err();
+        let e = connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_millis(100), &client(true, None).unwrap()).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
         drop(l);
     }
@@ -232,7 +347,7 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let peer = std::thread::spawn(move || { let mut s = l.accept().unwrap().0; s.write_all(b"HTTP/1.0 400\r\n\r\n").unwrap(); });
-        assert!(connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5), true).is_err());
+        assert!(connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5), &client(true, None).unwrap()).is_err());
         peer.join().unwrap();
     }
 }
