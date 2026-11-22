@@ -92,8 +92,8 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
                 let (config, fresh, tls) = (config.clone(), Busy::new(), tls.clone());
                 let local = stream.local_addr().unwrap_or(addr);
                 thread::spawn(move || {
-                    let Some(stream) = (match tls { Some(t) => crate::tls::accept(stream, &t), None => Some(stream) }) else { return };
-                    connection(&config, stream, (addr, local, peer), fresh)
+                    let Some((stream, ssl)) = (match tls { Some(t) => crate::tls::accept(stream, &t).map(|(s, ssl)| (s, Some(ssl))), None => Some((stream, None)) }) else { return };
+                    connection(&config, stream, (addr, local, peer, ssl), fresh)
                 });
             }
             ACCEPTING.fetch_sub(1, Ordering::SeqCst);
@@ -111,7 +111,7 @@ fn head_end(buf: &[u8]) -> Option<usize> {
 
 /// Serves the requests of a connection accepted on a listening address,
 /// with its local and remote addresses.
-fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer): (SocketAddr, SocketAddr, SocketAddr), fresh: Busy) {
+fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<crate::tls::Session>), fresh: Busy) {
     let mut fresh = Some(fresh);
     let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
     // After a kept-alive answer: how long the connection waits for the next request.
@@ -159,6 +159,7 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer): (So
             vars: Default::default(),
             unread: Default::default(),
             client: std::os::fd::AsRawFd::as_raw_fd(&stream),
+            ssl: ssl.clone(),
         };
         let parsed = parse(&mut r, &head, &default.level);
         let parsed = overflowed.map_or(parsed, Err);
@@ -1099,8 +1100,10 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
         statuses.push(status.unwrap_or(502).to_string());
         // proxy_next_upstream_tries and proxy_next_upstream_timeout end the tries too.
         let timeout = level.proxy_next_upstream_timeout;
-        let again = status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) && (timeout.is_zero() || first.elapsed() < timeout);
-        up.done(i, answer.is_none() || again && !matches!(status, Some(403 | 404)));
+        // The page fetch() generates for a timeout, rather than an answer of the server.
+        let timed_out = answer.as_ref().is_some_and(|a| a.generated);
+        let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout);
+        up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404)));
         if !again || tries == 0 { break; }
         answer = None;
     }
@@ -1236,7 +1239,9 @@ fn fetch((peer, ssl): (&SocketAddr, bool), socket: Option<socket2::Socket>, req:
         None => TcpStream::connect_timeout(peer, level.proxy_connect_timeout).ok()?,
     };
     // proxy_pass https://: the TLS handshake is part of connecting.
-    let mut s = if ssl { crate::tls::connect(s, peer.ip(), level.proxy_connect_timeout)? } else { s };
+    // A handshake that does not end within proxy_connect_timeout is a timeout, answered with 504.
+    let tls = |s| crate::tls::connect(s, peer.ip(), level.proxy_connect_timeout, level.proxy_ssl_session_reuse);
+    let mut s = if ssl { match tls(s) { Ok(s) => s, Err(e) => return (e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504)) } } else { s };
     time[0] = Some(start.elapsed().as_millis());
     let _ = s.set_read_timeout(Some(level.proxy_read_timeout));
     let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
@@ -1715,6 +1720,7 @@ mod tests {
             vars: Default::default(),
             unread: Default::default(),
             client: -1,
+            ssl: None,
         };
         (parse(&mut r, head.as_bytes(), &Level::default()), r)
     }

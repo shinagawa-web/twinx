@@ -53,10 +53,18 @@ pub fn server(config: Arc<Config>, listen: SocketAddr) -> Arc<ServerConfig> {
     Arc::new(ServerConfig::builder().with_no_client_auth().with_cert_resolver(Arc::new(Sni(config, listen))))
 }
 
+/// What the variables tell of a TLS connection: the protocol ($ssl_protocol,
+/// "TLSv1.3") and whether its session was reused ($ssl_session_reused).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Session {
+    pub protocol: String,
+    pub reused: bool,
+}
+
 /// Takes a TLS connection from a client: the handshake, then the plain end of it.
-pub fn accept(tcp: TcpStream, config: &Arc<ServerConfig>) -> Option<TcpStream> {
+pub fn accept(tcp: TcpStream, config: &Arc<ServerConfig>) -> Option<(TcpStream, Session)> {
     let conn = ServerConnection::new(config.clone()).ok()?;
-    pipe(tcp, conn.into(), HANDSHAKE)
+    pipe(tcp, conn.into(), HANDSHAKE).ok()
 }
 
 /// A proxied server's certificate is not verified, as with proxy_ssl_verify
@@ -82,31 +90,36 @@ impl ServerCertVerifier for Unverified {
 }
 
 /// Connects to a proxied server over TLS without SNI, as proxy_ssl_server_name
-/// off does; the plain end of the connection, None when the handshake fails.
-pub fn connect(tcp: TcpStream, peer: IpAddr, timeout: Duration) -> Option<TcpStream> {
-    static CLIENT: OnceLock<Arc<ClientConfig>> = OnceLock::new();
-    let config = CLIENT.get_or_init(|| {
+/// off does, reusing the sessions of earlier connections to it when
+/// proxy_ssl_session_reuse is on; the plain end of the connection, or the
+/// error the handshake failed with (WouldBlock once the timeout passed).
+pub fn connect(tcp: TcpStream, peer: IpAddr, timeout: Duration, reuse: bool) -> std::io::Result<TcpStream> {
+    static CLIENTS: [OnceLock<Arc<ClientConfig>>; 2] = [OnceLock::new(), OnceLock::new()];
+    let config = CLIENTS[reuse as usize].get_or_init(|| {
         let verifier = Arc::new(Unverified(provider().signature_verification_algorithms));
         let mut c = ClientConfig::builder().dangerous().with_custom_certificate_verifier(verifier).with_no_client_auth();
         c.enable_sni = false;
+        if !reuse { c.resumption = rustls::client::Resumption::disabled(); }
         Arc::new(c)
     });
-    let conn = ClientConnection::new(config.clone(), ServerName::from(peer)).ok()?;
-    pipe(tcp, conn.into(), timeout)
+    let conn = ClientConnection::new(config.clone(), ServerName::from(peer)).map_err(std::io::Error::other)?;
+    pipe(tcp, conn.into(), timeout).map(|(s, _)| s)
 }
 
 /// Completes the handshake, then passes data between the TLS connection and
 /// one end of a socket pair in a thread of its own, and gives the other end,
 /// on which twinx reads and writes as on a TCP connection.
-fn pipe(mut tcp: TcpStream, mut tls: Connection, timeout: Duration) -> Option<TcpStream> {
+fn pipe(mut tcp: TcpStream, mut tls: Connection, timeout: Duration) -> std::io::Result<(TcpStream, Session)> {
     let _ = tcp.set_read_timeout(Some(timeout));
-    while tls.is_handshaking() { tls.complete_io(&mut tcp).ok()?; }
+    while tls.is_handshaking() { tls.complete_io(&mut tcp)?; }
     let _ = tcp.set_read_timeout(None);
-    let (ours, theirs) = UnixStream::pair().ok()?;
+    let protocol = tls.protocol_version().map(|v| format!("{v:?}").replace('_', ".")).unwrap_or_default();
+    let session = Session { protocol, reused: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed) };
+    let (ours, theirs) = UnixStream::pair()?;
     std::thread::spawn(move || pump(tcp, tls, theirs));
     // SAFETY: the descriptor is a connected stream socket that nothing else owns; the
     // calls twinx makes on a TcpStream (read, write, shutdown, timeouts, poll) work on it.
-    Some(unsafe { TcpStream::from_raw_fd(ours.into_raw_fd()) })
+    Ok((unsafe { TcpStream::from_raw_fd(ours.into_raw_fd()) }, session))
 }
 
 /// Decrypts what the peer sends into the socket pair, and encrypts what twinx
@@ -188,8 +201,9 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
         assert_eq!(config.servers[0].ssl, [addr]);
         let tls = server(config, addr);
         let accepted = std::thread::spawn(move || accept(l.accept().unwrap().0, &tls).unwrap());
-        let mut client = connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5)).unwrap();
-        let mut server = accepted.join().unwrap();
+        let mut client = connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5), false).unwrap();
+        let (mut server, session) = accepted.join().unwrap();
+        assert_eq!(session, Session { protocol: "TLSv1.3".into(), reused: false });
         let mut buf = [0u8; 4];
         client.write_all(b"ping").unwrap();
         server.read_exact(&mut buf).unwrap();
@@ -205,11 +219,20 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
     }
 
     #[test]
+    fn a_handshake_that_does_not_end_in_time_times_out() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let e = connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_millis(100), true).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+        drop(l);
+    }
+
+    #[test]
     fn a_failed_handshake_gives_no_connection() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let peer = std::thread::spawn(move || { let mut s = l.accept().unwrap().0; s.write_all(b"HTTP/1.0 400\r\n\r\n").unwrap(); });
-        assert!(connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5)).is_none());
+        assert!(connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5), true).is_err());
         peer.join().unwrap();
     }
 }

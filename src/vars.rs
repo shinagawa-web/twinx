@@ -53,6 +53,8 @@ pub struct Request {
     /// The variables set gives values to, and the captures of the last regular
     /// expression matched ("1", "2", ...); shared by the internal redirects of the request.
     pub vars: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// The TLS session of a connection accepted with "ssl".
+    pub ssl: Option<crate::tls::Session>,
 }
 
 impl Request {
@@ -172,8 +174,10 @@ pub enum Var {
     ProxyAddXForwardedFor,
     Pid,
     ServerName,
-    /// The scheme of the request: http, as twinx listens only for plain HTTP.
+    /// The scheme of the request: https on a TLS connection, else http.
     Scheme,
+    SslProtocol,
+    SslSessionReused,
     LimitRate,
     /// A named capture of the server name's regular expression.
     Capture(String),
@@ -204,6 +208,7 @@ impl Var {
             ("upstream_response_length", Var::UpstreamBytes(0)), ("upstream_bytes_received", Var::UpstreamBytes(1)), ("upstream_bytes_sent", Var::UpstreamBytes(2)),
             ("proxy_host", Var::ProxyHost), ("proxy_port", Var::ProxyPort), ("proxy_add_x_forwarded_for", Var::ProxyAddXForwardedFor),
             ("server_name", Var::ServerName), ("scheme", Var::Scheme), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
+            ("ssl_protocol", Var::SslProtocol), ("ssl_session_reused", Var::SslSessionReused),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -247,7 +252,9 @@ impl Var {
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
             Var::Pid => std::process::id().to_string(),
             Var::ServerName => r.server_name.clone(),
-            Var::Scheme => "http".to_string(),
+            Var::Scheme => (if r.ssl.is_some() { "https" } else { "http" }).to_string(),
+            Var::SslProtocol => r.ssl.as_ref()?.protocol.clone(),
+            Var::SslSessionReused => (if r.ssl.as_ref()?.reused { "r" } else { "." }).to_string(),
             Var::LimitRate => r.limit_rate.get().unwrap_or(0).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
             Var::User(name) => r.vars.lock().unwrap().iter().find(|v| v.0 == *name)?.1.clone(),
@@ -490,6 +497,7 @@ mod tests {
             vars: Default::default(),
             unread: Default::default(),
             client: -1,
+            ssl: None,
         }
     }
 
