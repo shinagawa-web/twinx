@@ -1593,7 +1593,12 @@ pub fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) ->
         ServerName::Regex(re) => re.captures(host).map(|c| (s, re.capture_names().flatten().filter_map(|name| Some((name.to_string(), c.name(name)?.as_str().to_string()))).collect())),
         _ => None,
     });
-    regex.unwrap_or_else(|| (on().next().unwrap_or(&config.servers[0]), Vec::new()))
+    regex.unwrap_or_else(|| (default_server(config, listen), Vec::new()))
+}
+
+/// The default server of a listening address: the first server listening there.
+pub fn default_server(config: &Config, listen: SocketAddr) -> &Server {
+    config.servers.iter().find(|s| s.listen.contains(&listen)).unwrap_or(&config.servers[0])
 }
 
 /// The host as $host gives it: lower case, without the port or a trailing

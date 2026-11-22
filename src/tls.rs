@@ -524,7 +524,11 @@ pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option
         if let Some(hello) = acceptor.accept().ok()? { break hello }
     };
     let name = hello.client_hello().server_name().unwrap_or_default().to_string();
-    let tls = crate::http::server(config, listen, hello.client_hello().server_name()).0.tls.as_ref()?;
+    let server = crate::http::server(config, listen, hello.client_hello().server_name()).0;
+    // A rejected handshake gets a fatal unrecognized_name alert, as OpenSSL sends it.
+    if server.level.ssl_reject_handshake { let _ = tcp.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70]); return None }
+    // A server without certificates of its own takes the default server's.
+    let tls = server.tls.as_ref().or(crate::http::default_server(config, listen).tls.as_ref())?;
     let ciphers = hello.client_hello().cipher_suites().iter().map(|c| cipher(u16::from(*c))).collect::<Vec<_>>().join(":");
     let curves = hello.client_hello().named_groups().unwrap_or_default().iter().map(|g| curve(u16::from(*g))).collect::<Vec<_>>().join(":");
     let mut conn = hello.into_connection(tls.for_connection(&tcp, &name)?).ok()?;
@@ -1068,6 +1072,22 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         use rustls::server::ProducesTickets;
         assert!(tickets.enabled() && tickets.lifetime() == 10);
         assert_eq!(tickets.decrypt(&tickets.encrypt(b"t").unwrap()), Some(b"t".to_vec()));
+    }
+
+    #[test]
+    fn rejects_handshakes_and_lends_the_default_certificate() {
+        let dir = dir();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; }} server {{ listen {addr}; server_name virtual1; }} server {{ listen {addr}; server_name virtual2; ssl_reject_handshake on; }} }}");
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+        let accepted = std::thread::spawn(move || (0..2).map(|_| accept(l.accept().unwrap().0, &config, addr).map(|a| a.1.server_name)).collect::<Vec<_>>());
+        let tls = client((false, true), None, None).unwrap();
+        let ok = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), Some("virtual1")), Duration::from_secs(5), &tls).unwrap();
+        drop(ok);
+        let refused = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), Some("virtual2")), Duration::from_secs(5), &tls).err().unwrap();
+        assert!(format!("{refused:?}").contains("UnrecognisedName"), "{refused:?}");
+        assert_eq!(accepted.join().unwrap(), [Some("virtual1".to_string()), None]);
     }
 
     #[test]
