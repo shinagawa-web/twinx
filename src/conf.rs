@@ -95,6 +95,11 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_ssl_certificate_key", HSL, 1, 1, false),
     ("proxy_ssl_password_file", HSL, 1, 1, false),
     ("proxy_ssl_certificate_cache", HSL, 1, 3, false),
+    ("proxy_ssl_verify", HSL, 1, 1, false),
+    ("proxy_ssl_trusted_certificate", HSL, 1, 1, false),
+    ("proxy_ssl_crl", HSL, 1, 1, false),
+    ("proxy_ssl_verify_depth", HSL, 1, 1, false),
+    ("proxy_ssl_name", HSL, 1, 1, false),
     ("proxy_method", HSL, 1, 1, false),
     ("proxy_set_body", HSL, 1, 1, false),
     ("expires", HSL | LIF, 1, 2, false),
@@ -450,6 +455,15 @@ pub struct Level {
     pub proxy_ssl_certificate_vars: Option<(Template, Template, PathBuf)>,
     /// proxy_ssl_certificate_cache: what those connections keep loaded.
     pub proxy_ssl_certificate_cache: Option<Arc<crate::tls::CertCache>>,
+    /// proxy_ssl_verify, proxy_ssl_trusted_certificate, proxy_ssl_crl and
+    /// proxy_ssl_verify_depth: whether, and with what, proxied servers'
+    /// certificates are verified.
+    pub proxy_ssl_verify: bool,
+    pub proxy_ssl_trusted_certificate: Option<PathBuf>,
+    pub proxy_ssl_crl: Option<PathBuf>,
+    pub proxy_ssl_verify_depth: usize,
+    /// proxy_ssl_name: the name they are verified for, $proxy_host when not set.
+    pub proxy_ssl_name: Option<Template>,
     /// What connections to proxied servers over TLS are made with, made again
     /// at a level that sets one of the proxy_ssl_* directives above.
     pub proxy_tls: Option<Arc<rustls::ClientConfig>>,
@@ -597,7 +611,7 @@ impl Builder<'_> {
         // Without root, files come from html under the prefix, as nginx's default root is.
         let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_tls: Some(crate::tls::client(true, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, proxy_tls: Some(crate::tls::client(true, None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -745,6 +759,11 @@ impl Builder<'_> {
                 "proxy_ssl_certificate_key" => (level.proxy_ssl_certificate_key, own_tls) = (Some(Template::parse(&d.args[0]).map_err(at)?), true),
                 "proxy_ssl_certificate_cache" => level.proxy_ssl_certificate_cache = cert_cache(&d.args).map_err(at)?,
                 "proxy_ssl_password_file" => (level.proxy_ssl_password_file, own_tls) = (Some(self.path(&d.args[0])), true),
+                "proxy_ssl_verify" => (level.proxy_ssl_verify, own_tls) = (flag(d).map_err(at)?, true),
+                "proxy_ssl_trusted_certificate" => (level.proxy_ssl_trusted_certificate, own_tls) = (Some(self.path(&d.args[0])), true),
+                "proxy_ssl_crl" => (level.proxy_ssl_crl, own_tls) = (Some(self.path(&d.args[0])), true),
+                "proxy_ssl_verify_depth" => (level.proxy_ssl_verify_depth, own_tls) = (d.args[0].parse().map_err(|_| at(format!("invalid value \"{}\" in \"proxy_ssl_verify_depth\" directive", d.args[0])))?, true),
+                "proxy_ssl_name" => level.proxy_ssl_name = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_redirect" => {
                     let rule = if d.args == ["default"] {
                         let proxy = level.proxy.as_ref().filter(|_| own_proxy).ok_or_else(|| at("\"proxy_redirect default\" should be placed after the \"proxy_pass\" directive".into()))?;
@@ -863,7 +882,10 @@ impl Builder<'_> {
             let fixed = names.as_ref().and_then(|(c, k)| text(c).zip(text(k))).map(|(c, k)| (self.path(&c), self.path(&k)));
             level.proxy_ssl_certificate_vars = names.filter(|_| fixed.is_none()).map(|(c, k)| (c, k, self.prefix.to_path_buf()));
             let cert = fixed.as_ref().map(|(c, k)| (c.as_path(), k.as_path(), level.proxy_ssl_password_file.as_deref()));
-            level.proxy_tls = Some(crate::tls::client(level.proxy_ssl_session_reuse, cert)?);
+            // Without trusted certificates nothing verifies; a location that proxies over TLS must have them.
+            if level.proxy_ssl_verify && level.proxy_ssl_trusted_certificate.is_none() && level.proxy.as_ref().is_some_and(|p| p.ssl) { return Err("no proxy_ssl_trusted_certificate for proxy_ssl_verify".into()) }
+            let verify = level.proxy_ssl_verify.then(|| crate::tls::verify(level.proxy_ssl_trusted_certificate.as_deref(), level.proxy_ssl_crl.as_deref(), level.proxy_ssl_verify_depth)).transpose()?;
+            level.proxy_tls = Some(crate::tls::client(level.proxy_ssl_session_reuse, cert, verify)?);
         }
         // Without rules of its own or inherited, a location with proxy_pass has "proxy_redirect default".
         if level.proxy_redirect.as_ref().is_some_and(Vec::is_empty) && own_proxy {
@@ -1703,6 +1725,16 @@ mod tests {
         let redirect = s.locations[0].level.proxy_redirect.as_ref().unwrap();
         assert!(matches!(&redirect[0].pattern, CookiePattern::Text(t) if matches!(&t.0[..], [Part::Text(u)] if u == "https://127.0.0.1/u")));
         assert_eq!(s.locations[1].level.limit_except.as_ref().unwrap().0, ["GET", "HEAD"]);
+    }
+
+    #[test]
+    fn proxy_ssl_verify() {
+        let e = build_text("http { proxy_ssl_verify on; server { listen 127.0.0.1:8080; location / { proxy_pass https://127.0.0.1:8081; proxy_ssl_verify on; } } }").unwrap_err();
+        assert!(e.contains("no proxy_ssl_trusted_certificate for proxy_ssl_verify"), "{e}");
+        let e = build_text("http { server { listen 127.0.0.1:8080; location / { proxy_ssl_verify_depth x; } } }").unwrap_err();
+        assert!(e.contains("invalid value \"x\" in \"proxy_ssl_verify_depth\" directive"), "{e}");
+        let c = build_text("http { proxy_ssl_verify on; proxy_ssl_name $host; server { listen 127.0.0.1:8080; location / { proxy_ssl_verify_depth 2; } } }").unwrap();
+        assert!(c.servers[0].level.proxy_ssl_verify && c.servers[0].level.proxy_ssl_name.is_some());
     }
 
     #[test]
