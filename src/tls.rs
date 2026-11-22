@@ -313,9 +313,10 @@ impl rustls::server::ProducesTickets for Timed<Rotated> {
 /// The certificates a server presents, the same for every connection: one
 /// for each type of key, a later one replacing an earlier one of the same type,
 /// as OpenSSL keeps them. A connection gets the first that signs with an
-/// algorithm the client lists, in the client's order, or the first one.
+/// algorithm the client lists, in the client's order, or the first one, with
+/// its OCSP response stapled when the server staples them (ssl_stapling).
 #[derive(Debug)]
-struct Fixed(Vec<Arc<rustls::sign::CertifiedKey>>);
+struct Fixed(Vec<Arc<rustls::sign::CertifiedKey>>, Vec<Option<Arc<Staple>>>);
 
 impl Fixed {
     fn new(keys: Vec<Arc<rustls::sign::CertifiedKey>>) -> Fixed {
@@ -326,18 +327,78 @@ impl Fixed {
                 None => kept.push(key),
             }
         }
-        Fixed(kept)
+        Fixed(kept, Vec::new())
     }
 
     fn choose(&self, schemes: &[SignatureScheme]) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let signs = |scheme: &SignatureScheme| self.0.iter().find(|k| k.key.choose_scheme(&[*scheme]).is_some());
-        schemes.iter().find_map(signs).or(self.0.first()).cloned()
+        let signs = |scheme: &SignatureScheme| self.0.iter().position(|k| k.key.choose_scheme(&[*scheme]).is_some());
+        let i = schemes.iter().find_map(signs).or((!self.0.is_empty()).then_some(0))?;
+        Some(self.1.get(i).cloned().flatten().map_or_else(|| self.0[i].clone(), |s| s.key(&self.0[i])))
     }
 }
 
 impl rustls::server::ResolvesServerCert for Fixed {
     fn resolve(&self, hello: rustls::server::ClientHello) -> Option<Arc<rustls::sign::CertifiedKey>> {
         self.choose(hello.signature_schemes())
+    }
+}
+
+/// How a server staples OCSP responses to its certificates: ssl_stapling,
+/// with ssl_stapling_verify (verify), ssl_stapling_responder and
+/// ssl_stapling_file, whose response is stapled as it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stapling {
+    pub verify: bool,
+    pub responder: Option<String>,
+    pub file: Option<PathBuf>,
+}
+
+/// The OCSP response stapled to a certificate, as nginx keeps it. A
+/// connection asking for one while it is due to be refreshed has a new one
+/// fetched (source: the responder's URL, the request, the CertID and the
+/// issuer) while it is answered with the one there is. A good response is
+/// stapled until its next update and refreshed five minutes before that, an
+/// hour after it came at most; after an error, the next fetch waits five minutes.
+#[derive(Debug)]
+struct Staple {
+    source: Option<(String, Vec<u8>, Vec<u8>, Vec<u8>)>,
+    verify: bool,
+    /// The certificate with the response stapled and until when it holds,
+    /// when the response is to be refreshed, and whether it is being fetched.
+    state: Mutex<(Option<(Arc<rustls::sign::CertifiedKey>, i64)>, i64, bool)>,
+}
+
+impl Staple {
+    fn new(key: &rustls::sign::CertifiedKey, stapling: &Stapling, trusted: &[CertificateDer<'static>]) -> Result<Option<Arc<Staple>>, String> {
+        if let Some(file) = &stapling.file {
+            let response = std::fs::read(file).map_err(|e| format!("BIO_new_file(\"{}\") failed ({e})", file.display()))?;
+            let stapled = Arc::new(rustls::sign::CertifiedKey { ocsp: Some(response), ..key.clone() });
+            return Ok(Some(Arc::new(Staple { source: None, verify: false, state: Mutex::new((Some((stapled, i64::MAX)), i64::MAX, false)) })));
+        }
+        let source = crate::ocsp::stapled(&key.cert, trusted, stapling.responder.as_deref());
+        Ok(source.map(|source| Arc::new(Staple { source: Some(source), verify: stapling.verify, state: Mutex::new((None, 0, false)) })))
+    }
+
+    fn key(self: &Arc<Self>, key: &Arc<rustls::sign::CertifiedKey>) -> Arc<rustls::sign::CertifiedKey> {
+        let now = chrono::Utc::now().timestamp();
+        let mut state = self.state.lock().unwrap();
+        if now >= state.1 && !state.2 {
+            state.2 = true;
+            let (staple, key) = (self.clone(), key.clone());
+            std::thread::spawn(move || staple.refresh(&key));
+        }
+        state.0.as_ref().filter(|s| s.1 >= now).map_or_else(|| key.clone(), |s| s.0.clone())
+    }
+
+    fn refresh(&self, key: &rustls::sign::CertifiedKey) {
+        let now = chrono::Utc::now().timestamp();
+        let fetched = self.source.as_ref().and_then(|(url, request, id, issuer)| crate::ocsp::staple(url, (request, id, issuer), self.verify, now));
+        let mut state = self.state.lock().unwrap();
+        state.2 = false;
+        let Some((response, next)) = fetched else { state.1 = now + 300; return };
+        let valid = next.unwrap_or(i64::MAX);
+        state.0 = Some((Arc::new(rustls::sign::CertifiedKey { ocsp: Some(response), ..key.clone() }), valid));
+        state.1 = valid.saturating_sub(300).min(now + 3600).max(now + 300);
     }
 }
 
@@ -365,6 +426,8 @@ pub struct Options {
     pub ocsp: Option<crate::ocsp::Ocsp>,
     /// ssl_session_ticket_key: the files of the keys tickets are encrypted with.
     pub ticket_keys: Vec<PathBuf>,
+    /// ssl_stapling: how OCSP responses are stapled to the certificates; None does not.
+    pub stapling: Option<Stapling>,
 }
 
 /// The OpenSSL names of the TLS 1.2 cipher suites twinx has.
@@ -438,7 +501,9 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     let versions: Vec<_> = [&rustls::version::TLS12, &rustls::version::TLS13].into_iter().zip(options.protocols).filter_map(|(v, on)| on.then_some(v)).collect();
     let builder = ServerConfig::builder_with_provider(Arc::new(suites)).with_protocol_versions(&versions).map_err(|e| e.to_string())?;
     let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
-    let mut config = builder.with_cert_resolver(Arc::new(Fixed::new(fixed)));
+    let mut fixed = Fixed::new(fixed);
+    if let Some(stapling) = &options.stapling { fixed.1 = fixed.0.iter().map(|k| Staple::new(k, stapling, &trusted)).collect::<Result<_, _>>()?; }
+    let mut config = builder.with_cert_resolver(Arc::new(fixed));
     // Certificates are compressed with zlib, for TLS 1.3 clients that offer it.
     config.ignore_client_order = options.prefer;
     config.cert_compressors = if options.compress { vec![rustls::compress::ZLIB_COMPRESSOR] } else { Vec::new() };
@@ -1027,6 +1092,24 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 ";
 
     #[test]
+    fn staples_the_response_of_a_file_or_fetched() {
+        let dir = dir();
+        std::fs::write(dir.join("resp.der"), b"response").unwrap();
+        let key = certified(vec![der(CERT)], PrivateKeyDer::from_pem_slice(KEY.as_bytes()).unwrap()).unwrap();
+        let stapling = |file: Option<&str>, responder: Option<&str>| Stapling { verify: false, responder: responder.map(str::to_string), file: file.map(|f| dir.join(f)) };
+        let filed = Staple::new(&key, &stapling(Some("resp.der"), None), &[]).unwrap().unwrap();
+        let fixed = Fixed(vec![key.clone()], vec![Some(filed)]);
+        assert_eq!(fixed.choose(&[]).unwrap().ocsp.as_deref(), Some(&b"response"[..]));
+        assert!(Staple::new(&key, &stapling(Some("none"), None), &[]).unwrap_err().starts_with("BIO_new_file("));
+        // A certificate without an issuer has nothing stapled.
+        assert!(Staple::new(&key, &stapling(None, Some("http://127.0.0.1:1/")), &[]).unwrap().is_none());
+        let fetched = Arc::new(Staple { source: Some(("http://127.0.0.1:1/".into(), Vec::new(), Vec::new(), Vec::new())), verify: false, state: Mutex::new((None, 0, false)) });
+        assert!(fetched.key(&key).ocsp.is_none());
+        while fetched.state.lock().unwrap().2 { std::thread::yield_now(); }
+        assert!(fetched.state.lock().unwrap().1 > chrono::Utc::now().timestamp());
+    }
+
+    #[test]
     fn gives_the_client_certificate_in_pem() {
         let session = Session { cert: Some(der(CERT)), ..Session::default() };
         assert_eq!(session.client_var("raw_cert"), CERT);
@@ -1067,7 +1150,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = dir();
         let names = [(&*dir.join("$ssl_server_name"), &*dir.join("k.pem"))];
         let files = (&names[..], None);
-        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: false, curves: None, crl: None, depth: 1, ocsp: None, ticket_keys: Vec::new() };
+        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: false, curves: None, crl: None, depth: 1, ocsp: None, ticket_keys: Vec::new(), stapling: None };
         let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), &[], options.clone()).unwrap();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();

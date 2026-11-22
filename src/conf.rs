@@ -106,6 +106,10 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_client_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_crl", HTTP | SRV, 1, 1, false),
     ("ssl_ocsp", HTTP | SRV, 1, 1, false),
+    ("ssl_stapling", HTTP | SRV, 1, 1, false),
+    ("ssl_stapling_file", HTTP | SRV, 1, 1, false),
+    ("ssl_stapling_responder", HTTP | SRV, 1, 1, false),
+    ("ssl_stapling_verify", HTTP | SRV, 1, 1, false),
     ("ssl_ocsp_responder", HTTP | SRV, 1, 1, false),
     ("ssl_ocsp_cache", HTTP | SRV, 1, 1, false),
     ("ssl_verify_depth", HTTP | SRV, 1, 1, false),
@@ -503,6 +507,11 @@ pub struct Level {
     pub ssl_ocsp: Option<bool>,
     pub ssl_ocsp_responder: Option<String>,
     pub ssl_ocsp_cache: Option<String>,
+    /// ssl_stapling, ssl_stapling_file, ssl_stapling_responder and ssl_stapling_verify.
+    pub ssl_stapling: bool,
+    pub ssl_stapling_file: Option<PathBuf>,
+    pub ssl_stapling_responder: Option<String>,
+    pub ssl_stapling_verify: bool,
     /// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file:
     /// the certificate twinx presents to proxied servers.
     /// The certificate and key may have variables in their names.
@@ -727,7 +736,7 @@ impl Builder<'_> {
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
         let l = &s.level;
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
-        let mut options = crate::tls::Options { verify: l.ssl_verify_client > 0, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, curves: l.ssl_ecdh_curve.clone(), crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth, ocsp: l.ssl_ocsp.map(|leaf| crate::ocsp::Ocsp { leaf, responder: l.ssl_ocsp_responder.clone(), cache: l.ssl_ocsp_cache.clone() }), ticket_keys: l.ssl_session_ticket_key.clone() };
+        let mut options = crate::tls::Options { verify: l.ssl_verify_client > 0, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, curves: l.ssl_ecdh_curve.clone(), crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth, ocsp: l.ssl_ocsp.map(|leaf| crate::ocsp::Ocsp { leaf, responder: l.ssl_ocsp_responder.clone(), cache: l.ssl_ocsp_cache.clone() }), ticket_keys: l.ssl_session_ticket_key.clone(), stapling: l.ssl_stapling.then(|| crate::tls::Stapling { verify: l.ssl_stapling_verify, responder: l.ssl_stapling_responder.clone(), file: l.ssl_stapling_file.clone() }) };
         let extra = conf_commands(&l.ssl_conf_command, &mut options)?;
         let pairs = l.ssl_certificate.iter().zip(&l.ssl_certificate_key).chain(extra[0].iter().zip(&extra[1]));
         let files: Vec<(&Path, &Path)> = pairs.map(|(cert, key)| (cert.as_path(), key.as_path())).collect();
@@ -848,7 +857,13 @@ impl Builder<'_> {
                 "ssl_password_file" => level.ssl_password_file = Some(self.path(&d.args[0])),
                 "ssl_verify_client" => level.ssl_verify_client = ["off", "on", "optional", "optional_no_ca"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_verify_client\" directive, it must be \"on\", \"off\", \"optional\" or \"optional_no_ca\"", d.args[0])))? as u8,
                 "ssl_ocsp" => level.ssl_ocsp = [("off", None), ("on", Some(false)), ("leaf", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_ocsp\" directive, it must be \"on\", \"off\" or \"leaf\"", d.args[0])))?.1,
-                "ssl_ocsp_responder" => level.ssl_ocsp_responder = Some(Some(d.args[0].clone()).filter(|u| u.starts_with("http://")).ok_or_else(|| at(format!("invalid URL prefix in OCSP responder \"{}\" in resolver", d.args[0])))?),
+                "ssl_ocsp_responder" | "ssl_stapling_responder" => {
+                    let url = Some(d.args[0].clone()).filter(|u| u.starts_with("http://")).ok_or_else(|| at(format!("invalid URL prefix in OCSP responder \"{}\" in resolver", d.args[0])))?;
+                    if d.name == "ssl_ocsp_responder" { level.ssl_ocsp_responder = Some(url) } else { level.ssl_stapling_responder = Some(url) }
+                }
+                "ssl_stapling" => level.ssl_stapling = flag(d).map_err(at)?,
+                "ssl_stapling_verify" => level.ssl_stapling_verify = flag(d).map_err(at)?,
+                "ssl_stapling_file" => level.ssl_stapling_file = Some(self.path(&d.args[0])),
                 "ssl_ocsp_cache" => level.ssl_ocsp_cache = ocsp_cache(&d.args[0]).map_err(at)?,
                 "ssl_trusted_certificate" => level.ssl_trusted_certificate = Some(self.path(&d.args[0])),
                 "ssl_client_certificate" => level.ssl_client_certificate = Some(self.path(&d.args[0])),
@@ -1933,6 +1948,15 @@ mod tests {
     }
 
     #[test]
+    fn ssl_stapling() {
+        let c = build_text("http { ssl_stapling on; ssl_stapling_verify on; ssl_stapling_responder http://127.0.0.1:8081/; server { ssl_stapling_file resp.der; } }").unwrap();
+        let l = &c.servers[0].level;
+        assert_eq!((l.ssl_stapling, l.ssl_stapling_verify, l.ssl_stapling_responder.as_deref()), (true, true, Some("http://127.0.0.1:8081/")));
+        assert!(l.ssl_stapling_file.as_ref().unwrap().ends_with("resp.der"));
+        assert!(build_text("http { ssl_stapling_responder https://a; }").unwrap_err().starts_with("invalid URL prefix in OCSP responder \"https://a\""));
+    }
+
+    #[test]
     fn ssl_ocsp() {
         let c = build_text("http { ssl_ocsp leaf; ssl_ocsp_responder http://127.0.0.1:8080/x; ssl_ocsp_cache shared:OCSP:1m; ssl_verify_client optional_no_ca; server { listen 127.0.0.1:8080; ssl_ocsp_cache off; } }").unwrap();
         let level = &c.servers[0].level;
@@ -1952,7 +1976,7 @@ mod tests {
 
     #[test]
     fn ssl_conf_commands() {
-        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, curves: None, crl: None, depth: 1, ocsp: None, ticket_keys: Vec::new() };
+        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, curves: None, crl: None, depth: 1, ocsp: None, ticket_keys: Vec::new(), stapling: None };
         let commands = |c: &[(&str, &str)]| c.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
         let files = conf_commands(&commands(&[("Options", "-SessionTicket, -ServerPreference"), ("Certificate", "/c.crt"), ("PrivateKey", "/c.key")]), &mut options).unwrap();
         assert!(!options.sessions.tickets && !options.prefer);

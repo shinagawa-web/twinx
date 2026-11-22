@@ -22,7 +22,7 @@ pub struct Ocsp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Status {
+pub enum Status {
     Good,
     Revoked,
     Unknown,
@@ -52,10 +52,39 @@ impl Ocsp {
         let key = self.cache.clone().map(|zone| (zone, id.clone()));
         if let Some((status, _)) = key.as_ref().and_then(|k| CACHE.lock().unwrap().get(k).copied()).filter(|e| e.1 > now) { return Some(status) }
         let url = self.responder.clone().or_else(|| responder(cert))?;
-        let (status, valid) = verify(&fetch(&url, &der(0x30, &der(0x30, &der(0x30, &der(0x30, &id)))))?, &id, issuer, now)?;
+        let (status, next) = verify(&fetch(&url, &request(&id))?, &id, issuer, now, true)?;
+        let valid = next.unwrap_or(now + 3600);
         if let Some(key) = key { CACHE.lock().unwrap().insert(key, (status, valid)); }
         Some(status)
     }
+}
+
+/// An OCSP request for one certificate, by its CertID.
+pub fn request(id: &[u8]) -> Vec<u8> {
+    der(0x30, &der(0x30, &der(0x30, &der(0x30, id))))
+}
+
+/// What stapling a server's certificate (ssl_stapling) asks, as nginx finds
+/// it: the responder's URL (ssl_stapling_responder, or the one the certificate
+/// names), the request, the certificate's CertID and its issuer, found among
+/// the certificates sent with it, or else among the trusted ones
+/// (ssl_trusted_certificate). None without an issuer or a responder.
+pub fn stapled(chain: &[rustls::pki_types::CertificateDer], trusted: &[rustls::pki_types::CertificateDer], responder_url: Option<&str>) -> Option<(String, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let cert = X509Certificate::from_der(chain.first()?).ok()?.1;
+    let issued = |d: &&rustls::pki_types::CertificateDer| X509Certificate::from_der(d).is_ok_and(|(_, c)| c.subject().as_raw() == cert.issuer().as_raw() && cert.verify_signature(Some(c.public_key())).is_ok());
+    let issuer_der = chain[1..].iter().chain(trusted).find(issued)?;
+    let id = cert_id(&cert, &X509Certificate::from_der(issuer_der).ok()?.1);
+    Some((responder_url.map(str::to_string).or_else(|| responder(&cert))?, request(&id), id, issuer_der.to_vec()))
+}
+
+/// The response a responder gives for stapling (ssl_stapling) and until when
+/// it holds, as nginx takes it: the certificate's status must be good. With
+/// ssl_stapling_verify (check) its signer is checked as ssl_ocsp checks it;
+/// without, only its signature is (OpenSSL's OCSP_NOVERIFY).
+pub fn staple(url: &str, (request, id, issuer): (&[u8], &[u8], &[u8]), check: bool, now: i64) -> Option<(Vec<u8>, Option<i64>)> {
+    let body = fetch(url, request)?;
+    let (status, next) = verify(&body, id, &X509Certificate::from_der(issuer).ok()?.1, now, check)?;
+    (status == Status::Good).then_some((body, next))
 }
 
 fn sha1(data: &[u8]) -> Vec<u8> {
@@ -130,9 +159,9 @@ fn fetch(url: &str, request: &[u8]) -> Option<Vec<u8>> {
 /// until which it holds, as OpenSSL takes it with OCSP_basic_verify and
 /// OCSP_check_validity for nginx: a successful basic response, signed by the
 /// certificate's issuer or by a responder it issued a certificate for OCSP
-/// signing, valid now with five minutes' leeway. Without a next update, the
-/// status holds for an hour.
-fn verify(body: &[u8], id: &[u8], issuer: &X509Certificate, now: i64) -> Option<(Status, i64)> {
+/// signing (unless check is false), valid now with five minutes' leeway;
+/// the status and its next update, if there is one.
+fn verify(body: &[u8], id: &[u8], issuer: &X509Certificate, now: i64, check: bool) -> Option<(Status, Option<i64>)> {
     const BASIC: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
     let response = items(tlv(body)?.1)?;
     let bytes = items(tlv(response.get(1)?.1)?.1)?;
@@ -149,12 +178,12 @@ fn verify(body: &[u8], id: &[u8], issuer: &X509Certificate, now: i64) -> Option<
     x509_parser::verify::verify_signature(signer.public_key(), &alg, &x509_parser::asn1_rs::BitString::new(*bits.0, bits.1), tbs.2).ok()?;
     let itself = signer.subject().as_raw() == issuer.subject().as_raw() && signer.public_key().raw == issuer.public_key().raw;
     let delegated = signer.issuer().as_raw() == issuer.subject().as_raw() && signer.verify_signature(Some(issuer.public_key())).is_ok() && signer.extended_key_usage().ok().flatten().is_some_and(|e| e.value.ocsp_signing);
-    let single = responses.iter().filter_map(|r| items(r.1)).find(|r| r.first().is_some_and(|c| c.2 == id)).filter(|_| itself || delegated)?;
+    let single = responses.iter().filter_map(|r| items(r.1)).find(|r| r.first().is_some_and(|c| c.2 == id)).filter(|_| !check || itself || delegated)?;
     let status = match single.get(1)?.0 { 0x80 => Status::Good, 0xa1 => Status::Revoked, _ => Status::Unknown };
     let time = |d: &[u8]| chrono::NaiveDateTime::parse_from_str(std::str::from_utf8(d).ok()?, "%Y%m%d%H%M%SZ").ok().map(|t| t.and_utc().timestamp());
     let this = time(single.get(2)?.1)?;
     let next = match single.get(3).filter(|e| e.0 == 0xa0) { Some(e) => Some(time(tlv(e.1)?.1)?), None => None };
-    (this <= now + 300 && next.is_none_or(|n| n >= now - 300)).then_some((status, next.unwrap_or(now + 3600)))
+    (this <= now + 300 && next.is_none_or(|n| n >= now - 300)).then_some((status, next))
 }
 
 #[cfg(test)]
@@ -185,7 +214,19 @@ mod tests {
         assert_eq!(ocsp.check(&certs), Err("certificate status request failed"));
         let id = cert_id(&certs[0], &certs[1]);
         assert_eq!(&id[..13], &[0x30, id.len() as u8 - 2, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00]);
-        assert!(verify(b"\x30\x03\x0a\x01\x01", &id, &certs[1], 0).is_none());
+        assert!(verify(b"\x30\x03\x0a\x01\x01", &id, &certs[1], 0, true).is_none());
         assert!(fetch("https://127.0.0.1/", b"").is_none());
+    }
+
+    #[test]
+    fn finds_what_stapling_asks() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ocsp.pem")).unwrap();
+        let ders: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(text.as_bytes()).map(|c| c.unwrap()).collect();
+        let certs: Vec<X509Certificate> = ders.iter().map(|d| X509Certificate::from_der(d).unwrap().1).collect();
+        let id = cert_id(&certs[0], &certs[1]);
+        assert_eq!(stapled(&ders, &[], None), Some(("http://127.0.0.1:1".to_string(), request(&id), id.clone(), ders[1].to_vec())));
+        assert_eq!(stapled(&ders[..1], &ders[1..], Some("http://127.0.0.1:2/")).unwrap().0, "http://127.0.0.1:2/");
+        assert!(stapled(&ders[..1], &[], None).is_none());
+        assert!(staple("http://127.0.0.1:1", (&request(&id), &id, &ders[1]), true, 0).is_none());
     }
 }
