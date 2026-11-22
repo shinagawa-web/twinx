@@ -7,9 +7,10 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
@@ -27,15 +28,116 @@ const HANDSHAKE: Duration = Duration::from_secs(60);
 /// is decrypted with the first of the passwords that works, as
 /// ssl_password_file has them, one on each line.
 fn load(cert: &Path, key: &Path, passwords: Option<&Path>) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+    Ok((chain(cert)?, private_key(key, passwords)?.0))
+}
+
+/// The certificates of a certificate file, in PEM.
+fn chain(cert: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     let chain = CertificateDer::pem_file_iter(cert).and_then(|certs| certs.collect::<Result<Vec<_>, _>>()).ok().filter(|c| !c.is_empty());
-    let chain = chain.ok_or_else(|| format!("cannot load certificate \"{}\"", cert.display()))?;
+    chain.ok_or_else(|| format!("cannot load certificate \"{}\"", cert.display()))
+}
+
+/// The private key of a key file, in PEM, and whether it was encrypted.
+fn private_key(key: &Path, passwords: Option<&Path>) -> Result<(PrivateKeyDer<'static>, bool), String> {
     let text = std::fs::read_to_string(key).unwrap_or_default();
     let passwords = passwords.map(|p| std::fs::read_to_string(p).map_err(|e| format!("open() \"{}\" failed ({e})", p.display()))).transpose()?.unwrap_or_default();
     let encrypted = pkcs8::der::Document::from_pem(&text).ok().filter(|(label, _)| *label == "ENCRYPTED PRIVATE KEY").map(|(_, doc)| doc);
     let decrypt = |doc: &pkcs8::der::Document| passwords.lines().find_map(|p| pkcs8::EncryptedPrivateKeyInfoRef::try_from(doc.as_bytes()).ok()?.decrypt(p).ok());
-    let found = match encrypted { Some(doc) => decrypt(&doc).map(|d| PrivateKeyDer::Pkcs8(d.as_bytes().to_vec().into())), None => PrivateKeyDer::from_pem_slice(text.as_bytes()).ok() };
+    let found = match &encrypted { Some(doc) => decrypt(doc).map(|d| PrivateKeyDer::Pkcs8(d.as_bytes().to_vec().into())), None => PrivateKeyDer::from_pem_slice(text.as_bytes()).ok() };
     let found = found.filter(|k| provider().key_provider.load_private_key(k.clone_key()).is_ok());
-    Ok((chain, found.ok_or_else(|| format!("cannot load certificate key \"{}\"", key.display()))?))
+    Ok((found.ok_or_else(|| format!("cannot load certificate key \"{}\"", key.display()))?, encrypted.is_some()))
+}
+
+/// proxy_ssl_certificate_cache: the certificates and keys loaded for
+/// connections to proxied servers, by file, as nginx keeps them. At most max
+/// of them are kept, the least recently used one going first; one not used
+/// for inactive seconds goes when another comes in. After valid seconds, a
+/// file whose modification time or inode changed is loaded again. Encrypted
+/// keys are never kept.
+#[derive(Debug)]
+pub struct CertCache {
+    max: usize,
+    valid: u64,
+    inactive: u64,
+    /// The least recently used first.
+    nodes: Mutex<Vec<Node>>,
+}
+
+#[derive(Debug)]
+struct Node {
+    key: bool,
+    path: PathBuf,
+    value: Object,
+    created: u64,
+    accessed: u64,
+    file: (i64, u64),
+}
+
+/// A certificate chain, or a private key.
+#[derive(Debug)]
+struct Object {
+    chain: Vec<CertificateDer<'static>>,
+    key: Option<PrivateKeyDer<'static>>,
+}
+
+impl Object {
+    fn copy(&self) -> Object {
+        Object { chain: self.chain.clone(), key: self.key.as_ref().map(PrivateKeyDer::clone_key) }
+    }
+}
+
+/// A file's modification time and inode.
+fn file(path: &Path) -> Option<(i64, u64)> {
+    std::fs::metadata(path).ok().map(|m| (m.mtime(), m.ino()))
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+impl CertCache {
+    pub fn new(max: usize, valid: u64, inactive: u64) -> CertCache {
+        CertCache { max, valid, inactive, nodes: Mutex::new(Vec::new()) }
+    }
+
+    /// The object of a file, kept or loaded by create (which also says whether
+    /// it must not be kept); invalidate loads a kept one again.
+    fn fetch(&self, key: bool, path: &Path, invalidate: bool, create: &dyn Fn() -> Result<(Object, bool), String>) -> Result<Object, String> {
+        let (now, mut nodes) = (now(), self.nodes.lock().unwrap());
+        if let Some(i) = nodes.iter().position(|n| n.key == key && n.path == path) {
+            // One that fails to load or must not be kept is no longer kept.
+            let mut node = nodes.remove(i);
+            let stale = invalidate || now.saturating_sub(node.created) > self.valid;
+            let changed = if stale { file(path) } else { Some(node.file) };
+            if invalidate || changed != Some(node.file) {
+                node.file = changed.unwrap_or_default();
+                let (value, uncached) = create()?;
+                if uncached { return Ok(value) }
+                node.value = value;
+            }
+            if stale { node.created = now; }
+            node.accessed = now;
+            let value = node.value.copy();
+            nodes.push(node);
+            return Ok(value);
+        }
+        let (value, uncached) = create()?;
+        if uncached { return Ok(value) }
+        self.expire(&mut nodes, 1, now);
+        if nodes.len() >= self.max { self.expire(&mut nodes, 0, now); }
+        nodes.push(Node { key, path: path.into(), value: value.copy(), created: now, accessed: now, file: file(path).unwrap_or_default() });
+        Ok(value)
+    }
+
+    /// Removes up to two objects not used for inactive seconds, the least
+    /// recently used one first; with n 0, the least recently used one in any case before them.
+    fn expire(&self, nodes: &mut Vec<Node>, mut n: u32, now: u64) {
+        while n < 3 && !nodes.is_empty() {
+            if n != 0 && now.saturating_sub(nodes[0].accessed) <= self.inactive { return }
+            n += 1;
+            nodes.remove(0);
+        }
+    }
 }
 
 /// The certificates of a file, in PEM, that clients' certificates are verified with.
@@ -178,15 +280,37 @@ impl ServerCertVerifier for Unverified {
 /// connections when proxy_ssl_session_reuse is on; with the certificate of
 /// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file, if any.
 pub fn client(reuse: bool, cert: Option<(&Path, &Path, Option<&Path>)>) -> Result<Arc<ClientConfig>, String> {
-    let verifier = Arc::new(Unverified(provider().signature_verification_algorithms));
-    let builder = ClientConfig::builder().dangerous().with_custom_certificate_verifier(verifier);
     let mut c = match cert.map(|(c, k, p)| load(c, k, p)).transpose()? {
-        Some((chain, key)) => builder.with_client_auth_cert(chain, key).map_err(|e| e.to_string())?,
-        None => builder.with_no_client_auth(),
+        Some((chain, key)) => unverified().with_client_auth_cert(chain, key).map_err(|e| e.to_string())?,
+        None => unverified().with_no_client_auth(),
     };
     c.enable_sni = false;
     if !reuse { c.resumption = rustls::client::Resumption::disabled(); }
     Ok(Arc::new(c))
+}
+
+fn unverified() -> rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert> {
+    let verifier = Arc::new(Unverified(provider().signature_verification_algorithms));
+    ClientConfig::builder().dangerous().with_custom_certificate_verifier(verifier)
+}
+
+/// What one connection to a proxied server is made with when variables name
+/// the files of proxy_ssl_certificate and proxy_ssl_certificate_key: base's
+/// settings, with the certificate and key of those files, taken from the
+/// cache when there is one. A key that does not match its certificate, as a
+/// cache updated between the two may give, has both loaded again.
+pub fn client_cert(base: &Arc<ClientConfig>, (cert, key, passwords): (&Path, &Path, Option<&Path>), cache: Option<&CertCache>) -> Result<Arc<ClientConfig>, String> {
+    let fetch = |key: bool, path: &Path, invalidate: bool, create: &dyn Fn() -> Result<(Object, bool), String>| match cache { Some(c) => c.fetch(key, path, invalidate, create), None => create().map(|o| o.0) };
+    let mut invalidate = false;
+    loop {
+        let chain = fetch(false, cert, invalidate, &|| Ok((Object { chain: chain(cert)?, key: None }, false)))?.chain;
+        let pkey = fetch(true, key, invalidate, &|| private_key(key, passwords).map(|(k, encrypted)| (Object { chain: Vec::new(), key: Some(k) }, encrypted)))?.key;
+        let config = unverified().with_client_auth_cert(chain, pkey.ok_or("no key")?);
+        if !invalidate && matches!(config, Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch))) { invalidate = true; continue }
+        let mut c = config.map_err(|e| format!("SSL_use_PrivateKey(\"{}\") failed ({e})", key.display()))?;
+        (c.enable_sni, c.resumption) = (false, base.resumption.clone());
+        return Ok(Arc::new(c));
+    }
 }
 
 /// Connects to a proxied server over TLS; the plain end of the connection,
@@ -349,5 +473,47 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
         let peer = std::thread::spawn(move || { let mut s = l.accept().unwrap().0; s.write_all(b"HTTP/1.0 400\r\n\r\n").unwrap(); });
         assert!(connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5), &client(true, None).unwrap()).is_err());
         peer.join().unwrap();
+    }
+
+    #[test]
+    fn keeps_what_it_loaded_as_nginx_does() {
+        let dir = dir();
+        let (a, b, none) = (dir.join("c.pem"), dir.join("k.pem"), dir.join("none"));
+        let (cache, loads) = (CertCache::new(2, 60, 10), std::cell::Cell::new(0));
+        let loads = &loads;
+        let load = |uncached: bool| move || { loads.set(loads.get() + 1); Ok((Object { chain: Vec::new(), key: None }, uncached)) };
+        let (kept, uncached) = (load(false), load(true));
+        let fetch = |key, path: &Path, invalidate| { cache.fetch(key, path, invalidate, &kept).unwrap(); loads.get() };
+        assert_eq!((fetch(false, &a, false), fetch(false, &a, false)), (1, 1));
+        // The key of a file is another object; a third object evicts the least recently used one.
+        assert_eq!((fetch(true, &a, false), fetch(false, &b, false), fetch(false, &a, false)), (2, 3, 4));
+        assert_eq!(fetch(false, &a, true), 5);
+        // After valid seconds, a file that did not change is not loaded again; one that did is.
+        cache.nodes.lock().unwrap().last_mut().unwrap().created = 0;
+        assert_eq!(fetch(false, &a, false), 5);
+        (cache.nodes.lock().unwrap().last_mut().unwrap().created, cache.nodes.lock().unwrap().last_mut().unwrap().file) = (0, (0, 0));
+        assert_eq!(fetch(false, &a, false), 6);
+        // What must not be kept, or fails to load, is not kept.
+        for _ in 0..2 { cache.fetch(false, &none, false, &uncached).unwrap(); }
+        assert_eq!(loads.get(), 8);
+        assert!(cache.fetch(false, &a, true, &|| Err("failed".into())).is_err());
+        assert_eq!(cache.nodes.lock().unwrap().len(), 1);
+        // One not used for inactive seconds goes when another comes in.
+        cache.nodes.lock().unwrap()[0].accessed = 0;
+        fetch(true, &b, false);
+        assert_eq!(cache.nodes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn loads_the_certificate_for_a_connection() {
+        let dir = dir();
+        // A key that is not the certificate's.
+        std::fs::write(dir.join("other.pem"), "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwQWPnC2Jx/3u3hdA\njGUmqcD72PuhGmag3j4c7dVV64OhRANCAATANLzVnsMiRvhgpGBwTwrnsEsESgL3\nwQJBCIlLunPAFCk9taxLVaqjkHBX5E7184ZLnPSc8ZVLhpB/saEm9hMD\n-----END PRIVATE KEY-----\n").unwrap();
+        let (base, cache) = (client(true, None).unwrap(), CertCache::new(4, 60, 10));
+        let (cert, key, other) = (dir.join("c.pem"), dir.join("k.pem"), dir.join("other.pem"));
+        assert!(client_cert(&base, (&cert, &key, None), Some(&cache)).is_ok());
+        assert!(client_cert(&base, (&cert, &key, None), None).is_ok());
+        assert!(client_cert(&base, (&cert, &other, None), Some(&cache)).unwrap_err().starts_with("SSL_use_PrivateKey("));
+        assert!(client_cert(&base, (&dir.join("none"), &key, None), None).is_err());
     }
 }

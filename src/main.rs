@@ -22,6 +22,11 @@ use libc::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, c_int, pid_t, sigset_t};
 const CONFIGURE: &str = "--with-http_ssl_module --without-http_fastcgi_module --without-http_uwsgi_module \
 --with-http_gunzip_module --with-http_gzip_static_module --without-http_scgi_module --without-http_grpc_module --without-http_memcached_module";
 
+/// The TLS library line of `-V`. twinx does TLS with rustls; nginx-tests reads
+/// "with OpenSSL <version>" to tell which TLS features there are, so it names
+/// the version of the reference nginx, whose features twinx takes after.
+const TLS_LIBRARY: &str = "built with TLS by rustls, compatible with OpenSSL 3.5.7";
+
 /// The command line, as nginx takes it.
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -142,7 +147,7 @@ fn main() {
     let list: Vec<String> = std::env::args().skip(1).collect();
     let a = args(&list).unwrap_or_else(|e| fail(&e, None));
     if a.version {
-        eprintln!("twinx version: {}\nconfigure arguments: {CONFIGURE}", http::NAME);
+        eprintln!("twinx version: {}\n{TLS_LIBRARY}\nconfigure arguments: {CONFIGURE}", http::NAME);
         return;
     }
     if let Err(e) = run(&a) { fail(&e, Some(&a.prefix.join(&a.error_log))) }

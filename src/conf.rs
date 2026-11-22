@@ -94,6 +94,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_ssl_certificate", HSL, 1, 1, false),
     ("proxy_ssl_certificate_key", HSL, 1, 1, false),
     ("proxy_ssl_password_file", HSL, 1, 1, false),
+    ("proxy_ssl_certificate_cache", HSL, 1, 3, false),
     ("proxy_method", HSL, 1, 1, false),
     ("proxy_set_body", HSL, 1, 1, false),
     ("expires", HSL | LIF, 1, 2, false),
@@ -440,9 +441,15 @@ pub struct Level {
     pub ssl_client_certificate: Option<PathBuf>,
     /// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file:
     /// the certificate twinx presents to proxied servers.
-    pub proxy_ssl_certificate: Option<PathBuf>,
-    pub proxy_ssl_certificate_key: Option<PathBuf>,
+    /// The certificate and key may have variables in their names.
+    pub proxy_ssl_certificate: Option<Template>,
+    pub proxy_ssl_certificate_key: Option<Template>,
     pub proxy_ssl_password_file: Option<PathBuf>,
+    /// With variables in them, the names of the certificate and key that
+    /// each connection loads, relative to the prefix.
+    pub proxy_ssl_certificate_vars: Option<(Template, Template, PathBuf)>,
+    /// proxy_ssl_certificate_cache: what those connections keep loaded.
+    pub proxy_ssl_certificate_cache: Option<Arc<crate::tls::CertCache>>,
     /// What connections to proxied servers over TLS are made with, made again
     /// at a level that sets one of the proxy_ssl_* directives above.
     pub proxy_tls: Option<Arc<rustls::ClientConfig>>,
@@ -734,8 +741,9 @@ impl Builder<'_> {
                 "ssl_verify_client" => level.ssl_verify_client = ["off", "on", "optional", "optional_no_ca"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_verify_client\" directive, it must be \"on\", \"off\", \"optional\" or \"optional_no_ca\"", d.args[0])))? > 0,
                 "ssl_trusted_certificate" => level.ssl_trusted_certificate = Some(self.path(&d.args[0])),
                 "ssl_client_certificate" => level.ssl_client_certificate = Some(self.path(&d.args[0])),
-                "proxy_ssl_certificate" => (level.proxy_ssl_certificate, own_tls) = (Some(self.path(&d.args[0])), true),
-                "proxy_ssl_certificate_key" => (level.proxy_ssl_certificate_key, own_tls) = (Some(self.path(&d.args[0])), true),
+                "proxy_ssl_certificate" => (level.proxy_ssl_certificate, own_tls) = (Some(Template::parse(&d.args[0]).map_err(at)?), true),
+                "proxy_ssl_certificate_key" => (level.proxy_ssl_certificate_key, own_tls) = (Some(Template::parse(&d.args[0]).map_err(at)?), true),
+                "proxy_ssl_certificate_cache" => level.proxy_ssl_certificate_cache = cert_cache(&d.args).map_err(at)?,
                 "proxy_ssl_password_file" => (level.proxy_ssl_password_file, own_tls) = (Some(self.path(&d.args[0])), true),
                 "proxy_redirect" => {
                     let rule = if d.args == ["default"] {
@@ -850,7 +858,11 @@ impl Builder<'_> {
         if let Some(flags) = flags { level.proxy_cookie_flags = flags; }
         if let Some(redirects) = redirects { level.proxy_redirect = redirects; }
         if own_tls {
-            let cert = level.proxy_ssl_certificate.as_deref().zip(level.proxy_ssl_certificate_key.as_deref()).map(|(c, k)| (c, k, level.proxy_ssl_password_file.as_deref()));
+            // Names without variables are loaded once, here.
+            let names = level.proxy_ssl_certificate.clone().zip(level.proxy_ssl_certificate_key.clone());
+            let fixed = names.as_ref().and_then(|(c, k)| text(c).zip(text(k))).map(|(c, k)| (self.path(&c), self.path(&k)));
+            level.proxy_ssl_certificate_vars = names.filter(|_| fixed.is_none()).map(|(c, k)| (c, k, self.prefix.to_path_buf()));
+            let cert = fixed.as_ref().map(|(c, k)| (c.as_path(), k.as_path(), level.proxy_ssl_password_file.as_deref()));
             level.proxy_tls = Some(crate::tls::client(level.proxy_ssl_session_reuse, cert)?);
         }
         // Without rules of its own or inherited, a location with proxy_pass has "proxy_redirect default".
@@ -1002,6 +1014,26 @@ fn log_cache(args: &[String]) -> Result<Option<Arc<Cache>>, String> {
     if max == 0 { return Err("\"open_log_file_cache\" must have \"max\" parameter".into()); }
     let secs = |s: i64| Duration::from_secs(s as u64);
     Ok(Some(Arc::new(Cache::new(max as usize, secs(inactive), min_uses as u32, secs(valid)))))
+}
+
+/// The text of a value without variables.
+fn text(t: &Template) -> Option<String> {
+    t.0.iter().map(|p| match p { Part::Text(t) => Some(t.as_str()), Part::Var(_) => None }).collect()
+}
+
+/// proxy_ssl_certificate_cache off | max=N [inactive=time] [valid=time]
+fn cert_cache(args: &[String]) -> Result<Option<Arc<crate::tls::CertCache>>, String> {
+    let mut values = [("max", 0), ("inactive", 10), ("valid", 60)];
+    for a in args {
+        if a == "off" { return Ok(None); }
+        let invalid = format!("invalid parameter \"{a}\"");
+        let (name, value) = a.split_once('=').ok_or(invalid.clone())?;
+        let slot = values.iter_mut().find(|v| v.0 == name).ok_or(invalid.clone())?;
+        slot.1 = if name == "max" { value.parse().ok().filter(|v| *v > 0) } else { crate::expires::parse_time(value).filter(|v| *v >= 0) }.ok_or(invalid)?;
+    }
+    let [max, inactive, valid] = values.map(|v| v.1 as u64);
+    if max == 0 { return Err("\"proxy_ssl_certificate_cache\" must have the \"max\" parameter".into()); }
+    Ok(Some(Arc::new(crate::tls::CertCache::new(max as usize, valid, inactive))))
 }
 
 /// location [ = | ^~ | ~ | ~* ] uri
@@ -1671,5 +1703,16 @@ mod tests {
         let redirect = s.locations[0].level.proxy_redirect.as_ref().unwrap();
         assert!(matches!(&redirect[0].pattern, CookiePattern::Text(t) if matches!(&t.0[..], [Part::Text(u)] if u == "https://127.0.0.1/u")));
         assert_eq!(s.locations[1].level.limit_except.as_ref().unwrap().0, ["GET", "HEAD"]);
+    }
+
+    #[test]
+    fn proxy_ssl_certificate_cache() {
+        assert!(cert_cache(&["off".into()]).unwrap().is_none());
+        assert!(cert_cache(&["max=4".into(), "inactive=1s".into(), "valid=2s".into()]).unwrap().is_some());
+        assert_eq!(cert_cache(&["valid=2s".into()]).unwrap_err(), "\"proxy_ssl_certificate_cache\" must have the \"max\" parameter");
+        assert_eq!(cert_cache(&["max=0".into()]).unwrap_err(), "invalid parameter \"max=0\"");
+        assert_eq!(cert_cache(&["size=1".into()]).unwrap_err(), "invalid parameter \"size=1\"");
+        let c = build_text("http { server { listen 127.0.0.1:8080; proxy_ssl_certificate $arg_c.crt; proxy_ssl_certificate_key k.key; location / { } } }").unwrap();
+        assert!(c.servers[0].level.proxy_ssl_certificate_vars.is_some());
     }
 }
