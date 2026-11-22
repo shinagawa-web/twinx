@@ -32,8 +32,8 @@ const REASONS: &[(u16, &str)] = &[
 /// Binds every address the servers listen on and accepts connections on each in a thread.
 /// Opens the listening sockets: the master does this, so that bind errors stop it and every worker shares them.
 pub fn bind(config: &Config, open: &[(TcpListener, SocketAddr)]) -> Result<Vec<(TcpListener, SocketAddr)>, String> {
-    let mut addrs: Vec<SocketAddr> = config.servers.iter().flat_map(|s| s.listen.clone()).collect();
-    addrs.dedup();
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    for addr in config.servers.iter().flat_map(|s| &s.listen) { if !addrs.contains(addr) { addrs.push(*addr) } }
     // On a reload, a socket already open on the address is kept. accept() on
     // it gives up after a while, so that a worker shutting down stops accepting.
     let get = |addr| open.iter().find(|o| o.1 == addr).map_or_else(|| TcpListener::bind(addr), |o| o.0.try_clone());
@@ -1596,9 +1596,11 @@ pub fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) ->
     regex.unwrap_or_else(|| (default_server(config, listen), Vec::new()))
 }
 
-/// The default server of a listening address: the first server listening there.
+/// The default server of a listening address: the one listening there with
+/// default_server, else the first server listening there.
 pub fn default_server(config: &Config, listen: SocketAddr) -> &Server {
-    config.servers.iter().find(|s| s.listen.contains(&listen)).unwrap_or(&config.servers[0])
+    let on = || config.servers.iter().filter(|s| s.listen.contains(&listen));
+    on().find(|s| s.defaults.contains(&listen)).or_else(|| on().next()).unwrap_or(&config.servers[0])
 }
 
 /// The host as $host gives it: lower case, without the port or a trailing
@@ -1729,6 +1731,18 @@ mod tests {
         assert!(bind(&config, &[]).unwrap_err().starts_with(&format!("bind() to {addr} failed")));
         let open = vec![(open.into_iter().next().unwrap().0, addr)];
         assert_eq!(bind(&config, &open).unwrap()[0].0.local_addr().unwrap(), addr);
+    }
+
+    #[test]
+    fn binds_each_address_once_and_finds_its_default_server() {
+        let (a, b) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+        let (a, b) = ((a.local_addr().unwrap(), a), (b.local_addr().unwrap(), b));
+        let text = format!("http {{ server {{ listen {}; listen {}; server_name one; }} server {{ listen {}; listen {} default_server; server_name two; }} }}", a.0, b.0, a.0, b.0);
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let open = vec![(a.1, a.0), (b.1, b.0)];
+        assert_eq!(bind(&config, &open).unwrap().iter().map(|l| l.1).collect::<Vec<_>>(), [a.0, b.0]);
+        assert_eq!((default_server(&config, a.0).name.as_str(), default_server(&config, b.0).name.as_str()), ("one", "two"));
+        assert_eq!(server(&config, b.0, Some("other")).0.name, "two");
     }
 
     #[test]
