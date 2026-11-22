@@ -1009,8 +1009,9 @@ fn gunzip(resp: &mut Response) {
     resp.body = body;
 }
 
-/// Passes the request to the proxied servers in turn, as HTTP/1.0 with
-/// "Connection: close", until one answers with a response head.
+/// Passes the request to the proxied servers in turn, as proxy_http_version
+/// says (1.1 by default) and, as nginx 1.30 does, with no Connection header of
+/// its own, until one answers with a response head.
 fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let rest = escape_uri(r.uri.get(prefix.len()..).unwrap_or_default());
     let (host, uri, up) = match &p.url {
@@ -1038,7 +1039,6 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let mut req = format!("{method} {uri} HTTP/1.{}\r\n", level.proxy_http_11 as u8);
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     if !is_set("host") { req += &format!("Host: {host}\r\n"); }
-    if !is_set("connection") { req += "Connection: close\r\n"; }
     // A body passed as it comes: the rest of one with a Content-Length, or chunks.
     let mut unread = r.unread.lock().unwrap();
     let chunked = unread.as_ref().is_some_and(|u| u.chunked.is_some());
@@ -1221,8 +1221,10 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
     bytes[2] = req.len() as u64;
     // The rest of a body that is not buffered goes on as the client sends it.
     if let Some(u) = unread { bytes[2] += pass_body(u, max, &mut s)?; }
+    // A head that does not fit in proxy_buffer_size is too big: the answer is invalid.
     let end = loop {
-        if let Some(end) = head_end(&answer) { break end; }
+        if let Some(end) = head_end(&answer[..answer.len().min(level.proxy_buffer_size)]) { break end; }
+        if answer.len() >= level.proxy_buffer_size { return None; }
         if client_closed(&s, client, level.proxy_read_timeout)? { return Some(Response { status: 499, ..Response::default() }); }
         let n = s.read(&mut chunk).ok().filter(|n| *n > 0)?;
         answer.extend_from_slice(&chunk[..n]);
@@ -1234,8 +1236,9 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
     let status = lines.next()?.strip_prefix("HTTP/1.")?.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()?;
     let mut resp = Response { status, proxied: true, ..Response::default() };
     const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
-    for (name, value) in lines.filter_map(|l| l.split_once(':')) {
-        let (lower, value) = (name.to_ascii_lowercase(), value.trim().to_string());
+    for line in lines {
+        let (name, value) = upstream_header(line)?;
+        let (lower, value) = (name.to_ascii_lowercase(), value.to_string());
         resp.upstream.push((name.to_string(), value.clone()));
         if lower == "content-type" { resp.ctype = Some(value); continue; }
         // A second Expires is ignored.
@@ -1265,6 +1268,17 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
     Some(resp)
 }
 
+
+/// A header line of a proxied server's answer as ngx_http_parse_header_line()
+/// reads it: a line without ":" is a name with an empty value, and the value
+/// loses the spaces around it. None when the line is invalid: it starts with a
+/// space (a folded line) or ":", its name has spaces or control characters, or
+/// it has a NUL or a CR that does not end it.
+fn upstream_header(line: &str) -> Option<(&str, &str)> {
+    let (name, value) = line.split_once(':').unwrap_or((line, ""));
+    let invalid = name.is_empty() || name.bytes().any(|c| c <= 0x20 || c == 0x7f) || value.contains(['\0', '\r']);
+    (!invalid).then(|| (name, value.trim_matches(' ')))
+}
 
 /// Reads a proxied answer's body up to its length, up to its last chunk, or
 /// until the server closes the connection; what follows the last chunk is
@@ -1697,6 +1711,13 @@ mod tests {
     }
 
     #[test]
+    fn upstream_header_lines() {
+        assert_eq!(upstream_header("X-A:  a b \t "), Some(("X-A", "a b \t")));
+        assert_eq!(upstream_header("X_a!b"), Some(("X_a!b", "")));
+        for bad in [" Folded: yes", ": a", "X a: 1", "X-A: a\rB: c", "X-A: a\0b", "X\x7f: a"] { assert_eq!(upstream_header(bad), None, "{bad:?}"); }
+    }
+
+    #[test]
     fn head_end_with_lf_and_crlf() {
         assert_eq!(head_end(b"GET / HTTP/1.0\nHost: a\n\nrest"), Some(24));
         assert_eq!(head_end(b"GET / HTTP/1.0\r\n\r\n"), Some(18));
@@ -1745,7 +1766,7 @@ mod tests {
             let _ = s.read(&mut buf).unwrap();
             s.write_all(b"HTTP/1.1 201 Created\r\nServer: x\r\nContent-Type: a/b\r\nX-A: 1\r\nX-Accel-B: 2\r\n\r\nbody").unwrap();
         });
-        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
+        let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (mut time, mut bytes) = ([None; 3], [0; 3]);
         let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0, false).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
@@ -1850,7 +1871,7 @@ mod tests {
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
             from
         });
-        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
+        let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
         assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
@@ -1869,7 +1890,7 @@ mod tests {
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12000\r\nX-Rate: 4000\r\n\r\n").unwrap();
             s.write_all(&[b'x'; 12000]).unwrap();
         });
-        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
+        let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
         let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).unwrap();
         // The body is read after the head, 4000 bytes (what came with the head too)
@@ -1911,7 +1932,7 @@ mod tests {
                 thread::spawn(move || { thread::sleep(Duration::from_secs(5)); drop(s) });
             }
         });
-        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
+        let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
@@ -1940,7 +1961,7 @@ mod tests {
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
         let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
-        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
+        let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("POST /a HTTP/1.0\n\n");
         let resp = proxy(&p, &level, &r, "");
         assert_eq!((resp.internal.as_deref(), resp.as_get, r.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
@@ -2024,7 +2045,7 @@ mod tests {
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
         let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
-        let level = Level { proxy_hide_header: vec!["x-location".into(), "content-type".into()], proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
+        let level = Level { proxy_hide_header: vec!["x-location".into(), "content-type".into()], proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("GET / HTTP/1.0\n\n");
         let resp = proxy(&p, &level, &r, "/");
         assert_eq!(resp.upstream_addr, Some(addr.to_string()));
@@ -2321,7 +2342,7 @@ mod tests {
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
         let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
         let set = Some(Template::parse("b=$arg_a").unwrap());
-        let level = Level { proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), proxy_set_body: set, ..Level::default() };
+        let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), proxy_set_body: set, ..Level::default() };
         let (_, mut r) = request("POST /a?a=1 HTTP/1.0\nContent-Length: 3\n\n");
         r.body = b"xyz".to_vec();
         assert_eq!(proxy(&p, &level, &r, "").status, 204);
