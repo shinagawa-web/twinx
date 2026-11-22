@@ -1089,7 +1089,16 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
         let socket = bind.map(|b| bound(&up.peers[i].addr, b));
         if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
         let (start, mut time, mut counted) = (Instant::now(), [None; 3], [0; 3]);
-        answer = fetch((&up.peers[i].addr, p.ssl), socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade);
+        // Names of proxy_ssl_certificate with variables are loaded for each connection; failing to is 500.
+        let names = level.proxy_ssl_certificate_vars.as_ref().filter(|_| p.ssl).map(|(c, k, prefix)| (c.render(r, &Sent::default()), k.render(r, &Sent::default()), prefix));
+        let tls = match (names.filter(|(c, ..)| !c.is_empty()), level.proxy_tls.as_ref().filter(|_| p.ssl)) {
+            (Some((c, k, prefix)), Some(base)) => match crate::tls::client_cert(base, (&prefix.join(c), &prefix.join(k), level.proxy_ssl_password_file.as_deref()), level.proxy_ssl_certificate_cache.as_deref()) {
+                Ok(tls) => Some(tls),
+                Err(e) => { error_log(level, r, &e); return special(500) }
+            },
+            (_, tls) => tls.cloned(),
+        };
+        answer = fetch((&up.peers[i].addr, tls.as_ref()), socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade);
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
@@ -1232,7 +1241,7 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
 /// it took to connect and to send the response head. While it waits for the
 /// head, the client closing the connection ends the request with 499, as
 /// proxy_ignore_client_abort off does.
-fn fetch((peer, ssl): (&SocketAddr, bool), socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
+fn fetch((peer, tls): (&SocketAddr, Option<&Arc<rustls::ClientConfig>>), socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
     let start = Instant::now();
     let s = match socket {
         Some(socket) => socket.connect_timeout(&(*peer).into(), level.proxy_connect_timeout).ok().map(|()| TcpStream::from(socket))?,
@@ -1240,8 +1249,7 @@ fn fetch((peer, ssl): (&SocketAddr, bool), socket: Option<socket2::Socket>, req:
     };
     // proxy_pass https://: the TLS handshake is part of connecting.
     // A handshake that does not end within proxy_connect_timeout is a timeout, answered with 504.
-    let tls = |s| crate::tls::connect(s, peer.ip(), level.proxy_connect_timeout, level.proxy_tls.as_ref().ok_or(std::io::ErrorKind::Other)?);
-    let mut s = if ssl { match tls(s) { Ok(s) => s, Err(e) => return (e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504)) } } else { s };
+    let mut s = if let Some(tls) = tls { match crate::tls::connect(s, peer.ip(), level.proxy_connect_timeout, tls) { Ok(s) => s, Err(e) => return (e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504)) } } else { s };
     time[0] = Some(start.elapsed().as_millis());
     let _ = s.set_read_timeout(Some(level.proxy_read_timeout));
     let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
@@ -1799,7 +1807,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (mut time, mut bytes) = ([None; 3], [0; 3]);
-        let resp = fetch((&addr, false), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0, false).unwrap();
+        let resp = fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0, false).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
         // The body, the whole answer and the request, in bytes.
         assert_eq!(bytes, [4, 80, 18]);
@@ -1904,7 +1912,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
-        assert_eq!(fetch((&addr, false), socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap().status, 200);
+        assert_eq!(fetch((&addr, None), socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
@@ -1923,7 +1931,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
-        let mut resp = fetch((&addr, false), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).unwrap();
+        let mut resp = fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).unwrap();
         // The body is read after the head, 4000 bytes (what came with the head too)
         // in each second of the clock: it ends in the third second.
         assert!(resp.body.is_empty() && resp.rest.is_some());
@@ -1964,10 +1972,10 @@ mod tests {
             }
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = fetch((&addr, false), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap();
+        let resp = fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(fetch((&addr, false), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).is_none());
+            assert!(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).is_none());
         }
     }
 
