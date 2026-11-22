@@ -15,7 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime};
+use x509_parser::prelude::{ASN1Time, CertificateRevocationList, FromDer, GeneralName, X509Certificate, X509Version};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{ClientConfig, ClientConnection, Connection, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
 
@@ -253,13 +254,14 @@ fn subject(der: &[u8]) -> Option<String> {
     Some(rdns.into_iter().rev().collect::<Vec<_>>().join(","))
 }
 
-/// A proxied server's certificate is not verified, as with proxy_ssl_verify
-/// off; the handshake's signatures are.
+/// A proxied server's certificate is verified with proxy_ssl_verify on, and
+/// not with it off; the handshake's signatures are.
 #[derive(Debug)]
-struct Unverified(WebPkiSupportedAlgorithms);
+struct Proxied(WebPkiSupportedAlgorithms, Option<Verify>);
 
-impl ServerCertVerifier for Unverified {
-    fn verify_server_cert(&self, _: &CertificateDer, _: &[CertificateDer], _: &ServerName, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+impl ServerCertVerifier for Proxied {
+    fn verify_server_cert(&self, end: &CertificateDer, sent: &[CertificateDer], name: &ServerName, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+        self.1.as_ref().map_or(Ok(()), |v| v.check(end, sent, name))?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -275,22 +277,92 @@ impl ServerCertVerifier for Unverified {
     }
 }
 
+/// proxy_ssl_verify: what proxied servers' certificates are verified with,
+/// as OpenSSL verifies them for nginx: the certificates of
+/// proxy_ssl_trusted_certificate, the CRLs of proxy_ssl_crl, if any, and
+/// proxy_ssl_verify_depth; the name is the one the connection is made to.
+#[derive(Debug)]
+pub struct Verify {
+    trusted: Vec<CertificateDer<'static>>,
+    crls: Option<Vec<Vec<u8>>>,
+    depth: usize,
+}
+
+/// The files of proxy_ssl_trusted_certificate (none trusts nothing) and proxy_ssl_crl, and proxy_ssl_verify_depth.
+pub fn verify(trust: Option<&Path>, crl: Option<&Path>, depth: usize) -> Result<Verify, String> {
+    let crls = crl.map(|p| CertificateRevocationListDer::pem_file_iter(p).and_then(|c| c.map(|c| c.map(|c| c.to_vec())).collect()).map_err(|_| format!("X509_LOOKUP_load_file(\"{}\") failed", p.display()))).transpose()?;
+    Ok(Verify { trusted: trust.map(trusted).transpose()?.unwrap_or_default(), crls, depth })
+}
+
+impl Verify {
+    fn check(&self, end: &CertificateDer, sent: &[CertificateDer], name: &ServerName) -> Result<(), rustls::Error> {
+        let name = match name { ServerName::IpAddress(ip) => IpAddr::from(*ip).to_string(), n => n.to_str().into_owned() };
+        let leaf = verify_chain(end, sent, &self.trusted, self.crls.as_deref(), self.depth).map_err(|e| rustls::Error::General(format!("upstream SSL certificate verify error: ({e})")))?;
+        for_name(&leaf, &name).then_some(()).ok_or_else(|| rustls::Error::General(format!("upstream SSL certificate does not match \"{name}\"")))
+    }
+}
+
+/// Verifies a certificate chain as OpenSSL does without partial chains: from
+/// the peer's certificate up through the issuers it sent or the trusted ones,
+/// each signing the one below, to a trusted self-signed certificate, the
+/// chain at most depth + 1 certificates long with it; all of them valid now, the issuers CAs, and
+/// with CRLs, none revoked by a CRL of its issuer, which each must have (as
+/// X509_V_FLAG_CRL_CHECK_ALL). Gives the peer's certificate parsed, or the
+/// error as OpenSSL words it.
+fn verify_chain<'a>(end: &'a [u8], sent: &'a [CertificateDer], trusted: &'a [CertificateDer], crls: Option<&'a [Vec<u8>]>, depth: usize) -> Result<X509Certificate<'a>, &'static str> {
+    let parse = |d: &'a [u8]| X509Certificate::from_der(d).ok().map(|(_, c)| c);
+    let (anchors, sent): (Vec<_>, Vec<_>) = (trusted.iter().filter_map(|d| parse(d)).collect(), sent.iter().filter_map(|d| parse(d)).collect());
+    let mut chain = vec![parse(end).ok_or("unable to decode certificate")?];
+    loop {
+        let cur = chain.last().unwrap();
+        let self_signed = cur.subject().as_raw() == cur.issuer().as_raw();
+        if self_signed && trusted.iter().any(|t| t.as_ref() == cur.as_raw()) { break }
+        if self_signed { return Err(if chain.len() == 1 { "self-signed certificate" } else { "self-signed certificate in certificate chain" }) }
+        let issued = |c: &&X509Certificate<'a>| c.subject().as_raw() == cur.issuer().as_raw() && cur.verify_signature(Some(c.public_key())).is_ok();
+        let issuer = anchors.iter().find(issued).or_else(|| sent.iter().find(issued)).ok_or("unable to get local issuer certificate")?.clone();
+        if chain.len() > depth { return Err("certificate chain too long") }
+        chain.push(issuer);
+    }
+    if let Some(c) = chain.iter().find(|c| !c.validity().is_valid()) { return Err(if c.validity().not_before > ASN1Time::now() { "certificate is not yet valid" } else { "certificate has expired" }) }
+    if chain[1..].iter().any(|c| !c.is_ca() && c.version() != X509Version::V1) { return Err("invalid CA certificate") }
+    let Some(crls) = crls else { return Ok(chain.swap_remove(0)) };
+    let crls: Vec<_> = crls.iter().filter_map(|d| CertificateRevocationList::from_der(d).ok().map(|(_, c)| c)).collect();
+    for (i, c) in chain.iter().enumerate() {
+        let issuer = chain.get(i + 1).unwrap_or(c);
+        let crl = crls.iter().find(|l| l.issuer().as_raw() == c.issuer().as_raw() && l.verify_signature(issuer.public_key()).is_ok()).ok_or("unable to get certificate CRL")?;
+        if crl.next_update().is_some_and(|t| t < ASN1Time::now()) { return Err("CRL has expired") }
+        if crl.iter_revoked_certificates().any(|r| r.raw_serial() == c.raw_serial()) { return Err("certificate revoked") }
+    }
+    Ok(chain.swap_remove(0))
+}
+
+/// Whether a certificate is for a name, as X509_check_host checks it:
+/// against the DNS names of subjectAltName, or without them, the subject's
+/// last common name, ignoring case.
+fn for_name(cert: &X509Certificate, name: &str) -> bool {
+    let names = cert.subject_alternative_name().ok().flatten().map(|e| e.value.general_names.clone()).unwrap_or_default();
+    let mut dns: Vec<&str> = names.iter().filter_map(|g| if let GeneralName::DNSName(d) = g { Some(*d) } else { None }).collect();
+    if dns.is_empty() { dns.extend(cert.subject().iter_common_name().last().and_then(|a| a.as_str().ok())); }
+    dns.iter().any(|p| p.eq_ignore_ascii_case(name))
+}
+
 /// What connections to proxied servers are made with: without SNI, as
 /// proxy_ssl_server_name off does; reusing the sessions of earlier
 /// connections when proxy_ssl_session_reuse is on; with the certificate of
-/// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file, if any.
-pub fn client(reuse: bool, cert: Option<(&Path, &Path, Option<&Path>)>) -> Result<Arc<ClientConfig>, String> {
+/// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file, if any;
+/// verifying their certificates with verify, if any (proxy_ssl_verify on).
+pub fn client(reuse: bool, cert: Option<(&Path, &Path, Option<&Path>)>, verify: Option<Verify>) -> Result<Arc<ClientConfig>, String> {
     let mut c = match cert.map(|(c, k, p)| load(c, k, p)).transpose()? {
-        Some((chain, key)) => unverified().with_client_auth_cert(chain, key).map_err(|e| e.to_string())?,
-        None => unverified().with_no_client_auth(),
+        Some((chain, key)) => proxied(verify).with_client_auth_cert(chain, key).map_err(|e| e.to_string())?,
+        None => proxied(verify).with_no_client_auth(),
     };
     c.enable_sni = false;
     if !reuse { c.resumption = rustls::client::Resumption::disabled(); }
     Ok(Arc::new(c))
 }
 
-fn unverified() -> rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert> {
-    let verifier = Arc::new(Unverified(provider().signature_verification_algorithms));
+fn proxied(verify: Option<Verify>) -> rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert> {
+    let verifier = Arc::new(Proxied(provider().signature_verification_algorithms, verify));
     ClientConfig::builder().dangerous().with_custom_certificate_verifier(verifier)
 }
 
@@ -305,18 +377,20 @@ pub fn client_cert(base: &Arc<ClientConfig>, (cert, key, passwords): (&Path, &Pa
     loop {
         let chain = fetch(false, cert, invalidate, &|| Ok((Object { chain: chain(cert)?, key: None }, false)))?.chain;
         let pkey = fetch(true, key, invalidate, &|| private_key(key, passwords).map(|(k, encrypted)| (Object { chain: Vec::new(), key: Some(k) }, encrypted)))?.key;
-        let config = unverified().with_client_auth_cert(chain, pkey.ok_or("no key")?);
+        let config = proxied(None).with_client_auth_cert(chain, pkey.ok_or("no key")?);
         if !invalidate && matches!(config, Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch))) { invalidate = true; continue }
-        let mut c = config.map_err(|e| format!("SSL_use_PrivateKey(\"{}\") failed ({e})", key.display()))?;
-        (c.enable_sni, c.resumption) = (false, base.resumption.clone());
+        let mut c = (**base).clone();
+        c.client_auth_cert_resolver = config.map_err(|e| format!("SSL_use_PrivateKey(\"{}\") failed ({e})", key.display()))?.client_auth_cert_resolver;
         return Ok(Arc::new(c));
     }
 }
 
-/// Connects to a proxied server over TLS; the plain end of the connection,
-/// or the error the handshake failed with (WouldBlock once the timeout passed).
-pub fn connect(tcp: TcpStream, peer: IpAddr, timeout: Duration, config: &Arc<ClientConfig>) -> std::io::Result<TcpStream> {
-    let conn = ClientConnection::new(config.clone(), ServerName::from(peer)).map_err(std::io::Error::other)?;
+/// Connects to a proxied server over TLS, to the name its certificate is
+/// verified for, if any (one that is no name fails); the plain end of the
+/// connection, or the error the handshake failed with (WouldBlock once the timeout passed).
+pub fn connect(tcp: TcpStream, (peer, name): (IpAddr, Option<&str>), timeout: Duration, config: &Arc<ClientConfig>) -> std::io::Result<TcpStream> {
+    let name = name.map_or(Ok(ServerName::from(peer)), |n| ServerName::try_from(n.to_string()).map_err(std::io::Error::other))?;
+    let conn = ClientConnection::new(config.clone(), name).map_err(std::io::Error::other)?;
     pipe(tcp, conn.into(), timeout).map(|(s, ..)| s)
 }
 
@@ -391,6 +465,107 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
 -----END PRIVATE KEY-----
 ";
 
+    /// A root CA, an intermediate CA it signed and an end certificate the
+    /// intermediate signed (P-256), with CRLs: the root's revoking nothing,
+    /// the intermediate's revoking nothing, and the root's revoking the
+    /// intermediate. Made by openssl only for these tests.
+    const ROOT: &str = "-----BEGIN CERTIFICATE-----
+MIIBYzCCAQqgAwIBAgIUIv/pRqL1Az/j5BHh2Let4xBS2jIwCgYIKoZIzj0EAwIw
+DzENMAsGA1UEAwwEcm9vdDAgFw0yNjExMjIwOTQ1MzRaGA8yMTI2MTAyOTA5NDUz
+NFowDzENMAsGA1UEAwwEcm9vdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABABw
+ae10AMAhl8c/BoFz9q/w11p0gkpzzAC2SxnWawPlYQvYh8g8Jqp1YyoK3T1nsF33
+w5qmnItsLHRcopZK/tqjQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQD
+AgGGMB0GA1UdDgQWBBRwrEbKw5rBr1CWseCMgK/RhJML+zAKBggqhkjOPQQDAgNH
+ADBEAiB4a+vdhEcjCrUyuWZldZUksLYMtq84fO7m1jLtsenSTAIgK3tuL3cBUkgI
+IFy7nh4LNruGJY4pdxA84ruSOSlgfxo=
+-----END CERTIFICATE-----
+";
+    const INT: &str = "-----BEGIN CERTIFICATE-----
+MIIBczCCARigAwIBAgICEAAwCgYIKoZIzj0EAwIwDzENMAsGA1UEAwwEcm9vdDAg
+Fw0yNjExMjIwOTQ1MzRaGA8yMTI2MTAyOTA5NDUzNFowDjEMMAoGA1UEAwwDaW50
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEktCMzU0NVv0Z+DPJbjFgT21DMhog
+TOcDyN3aoht5E4dcYU+mCjWBUDHpQdDi9k4rLRcj2hISi95yJQtfBE3WmaNjMGEw
+DwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAYYwHQYDVR0OBBYEFK5URGEK
+vn5ctHP2iDwCqvWS0SkyMB8GA1UdIwQYMBaAFHCsRsrDmsGvUJax4IyAr9GEkwv7
+MAoGCCqGSM49BAMCA0kAMEYCIQClDdR8mOhN9TtUT8TggrEiR09w1sPFpaw8uZe/
+gIXy7wIhAKfgRdXTI5WZ+1xG+YONzrbNF2/wYkhn6ktkoUAwrLJy
+-----END CERTIFICATE-----
+";
+    const END: &str = "-----BEGIN CERTIFICATE-----
+MIIBcDCCARegAwIBAgICEAEwCgYIKoZIzj0EAwIwDjEMMAoGA1UEAwwDaW50MCAX
+DTI2MTEyMjA5NDUzNFoYDzIxMjYxMDI5MDk0NTM0WjAOMQwwCgYDVQQDDANlbmQw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAT6xm5HERgVoebZ6H67ZCF74GeFajaw
+FKXmF6lKHOjmIH03bQk5MZJjdckE0FgQjTC9D+zP2W0evumcK2dJR3CTo2MwYTAP
+BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU1RTqTPRC
+3Tpb95yIPVn7wi4v6RYwHwYDVR0jBBgwFoAUrlREYQq+fly0c/aIPAKq9ZLRKTIw
+CgYIKoZIzj0EAwIDRwAwRAIgRpBwhXEdp9/JA49lztWjfdzy9M/KrTA3D8AXD1i8
+UW4CICCNDgcxcN0yXyhmyTeQfYsG7BCDWBfCyCP84gEfEO3B
+-----END CERTIFICATE-----
+";
+    const ROOT_CRL: &str = "-----BEGIN X509 CRL-----
+MIGWMD0wCgYIKoZIzj0EAwIwDzENMAsGA1UEAwwEcm9vdBcNMjYxMTIyMDk0NTM0
+WhgPMjEyNjEwMjkwOTQ1MzRaMAoGCCqGSM49BAMCA0kAMEYCIQCS/4IYGgU9omGJ
+4UWg11Ujpz2TmQ9sy5rLq0DXtKjvOQIhAPmIZQVF+BFA4vdtCCCb4yxT3mv/6lIK
+KvMb7DTelAtI
+-----END X509 CRL-----
+";
+    const INT_CRL: &str = "-----BEGIN X509 CRL-----
+MIGVMDwwCgYIKoZIzj0EAwIwDjEMMAoGA1UEAwwDaW50Fw0yNjExMjIwOTQ1MzRa
+GA8yMTI2MTAyOTA5NDUzNFowCgYIKoZIzj0EAwIDSQAwRgIhAMipASw24YTfro53
+dWN+wM2EflB90tqJyjbgsYP1ykKbAiEA+3eISlmqDMihzNFquUe6FCOZH7+1VP97
+gj8U+vs04KU=
+-----END X509 CRL-----
+";
+    const REVOKED_CRL: &str = "-----BEGIN X509 CRL-----
+MIGtMFQwCgYIKoZIzj0EAwIwDzENMAsGA1UEAwwEcm9vdBcNMjYxMTIyMDk0NTM0
+WhgPMjEyNjEwMjkwOTQ1MzRaMBUwEwICEAAXDTI2MTEyMjA5NDUzNFowCgYIKoZI
+zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
+0R29jMSPXK8ryrqczZDuYUeDGnru7yYK+cOrmnEcL1U=
+-----END X509 CRL-----
+";
+
+    fn der(pem: &str) -> CertificateDer<'static> {
+        CertificateDer::from_pem_slice(pem.as_bytes()).unwrap()
+    }
+
+    fn crl(pem: &str) -> Vec<u8> {
+        CertificateRevocationListDer::from_pem_slice(pem.as_bytes()).unwrap().to_vec()
+    }
+
+    #[test]
+    fn verifies_chains_as_openssl() {
+        let (root, int, end) = (der(ROOT), der(INT), der(END));
+        let ok = |sent: &[CertificateDer<'static>], trusted: &[CertificateDer<'static>], crls: Option<&[Vec<u8>]>, depth| verify_chain(&end, sent, trusted, crls, depth).map(|_| ());
+        assert_eq!(ok(&[int.clone()], &[root.clone()], None, 2), Ok(()));
+        assert_eq!(ok(&[int.clone()], &[root.clone()], None, 1), Err("certificate chain too long"));
+        assert_eq!(ok(&[], &[root.clone()], None, 2), Err("unable to get local issuer certificate"));
+        // A trusted intermediate is no end: the chain goes on to the root.
+        assert_eq!(ok(&[], &[int.clone(), root.clone()], None, 1), Err("certificate chain too long"));
+        assert_eq!(ok(&[], &[int.clone()], None, 2), Err("unable to get local issuer certificate"));
+        // Every certificate needs a CRL of its issuer, the root its own.
+        assert_eq!(ok(&[int.clone()], &[root.clone()], Some(&[crl(ROOT_CRL)]), 2), Err("unable to get certificate CRL"));
+        assert_eq!(ok(&[int.clone()], &[root.clone()], Some(&[crl(ROOT_CRL), crl(INT_CRL)]), 2), Ok(()));
+        assert_eq!(ok(&[int.clone()], &[root.clone()], Some(&[crl(REVOKED_CRL), crl(INT_CRL)]), 2), Err("certificate revoked"));
+        // A self-signed certificate verifies only when it is trusted.
+        assert!(verify_chain(&root, &[], &[root.clone()], None, 0).is_ok());
+        assert_eq!(verify_chain(&root, &[], &[], None, 0).map(|_| ()), Err("self-signed certificate"));
+        assert_eq!(verify_chain(&int, &[root.clone()], &[], None, 1).map(|_| ()), Err("self-signed certificate in certificate chain"));
+    }
+
+    #[test]
+    fn verifies_names_and_loads_files() {
+        let dir = dir();
+        std::fs::write(dir.join("root.crt"), ROOT).unwrap();
+        std::fs::write(dir.join("chain.crl"), format!("{ROOT_CRL}{INT_CRL}")).unwrap();
+        let v = verify(Some(&dir.join("root.crt")), Some(&dir.join("chain.crl")), 2).unwrap();
+        let name = |n: &str| ServerName::try_from(n.to_string()).unwrap();
+        assert!(v.check(&der(END), &[der(INT)], &name("END")).is_ok());
+        assert_eq!(v.check(&der(END), &[der(INT)], &name("int")).unwrap_err().to_string(), "unexpected error: upstream SSL certificate does not match \"int\"");
+        assert!(v.check(&der(END), &[der(INT)], &name("127.0.0.1")).is_err());
+        assert!(verify(None, Some(&dir.join("none")), 1).unwrap_err().starts_with("X509_LOOKUP_load_file("));
+        assert!(verify(None, None, 1).unwrap().check(&der(END), &[der(INT)], &name("end")).is_err());
+    }
+
     fn dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("twinx-tls-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -440,7 +615,7 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
         assert_eq!(config.servers[0].ssl, [addr]);
         let accepted = std::thread::spawn(move || accept(l.accept().unwrap().0, &config, addr).unwrap());
         let c = dir.join("c.pem");
-        let mut client = connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5), &client(false, Some((&c, &dir.join("k.pem"), None))).unwrap()).unwrap();
+        let mut client = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), None), Duration::from_secs(5), &client(false, Some((&c, &dir.join("k.pem"), None)), None).unwrap()).unwrap();
         let (mut server, session) = accepted.join().unwrap();
         assert_eq!(session, Session { protocol: "TLSv1.3".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()) });
         let mut buf = [0u8; 4];
@@ -461,7 +636,7 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
     fn a_handshake_that_does_not_end_in_time_times_out() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        let e = connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_millis(100), &client(true, None).unwrap()).unwrap_err();
+        let e = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), None), Duration::from_millis(100), &client(true, None, None).unwrap()).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
         drop(l);
     }
@@ -471,7 +646,7 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let peer = std::thread::spawn(move || { let mut s = l.accept().unwrap().0; s.write_all(b"HTTP/1.0 400\r\n\r\n").unwrap(); });
-        assert!(connect(TcpStream::connect(addr).unwrap(), addr.ip(), Duration::from_secs(5), &client(true, None).unwrap()).is_err());
+        assert!(connect(TcpStream::connect(addr).unwrap(), (addr.ip(), None), Duration::from_secs(5), &client(true, None, None).unwrap()).is_err());
         peer.join().unwrap();
     }
 
@@ -509,7 +684,7 @@ PNBj+/rwm0WoMqtlMzej/znJb0K03rUCX+VpEXgEh09RKGvdwPekFRxU
         let dir = dir();
         // A key that is not the certificate's.
         std::fs::write(dir.join("other.pem"), "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwQWPnC2Jx/3u3hdA\njGUmqcD72PuhGmag3j4c7dVV64OhRANCAATANLzVnsMiRvhgpGBwTwrnsEsESgL3\nwQJBCIlLunPAFCk9taxLVaqjkHBX5E7184ZLnPSc8ZVLhpB/saEm9hMD\n-----END PRIVATE KEY-----\n").unwrap();
-        let (base, cache) = (client(true, None).unwrap(), CertCache::new(4, 60, 10));
+        let (base, cache) = (client(true, None, None).unwrap(), CertCache::new(4, 60, 10));
         let (cert, key, other) = (dir.join("c.pem"), dir.join("k.pem"), dir.join("other.pem"));
         assert!(client_cert(&base, (&cert, &key, None), Some(&cache)).is_ok());
         assert!(client_cert(&base, (&cert, &key, None), None).is_ok());

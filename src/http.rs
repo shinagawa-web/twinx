@@ -1083,6 +1083,8 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     let (mut statuses, limit, first) = (Vec::new(), level.proxy_next_upstream_tries, Instant::now());
     let (mut tries, next) = (if limit > 0 { up.tries().min(limit) } else { up.tries() }, |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
     let upgrade = r.headers.iter().any(|h| h.0.eq_ignore_ascii_case("upgrade"));
+    // proxy_ssl_verify: the name certificates are verified for, proxy_ssl_name or $proxy_host, without the port.
+    let name = (level.proxy_ssl_verify && p.ssl).then(|| ssl_name(&level.proxy_ssl_name.as_ref().map_or_else(|| host.clone(), |t| t.render(r, &sent))).to_string());
     while let Some(i) = up.pick(&mut tried) {
         addrs.push(up.peers[i].addr.to_string());
         // A socket that cannot be bound fails the request without trying the next server.
@@ -1098,7 +1100,7 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
             },
             (_, tls) => tls.cloned(),
         };
-        answer = fetch((&up.peers[i].addr, tls.as_ref()), socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade);
+        answer = fetch((&up.peers[i].addr, tls.as_ref().map(|t| (t, name.as_deref()))), socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade);
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
@@ -1241,7 +1243,15 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
 /// it took to connect and to send the response head. While it waits for the
 /// head, the client closing the connection ends the request with 499, as
 /// proxy_ignore_client_abort off does.
-fn fetch((peer, tls): (&SocketAddr, Option<&Arc<rustls::ClientConfig>>), socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
+/// The host of a name such as proxy_ssl_name gives, as nginx takes it: up to a
+/// port, if any, and without the brackets of an IPv6 address.
+fn ssl_name(name: &str) -> &str {
+    let bracket = if name.starts_with('[') { name.find(']').unwrap_or(0) } else { 0 };
+    let host = name[bracket..].find(':').map_or(name, |i| &name[..bracket + i]);
+    host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
+}
+
+fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Option<&str>)>), socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
     let start = Instant::now();
     let s = match socket {
         Some(socket) => socket.connect_timeout(&(*peer).into(), level.proxy_connect_timeout).ok().map(|()| TcpStream::from(socket))?,
@@ -1249,7 +1259,7 @@ fn fetch((peer, tls): (&SocketAddr, Option<&Arc<rustls::ClientConfig>>), socket:
     };
     // proxy_pass https://: the TLS handshake is part of connecting.
     // A handshake that does not end within proxy_connect_timeout is a timeout, answered with 504.
-    let mut s = if let Some(tls) = tls { match crate::tls::connect(s, peer.ip(), level.proxy_connect_timeout, tls) { Ok(s) => s, Err(e) => return (e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504)) } } else { s };
+    let mut s = if let Some((tls, name)) = tls { match crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls) { Ok(s) => s, Err(e) => return (e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504)) } } else { s };
     time[0] = Some(start.elapsed().as_millis());
     let _ = s.set_read_timeout(Some(level.proxy_read_timeout));
     let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
@@ -1793,6 +1803,15 @@ mod tests {
         }
         assert_eq!(valid_host("A.b.:"), Some("a.b".into()));
         assert_eq!(valid_host("[::1]:80"), Some("[::1]".into()));
+    }
+
+    #[test]
+    fn takes_the_host_of_ssl_names() {
+        assert_eq!(ssl_name("example.com"), "example.com");
+        assert_eq!(ssl_name("127.0.0.1:8081"), "127.0.0.1");
+        assert_eq!(ssl_name("[::1]:8081"), "::1");
+        assert_eq!(ssl_name("[::1]"), "::1");
+        assert_eq!(ssl_name("::1"), "");
     }
 
     #[test]
