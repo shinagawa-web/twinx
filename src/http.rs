@@ -174,6 +174,7 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl)
         let (server, captures) = server(config, listen, r.host.as_deref());
         r.captures = captures;
         let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
+        let parsed = parsed.and_then(|()| cert_error(server.level.ssl_verify_client, r.ssl.as_ref()));
         r.server_name = server.name.clone();
         let found = located(server, &r, &r.uri);
         let level = found.1;
@@ -414,12 +415,27 @@ fn finish(resp: &mut Response) {
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
 }
 
+/// What nginx answers a request on a connection whose client's certificate
+/// it asked for (ssl_verify_client): 495 when it did not verify, but for the
+/// errors optional_no_ca lets through, and with ssl_verify_client on, 496 without one.
+fn cert_error(mode: u8, ssl: Option<&crate::tls::Session>) -> Result<(), u16> {
+    const OPTIONAL: &[&str] = &["self-signed certificate", "self-signed certificate in certificate chain", "unable to get issuer certificate", "unable to get local issuer certificate", "unable to verify the first certificate"];
+    let Some(verify) = ssl.filter(|_| mode > 0).map(|s| s.verify.as_str()) else { return Ok(()) };
+    match verify.strip_prefix("FAILED:") {
+        Some(e) if !(mode == 3 && OPTIONAL.contains(&e)) => Err(495),
+        _ if mode == 1 && verify == "NONE" => Err(496),
+        _ => Ok(()),
+    }
+}
+
 /// The page nginx generates for an error status.
 fn special(status: u16) -> Response {
     let ctype = Some("text/html".to_string());
     // 494, a header line too long, is answered as 400 with a page of its own.
     let (status, body) = match status {
         494 => (400, page_with(400, "Request Header Or Cookie Too Large", "<center>Request Header Or Cookie Too Large</center>\r\n")),
+        // A client's certificate that did not verify (495), or none (496).
+        495 | 496 => { let text = ["The SSL certificate error", "No required SSL certificate was sent"][usize::from(status == 496)]; (400, page_with(400, text, &format!("<center>{text}</center>\r\n"))) }
         _ => (status, page(status)),
     };
     Response { status, ctype, body: body.into_bytes(), generated: true, ..Response::default() }
@@ -1884,6 +1900,20 @@ mod tests {
         assert!(on.contains("WWW-Authenticate: a\r\nWWW-Authenticate: b\r\n") && !on.contains("X-A"), "{on}");
         let off = answer("/off");
         assert!(off.starts_with("HTTP/1.1 401 ") && off.contains("X-A: 1") && off.ends_with("upstream"), "{off}");
+    }
+
+    #[test]
+    fn answers_certificate_errors() {
+        let ssl = |verify: &str| Some(crate::tls::Session { verify: verify.to_string(), ..Default::default() });
+        assert_eq!(cert_error(1, ssl("FAILED:certificate revoked").as_ref()), Err(495));
+        assert_eq!(cert_error(3, ssl("FAILED:self-signed certificate").as_ref()), Ok(()));
+        assert_eq!(cert_error(3, ssl("FAILED:certificate has expired").as_ref()), Err(495));
+        assert_eq!(cert_error(1, ssl("NONE").as_ref()), Err(496));
+        assert_eq!(cert_error(2, ssl("NONE").as_ref()), Ok(()));
+        assert_eq!(cert_error(0, ssl("FAILED:certificate revoked").as_ref()), Ok(()));
+        assert_eq!(cert_error(1, None), Ok(()));
+        assert_eq!(special(495).status, 400);
+        assert!(String::from_utf8(special(496).body).unwrap().contains("<center>No required SSL certificate was sent</center>"));
     }
 
     #[test]

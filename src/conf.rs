@@ -102,6 +102,9 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_trusted_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_client_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_crl", HTTP | SRV, 1, 1, false),
+    ("ssl_ocsp", HTTP | SRV, 1, 1, false),
+    ("ssl_ocsp_responder", HTTP | SRV, 1, 1, false),
+    ("ssl_ocsp_cache", HTTP | SRV, 1, 1, false),
     ("ssl_verify_depth", HTTP | SRV, 1, 1, false),
     ("proxy_ssl_certificate", HSL, 1, 1, false),
     ("proxy_ssl_certificate_key", HSL, 1, 1, false),
@@ -472,8 +475,9 @@ pub struct Level {
     pub ssl_certificate_cache: Option<Arc<crate::tls::CertCache>>,
     /// ssl_password_file: the passwords an encrypted ssl_certificate_key is tried with.
     pub ssl_password_file: Option<PathBuf>,
-    /// ssl_verify_client: whether clients are asked for a certificate (not "off").
-    pub ssl_verify_client: bool,
+    /// ssl_verify_client: off (0), on (1), optional (2) or optional_no_ca (3);
+    /// clients are asked for a certificate unless it is off.
+    pub ssl_verify_client: u8,
     /// ssl_trusted_certificate and ssl_client_certificate: the certificates
     /// clients' certificates are verified with.
     pub ssl_trusted_certificate: Option<PathBuf>,
@@ -482,6 +486,11 @@ pub struct Level {
     /// checked against, and how many issuers their chains may have (1).
     pub ssl_crl: Option<PathBuf>,
     pub ssl_verify_depth: usize,
+    /// ssl_ocsp (off, on, or leaf: only the client's own certificate),
+    /// ssl_ocsp_responder and ssl_ocsp_cache (the name of its zone).
+    pub ssl_ocsp: Option<bool>,
+    pub ssl_ocsp_responder: Option<String>,
+    pub ssl_ocsp_cache: Option<String>,
     /// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file:
     /// the certificate twinx presents to proxied servers.
     /// The certificate and key may have variables in their names.
@@ -701,7 +710,7 @@ impl Builder<'_> {
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
         let l = &s.level;
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
-        let mut options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, curves: l.ssl_ecdh_curve.clone(), crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth };
+        let mut options = crate::tls::Options { verify: l.ssl_verify_client > 0, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, curves: l.ssl_ecdh_curve.clone(), crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth, ocsp: l.ssl_ocsp.map(|leaf| crate::ocsp::Ocsp { leaf, responder: l.ssl_ocsp_responder.clone(), cache: l.ssl_ocsp_cache.clone() }) };
         let extra = conf_commands(&l.ssl_conf_command, &mut options)?;
         let pairs = l.ssl_certificate.iter().zip(&l.ssl_certificate_key).chain(extra[0].iter().zip(&extra[1]));
         let files: Vec<(&Path, &Path)> = pairs.map(|(cert, key)| (cert.as_path(), key.as_path())).collect();
@@ -816,7 +825,10 @@ impl Builder<'_> {
                 "ssl_session_timeout" => level.ssl_sessions.timeout = seconds(&d.args[0]).map_err(at)?.as_secs(),
                 "proxy_ssl_session_reuse" => (level.proxy_ssl_session_reuse, own_tls) = (flag(d).map_err(at)?, true),
                 "ssl_password_file" => level.ssl_password_file = Some(self.path(&d.args[0])),
-                "ssl_verify_client" => level.ssl_verify_client = ["off", "on", "optional", "optional_no_ca"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_verify_client\" directive, it must be \"on\", \"off\", \"optional\" or \"optional_no_ca\"", d.args[0])))? > 0,
+                "ssl_verify_client" => level.ssl_verify_client = ["off", "on", "optional", "optional_no_ca"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_verify_client\" directive, it must be \"on\", \"off\", \"optional\" or \"optional_no_ca\"", d.args[0])))? as u8,
+                "ssl_ocsp" => level.ssl_ocsp = [("off", None), ("on", Some(false)), ("leaf", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_ocsp\" directive, it must be \"on\", \"off\" or \"leaf\"", d.args[0])))?.1,
+                "ssl_ocsp_responder" => level.ssl_ocsp_responder = Some(Some(d.args[0].clone()).filter(|u| u.starts_with("http://")).ok_or_else(|| at(format!("invalid URL prefix in OCSP responder \"{}\" in resolver", d.args[0])))?),
+                "ssl_ocsp_cache" => level.ssl_ocsp_cache = ocsp_cache(&d.args[0]).map_err(at)?,
                 "ssl_trusted_certificate" => level.ssl_trusted_certificate = Some(self.path(&d.args[0])),
                 "ssl_client_certificate" => level.ssl_client_certificate = Some(self.path(&d.args[0])),
                 "ssl_crl" => level.ssl_crl = Some(self.path(&d.args[0])),
@@ -1245,6 +1257,13 @@ fn conf_commands(commands: &[(String, String)], options: &mut crate::tls::Option
         }
     }
     Ok(files)
+}
+
+/// ssl_ocsp_cache: off, or shared:name:size, as the zone's name.
+fn ocsp_cache(value: &str) -> Result<Option<String>, String> {
+    if value == "off" { return Ok(None) }
+    let zone = value.strip_prefix("shared:").and_then(|z| z.rsplit_once(':')).filter(|(name, n)| !name.is_empty() && size(n).is_ok());
+    zone.map(|(name, _)| Some(name.to_string())).ok_or_else(|| format!("invalid value \"{value}\""))
 }
 
 fn flag(d: &Directive) -> Result<bool, String> {
@@ -1872,8 +1891,19 @@ mod tests {
     }
 
     #[test]
+    fn ssl_ocsp() {
+        let c = build_text("http { ssl_ocsp leaf; ssl_ocsp_responder http://127.0.0.1:8080/x; ssl_ocsp_cache shared:OCSP:1m; ssl_verify_client optional_no_ca; server { listen 127.0.0.1:8080; ssl_ocsp_cache off; } }").unwrap();
+        let level = &c.servers[0].level;
+        assert_eq!((level.ssl_ocsp, level.ssl_ocsp_responder.as_deref(), level.ssl_ocsp_cache.as_deref(), level.ssl_verify_client), (Some(true), Some("http://127.0.0.1:8080/x"), None, 3));
+        assert_eq!(ocsp_cache("shared:OCSP:1m"), Ok(Some("OCSP".to_string())));
+        assert_eq!(ocsp_cache("shared::1m"), Err("invalid value \"shared::1m\"".to_string()));
+        assert!(build_text("http { ssl_ocsp yes; }").unwrap_err().starts_with("invalid value \"yes\" in \"ssl_ocsp\" directive"));
+        assert!(build_text("http { ssl_ocsp_responder https://a; }").unwrap_err().starts_with("invalid URL prefix in OCSP responder \"https://a\""));
+    }
+
+    #[test]
     fn ssl_conf_commands() {
-        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, curves: None, crl: None, depth: 1 };
+        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, curves: None, crl: None, depth: 1, ocsp: None };
         let commands = |c: &[(&str, &str)]| c.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
         let files = conf_commands(&commands(&[("Options", "-SessionTicket, -ServerPreference"), ("Certificate", "/c.crt"), ("PrivateKey", "/c.key")]), &mut options).unwrap();
         assert!(!options.sessions.tickets && !options.prefer);
