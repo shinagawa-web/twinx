@@ -50,6 +50,11 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "JUDGE_DIR=$RUNNER_TEMP/judge" >> "$GITHUB_ENV"
 
+      # ssl_ktls.t runs only where the kernel's TLS module is loaded, and runners
+      # differ in that; loading it here makes nginx run the file on every runner.
+      - name: Load the kernel's TLS module
+        run: sudo modprobe tls && test -r /proc/net/tls_stat
+
       # What passes on main right now. Cached per main commit, and saved before
       # any of the pull request's code runs.
       - name: Restore main's results

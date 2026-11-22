@@ -5,8 +5,9 @@
 # here (it needs root, another OS, or a tool the image lacks) is not expected.
 #
 # twinx names itself twinx, not nginx. server_tokens.t checks the name in the
-# Server header and error pages, so for twinx it is run expecting "twinx" there
-# (harness/nginx-tests/rename.pl); nginx runs it as it is.
+# Server header and error pages, so for twinx it is run expecting "twinx" there,
+# and Test::Nginx's version checks (has_version) answer for twinx as for nginx
+# 1.30.6 (harness/nginx-tests/rename.pl); nginx runs them as they are.
 
 # Stage 1, static files and reverse proxying over HTTP/1.1, was cut at v0.1.0
 # (2026-11-20): these are the files that passed then, and those nginx passes no
