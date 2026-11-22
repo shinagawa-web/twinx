@@ -1224,13 +1224,12 @@ fn protocols(args: &[String]) -> Result<[bool; 2], String> {
 fn conf_commands(commands: &[(String, String)], options: &mut crate::tls::Options) -> Result<[Vec<PathBuf>; 2], String> {
     let mut files = [Vec::new(), Vec::new()];
     for (name, value) in commands {
-        let failed = || format!("SSL_CONF_cmd(\"{name}\", \"{value}\") failed");
         match name.as_str() {
             "Options" => for o in value.split(',').map(str::trim) {
                 let (on, option) = o.strip_prefix('-').map_or((true, o), |o| (false, o));
-                match option { "SessionTicket" => options.sessions.tickets = on, "ServerPreference" => options.prefer = on, _ => return Err(failed()) }
+                match option { "SessionTicket" => options.sessions.tickets = on, "ServerPreference" => options.prefer = on, _ => return Err(format!("SSL_CONF_cmd(\"{name}\", \"{value}\") failed")) }
             },
-            "Certificate" | "PrivateKey" => files[usize::from(name == "PrivateKey")].push(PathBuf::from(value)), _ => return Err(failed()),
+            "Certificate" | "PrivateKey" => files[usize::from(name == "PrivateKey")].push(PathBuf::from(value)), _ => return Err(format!("SSL_CONF_cmd(\"{name}\", \"{value}\") failed")),
         }
     }
     Ok(files)
