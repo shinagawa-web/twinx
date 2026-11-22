@@ -235,14 +235,45 @@ impl rustls::server::ProducesTickets for Timed<Arc<dyn rustls::server::ProducesT
     }
 }
 
-/// The certificate a server presents, the same for every connection.
+/// The certificates a server presents, the same for every connection: one
+/// for each type of key, a later one replacing an earlier one of the same type,
+/// as OpenSSL keeps them. A connection gets the first that signs with an
+/// algorithm the client lists, in the client's order, or the first one.
 #[derive(Debug)]
-struct Fixed(Option<Arc<rustls::sign::CertifiedKey>>);
+struct Fixed(Vec<Arc<rustls::sign::CertifiedKey>>);
+
+impl Fixed {
+    fn new(keys: Vec<Arc<rustls::sign::CertifiedKey>>) -> Fixed {
+        let mut kept: Vec<Arc<rustls::sign::CertifiedKey>> = Vec::new();
+        for key in keys {
+            match kept.iter_mut().find(|k| k.key.algorithm() == key.key.algorithm()) {
+                Some(k) => *k = key,
+                None => kept.push(key),
+            }
+        }
+        Fixed(kept)
+    }
+
+    fn choose(&self, schemes: &[SignatureScheme]) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let signs = |scheme: &SignatureScheme| self.0.iter().find(|k| k.key.choose_scheme(&[*scheme]).is_some());
+        schemes.iter().find_map(signs).or(self.0.first()).cloned()
+    }
+}
 
 impl rustls::server::ResolvesServerCert for Fixed {
-    fn resolve(&self, _: rustls::server::ClientHello) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        self.0.clone()
+    fn resolve(&self, hello: rustls::server::ClientHello) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.choose(hello.signature_schemes())
     }
+}
+
+/// How a server takes connections: whether clients are asked for a
+/// certificate (ssl_verify_client not off), how their sessions are resumed,
+/// and whether certificates are sent compressed (ssl_certificate_compression).
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    pub verify: bool,
+    pub sessions: Sessions,
+    pub compress: bool,
 }
 
 /// ssl_certificate and ssl_certificate_key with variables: their names, made
@@ -250,8 +281,7 @@ impl rustls::server::ResolvesServerCert for Fixed {
 /// ssl_certificate_cache, which keeps what they name loaded.
 #[derive(Debug)]
 struct Named {
-    cert: crate::vars::Template,
-    key: crate::vars::Template,
+    files: Vec<(crate::vars::Template, crate::vars::Template)>,
     passwords: Option<PathBuf>,
     cache: Option<Arc<CertCache>>,
 }
@@ -275,20 +305,26 @@ fn certified(chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -
     rustls::sign::CertifiedKey::from_der(chain, key, &provider()).map(Arc::new)
 }
 
-/// The files of ssl_certificate, ssl_certificate_key and ssl_password_file,
-/// and when the names have variables, the cache of what they name
-/// (ssl_certificate_cache) in named; whether clients are asked for a
-/// certificate (ssl_verify_client not off), the files of the certificates
-/// theirs are verified with, and how their sessions are resumed.
-pub fn server((cert, key, passwords): (&Path, &Path, Option<&Path>), named: Option<Option<Arc<CertCache>>>, verify: bool, trust: &[&Path], sessions: Sessions) -> Result<ServerTls, String> {
-    let fixed = named.is_none().then(|| load(cert, key, passwords, true)).transpose()?;
-    let fixed = fixed.map(|(chain, key)| certified(chain, key)).transpose().map_err(|e| format!("cannot load certificate \"{}\" ({e})", cert.display()))?;
+/// The files of ssl_certificate and ssl_certificate_key, in pairs, and of
+/// ssl_password_file, and when the names have variables, the cache of what
+/// they name (ssl_certificate_cache) in named; the files of the certificates
+/// clients' are verified with, and how connections are taken.
+pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Option<Option<Arc<CertCache>>>, trust: &[&Path], options: Options) -> Result<ServerTls, String> {
+    let mut fixed = Vec::new();
+    for (cert, key) in files.iter().filter(|_| named.is_none()) {
+        let (chain, key) = load(cert, key, passwords, true)?;
+        fixed.push(certified(chain, key).map_err(|e| format!("cannot load certificate \"{}\" ({e})", cert.display()))?);
+    }
     let template = |p: &Path| crate::vars::Template::parse(&p.to_string_lossy());
-    let named = named.map(|cache| Ok::<_, String>(Named { cert: template(cert)?, key: template(key)?, passwords: passwords.map(Path::to_path_buf), cache })).transpose()?;
+    let templates = || files.iter().map(|(c, k)| Ok((template(c)?, template(k)?))).collect::<Result<Vec<_>, String>>();
+    let named = named.map(|cache| Ok::<_, String>(Named { files: templates()?, passwords: passwords.map(Path::to_path_buf), cache })).transpose()?;
     let trusted = trust.iter().map(|p| trusted(p)).collect::<Result<Vec<_>, _>>()?.concat();
     let builder = ServerConfig::builder();
-    let builder = if verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
-    let mut config = builder.with_cert_resolver(Arc::new(Fixed(fixed)));
+    let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
+    let mut config = builder.with_cert_resolver(Arc::new(Fixed::new(fixed)));
+    // Certificates are compressed with zlib, for TLS 1.3 clients that offer it.
+    config.cert_compressors = if options.compress { vec![rustls::compress::ZLIB_COMPRESSOR] } else { Vec::new() };
+    let sessions = options.sessions;
     config.session_storage = if sessions.cache { rustls::server::ServerSessionMemoryCache::new(20480) } else { Arc::new(rustls::server::NoServerSessionStorage {}) };
     if sessions.tickets { config.ticketer = Arc::new(Timed(rustls::crypto::ring::Ticketer::new().map_err(|e| e.to_string())?, sessions.timeout)); }
     Ok(ServerTls { config: Arc::new(config), trusted, named })
@@ -301,10 +337,13 @@ impl ServerTls {
         let Some(n) = &self.named else { return Some(self.config.clone()) };
         let r = crate::vars::Request::connection(tcp.peer_addr().ok()?, tcp.local_addr().ok()?, Some(Session { server_name: name.to_string(), ..Session::default() }));
         let sent = crate::vars::Sent::default();
-        let (cert, key) = (PathBuf::from(n.cert.render(&r, &sent)), PathBuf::from(n.key.render(&r, &sent)));
-        let key = cached((&cert, &key, n.passwords.as_deref()), n.cache.as_deref(), &certified).ok()?.ok()?;
+        let mut keys = Vec::new();
+        for (cert, key) in &n.files {
+            let (cert, key) = (PathBuf::from(cert.render(&r, &sent)), PathBuf::from(key.render(&r, &sent)));
+            keys.push(cached((&cert, &key, n.passwords.as_deref()), n.cache.as_deref(), &certified).ok()?.ok()?);
+        }
         let mut config = (*self.config).clone();
-        config.cert_resolver = Arc::new(Fixed(Some(key)));
+        config.cert_resolver = Arc::new(Fixed::new(keys));
         Some(Arc::new(config))
     }
 }
@@ -799,16 +838,46 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert_eq!(trusted(&dir.join("c.pem")).unwrap().len(), 1);
     }
 
+    /// An Ed25519 key and its certificate, made by openssl only for these tests.
+    const ED_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIABI8p3dtZAQNO9IIpddv0KdrpTZgBtF07GcXXMRAqlr\n-----END PRIVATE KEY-----\n";
+    const ED_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBMDCB46ADAgECAhQw6INwvSpRntD3tYuScAjkJthNEDAFBgMrZXAwDTELMAkG
+A1UEAwwCZWQwIBcNMjYxMTIyMTE0MTE3WhgPMjEyNjEwMjkxMTQxMTdaMA0xCzAJ
+BgNVBAMMAmVkMCowBQYDK2VwAyEAL8XKbEjgrlhEUcjM4UHN6toe66wfOnYQD/ra
+ShFX2D6jUzBRMB0GA1UdDgQWBBRx0M5Y4lwOex/ffMorAD1tsQoe8TAfBgNVHSME
+GDAWgBRx0M5Y4lwOex/ffMorAD1tsQoe8TAPBgNVHRMBAf8EBTADAQH/MAUGAytl
+cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
+4q04yOy8aX97GVjXKn4C5xldyA0=
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn presents_the_certificate_the_client_can_verify() {
+        let key = |cert: &str, key: &str| certified(vec![der(cert)], PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap()).unwrap();
+        let (ec, ed) = (key(CERT, KEY), key(ED_CERT, ED_KEY));
+        // A later certificate with a key of the same type replaces an earlier one.
+        let fixed = Fixed::new(vec![ed.clone(), key(CERT, KEY), ec.clone()]);
+        assert_eq!(fixed.0.len(), 2);
+        assert!(Arc::ptr_eq(&fixed.0[1], &ec));
+        let chosen = |schemes: &[SignatureScheme]| fixed.choose(schemes).unwrap();
+        assert!(Arc::ptr_eq(&chosen(&[SignatureScheme::ECDSA_NISTP256_SHA256, SignatureScheme::ED25519]), &ec));
+        assert!(Arc::ptr_eq(&chosen(&[SignatureScheme::RSA_PSS_SHA256, SignatureScheme::ED25519]), &ed));
+        assert!(Arc::ptr_eq(&chosen(&[SignatureScheme::RSA_PSS_SHA256]), &ed));
+        assert!(Fixed::new(Vec::new()).choose(&[SignatureScheme::ED25519]).is_none());
+    }
+
     #[test]
     fn loads_the_certificate_a_connection_names() {
         let dir = dir();
-        let files = (&*dir.join("$ssl_server_name"), &*dir.join("k.pem"), None);
-        let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), false, &[], Sessions::default()).unwrap();
+        let names = [(&*dir.join("$ssl_server_name"), &*dir.join("k.pem"))];
+        let files = (&names[..], None);
+        let options = Options { verify: false, sessions: Sessions::default(), compress: false };
+        let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), &[], options).unwrap();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         assert!(tls.for_connection(&tcp, "c.pem").is_some());
         assert!(tls.for_connection(&tcp, "none").is_none());
-        assert!(server(files, None, false, &[], Sessions::default()).is_err());
+        assert!(server(files, None, &[], options).is_err());
     }
 
     #[test]

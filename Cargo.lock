@@ -693,6 +693,7 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
+ "zlib-rs",
 ]
 
 [[package]]
