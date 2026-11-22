@@ -637,7 +637,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().rev().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
-    crate::tls::INHERITABLE.store(inheritable, std::sync::atomic::Ordering::Relaxed);
+    crate::tls::new_configuration(inheritable);
     for d in main {
         b.check(d, MAIN)?;
         match d.name.as_str() {

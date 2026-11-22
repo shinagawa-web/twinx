@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,20 +38,33 @@ fn load(cert: &Path, key: &Path, passwords: Option<&Path>, kept: bool) -> Result
 /// certificates and keys the one before it loaded.
 pub static INHERITABLE: AtomicBool = AtomicBool::new(true);
 
-/// The certificate and key files configurations loaded, by name, with the
-/// modification time and inode they had then. As nginx's cache of SSL objects,
-/// a configuration loaded again (a reload) takes a file whose time and inode
-/// did not change as it was loaded, not as it is now, while
-/// ssl_object_cache_inheritable is on.
-static LOADED: Mutex<Vec<(PathBuf, (i64, u64), Vec<u8>)>> = Mutex::new(Vec::new());
+/// The configuration being loaded, counted from the first: each one loads a
+/// file it names more than once only once, as nginx's cache of SSL objects.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// A file's contents, those loaded before when kept and they may be inherited.
+/// Begins loading a configuration, whose files are read again, unless
+/// inherited (ssl_object_cache_inheritable).
+pub fn new_configuration(inheritable: bool) {
+    INHERITABLE.store(inheritable, Ordering::Relaxed);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The certificate, key, CA and CRL files configurations loaded, by name, with
+/// the modification time and inode they had then and the configuration that
+/// last took them. As nginx's cache of SSL objects, a configuration takes a
+/// file it already loaded as it loaded it, and a configuration loaded again (a
+/// reload) takes a file whose time and inode did not change as it was loaded,
+/// not as it is now, while ssl_object_cache_inheritable is on.
+static LOADED: Mutex<Vec<(PathBuf, (i64, u64), u64, Vec<u8>)>> = Mutex::new(Vec::new());
+
+/// A file's contents, those loaded before when kept and they may be taken.
 fn read(path: &Path, kept: bool) -> std::io::Result<Vec<u8>> {
-    let (meta, mut loaded) = (file(path), LOADED.lock().unwrap());
-    let inherit = kept && INHERITABLE.load(Ordering::Relaxed);
-    if let Some(old) = loaded.iter().find(|l| inherit && l.0 == path && Some(l.1) == meta) { return Ok(old.2.clone()) }
+    let (generation, mut loaded) = (GENERATION.load(Ordering::Relaxed), LOADED.lock().unwrap());
+    if let Some(old) = loaded.iter().find(|l| kept && l.0 == path && l.2 == generation) { return Ok(old.3.clone()) }
+    let (meta, inherit) = (file(path), kept && INHERITABLE.load(Ordering::Relaxed));
+    if let Some(old) = loaded.iter_mut().find(|l| inherit && l.0 == path && Some(l.1) == meta) { old.2 = generation; return Ok(old.3.clone()) }
     let data = std::fs::read(path)?;
-    if let Some(meta) = meta.filter(|_| kept) { loaded.retain(|l| l.0 != path); loaded.push((path.to_path_buf(), meta, data.clone())); }
+    if let Some(meta) = meta.filter(|_| kept) { loaded.retain(|l| l.0 != path); loaded.push((path.to_path_buf(), meta, generation, data.clone())); }
     Ok(data)
 }
 
@@ -166,13 +179,14 @@ impl CertCache {
 
 /// The certificates of a file, in PEM, that clients' certificates are verified with.
 fn trusted(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let certs = CertificateDer::pem_file_iter(path).and_then(|certs| certs.collect::<Result<Vec<_>, _>>());
-    certs.map_err(|_| format!("SSL_CTX_load_verify_locations(\"{}\") failed", path.display()))
+    let certs = read(path, true).ok().and_then(|pem| CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>().ok());
+    certs.ok_or_else(|| format!("SSL_CTX_load_verify_locations(\"{}\") failed", path.display()))
 }
 
 /// The CRLs of a file, in PEM (ssl_crl, proxy_ssl_crl).
 fn crls(path: &Path) -> Result<Vec<Vec<u8>>, String> {
-    CertificateRevocationListDer::pem_file_iter(path).and_then(|c| c.map(|c| c.map(|c| c.to_vec())).collect()).map_err(|_| format!("X509_LOOKUP_load_file(\"{}\") failed", path.display()))
+    let crls = read(path, true).ok().and_then(|pem| CertificateRevocationListDer::pem_slice_iter(&pem).map(|c| c.map(|c| c.to_vec())).collect::<Result<_, _>>().ok());
+    crls.ok_or_else(|| format!("X509_LOOKUP_load_file(\"{}\") failed", path.display()))
 }
 
 fn provider() -> Arc<CryptoProvider> {
@@ -1195,7 +1209,13 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::fs::write(&path, "b").unwrap();
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(mtime).unwrap();
+        new_configuration(true);
         assert_eq!((read(&path, true).unwrap(), read(&path, false).unwrap()), (b"a".to_vec(), b"b".to_vec()));
+        new_configuration(false);
+        assert_eq!(read(&path, true).unwrap(), b"b");
+        std::fs::write(&path, "x").unwrap();
+        assert_eq!(read(&path, true).unwrap(), b"b");
+        new_configuration(true);
         let new = path.with_extension("new");
         std::fs::write(&new, "c").unwrap();
         std::fs::rename(&new, &path).unwrap();
