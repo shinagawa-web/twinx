@@ -53,8 +53,8 @@ SKIP = re.compile(r"#\s*skip", re.IGNORECASE)
 def image(target):
     """The tag of an nginx-tests image ("nginx" or "twinx"), named after what it is built from."""
     digest = hashlib.sha256()
-    for name in sorted(p.name for p in TESTS_DIR.iterdir()):
-        digest.update(name.encode() + b"\0" + (TESTS_DIR / name).read_bytes())
+    for path in sorted(p for p in TESTS_DIR.rglob("*") if p.is_file()):
+        digest.update(str(path.relative_to(TESTS_DIR)).encode() + b"\0" + path.read_bytes())
     return f"twinx-nginx-tests:{digest.hexdigest()[:12]}-{target}"
 
 

@@ -24,9 +24,14 @@ files = [
 
 # Stage 2: what stage 1 left (files that need only the http, rewrite and proxy
 # modules), and gzip: files that need only those and the gzip, gunzip or
-# gzip_static modules.
+# gzip_static modules. The twinx_*.t files are twinx's own tests
+# (harness/nginx-tests/extra): behaviour of those files that nginx-tests does not
+# check, found by the security checks in v0.1.1.
 [stage2]
 files = [
+  "twinx_body.t", "twinx_body_chunked.t", "twinx_default_root.t", "twinx_header_buffers.t",
+  "twinx_location_captures.t", "twinx_return_url.t", "twinx_upstream_response.t",
+  "twinx_variable_strings.t",
   "http_headers_multi.t", "http_keepalive.t", "http_listen.t", "http_location_auto.t",
   "http_max_headers.t", "http_request_port.t", "http_resolver.t",
   "http_resolver_aaaa.t", "http_resolver_cleanup.t", "http_resolver_cname.t",
