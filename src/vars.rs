@@ -220,7 +220,7 @@ impl Var {
 
     /// The value, or None when the variable is "not found" (no such header, no user).
     pub fn value(&self, r: &Request, s: &Sent, now: &DateTime<Local>) -> Option<Vec<u8>> {
-        Some(match self {
+        Some(bytes(match self {
             Var::Uri => r.uri.clone(),
             Var::RequestMethod => r.method.clone(),
             Var::Status => format!("{:03}", s.status),
@@ -261,7 +261,8 @@ impl Var {
             Var::ProxyHost => s.proxy_host.clone()?,
             Var::ProxyPort => s.proxy_host.as_ref()?.rsplit_once(':').map_or("80", |(_, p)| p).to_string(),
             Var::ProxyAddXForwardedFor => joined(&r.headers, "x-forwarded-for", ", ").map_or_else(|| r.peer.ip().to_string(), |x| format!("{x}, {}", r.peer.ip())),
-            Var::Args => r.target.split_once('?').map_or("", |(_, a)| a).to_string(),
+            // Empty arguments, with "?" or without, are not found.
+            Var::Args => r.target.split_once('?').map(|(_, a)| a).filter(|a| !a.is_empty())?.to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
             Var::Arg(name) => {
@@ -275,8 +276,30 @@ impl Var {
             Var::SentTrailer(name) => joined(&s.trailers, name, ", ")?,
             Var::UpstreamHttp(name) => joined(if s.upstream.is_empty() { &r.upstream } else { &s.upstream }, name, ", ")?,
             Var::UpstreamCookie(name) => set_cookie(if s.upstream.is_empty() { &r.upstream } else { &s.upstream }, name)?,
-        }.into_bytes())
+        }.as_str()))
     }
+}
+
+/// Text read from the network, its bytes that are not UTF-8 kept as nginx
+/// keeps them: each becomes a character of the Private Use Area, U+10FF00
+/// plus the byte, which bytes() turns back into the byte when it is sent.
+pub fn text(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len());
+    for chunk in b.utf8_chunks() {
+        out.push_str(chunk.valid());
+        out.extend(chunk.invalid().iter().filter_map(|&c| char::from_u32(0x10FF00 + c as u32)));
+    }
+    out
+}
+
+/// The bytes of text made by text(), each character of U+10FF00 to U+10FFFF
+/// the byte it stands for.
+pub fn bytes(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        match c as u32 { n @ 0x10FF00.. => out.push(n as u8), _ => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()) }
+    }
+    out
 }
 
 /// The values of every header with the name, joined; None when there is none.
@@ -390,7 +413,7 @@ impl Template {
     /// The value for a directive: variables that are not found give "".
     pub fn render(&self, r: &Request, s: &Sent) -> String {
         let now = Local::now();
-        let value = |v: &Var| v.value(r, s, &now).map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default();
+        let value = |v: &Var| v.value(r, s, &now).map(|v| text(&v)).unwrap_or_default();
         self.0.iter().map(|p| match p { Part::Text(t) => t.clone(), Part::Var(v) => value(v) }).collect()
     }
 
@@ -500,6 +523,18 @@ mod tests {
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"127.0.0.1:1234:127.0.0.1:8080|\\x7F\\x00\\x00\\x01|\\x22\\x5C\\x0A\\x01\\xC3\\xA9");
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Json), b"127.0.0.1:1234:127.0.0.1:8080|\x7F\\u0000\\u0000\\u0001|\\\"\\\\\\n\\u0001\xC3\xA9".as_slice());
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::None), b"127.0.0.1:1234:127.0.0.1:8080|\x7F\x00\x00\x01|\"\\\n\x01\xC3\xA9");
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8() {
+        let raw = b"/\xff\xfe?q=\xc3\xa9\xc3";
+        assert_eq!(text(raw), "/\u{10ffff}\u{10fffe}?q=\u{e9}\u{10ffc3}");
+        assert_eq!(bytes(&text(raw)), raw);
+        let mut r = request();
+        r.target = text(raw);
+        assert_eq!(Template::parse("$args").unwrap().log_line(&r, &Sent::default(), Escape::Default), b"q=\\xC3\\xA9\\xC3");
+        r.target = "/a?".into();
+        assert_eq!(Template::parse("[$args]").unwrap().log_line(&r, &Sent::default(), Escape::Default), b"[-]");
     }
 
     #[test]
