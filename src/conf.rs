@@ -86,6 +86,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("limit_except", LOC, 1, usize::MAX, true),
     ("ssl_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_key", HTTP | SRV, 1, 1, false),
+    ("ssl_certificate_compression", HTTP | SRV, 1, 1, false),
     ("ssl_session_cache", HTTP | SRV, 1, 2, false),
     ("ssl_session_tickets", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_cache", HTTP | SRV, 1, 3, false),
@@ -432,9 +433,13 @@ pub struct Level {
     /// if_modified_since: None when off; Some(true) for "before", where an
     /// If-Modified-Since time after Last-Modified holds too, not only an equal one.
     pub if_modified_since: Option<bool>,
-    /// ssl_certificate and ssl_certificate_key: the files of the server's certificate and its key.
-    pub ssl_certificate: Option<PathBuf>,
-    pub ssl_certificate_key: Option<PathBuf>,
+    /// ssl_certificate and ssl_certificate_key: the files of the server's
+    /// certificates and their keys, in pairs, in the order they were given.
+    pub ssl_certificate: Vec<PathBuf>,
+    pub ssl_certificate_key: Vec<PathBuf>,
+    /// ssl_certificate_compression: certificates are sent compressed to
+    /// clients that ask for it.
+    pub ssl_certificate_compression: bool,
     /// limit_except: the methods allowed (HEAD with GET), and the settings of
     /// the block, which requests with any other method get instead of the
     /// location's. Nested locations and if blocks do not inherit it.
@@ -674,9 +679,10 @@ impl Builder<'_> {
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
         let l = &s.level;
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
-        let files = l.ssl_certificate.as_deref().zip(l.ssl_certificate_key.as_deref());
-        let named = |p: &Path| p.to_string_lossy().contains('$');
-        s.tls = files.map(|(cert, key)| crate::tls::server((cert, key, l.ssl_password_file.as_deref()), (named(cert) || named(key)).then(|| l.ssl_certificate_cache.clone()), l.ssl_verify_client, &trust, l.ssl_sessions)).transpose()?;
+        let files: Vec<(&Path, &Path)> = l.ssl_certificate.iter().map(PathBuf::as_path).zip(l.ssl_certificate_key.iter().map(PathBuf::as_path)).collect();
+        let named = files.iter().any(|(cert, key)| [cert, key].iter().any(|p| p.to_string_lossy().contains('$')));
+        let options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression };
+        s.tls = (!files.is_empty()).then(|| crate::tls::server((&files, l.ssl_password_file.as_deref()), named.then(|| l.ssl_certificate_cache.clone()), &trust, options)).transpose()?;
         let level = s.level.clone();
         self.locations(block, &level, &mut s.locations)?;
         Ok(s)
@@ -703,6 +709,8 @@ impl Builder<'_> {
         let mut logs: Option<Vec<Arc<AccessLog>>> = None;
         let (mut headers, mut trailers): (Option<Vec<(String, Template, bool)>>, Option<Vec<_>>) = (None, None);
         let mut pages: Option<Vec<ErrorPage>> = None;
+        // ssl_certificate and ssl_certificate_key of this level, which replace those inherited.
+        let mut certs: [Option<Vec<PathBuf>>; 2] = [None, None];
         let mut proxy_headers: Option<Vec<(String, Template)>> = None;
         let mut hidden: Option<Vec<String>> = None;
         // proxy_cookie_domain and proxy_cookie_path of this level: Some(None) once "off".
@@ -766,8 +774,8 @@ impl Builder<'_> {
                     let get = d.args.iter().any(|m| m == "GET").then(|| "HEAD".to_string());
                     limit = Some((d.args.iter().cloned().chain(get).collect::<Vec<_>>(), d));
                 }
-                "ssl_certificate" => level.ssl_certificate = Some(self.path(&d.args[0])),
-                "ssl_certificate_key" => level.ssl_certificate_key = Some(self.path(&d.args[0])),
+                "ssl_certificate" | "ssl_certificate_key" => certs[usize::from(d.name == "ssl_certificate_key")].get_or_insert_default().push(self.path(&d.args[0])),
+                "ssl_certificate_compression" => level.ssl_certificate_compression = flag(d).map_err(at)?,
                 // The sessions are kept in memory of each server, whatever the cache.
                 "ssl_session_cache" => {
                     if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
@@ -895,6 +903,9 @@ impl Builder<'_> {
         if let Some(headers) = headers { level.add_header = headers; }
         if let Some(trailers) = trailers { level.add_trailer = trailers; }
         if let Some(pages) = pages { level.error_page = pages; }
+        let [certificates, keys] = certs;
+        if let Some(c) = certificates { level.ssl_certificate = c; }
+        if let Some(k) = keys { level.ssl_certificate_key = k; }
         if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
         if let Some(hidden) = hidden { level.proxy_hide_header = hidden; }
         let [domain, path] = cookies;
@@ -1762,6 +1773,17 @@ mod tests {
         assert!(e.contains("invalid value \"x\" in \"proxy_ssl_verify_depth\" directive"), "{e}");
         let c = build_text("http { proxy_ssl_verify on; proxy_ssl_name $host; server { listen 127.0.0.1:8080; location / { proxy_ssl_verify_depth 2; } } }").unwrap();
         assert!(c.servers[0].level.proxy_ssl_verify && c.servers[0].level.proxy_ssl_name.is_some());
+    }
+
+    #[test]
+    fn ssl_certificates_of_a_level_replace_those_inherited() {
+        let c = build_text("http { ssl_certificate_compression on; ssl_certificate a$ssl_server_name.crt; ssl_certificate_key a$ssl_server_name.key; server { listen 127.0.0.1:8080; ssl_certificate b$ssl_server_name.crt; ssl_certificate_key b$ssl_server_name.key; ssl_certificate c$ssl_server_name.crt; ssl_certificate_key c$ssl_server_name.key; ssl_certificate_compression off; } server { listen 127.0.0.1:8081; } }").unwrap();
+        let names = |files: &[PathBuf]| files.iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let (own, inherited) = (&c.servers[0].level, &c.servers[1].level);
+        assert_eq!((names(&own.ssl_certificate), names(&own.ssl_certificate_key)), (vec!["b$ssl_server_name.crt".to_string(), "c$ssl_server_name.crt".into()], vec!["b$ssl_server_name.key".to_string(), "c$ssl_server_name.key".into()]));
+        assert_eq!(names(&inherited.ssl_certificate), ["a$ssl_server_name.crt"]);
+        assert_eq!((own.ssl_certificate_compression, inherited.ssl_certificate_compression), (false, true));
+        assert!(c.servers.iter().all(|s| s.tls.is_some()));
     }
 
     #[test]
