@@ -49,3 +49,23 @@ files = [
   "worker_shutdown_timeout.t", "worker_shutdown_timeout_proxy_upgrade.t",
   "working_directory.t", "access_log.t", "gunzip.t", "gunzip_static.t", "gzip.t",
 ]
+
+# Stage 3: TLS. Files that need, besides the modules of stages 1 and 2, only
+# http_ssl and the TLS features of the test client (socket_ssl*, sni, openssl
+# versions, cryptx); files that also need HTTP/2, HTTP/3, stream or mail wait
+# for their stages.
+[stage3]
+files = [
+  "proxy_if.t", "proxy_request_buffering_ssl.t", "proxy_ssl.t",
+  "proxy_ssl_certificate.t", "proxy_ssl_certificate_cache.t",
+  "proxy_ssl_certificate_empty.t", "proxy_ssl_certificate_vars.t", "proxy_ssl_crl.t",
+  "proxy_ssl_name.t", "proxy_ssl_verify.t", "proxy_ssl_verify_ip.t", "ssl.t",
+  "ssl_cache.t", "ssl_cache_reload.t", "ssl_certificate_aux.t",
+  "ssl_certificate_cache.t", "ssl_certificate_chain.t",
+  "ssl_certificate_compression.t", "ssl_certificates.t", "ssl_client_escaped_cert.t",
+  "ssl_conf_command.t", "ssl_crl.t", "ssl_curve.t", "ssl_engine_keys.t", "ssl_ktls.t",
+  "ssl_ocsp.t", "ssl_password_file.t", "ssl_proxy_upgrade.t", "ssl_reject_handshake.t",
+  "ssl_session_reuse.t", "ssl_session_ticket_key.t", "ssl_sigalgs.t", "ssl_sni.t",
+  "ssl_sni_protocols.t", "ssl_sni_reneg.t", "ssl_sni_sessions.t", "ssl_stapling.t",
+  "ssl_verify_client.t", "ssl_verify_client_trusted.t", "ssl_verify_depth.t",
+]

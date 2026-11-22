@@ -24,7 +24,7 @@ Each stage is a list of nginx-tests files (`harness/stages.toml`). A stage is do
 |---|---|---|
 | 1 | Static file serving and reverse proxying over HTTP/1.1 | cut at v0.1.0 (2026-11-20): the 12 files that passed then |
 | 2 | What stage 1 left, and gzip | the stage 1 files that did not pass at v0.1.0, and those that also need the gzip, gunzip or gzip_static modules |
-| 3 | TLS | to be listed |
+| 3 | TLS | those that also need only http_ssl and the test client's TLS features (40; HTTP/2, HTTP/3, stream and mail wait) |
 | 4 | HTTP/2 | to be listed |
 | 5 | Caching (proxy_cache) | to be listed |
 
