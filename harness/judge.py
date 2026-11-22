@@ -145,9 +145,9 @@ def main():
     expected = {name: tests for name, tests in expected.items() if tests}
     regressed = []
     for name, tests in sorted(expected.items()):
-        lost = sorted((tests & passing(baseline, name)) - passing(results, name), key=int)
+        lost = sorted((tests & passing(baseline, name)) - passing(results, name), key=lambda k: int(k.split()[0]))
         if lost:
-            regressed.append(f"{name} ({', '.join(lost)})")
+            regressed.append(f"{name} ({', '.join(k.split()[0] for k in lost)})")
     if regressed:
         problems.append("subtests that pass on main no longer pass: " + "; ".join(regressed))
 
@@ -160,8 +160,8 @@ def main():
         if target not in expected:
             problems.append(f"{target} is not an nginx-tests file that nginx passes in the current stages")
         elif target not in passing_after:
-            missing = sorted(expected[target] - passing(results, target), key=int)
-            problems.append(f"{target} still does not pass: subtests {', '.join(missing)}")
+            missing = sorted(expected[target] - passing(results, target), key=lambda k: int(k.split()[0]))
+            problems.append(f"{target} still does not pass: subtests {', '.join(k.split()[0] for k in missing)}")
 
     coverage = json.loads(Path(args.coverage).read_text()) if args.coverage and Path(args.coverage).exists() else None
     if role == "fix":

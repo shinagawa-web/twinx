@@ -22,7 +22,7 @@ select STDERR; $| = 1;
 select STDOUT; $| = 1;
 use File::Find;
 
-my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(7);
+my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(6);
 
 mkdir($t->testdir() . '/ro');
 chmod(0555, $t->testdir() . '/ro');
@@ -51,14 +51,15 @@ http {
             client_max_body_size 0;
             proxy_pass http://127.0.0.1:8080/ok;
         }
-        location /giga {
-            client_max_body_size 1g;
-            proxy_pass http://127.0.0.1:8080/ok;
+        location = /file {
+            client_max_body_size 0;
+            return 200 "$http_x_file";
         }
         location /clean {
             client_body_in_file_only clean;
             client_body_temp_path %%TESTDIR%%/clean;
-            proxy_pass http://127.0.0.1:8080/ok;
+            proxy_set_header X-File $request_body_file;
+            proxy_pass http://127.0.0.1:8080/file;
         }
         location /levels {
             client_body_in_file_only on;
@@ -82,12 +83,13 @@ $t->run();
 
 ###############################################################################
 
-like(post('/zero', 'z'), qr/^HTTP\/1\.1 200 /, 'client_max_body_size 0 is no limit');
-like(post('/giga', 'g' x 2097152), qr/^HTTP\/1\.1 200 /, 'client_max_body_size 1g');
+like(post('/zero', 'z' x 2097152), qr/^HTTP\/1\.1 200 /, 'client_max_body_size 0 is no limit');
 
-like(post('/clean', 'c' x 10), qr/^HTTP\/1\.1 200 /, 'in file only clean');
+my $testdir = $t->testdir();
+like(post('/clean', 'c' x 10), qr!\x0d\x0a\x0d\x0a\Q$testdir\E/clean/\d{10}$!,
+	'in file only clean writes the body to a file');
 select undef, undef, undef, 0.2;
-is(join(',', files('clean')), '', 'in file only clean removes the temporary file');
+is(join(',', files('clean')), '', 'in file only clean removes the file afterwards');
 
 post('/levels', 'l' x 10);
 select undef, undef, undef, 0.2;

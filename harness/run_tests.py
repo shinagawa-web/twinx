@@ -48,6 +48,7 @@ TIMEOUT = 300
 PLAN = re.compile(r"^1\.\.(\d+)(?:\s*#\s*skip\S*\s*(.*))?$", re.IGNORECASE)
 RESULT = re.compile(r"^(not )?ok (\d+)\b(.*)$")
 SKIP = re.compile(r"#\s*skip", re.IGNORECASE)
+DIRECTIVE = re.compile(r"\s#\s*(todo|skip)\b.*$", re.IGNORECASE)
 
 
 def image(target):
@@ -101,11 +102,15 @@ def parse_tap(text):
             if planned == 0:
                 skip_all = match.group(2) or "skipped"
         elif match := RESULT.match(line):
-            number = match.group(2)
+            # Keyed by number and name: when a server refuses its configuration, the
+            # checks Test::Nginx runs at exit ("no alerts", ...) take numbers 1 and 2,
+            # and must not count as the file's own subtests 1 and 2.
+            name = DIRECTIVE.sub("", match.group(3)).strip().lstrip("-").strip()
+            key = f"{match.group(2)} {name}".strip()
             if SKIP.search(match.group(3)):
-                tests[number] = "skip"
+                tests[key] = "skip"
             else:
-                tests[number] = "not ok" if match.group(1) else "ok"
+                tests[key] = "not ok" if match.group(1) else "ok"
     return tests, planned, skip_all
 
 
@@ -190,8 +195,8 @@ def main():
         if reference is not None and r["file"] in reference:
             expected = {n for n, s in reference[r["file"]]["tests"].items() if s == "ok"}
             if expected:
-                missing = sorted(expected - oks, key=int)
-                state = "PASS" if not missing else f"FAIL, not ok: {', '.join(missing)}"
+                missing = sorted(expected - oks, key=lambda k: int(k.split()[0]))
+                state = "PASS" if not missing else f"FAIL, not ok: {', '.join(k.split()[0] for k in missing)}"
             else:
                 state = "not expected (nginx passes no subtest here)"
         print(f"{r['file']}: {state}")
