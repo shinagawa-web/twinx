@@ -58,6 +58,18 @@ pub struct Request {
 }
 
 impl Request {
+    /// A request of a connection whose head has not been read: for what only
+    /// the connection gives, such as $ssl_server_name in ssl_certificate.
+    pub fn connection(peer: SocketAddr, local: SocketAddr, ssl: Option<crate::tls::Session>) -> Request {
+        let now = Instant::now();
+        Request {
+            method: String::new(), uri: String::new(), target: String::new(), line: String::new(), headers: Vec::new(), host: None,
+            server_name: String::new(), peer, local, started: now, pipelined: false, connected: now, requests: 0, length: 0,
+            body: Vec::new(), body_file: None, upstream_addr: None, upstream_status: None, upstream: Vec::new(), captures: Vec::new(),
+            limit_rate: Default::default(), vars: Default::default(), unread: Default::default(), client: -1, ssl,
+        }
+    }
+
     /// Gives a variable of set, or a capture, its value for this request.
     pub fn set_var(&self, name: &str, value: String) {
         let mut vars = self.vars.lock().unwrap();

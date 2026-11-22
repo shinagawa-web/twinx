@@ -181,6 +181,7 @@ fn provider() -> Arc<CryptoProvider> {
 pub struct ServerTls {
     config: Arc<ServerConfig>,
     trusted: Vec<CertificateDer<'static>>,
+    named: Option<Named>,
 }
 
 /// How a server resumes clients' sessions: with tickets (ssl_session_tickets),
@@ -234,19 +235,78 @@ impl rustls::server::ProducesTickets for Timed<Arc<dyn rustls::server::ProducesT
     }
 }
 
-/// The files of ssl_certificate, ssl_certificate_key and ssl_password_file;
-/// whether clients are asked for a certificate (ssl_verify_client not off),
-/// the files of the certificates theirs are verified with, and how their
-/// sessions are resumed.
-pub fn server(cert: &Path, key: &Path, passwords: Option<&Path>, verify: bool, trust: &[&Path], sessions: Sessions) -> Result<ServerTls, String> {
-    let (chain, key) = load(cert, key, passwords, true)?;
+/// The certificate a server presents, the same for every connection.
+#[derive(Debug)]
+struct Fixed(Option<Arc<rustls::sign::CertifiedKey>>);
+
+impl rustls::server::ResolvesServerCert for Fixed {
+    fn resolve(&self, _: rustls::server::ClientHello) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.0.clone()
+    }
+}
+
+/// ssl_certificate and ssl_certificate_key with variables: their names, made
+/// for each connection, the passwords of ssl_password_file, and
+/// ssl_certificate_cache, which keeps what they name loaded.
+#[derive(Debug)]
+struct Named {
+    cert: crate::vars::Template,
+    key: crate::vars::Template,
+    passwords: Option<PathBuf>,
+    cache: Option<Arc<CertCache>>,
+}
+
+/// The certificate and key of files, taken from the cache when there is one,
+/// and checked with check. A key that does not match its certificate, as a
+/// cache updated between the two may give, has both loaded again.
+fn cached<T>((cert, key, passwords): (&Path, &Path, Option<&Path>), cache: Option<&CertCache>, check: &dyn Fn(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) -> Result<T, rustls::Error>) -> Result<Result<T, rustls::Error>, String> {
+    let fetch = |key: bool, path: &Path, invalidate: bool, create: &dyn Fn() -> Result<(Object, bool), String>| match cache { Some(c) => c.fetch(key, path, invalidate, create), None => create().map(|o| o.0) };
+    let mut invalidate = false;
+    loop {
+        let chain = fetch(false, cert, invalidate, &|| Ok((Object { chain: chain(cert, false)?, key: None }, false)))?.chain;
+        let pkey = fetch(true, key, invalidate, &|| private_key(key, passwords, false).map(|(k, encrypted)| (Object { chain: Vec::new(), key: Some(k) }, encrypted)))?.key;
+        let checked = check(chain, pkey.ok_or("no key")?);
+        if !invalidate && matches!(checked, Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch))) { invalidate = true; continue }
+        return Ok(checked);
+    }
+}
+
+fn certified(chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<Arc<rustls::sign::CertifiedKey>, rustls::Error> {
+    rustls::sign::CertifiedKey::from_der(chain, key, &provider()).map(Arc::new)
+}
+
+/// The files of ssl_certificate, ssl_certificate_key and ssl_password_file,
+/// and when the names have variables, the cache of what they name
+/// (ssl_certificate_cache) in named; whether clients are asked for a
+/// certificate (ssl_verify_client not off), the files of the certificates
+/// theirs are verified with, and how their sessions are resumed.
+pub fn server((cert, key, passwords): (&Path, &Path, Option<&Path>), named: Option<Option<Arc<CertCache>>>, verify: bool, trust: &[&Path], sessions: Sessions) -> Result<ServerTls, String> {
+    let fixed = named.is_none().then(|| load(cert, key, passwords, true)).transpose()?;
+    let fixed = fixed.map(|(chain, key)| certified(chain, key)).transpose().map_err(|e| format!("cannot load certificate \"{}\" ({e})", cert.display()))?;
+    let template = |p: &Path| crate::vars::Template::parse(&p.to_string_lossy());
+    let named = named.map(|cache| Ok::<_, String>(Named { cert: template(cert)?, key: template(key)?, passwords: passwords.map(Path::to_path_buf), cache })).transpose()?;
     let trusted = trust.iter().map(|p| trusted(p)).collect::<Result<Vec<_>, _>>()?.concat();
     let builder = ServerConfig::builder();
     let builder = if verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
-    let mut config = builder.with_single_cert(chain, key).map_err(|e| format!("cannot load certificate \"{}\" ({e})", cert.display()))?;
+    let mut config = builder.with_cert_resolver(Arc::new(Fixed(fixed)));
     config.session_storage = if sessions.cache { rustls::server::ServerSessionMemoryCache::new(20480) } else { Arc::new(rustls::server::NoServerSessionStorage {}) };
     if sessions.tickets { config.ticketer = Arc::new(Timed(rustls::crypto::ring::Ticketer::new().map_err(|e| e.to_string())?, sessions.timeout)); }
-    Ok(ServerTls { config: Arc::new(config), trusted })
+    Ok(ServerTls { config: Arc::new(config), trusted, named })
+}
+
+impl ServerTls {
+    /// What a connection is taken with: with files named with variables, the
+    /// certificate and key they name for it (None when they cannot be loaded).
+    fn for_connection(&self, tcp: &TcpStream, name: &str) -> Option<Arc<ServerConfig>> {
+        let Some(n) = &self.named else { return Some(self.config.clone()) };
+        let r = crate::vars::Request::connection(tcp.peer_addr().ok()?, tcp.local_addr().ok()?, Some(Session { server_name: name.to_string(), ..Session::default() }));
+        let sent = crate::vars::Sent::default();
+        let (cert, key) = (PathBuf::from(n.cert.render(&r, &sent)), PathBuf::from(n.key.render(&r, &sent)));
+        let key = cached((&cert, &key, n.passwords.as_deref()), n.cache.as_deref(), &certified).ok()?.ok()?;
+        let mut config = (*self.config).clone();
+        config.cert_resolver = Arc::new(Fixed(Some(key)));
+        Some(Arc::new(config))
+    }
 }
 
 /// What the variables tell of a TLS connection: the protocol ($ssl_protocol,
@@ -333,7 +393,7 @@ pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option
     let name = hello.client_hello().server_name().unwrap_or_default().to_string();
     let tls = crate::http::server(config, listen, hello.client_hello().server_name()).0.tls.as_ref()?;
     let ciphers = hello.client_hello().cipher_suites().iter().map(|c| cipher(u16::from(*c))).collect::<Vec<_>>().join(":");
-    let mut conn = hello.into_connection(tls.config.clone()).ok()?;
+    let mut conn = hello.into_connection(tls.for_connection(&tcp, &name)?).ok()?;
     // A session keeps its identifier when it is resumed, as OpenSSL's does.
     let id = conn.received_resumption_data().map_or_else(|| { let mut id = [0u8; 32]; provider().secure_random.fill(&mut id).map(|_| id.to_vec()) }, |id| Ok(id.to_vec())).ok()?;
     conn.set_resumption_data(&id);
@@ -517,20 +577,12 @@ fn proxied(verify: Option<Verify>) -> rustls::ConfigBuilder<ClientConfig, rustls
 /// What one connection to a proxied server is made with when variables name
 /// the files of proxy_ssl_certificate and proxy_ssl_certificate_key: base's
 /// settings, with the certificate and key of those files, taken from the
-/// cache when there is one. A key that does not match its certificate, as a
-/// cache updated between the two may give, has both loaded again.
-pub fn client_cert(base: &Arc<ClientConfig>, (cert, key, passwords): (&Path, &Path, Option<&Path>), cache: Option<&CertCache>) -> Result<Arc<ClientConfig>, String> {
-    let fetch = |key: bool, path: &Path, invalidate: bool, create: &dyn Fn() -> Result<(Object, bool), String>| match cache { Some(c) => c.fetch(key, path, invalidate, create), None => create().map(|o| o.0) };
-    let mut invalidate = false;
-    loop {
-        let chain = fetch(false, cert, invalidate, &|| Ok((Object { chain: chain(cert, false)?, key: None }, false)))?.chain;
-        let pkey = fetch(true, key, invalidate, &|| private_key(key, passwords, false).map(|(k, encrypted)| (Object { chain: Vec::new(), key: Some(k) }, encrypted)))?.key;
-        let config = proxied(None).with_client_auth_cert(chain, pkey.ok_or("no key")?);
-        if !invalidate && matches!(config, Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch))) { invalidate = true; continue }
-        let mut c = (**base).clone();
-        c.client_auth_cert_resolver = config.map_err(|e| format!("SSL_use_PrivateKey(\"{}\") failed ({e})", key.display()))?.client_auth_cert_resolver;
-        return Ok(Arc::new(c));
-    }
+/// cache when there is one.
+pub fn client_cert(base: &Arc<ClientConfig>, files: (&Path, &Path, Option<&Path>), cache: Option<&CertCache>) -> Result<Arc<ClientConfig>, String> {
+    let config = cached(files, cache, &|chain, pkey| proxied(None).with_client_auth_cert(chain, pkey))?;
+    let mut c = (**base).clone();
+    c.client_auth_cert_resolver = config.map_err(|e| format!("SSL_use_PrivateKey(\"{}\") failed ({e})", files.1.display()))?.client_auth_cert_resolver;
+    Ok(Arc::new(c))
 }
 
 /// Connects to a proxied server over TLS, to the name its certificate is
@@ -745,6 +797,18 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert_eq!(load(&dir.join("c.pem"), &dir.join("c.pem"), None, false).unwrap_err(), format!("cannot load certificate key \"{}\"", dir.join("c.pem").display()));
         assert!(load(&dir.join("c.pem"), &dir.join("k.pem"), Some(&dir.join("none")), false).unwrap_err().starts_with("open() "));
         assert_eq!(trusted(&dir.join("c.pem")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn loads_the_certificate_a_connection_names() {
+        let dir = dir();
+        let files = (&*dir.join("$ssl_server_name"), &*dir.join("k.pem"), None);
+        let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), false, &[], Sessions::default()).unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        assert!(tls.for_connection(&tcp, "c.pem").is_some());
+        assert!(tls.for_connection(&tcp, "none").is_none());
+        assert!(server(files, None, false, &[], Sessions::default()).is_err());
     }
 
     #[test]
