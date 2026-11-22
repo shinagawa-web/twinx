@@ -236,7 +236,7 @@ impl Var {
             ("ssl_curve", Var::SslCurve), ("ssl_curves", Var::SslCurves),
             ("ssl_client_i_dn", Var::SslClient("i_dn")), ("ssl_client_s_dn_legacy", Var::SslClient("s_dn_legacy")), ("ssl_client_i_dn_legacy", Var::SslClient("i_dn_legacy")),
             ("ssl_client_v_start", Var::SslClient("v_start")), ("ssl_client_v_end", Var::SslClient("v_end")), ("ssl_client_v_remain", Var::SslClient("v_remain")),
-            ("ssl_client_raw_cert", Var::SslClient("raw_cert")), ("ssl_client_escaped_cert", Var::SslClient("escaped_cert")),
+            ("ssl_client_raw_cert", Var::SslClient("raw_cert")), ("ssl_client_cert", Var::SslClient("cert")), ("ssl_client_escaped_cert", Var::SslClient("escaped_cert")),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.

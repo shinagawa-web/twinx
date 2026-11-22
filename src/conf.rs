@@ -37,6 +37,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("pid", MAIN, 1, 1, false),
     ("ssl_object_cache_inheritable", MAIN, 1, 1, false),
     ("worker_rlimit_nofile", MAIN, 1, 1, false),
+    ("worker_processes", MAIN, 1, 1, false),
     ("working_directory", MAIN, 1, 1, false),
     ("worker_shutdown_timeout", MAIN, 1, 1, false),
     ("error_log", MAIN | HSL, 1, usize::MAX, false),
@@ -92,9 +93,11 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_protocols", HTTP | SRV, 1, usize::MAX, false),
     ("ssl_ecdh_curve", HTTP | SRV, 1, 1, false),
     ("ssl_prefer_server_ciphers", HTTP | SRV, 1, 1, false),
+    ("ssl_reject_handshake", HTTP | SRV, 1, 1, false),
     ("ssl_conf_command", HTTP | SRV, 2, 2, false),
     ("ssl_session_cache", HTTP | SRV, 1, 2, false),
     ("ssl_session_tickets", HTTP | SRV, 1, 1, false),
+    ("ssl_session_ticket_key", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_cache", HTTP | SRV, 1, 3, false),
     ("ssl_session_timeout", HTTP | SRV, 1, 1, false),
     ("proxy_ssl_session_reuse", HSL, 1, 1, false),
@@ -103,6 +106,13 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_trusted_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_client_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_crl", HTTP | SRV, 1, 1, false),
+    ("ssl_ocsp", HTTP | SRV, 1, 1, false),
+    ("ssl_stapling", HTTP | SRV, 1, 1, false),
+    ("ssl_stapling_file", HTTP | SRV, 1, 1, false),
+    ("ssl_stapling_responder", HTTP | SRV, 1, 1, false),
+    ("ssl_stapling_verify", HTTP | SRV, 1, 1, false),
+    ("ssl_ocsp_responder", HTTP | SRV, 1, 1, false),
+    ("ssl_ocsp_cache", HTTP | SRV, 1, 1, false),
     ("ssl_verify_depth", HTTP | SRV, 1, 1, false),
     ("proxy_ssl_certificate", HSL, 1, 1, false),
     ("proxy_ssl_certificate_key", HSL, 1, 1, false),
@@ -135,6 +145,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_pass_request_body", HSL, 1, 1, false),
     ("proxy_connect_timeout", HSL, 1, 1, false),
     ("proxy_read_timeout", HSL, 1, 1, false),
+    ("send_timeout", HSL, 1, 1, false),
     ("proxy_buffer_size", HSL, 1, 1, false),
     ("proxy_buffering", HSL, 1, 1, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
@@ -421,6 +432,8 @@ pub struct Level {
     pub resolver_timeout: Duration,
     pub proxy_connect_timeout: Duration,
     pub proxy_read_timeout: Duration,
+    /// send_timeout: how long a write to the client may wait (60s).
+    pub send_timeout: Duration,
     /// proxy_bind: the local address, which may have variables, that
     /// connections to proxied servers are made from, and whether it may be
     /// a foreign one ("transparent"); None when off.
@@ -454,8 +467,14 @@ pub struct Level {
     pub ssl_protocols: [bool; 2],
     /// ssl_prefer_server_ciphers: the server's order of cipher suites wins over the client's.
     pub ssl_prefer_server_ciphers: bool,
+    /// ssl_reject_handshake: handshakes for the server are refused with an
+    /// unrecognized_name alert.
+    pub ssl_reject_handshake: bool,
     /// ssl_ecdh_curve: the groups keys are exchanged with; None takes the default ones.
     pub ssl_ecdh_curve: Option<String>,
+    /// ssl_session_ticket_key: the files of the keys tickets are encrypted
+    /// with; those of a level replace those inherited as a whole.
+    pub ssl_session_ticket_key: Vec<PathBuf>,
     /// ssl_conf_command: OpenSSL's commands and their values, files named in
     /// full; those of a level replace those inherited as a whole.
     pub ssl_conf_command: Vec<(String, String)>,
@@ -473,8 +492,9 @@ pub struct Level {
     pub ssl_certificate_cache: Option<Arc<crate::tls::CertCache>>,
     /// ssl_password_file: the passwords an encrypted ssl_certificate_key is tried with.
     pub ssl_password_file: Option<PathBuf>,
-    /// ssl_verify_client: whether clients are asked for a certificate (not "off").
-    pub ssl_verify_client: bool,
+    /// ssl_verify_client: off (0), on (1), optional (2) or optional_no_ca (3);
+    /// clients are asked for a certificate unless it is off.
+    pub ssl_verify_client: u8,
     /// ssl_trusted_certificate and ssl_client_certificate: the certificates
     /// clients' certificates are verified with.
     pub ssl_trusted_certificate: Option<PathBuf>,
@@ -483,6 +503,16 @@ pub struct Level {
     /// checked against, and how many issuers their chains may have (1).
     pub ssl_crl: Option<PathBuf>,
     pub ssl_verify_depth: usize,
+    /// ssl_ocsp (off, on, or leaf: only the client's own certificate),
+    /// ssl_ocsp_responder and ssl_ocsp_cache (the name of its zone).
+    pub ssl_ocsp: Option<bool>,
+    pub ssl_ocsp_responder: Option<String>,
+    pub ssl_ocsp_cache: Option<String>,
+    /// ssl_stapling, ssl_stapling_file, ssl_stapling_responder and ssl_stapling_verify.
+    pub ssl_stapling: bool,
+    pub ssl_stapling_file: Option<PathBuf>,
+    pub ssl_stapling_responder: Option<String>,
+    pub ssl_stapling_verify: bool,
     /// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file:
     /// the certificate twinx presents to proxied servers.
     /// The certificate and key may have variables in their names.
@@ -569,6 +599,8 @@ pub struct Server {
     /// connections with, when it has a certificate.
     pub ssl: Vec<SocketAddr>,
     pub tls: Option<crate::tls::ServerTls>,
+    /// The addresses it is the default server of ("listen ... default_server").
+    pub defaults: Vec<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -611,6 +643,8 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
         match d.name.as_str() {
             "pid" => config.pid = b.path(&d.args[0]),
             "worker_rlimit_nofile" => config.rlimit_nofile = Some(d.args[0].parse().map_err(|_| format!("invalid number in {}", d.at))?),
+            // twinx serves every connection from one process, however many workers are asked for.
+            "worker_processes" => if d.args[0] != "auto" && d.args[0].parse::<u32>().is_err() { return Err(format!("invalid value \"{}\" in \"worker_processes\" directive in {}", d.args[0], d.at)) },
             "worker_shutdown_timeout" => config.shutdown_timeout = Some(millis(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?),
             "working_directory" => config.working_directory = Some(d.args[0].clone().into()),
             "error_log" => {
@@ -658,7 +692,7 @@ impl Builder<'_> {
         // Without root, files come from html under the prefix, as nginx's default root is.
         let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -683,13 +717,14 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new() };
         self.level(block, SRV, &mut s.level)?;
         for d in block {
             match d.name.as_str() {
                 "listen" => {
                     let addrs = listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
                     if d.args[1..].iter().any(|a| a == "ssl") { s.ssl.extend(&addrs); }
+                    if d.args[1..].iter().any(|a| a == "default_server" || a == "default") { s.defaults.extend(&addrs); }
                     s.listen.extend(addrs);
                 }
                 "server_name" => {
@@ -702,7 +737,7 @@ impl Builder<'_> {
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
         let l = &s.level;
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
-        let mut options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, curves: l.ssl_ecdh_curve.clone(), crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth };
+        let mut options = crate::tls::Options { verify: l.ssl_verify_client > 0, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, curves: l.ssl_ecdh_curve.clone(), crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth, ocsp: l.ssl_ocsp.map(|leaf| crate::ocsp::Ocsp { leaf, responder: l.ssl_ocsp_responder.clone(), cache: l.ssl_ocsp_cache.clone() }), ticket_keys: l.ssl_session_ticket_key.clone(), stapling: l.ssl_stapling.then(|| crate::tls::Stapling { verify: l.ssl_stapling_verify, responder: l.ssl_stapling_responder.clone(), file: l.ssl_stapling_file.clone() }), client_ca: l.ssl_client_certificate.clone() };
         let extra = conf_commands(&l.ssl_conf_command, &mut options)?;
         let pairs = l.ssl_certificate.iter().zip(&l.ssl_certificate_key).chain(extra[0].iter().zip(&extra[1]));
         let files: Vec<(&Path, &Path)> = pairs.map(|(cert, key)| (cert.as_path(), key.as_path())).collect();
@@ -737,6 +772,7 @@ impl Builder<'_> {
         // ssl_certificate and ssl_certificate_key of this level, which replace those inherited.
         let mut certs: [Option<Vec<PathBuf>>; 2] = [None, None];
         let mut commands: Option<Vec<(String, String)>> = None;
+        let mut ticket_keys: Option<Vec<PathBuf>> = None;
         let mut proxy_headers: Option<Vec<(String, Template)>> = None;
         let mut hidden: Option<Vec<String>> = None;
         // proxy_cookie_domain and proxy_cookie_path of this level: Some(None) once "off".
@@ -808,18 +844,30 @@ impl Builder<'_> {
                 "ssl_protocols" => level.ssl_protocols = protocols(&d.args).map_err(at)?,
                 "ssl_ecdh_curve" => level.ssl_ecdh_curve = Some(d.args[0].clone()),
                 "ssl_prefer_server_ciphers" => level.ssl_prefer_server_ciphers = flag(d).map_err(at)?,
+                "ssl_reject_handshake" => level.ssl_reject_handshake = flag(d).map_err(at)?,
                 // OpenSSL's commands that take a file are given its name in full, as nginx does.
                 "ssl_conf_command" => commands.get_or_insert_default().push((d.args[0].clone(), if ["Certificate", "PrivateKey"].contains(&d.args[0].as_str()) { self.path(&d.args[1]).to_string_lossy().into_owned() } else { d.args[1].clone() })),
                 // The sessions are kept in memory of each server, whatever the cache.
                 "ssl_session_cache" => {
                     if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
                     level.ssl_sessions.cache = d.args.iter().all(|a| a != "off" && a != "none");
+                    level.ssl_sessions.shared = level.ssl_sessions.cache && d.args.iter().any(|a| a.starts_with("shared:"));
                 }
+                "ssl_session_ticket_key" => ticket_keys.get_or_insert_default().push(self.path(&d.args[0])),
                 "ssl_session_tickets" => level.ssl_sessions.tickets = flag(d).map_err(at)?,
                 "ssl_session_timeout" => level.ssl_sessions.timeout = seconds(&d.args[0]).map_err(at)?.as_secs(),
                 "proxy_ssl_session_reuse" => (level.proxy_ssl_session_reuse, own_tls) = (flag(d).map_err(at)?, true),
                 "ssl_password_file" => level.ssl_password_file = Some(self.path(&d.args[0])),
-                "ssl_verify_client" => level.ssl_verify_client = ["off", "on", "optional", "optional_no_ca"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_verify_client\" directive, it must be \"on\", \"off\", \"optional\" or \"optional_no_ca\"", d.args[0])))? > 0,
+                "ssl_verify_client" => level.ssl_verify_client = ["off", "on", "optional", "optional_no_ca"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_verify_client\" directive, it must be \"on\", \"off\", \"optional\" or \"optional_no_ca\"", d.args[0])))? as u8,
+                "ssl_ocsp" => level.ssl_ocsp = [("off", None), ("on", Some(false)), ("leaf", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_ocsp\" directive, it must be \"on\", \"off\" or \"leaf\"", d.args[0])))?.1,
+                "ssl_ocsp_responder" | "ssl_stapling_responder" => {
+                    let url = Some(d.args[0].clone()).filter(|u| u.starts_with("http://")).ok_or_else(|| at(format!("invalid URL prefix in OCSP responder \"{}\" in resolver", d.args[0])))?;
+                    if d.name == "ssl_ocsp_responder" { level.ssl_ocsp_responder = Some(url) } else { level.ssl_stapling_responder = Some(url) }
+                }
+                "ssl_stapling" => level.ssl_stapling = flag(d).map_err(at)?,
+                "ssl_stapling_verify" => level.ssl_stapling_verify = flag(d).map_err(at)?,
+                "ssl_stapling_file" => level.ssl_stapling_file = Some(self.path(&d.args[0])),
+                "ssl_ocsp_cache" => level.ssl_ocsp_cache = ocsp_cache(&d.args[0]).map_err(at)?,
                 "ssl_trusted_certificate" => level.ssl_trusted_certificate = Some(self.path(&d.args[0])),
                 "ssl_client_certificate" => level.ssl_client_certificate = Some(self.path(&d.args[0])),
                 "ssl_crl" => level.ssl_crl = Some(self.path(&d.args[0])),
@@ -893,6 +941,7 @@ impl Builder<'_> {
                 "resolver_timeout" => level.resolver_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_connect_timeout" => level.proxy_connect_timeout = millis(&d.args[0]).map_err(at)?,
                 "proxy_read_timeout" => level.proxy_read_timeout = seconds(&d.args[0]).map_err(at)?,
+                "send_timeout" => level.send_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_intercept_errors" => level.proxy_intercept_errors = flag(d).map_err(at)?,
                 "proxy_pass_request_headers" => level.proxy_pass_request_headers = flag(d).map_err(at)?,
                 "proxy_pass_request_body" => level.proxy_pass_request_body = flag(d).map_err(at)?,
@@ -943,6 +992,7 @@ impl Builder<'_> {
         if let Some(c) = certificates { level.ssl_certificate = c; }
         if let Some(k) = keys { level.ssl_certificate_key = k; }
         if let Some(c) = commands { level.ssl_conf_command = c; }
+        if let Some(k) = ticket_keys { level.ssl_session_ticket_key = k; }
         if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
         if let Some(hidden) = hidden { level.proxy_hide_header = hidden; }
         let [domain, path] = cookies;
@@ -1252,6 +1302,13 @@ fn conf_commands(commands: &[(String, String)], options: &mut crate::tls::Option
     Ok(files)
 }
 
+/// ssl_ocsp_cache: off, or shared:name:size, as the zone's name.
+fn ocsp_cache(value: &str) -> Result<Option<String>, String> {
+    if value == "off" { return Ok(None) }
+    let zone = value.strip_prefix("shared:").and_then(|z| z.rsplit_once(':')).filter(|(name, n)| !name.is_empty() && size(n).is_ok());
+    zone.map(|(name, _)| Some(name.to_string())).ok_or_else(|| format!("invalid value \"{value}\""))
+}
+
 fn flag(d: &Directive) -> Result<bool, String> {
     let (value, name) = (&d.args[0], &d.name);
     let found = [("on", true), ("off", false)].into_iter().find(|f| f.0 == value.to_ascii_lowercase()).map(|f| f.1);
@@ -1522,6 +1579,18 @@ mod tests {
         assert_eq!(build_text("worker_rlimit_nofile 32; http { }").unwrap().rlimit_nofile, Some(32));
         assert_eq!(build_text("http { }").unwrap().rlimit_nofile, None);
         assert_eq!(build_text("worker_rlimit_nofile x;").unwrap_err(), "invalid number in t.conf:1");
+    }
+
+    #[test]
+    fn worker_processes() {
+        assert!(build_text("worker_processes 2; http { }").is_ok() && build_text("worker_processes auto; http { }").is_ok());
+        assert_eq!(build_text("worker_processes x;").unwrap_err(), "invalid value \"x\" in \"worker_processes\" directive in t.conf:1");
+    }
+
+    #[test]
+    fn shared_session_caches() {
+        let c = build_text("http { server { ssl_session_cache builtin shared:SSL:1m; } server { ssl_session_cache builtin; } server { ssl_session_cache none; } }").unwrap();
+        assert_eq!(c.servers.iter().map(|s| s.level.ssl_sessions.shared).collect::<Vec<_>>(), [true, false, false]);
     }
 
     #[test]
@@ -1883,8 +1952,42 @@ mod tests {
     }
 
     #[test]
+    fn send_timeout() {
+        let c = build_text("http { send_timeout 2s; server { listen 127.0.0.1:8080; } server { listen 127.0.0.1:8081; send_timeout 0; } }").unwrap();
+        assert_eq!((c.servers[0].level.send_timeout, c.servers[1].level.send_timeout), (Duration::from_secs(2), Duration::ZERO));
+        assert_eq!(build_text("http { }").unwrap().servers.first().map(|s| s.level.send_timeout), None);
+    }
+
+    #[test]
+    fn ssl_stapling() {
+        let c = build_text("http { ssl_stapling on; ssl_stapling_verify on; ssl_stapling_responder http://127.0.0.1:8081/; server { ssl_stapling_file resp.der; } }").unwrap();
+        let l = &c.servers[0].level;
+        assert_eq!((l.ssl_stapling, l.ssl_stapling_verify, l.ssl_stapling_responder.as_deref()), (true, true, Some("http://127.0.0.1:8081/")));
+        assert!(l.ssl_stapling_file.as_ref().unwrap().ends_with("resp.der"));
+        assert!(build_text("http { ssl_stapling_responder https://a; }").unwrap_err().starts_with("invalid URL prefix in OCSP responder \"https://a\""));
+    }
+
+    #[test]
+    fn ssl_ocsp() {
+        let c = build_text("http { ssl_ocsp leaf; ssl_ocsp_responder http://127.0.0.1:8080/x; ssl_ocsp_cache shared:OCSP:1m; ssl_verify_client optional_no_ca; server { listen 127.0.0.1:8080; ssl_ocsp_cache off; } }").unwrap();
+        let level = &c.servers[0].level;
+        assert_eq!((level.ssl_ocsp, level.ssl_ocsp_responder.as_deref(), level.ssl_ocsp_cache.as_deref(), level.ssl_verify_client), (Some(true), Some("http://127.0.0.1:8080/x"), None, 3));
+        assert_eq!(ocsp_cache("shared:OCSP:1m"), Ok(Some("OCSP".to_string())));
+        assert_eq!(ocsp_cache("shared::1m"), Err("invalid value \"shared::1m\"".to_string()));
+        assert!(build_text("http { ssl_ocsp yes; }").unwrap_err().starts_with("invalid value \"yes\" in \"ssl_ocsp\" directive"));
+        assert!(build_text("http { ssl_ocsp_responder https://a; }").unwrap_err().starts_with("invalid URL prefix in OCSP responder \"https://a\""));
+    }
+
+    #[test]
+    fn ssl_session_ticket_keys_replace_those_inherited() {
+        let c = build_text("http { ssl_session_ticket_key a; ssl_session_ticket_key b; server { } server { ssl_session_ticket_key c; } }").unwrap();
+        let names = |i: usize| c.servers[i].level.ssl_session_ticket_key.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!((names(0), names(1)), (vec!["a".to_string(), "b".to_string()], vec!["c".to_string()]));
+    }
+
+    #[test]
     fn ssl_conf_commands() {
-        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, curves: None, crl: None, depth: 1 };
+        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, curves: None, crl: None, depth: 1, ocsp: None, ticket_keys: Vec::new(), stapling: None, client_ca: None };
         let commands = |c: &[(&str, &str)]| c.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
         let files = conf_commands(&commands(&[("Options", "-SessionTicket, -ServerPreference"), ("Certificate", "/c.crt"), ("PrivateKey", "/c.key")]), &mut options).unwrap();
         assert!(!options.sessions.tickets && !options.prefer);

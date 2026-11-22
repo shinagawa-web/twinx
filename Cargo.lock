@@ -911,6 +911,7 @@ dependencies = [
  "libc",
  "pkcs8",
  "regex",
+ "ring",
  "rustls",
  "socket2",
  "x509-parser",

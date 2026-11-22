@@ -189,21 +189,89 @@ pub struct ServerTls {
     crls: Option<Vec<Vec<u8>>>,
     depth: usize,
     named: Option<Named>,
+    ocsp: Option<crate::ocsp::Ocsp>,
 }
 
 /// How a server resumes clients' sessions: with tickets (ssl_session_tickets),
-/// from sessions it keeps (ssl_session_cache not off or none), and for how
-/// many seconds after they began (ssl_session_timeout).
+/// from sessions it keeps (ssl_session_cache not off or none; shared when a
+/// shared cache is among them), and for how many seconds after they began
+/// (ssl_session_timeout).
 #[derive(Debug, Clone, Copy)]
 pub struct Sessions {
     pub tickets: bool,
     pub cache: bool,
+    pub shared: bool,
     pub timeout: u64,
 }
 
 impl Default for Sessions {
     fn default() -> Sessions {
-        Sessions { tickets: true, cache: false, timeout: 300 }
+        Sessions { tickets: true, cache: false, shared: false, timeout: 300 }
+    }
+}
+
+/// A server's session ticket keys, made when the first ticket is. With a
+/// shared session cache they rotate as nginx rotates those it keeps in the
+/// cache (rotate is ssl_session_timeout): a key encrypts tickets for that many
+/// seconds, the first ticket made after that gets a new key, and the key
+/// before still decrypts tickets. Without one (None) the key stays. Keys
+/// read from files (ssl_session_ticket_key) are used instead when there are
+/// any: the first encrypts tickets, and each decrypts those named with it.
+#[derive(Debug)]
+struct Rotated {
+    rotate: Option<u64>,
+    file: Vec<TicketKey>,
+    /// When the current key stops encrypting, the current key, and the one before.
+    keys: Mutex<Option<(u64, Arc<dyn rustls::server::ProducesTickets>, Option<Arc<dyn rustls::server::ProducesTickets>>)>>,
+}
+
+impl Rotated {
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        if let Some(key) = self.file.first() { return key.seal(plain) }
+        let mut keys = self.keys.lock().unwrap();
+        let now = now();
+        if keys.as_ref().is_none_or(|k| now >= k.0) { *keys = Some((self.rotate.map_or(u64::MAX, |t| now + t), rustls::crypto::ring::Ticketer::new().ok()?, keys.take().map(|k| k.1))); }
+        keys.as_ref()?.1.encrypt(plain)
+    }
+
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        if !self.file.is_empty() { return self.file.iter().find(|k| cipher.starts_with(&k.name))?.open(cipher) }
+        let keys = self.keys.lock().unwrap();
+        keys.iter().flat_map(|k| std::iter::once(&k.1).chain(&k.2)).find_map(|k| k.decrypt(cipher))
+    }
+}
+
+/// A key of ssl_session_ticket_key, read from a file of 48 or 80 bytes as
+/// nginx reads it: the name tickets carry first (16 bytes), and the key they
+/// are encrypted with (16 bytes after the name in a file of 48 bytes, the last
+/// 32 in one of 80), with AES-GCM. A ticket is the name, the nonce and the
+/// sealed session.
+#[derive(Debug)]
+struct TicketKey {
+    name: [u8; 16],
+    key: ring::aead::LessSafeKey,
+}
+
+impl TicketKey {
+    fn load(file: &Path) -> Result<TicketKey, String> {
+        let data = std::fs::read(file).map_err(|e| format!("open() \"{}\" failed ({e})", file.display()))?;
+        let (alg, key) = match data.len() { 48 => (&ring::aead::AES_128_GCM, &data[16..32]), 80 => (&ring::aead::AES_256_GCM, &data[48..]), _ => return Err(format!("\"{}\" must be 48 or 80 bytes", file.display())) };
+        Ok(TicketKey { name: data[..16].try_into().map_err(|_| "short")?, key: ring::aead::LessSafeKey::new(ring::aead::UnboundKey::new(alg, key).map_err(|_| "bad key")?) })
+    }
+
+    fn seal(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        let mut nonce = [0u8; 12];
+        provider().secure_random.fill(&mut nonce).ok()?;
+        let mut sealed = plain.to_vec();
+        self.key.seal_in_place_append_tag(ring::aead::Nonce::assume_unique_for_key(nonce), ring::aead::Aad::from(self.name), &mut sealed).ok()?;
+        Some([&self.name[..], &nonce, &sealed].concat())
+    }
+
+    fn open(&self, ticket: &[u8]) -> Option<Vec<u8>> {
+        let (nonce, sealed) = ticket.get(16..)?.split_at_checked(12)?;
+        let mut sealed = sealed.to_vec();
+        let nonce = ring::aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
+        Some(self.key.open_in_place(nonce, ring::aead::Aad::from(self.name), &mut sealed).ok()?.to_vec())
     }
 }
 
@@ -224,7 +292,7 @@ impl<T> Timed<T> {
     }
 }
 
-impl rustls::server::ProducesTickets for Timed<Arc<dyn rustls::server::ProducesTickets>> {
+impl rustls::server::ProducesTickets for Timed<Rotated> {
     fn enabled(&self) -> bool {
         true
     }
@@ -245,9 +313,10 @@ impl rustls::server::ProducesTickets for Timed<Arc<dyn rustls::server::ProducesT
 /// The certificates a server presents, the same for every connection: one
 /// for each type of key, a later one replacing an earlier one of the same type,
 /// as OpenSSL keeps them. A connection gets the first that signs with an
-/// algorithm the client lists, in the client's order, or the first one.
+/// algorithm the client lists, in the client's order, or the first one, with
+/// its OCSP response stapled when the server staples them (ssl_stapling).
 #[derive(Debug)]
-struct Fixed(Vec<Arc<rustls::sign::CertifiedKey>>);
+struct Fixed(Vec<Arc<rustls::sign::CertifiedKey>>, Vec<Option<Arc<Staple>>>);
 
 impl Fixed {
     fn new(keys: Vec<Arc<rustls::sign::CertifiedKey>>) -> Fixed {
@@ -258,18 +327,78 @@ impl Fixed {
                 None => kept.push(key),
             }
         }
-        Fixed(kept)
+        Fixed(kept, Vec::new())
     }
 
     fn choose(&self, schemes: &[SignatureScheme]) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let signs = |scheme: &SignatureScheme| self.0.iter().find(|k| k.key.choose_scheme(&[*scheme]).is_some());
-        schemes.iter().find_map(signs).or(self.0.first()).cloned()
+        let signs = |scheme: &SignatureScheme| self.0.iter().position(|k| k.key.choose_scheme(&[*scheme]).is_some());
+        let i = schemes.iter().find_map(signs).or((!self.0.is_empty()).then_some(0))?;
+        Some(self.1.get(i).cloned().flatten().map_or_else(|| self.0[i].clone(), |s| s.key(&self.0[i])))
     }
 }
 
 impl rustls::server::ResolvesServerCert for Fixed {
     fn resolve(&self, hello: rustls::server::ClientHello) -> Option<Arc<rustls::sign::CertifiedKey>> {
         self.choose(hello.signature_schemes())
+    }
+}
+
+/// How a server staples OCSP responses to its certificates: ssl_stapling,
+/// with ssl_stapling_verify (verify), ssl_stapling_responder and
+/// ssl_stapling_file, whose response is stapled as it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stapling {
+    pub verify: bool,
+    pub responder: Option<String>,
+    pub file: Option<PathBuf>,
+}
+
+/// The OCSP response stapled to a certificate, as nginx keeps it. A
+/// connection asking for one while it is due to be refreshed has a new one
+/// fetched (source: the responder's URL, the request, the CertID and the
+/// issuer) while it is answered with the one there is. A good response is
+/// stapled until its next update and refreshed five minutes before that, an
+/// hour after it came at most; after an error, the next fetch waits five minutes.
+#[derive(Debug)]
+struct Staple {
+    source: Option<(String, Vec<u8>, Vec<u8>, Vec<u8>)>,
+    verify: bool,
+    /// The certificate with the response stapled and until when it holds,
+    /// when the response is to be refreshed, and whether it is being fetched.
+    state: Mutex<(Option<(Arc<rustls::sign::CertifiedKey>, i64)>, i64, bool)>,
+}
+
+impl Staple {
+    fn new(key: &rustls::sign::CertifiedKey, stapling: &Stapling, trusted: &[CertificateDer<'static>]) -> Result<Option<Arc<Staple>>, String> {
+        if let Some(file) = &stapling.file {
+            let response = std::fs::read(file).map_err(|e| format!("BIO_new_file(\"{}\") failed ({e})", file.display()))?;
+            let stapled = Arc::new(rustls::sign::CertifiedKey { ocsp: Some(response), ..key.clone() });
+            return Ok(Some(Arc::new(Staple { source: None, verify: false, state: Mutex::new((Some((stapled, i64::MAX)), i64::MAX, false)) })));
+        }
+        let source = crate::ocsp::stapled(&key.cert, trusted, stapling.responder.as_deref());
+        Ok(source.map(|source| Arc::new(Staple { source: Some(source), verify: stapling.verify, state: Mutex::new((None, 0, false)) })))
+    }
+
+    fn key(self: &Arc<Self>, key: &Arc<rustls::sign::CertifiedKey>) -> Arc<rustls::sign::CertifiedKey> {
+        let now = chrono::Utc::now().timestamp();
+        let mut state = self.state.lock().unwrap();
+        if now >= state.1 && !state.2 {
+            state.2 = true;
+            let (staple, key) = (self.clone(), key.clone());
+            std::thread::spawn(move || staple.refresh(&key));
+        }
+        state.0.as_ref().filter(|s| s.1 >= now).map_or_else(|| key.clone(), |s| s.0.clone())
+    }
+
+    fn refresh(&self, key: &rustls::sign::CertifiedKey) {
+        let now = chrono::Utc::now().timestamp();
+        let fetched = self.source.as_ref().and_then(|(url, request, id, issuer)| crate::ocsp::staple(url, (request, id, issuer), self.verify, now));
+        let mut state = self.state.lock().unwrap();
+        state.2 = false;
+        let Some((response, next)) = fetched else { state.1 = now + 300; return };
+        let valid = next.unwrap_or(i64::MAX);
+        state.0 = Some((Arc::new(rustls::sign::CertifiedKey { ocsp: Some(response), ..key.clone() }), valid));
+        state.1 = valid.saturating_sub(300).min(now + 3600).max(now + 300);
     }
 }
 
@@ -293,6 +422,15 @@ pub struct Options {
     /// checked against, and how many issuers their chains may have.
     pub crl: Option<PathBuf>,
     pub depth: usize,
+    /// ssl_ocsp: how clients' certificates are checked with OCSP once they verified.
+    pub ocsp: Option<crate::ocsp::Ocsp>,
+    /// ssl_session_ticket_key: the files of the keys tickets are encrypted with.
+    pub ticket_keys: Vec<PathBuf>,
+    /// ssl_stapling: how OCSP responses are stapled to the certificates; None does not.
+    pub stapling: Option<Stapling>,
+    /// ssl_client_certificate: the file whose certificates' names clients are
+    /// sent when asked for theirs (those of ssl_trusted_certificate are not).
+    pub client_ca: Option<PathBuf>,
 }
 
 /// The OpenSSL names of the TLS 1.2 cipher suites twinx has.
@@ -365,15 +503,19 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     let suites = CryptoProvider { cipher_suites: suites.unwrap_or_else(|| provider().cipher_suites.clone()), kx_groups: groups.unwrap_or_else(|| provider().kx_groups.clone()), ..(*provider()).clone() };
     let versions: Vec<_> = [&rustls::version::TLS12, &rustls::version::TLS13].into_iter().zip(options.protocols).filter_map(|(v, on)| on.then_some(v)).collect();
     let builder = ServerConfig::builder_with_provider(Arc::new(suites)).with_protocol_versions(&versions).map_err(|e| e.to_string())?;
-    let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
-    let mut config = builder.with_cert_resolver(Arc::new(Fixed::new(fixed)));
+    let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms, ca_names(options.client_ca.as_deref())?))) } else { builder.with_no_client_auth() };
+    let mut fixed = Fixed::new(fixed);
+    if let Some(stapling) = &options.stapling { fixed.1 = fixed.0.iter().map(|k| Staple::new(k, stapling, &trusted)).collect::<Result<_, _>>()?; }
+    let mut config = builder.with_cert_resolver(Arc::new(fixed));
     // Certificates are compressed with zlib, for TLS 1.3 clients that offer it.
     config.ignore_client_order = options.prefer;
     config.cert_compressors = if options.compress { vec![rustls::compress::ZLIB_COMPRESSOR] } else { Vec::new() };
     let sessions = options.sessions;
     config.session_storage = if sessions.cache { rustls::server::ServerSessionMemoryCache::new(20480) } else { Arc::new(rustls::server::NoServerSessionStorage {}) };
-    if sessions.tickets { config.ticketer = Arc::new(Timed(rustls::crypto::ring::Ticketer::new().map_err(|e| e.to_string())?, sessions.timeout)); }
-    Ok(ServerTls { config: Arc::new(config), trusted, crls: options.crl.as_deref().map(crls).transpose()?, depth: options.depth, named })
+    let file = options.ticket_keys.iter().map(|f| TicketKey::load(f)).collect::<Result<Vec<_>, _>>()?;
+    let keys = Rotated { rotate: sessions.shared.then_some(sessions.timeout), file, keys: Mutex::new(None) };
+    if sessions.tickets { config.ticketer = Arc::new(Timed(keys, sessions.timeout)); }
+    Ok(ServerTls { config: Arc::new(config), trusted, crls: options.crl.as_deref().map(crls).transpose()?, depth: options.depth, named, ocsp: options.ocsp })
 }
 
 impl ServerTls {
@@ -470,12 +612,22 @@ fn name(name: &x509_parser::x509::X509Name, legacy: bool) -> String {
     rdns.map(|a| a.join("+")).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(",")
 }
 
+/// Data in base64, padded with "=".
+pub fn base64(data: &[u8]) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let quad = |c: &[u8]| { let (n, len) = (c.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)) << (8 * (3 - c.len())), c.len()); (0..4).map(move |i| if i <= len { DIGITS[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' }) };
+    data.chunks(3).flat_map(quad).collect()
+}
+
+/// Text escaped as nginx's NGX_ESCAPE_URI_COMPONENT: all but letters, digits and "-._~".
+pub fn escape(text: &str) -> String {
+    text.bytes().map(|c| if c.is_ascii_alphanumeric() || b"-._~".contains(&c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
+}
+
 /// A certificate in PEM, as OpenSSL writes it: base64 in lines of 64 characters.
 fn pem(der: &[u8]) -> String {
-    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let quad = |c: &[u8]| { let (n, len) = (c.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)) << (8 * (3 - c.len())), c.len()); (0..4).map(move |i| if i <= len { DIGITS[(n >> (18 - 6 * i) & 63) as usize] } else { b'=' }) };
-    let base64: Vec<u8> = der.chunks(3).flat_map(quad).collect();
-    let lines: Vec<&str> = base64.chunks(64).map(|l| std::str::from_utf8(l).unwrap_or_default()).collect();
+    let base64 = base64(der);
+    let lines: Vec<&str> = base64.as_bytes().chunks(64).map(|l| std::str::from_utf8(l).unwrap_or_default()).collect();
     format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", lines.join("\n"))
 }
 
@@ -494,8 +646,9 @@ impl Session {
             "v_start" => time(cert.validity().not_before),
             "v_end" => time(cert.validity().not_after),
             "raw_cert" => pem(self.cert.as_deref().unwrap_or_default()),
-            // As nginx's NGX_ESCAPE_URI_COMPONENT: all but letters, digits and "-._~".
-            "escaped_cert" => pem(self.cert.as_deref().unwrap_or_default()).bytes().map(|c| if c.is_ascii_alphanumeric() || b"-._~".contains(&c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect(),
+            "escaped_cert" => escape(&pem(self.cert.as_deref().unwrap_or_default())),
+            // $ssl_client_cert: each line but the first begins with a tab, as in a folded header.
+            "cert" => { let pem = pem(self.cert.as_deref().unwrap_or_default()); format!("{}\n", pem.trim_end().replace('\n', "\n\t")) }
             _ => ((cert.validity().not_after.timestamp() - now() as i64) / 86400).max(0).to_string(),
         }
     }
@@ -512,7 +665,11 @@ pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option
         if let Some(hello) = acceptor.accept().ok()? { break hello }
     };
     let name = hello.client_hello().server_name().unwrap_or_default().to_string();
-    let tls = crate::http::server(config, listen, hello.client_hello().server_name()).0.tls.as_ref()?;
+    let server = crate::http::server(config, listen, hello.client_hello().server_name()).0;
+    // A rejected handshake gets a fatal unrecognized_name alert, as OpenSSL sends it.
+    if server.level.ssl_reject_handshake { let _ = tcp.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70]); return None }
+    // A server without certificates of its own takes the default server's.
+    let tls = server.tls.as_ref().or(crate::http::default_server(config, listen).tls.as_ref())?;
     let ciphers = hello.client_hello().cipher_suites().iter().map(|c| cipher(u16::from(*c))).collect::<Vec<_>>().join(":");
     let curves = hello.client_hello().named_groups().unwrap_or_default().iter().map(|g| curve(u16::from(*g))).collect::<Vec<_>>().join(":");
     let mut conn = hello.into_connection(tls.for_connection(&tcp, &name)?).ok()?;
@@ -520,7 +677,7 @@ pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option
     let id = conn.received_resumption_data().map_or_else(|| { let mut id = [0u8; 32]; provider().secure_random.fill(&mut id).map(|_| id.to_vec()) }, |id| Ok(id.to_vec())).ok()?;
     conn.set_resumption_data(&id);
     let (stream, mut session, chain) = pipe(tcp, conn.into(), HANDSHAKE).ok()?;
-    (session.server_name, session.verify, session.subject) = (name, verified(&chain, (&tls.trusted, tls.crls.as_deref(), tls.depth)), chain.first().and_then(|c| subject(c)));
+    (session.server_name, session.verify, session.subject) = (name, verified(&chain, (&tls.trusted, tls.crls.as_deref(), tls.depth), tls.ocsp.as_ref()), chain.first().and_then(|c| subject(c)));
     (session.id, session.ciphers, session.cert, session.curves) = (id.iter().map(|b| format!("{b:02x}")).collect(), ciphers, chain.first().cloned(), curves);
     Some((stream, session))
 }
@@ -528,7 +685,18 @@ pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option
 /// Clients may send a certificate, which the handshake takes whatever it is;
 /// whether it verifies is told by $ssl_client_verify.
 #[derive(Debug)]
-struct AnyClient(WebPkiSupportedAlgorithms);
+struct AnyClient(WebPkiSupportedAlgorithms, Vec<DistinguishedName>);
+
+/// The subjects of the certificates of a file, each once, in their order, as
+/// OpenSSL's SSL_load_client_CA_file gives them.
+fn ca_names(file: Option<&Path>) -> Result<Vec<DistinguishedName>, String> {
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    for cert in file.map(trusted).transpose()?.unwrap_or_default() {
+        let name = X509Certificate::from_der(&cert).map_err(|e| e.to_string())?.1.subject().as_raw().to_vec();
+        if !names.contains(&name) { names.push(name) }
+    }
+    Ok(names.into_iter().map(DistinguishedName::from).collect())
+}
 
 impl ClientCertVerifier for AnyClient {
     fn client_auth_mandatory(&self) -> bool {
@@ -536,7 +704,7 @@ impl ClientCertVerifier for AnyClient {
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
+        &self.1
     }
 
     fn verify_client_cert(&self, _: &CertificateDer, _: &[CertificateDer], _: UnixTime) -> Result<ClientCertVerified, rustls::Error> {
@@ -556,10 +724,12 @@ impl ClientCertVerifier for AnyClient {
 }
 
 /// How a client's certificate chain verifies against the trusted
-/// certificates, the CRLs and the depth of a server, as $ssl_client_verify tells it.
-fn verified(chain: &[CertificateDer<'static>], (trusted, crls, depth): (&[CertificateDer<'static>], Option<&[Vec<u8>]>, usize)) -> String {
+/// certificates, the CRLs and the depth of a server, then with OCSP (ssl_ocsp),
+/// as $ssl_client_verify tells it.
+fn verified(chain: &[CertificateDer<'static>], (trusted, crls, depth): (&[CertificateDer<'static>], Option<&[Vec<u8>]>, usize), ocsp: Option<&crate::ocsp::Ocsp>) -> String {
     let Some(leaf) = chain.first() else { return "NONE".to_string() };
-    verify_chain(leaf, &chain[1..], trusted, crls, depth, true).map_or_else(|e| format!("FAILED:{e}"), |_| "SUCCESS".to_string())
+    let checked = verify_chain(leaf, &chain[1..], trusted, crls, depth, true).and_then(|certs| ocsp.map_or(Ok(()), |o| o.check(&certs)));
+    checked.map_or_else(|e| format!("FAILED:{e}"), |()| "SUCCESS".to_string())
 }
 
 /// The subject of a certificate as RFC 2253 writes it, as $ssl_client_s_dn
@@ -610,8 +780,8 @@ pub fn verify(trust: Option<&Path>, crl: Option<&Path>, depth: usize) -> Result<
 impl Verify {
     fn check(&self, end: &CertificateDer, sent: &[CertificateDer], name: &ServerName) -> Result<(), rustls::Error> {
         let name = match name { ServerName::IpAddress(ip) => IpAddr::from(*ip).to_string(), n => n.to_str().into_owned() };
-        let leaf = verify_chain(end, sent, &self.trusted, self.crls.as_deref(), self.depth, false).map_err(|e| rustls::Error::General(format!("upstream SSL certificate verify error: ({e})")))?;
-        for_name(&leaf, &name).then_some(()).ok_or_else(|| rustls::Error::General(format!("upstream SSL certificate does not match \"{name}\"")))
+        let chain = verify_chain(end, sent, &self.trusted, self.crls.as_deref(), self.depth, false).map_err(|e| rustls::Error::General(format!("upstream SSL certificate verify error: ({e})")))?;
+        for_name(&chain[0], &name).then_some(()).ok_or_else(|| rustls::Error::General(format!("upstream SSL certificate does not match \"{name}\"")))
     }
 }
 
@@ -620,13 +790,13 @@ impl Verify {
 /// each signing the one below, to a trusted self-signed certificate, the
 /// chain at most depth + 1 certificates long with it; all of them valid now, the issuers CAs, and
 /// with CRLs, none revoked by a CRL of its issuer, which each must have (as
-/// X509_V_FLAG_CRL_CHECK_ALL). Gives the peer's certificate parsed, or the
+/// X509_V_FLAG_CRL_CHECK_ALL). Gives the chain parsed, the peer's certificate first, or the
 /// error as OpenSSL words it: once the chain is built, the first error in
 /// the order OpenSSL checks (the issuers being CAs, the CRLs from the peer's
 /// certificate up, the times from the top down), or with last the last one,
 /// as OpenSSL ends with when its callback goes on after each, as nginx's
 /// does for clients' certificates.
-fn verify_chain<'a>(end: &'a [u8], sent: &'a [CertificateDer], trusted: &'a [CertificateDer], crls: Option<&'a [Vec<u8>]>, depth: usize, last: bool) -> Result<X509Certificate<'a>, &'static str> {
+fn verify_chain<'a>(end: &'a [u8], sent: &'a [CertificateDer], trusted: &'a [CertificateDer], crls: Option<&'a [Vec<u8>]>, depth: usize, last: bool) -> Result<Vec<X509Certificate<'a>>, &'static str> {
     let parse = |d: &'a [u8]| X509Certificate::from_der(d).ok().map(|(_, c)| c);
     let (anchors, sent): (Vec<_>, Vec<_>) = (trusted.iter().filter_map(|d| parse(d)).collect(), sent.iter().filter_map(|d| parse(d)).collect());
     let mut chain = vec![parse(end).ok_or("unable to decode certificate")?];
@@ -650,7 +820,7 @@ fn verify_chain<'a>(end: &'a [u8], sent: &'a [CertificateDer], trusted: &'a [Cer
         if crl.iter_revoked_certificates().any(|r| r.raw_serial() == c.raw_serial()) { errors.push("certificate revoked") }
     }
     errors.extend(chain.iter().rev().filter(|c| !c.validity().is_valid()).map(|c| if c.validity().not_before > ASN1Time::now() { "certificate is not yet valid" } else { "certificate has expired" }));
-    match if last { errors.last() } else { errors.first() } { Some(e) => Err(e), None => Ok(chain.swap_remove(0)) }
+    match if last { errors.last() } else { errors.first() } { Some(e) => Err(e), None => Ok(chain) }
 }
 
 /// Whether a certificate is for a name, as X509_check_host checks it:
@@ -868,7 +1038,7 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert_eq!(ok(&[int.clone()], &[root.clone()], Some(&[crl(ROOT_CRL), crl(INT_CRL)]), 2), Ok(()));
         assert_eq!(ok(&[int.clone()], &[root.clone()], Some(&[crl(REVOKED_CRL), crl(INT_CRL)]), 2), Err("certificate revoked"));
         // A client's: the last error, not the first.
-        let last = |crls: &[Vec<u8>]| verified(&[end.clone(), int.clone()], (std::slice::from_ref(&root), Some(crls), 2));
+        let last = |crls: &[Vec<u8>]| verified(&[end.clone(), int.clone()], (std::slice::from_ref(&root), Some(crls), 2), None);
         assert_eq!(last(&[crl(REVOKED_CRL)]), "FAILED:certificate revoked");
         assert_eq!(last(&[crl(ROOT_CRL)]), "FAILED:unable to get certificate CRL");
         assert_eq!(last(&[crl(ROOT_CRL), crl(INT_CRL)]), "SUCCESS");
@@ -938,6 +1108,35 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 ";
 
     #[test]
+    fn names_each_client_ca_once() {
+        let dir = dir();
+        std::fs::write(dir.join("dup.pem"), format!("{CERT}{CERT}")).unwrap();
+        let names = ca_names(Some(&dir.join("dup.pem"))).unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].as_ref(), X509Certificate::from_der(&der(CERT)).unwrap().1.subject().as_raw());
+        assert!(ca_names(None).unwrap().is_empty());
+        assert!(ca_names(Some(&dir.join("none"))).is_err());
+    }
+
+    #[test]
+    fn staples_the_response_of_a_file_or_fetched() {
+        let dir = dir();
+        std::fs::write(dir.join("resp.der"), b"response").unwrap();
+        let key = certified(vec![der(CERT)], PrivateKeyDer::from_pem_slice(KEY.as_bytes()).unwrap()).unwrap();
+        let stapling = |file: Option<&str>, responder: Option<&str>| Stapling { verify: false, responder: responder.map(str::to_string), file: file.map(|f| dir.join(f)) };
+        let filed = Staple::new(&key, &stapling(Some("resp.der"), None), &[]).unwrap().unwrap();
+        let fixed = Fixed(vec![key.clone()], vec![Some(filed)]);
+        assert_eq!(fixed.choose(&[]).unwrap().ocsp.as_deref(), Some(&b"response"[..]));
+        assert!(Staple::new(&key, &stapling(Some("none"), None), &[]).unwrap_err().starts_with("BIO_new_file("));
+        // A certificate without an issuer has nothing stapled.
+        assert!(Staple::new(&key, &stapling(None, Some("http://127.0.0.1:1/")), &[]).unwrap().is_none());
+        let fetched = Arc::new(Staple { source: Some(("http://127.0.0.1:1/".into(), Vec::new(), Vec::new(), Vec::new())), verify: false, state: Mutex::new((None, 0, false)) });
+        assert!(fetched.key(&key).ocsp.is_none());
+        while fetched.state.lock().unwrap().2 { std::thread::yield_now(); }
+        assert!(fetched.state.lock().unwrap().1 > chrono::Utc::now().timestamp());
+    }
+
+    #[test]
     fn gives_the_client_certificate_in_pem() {
         let session = Session { cert: Some(der(CERT)), ..Session::default() };
         assert_eq!(session.client_var("raw_cert"), CERT);
@@ -946,6 +1145,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert!(escaped.ends_with("wYWN%0A-----END%20CERTIFICATE-----%0A"));
         assert_eq!(pem(b"ab"), "-----BEGIN CERTIFICATE-----\nYWI=\n-----END CERTIFICATE-----\n");
         assert_eq!(Session::default().client_var("raw_cert"), "");
+        assert_eq!(session.client_var("cert"), format!("{}\n", CERT.trim_end().replace('\n', "\n\t")));
     }
 
     #[test]
@@ -978,7 +1178,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = dir();
         let names = [(&*dir.join("$ssl_server_name"), &*dir.join("k.pem"))];
         let files = (&names[..], None);
-        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: false, curves: None, crl: None, depth: 1 };
+        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: false, curves: None, crl: None, depth: 1, ocsp: None, ticket_keys: Vec::new(), stapling: None, client_ca: None };
         let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), &[], options.clone()).unwrap();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
@@ -1017,9 +1217,9 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     #[test]
     fn verifies_and_names_client_certificates() {
         let cert = CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap();
-        assert_eq!(verified(&[], (&[], None, 1)), "NONE");
-        assert_eq!(verified(std::slice::from_ref(&cert), (std::slice::from_ref(&cert), None, 1)), "SUCCESS");
-        assert_eq!(verified(std::slice::from_ref(&cert), (&[], None, 1)), "FAILED:self-signed certificate");
+        assert_eq!(verified(&[], (&[], None, 1), None), "NONE");
+        assert_eq!(verified(std::slice::from_ref(&cert), (std::slice::from_ref(&cert), None, 1), None), "SUCCESS");
+        assert_eq!(verified(std::slice::from_ref(&cert), (&[], None, 1), None), "FAILED:self-signed certificate");
         assert_eq!(subject(&cert).as_deref(), Some("CN=localhost"));
     }
 
@@ -1044,16 +1244,67 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     }
 
     #[test]
+    fn shared_ticket_keys_rotate_after_the_timeout() {
+        let keys = Rotated { rotate: Some(10), file: Vec::new(), keys: Mutex::new(None) };
+        let first = keys.encrypt(b"a").unwrap();
+        assert_eq!(&keys.encrypt(b"b").unwrap()[..16], &first[..16]);
+        keys.keys.lock().unwrap().as_mut().unwrap().0 = now();
+        let next = keys.encrypt(b"c").unwrap();
+        assert_ne!(&next[..16], &first[..16]);
+        assert_eq!((keys.decrypt(&first), keys.decrypt(&next), keys.decrypt(b"x")), (Some(b"a".to_vec()), Some(b"c".to_vec()), None));
+        let fixed = Rotated { rotate: None, file: Vec::new(), keys: Mutex::new(None) };
+        let first = fixed.encrypt(b"a").unwrap();
+        fixed.keys.lock().unwrap().as_mut().unwrap().0 = now() + 1;
+        assert_eq!(&fixed.encrypt(b"b").unwrap()[..16], &first[..16]);
+    }
+
+    #[test]
+    fn ticket_keys_from_files_encrypt_with_the_first() {
+        let dir = dir();
+        let (short, long, bad) = (dir.join("t48.key"), dir.join("t80.key"), dir.join("t1.key"));
+        std::fs::write(&short, [b'1'; 48]).unwrap();
+        std::fs::write(&long, [b'2'; 80]).unwrap();
+        std::fs::write(&bad, b"1").unwrap();
+        let keys = Rotated { rotate: Some(10), file: vec![TicketKey::load(&long).unwrap(), TicketKey::load(&short).unwrap()], keys: Mutex::new(None) };
+        let ticket = keys.encrypt(b"a").unwrap();
+        assert_eq!((&ticket[..16], keys.decrypt(&ticket)), (&[b'2'; 16][..], Some(b"a".to_vec())));
+        let other = Rotated { rotate: None, file: vec![TicketKey::load(&short).unwrap()], keys: Mutex::new(None) };
+        let theirs = other.encrypt(b"b").unwrap();
+        assert_eq!((keys.decrypt(&theirs), other.decrypt(&ticket)), (Some(b"b".to_vec()), None));
+        let mut forged = theirs.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        assert_eq!((keys.decrypt(&forged), keys.decrypt(&theirs[..20])), (None, None));
+        assert!(TicketKey::load(&bad).unwrap_err().ends_with("must be 48 or 80 bytes"));
+        assert!(TicketKey::load(&dir.join("none")).unwrap_err().starts_with("open() "));
+    }
+
+    #[test]
     fn sessions_last_for_the_timeout() {
         let timed = Timed((), 10);
         let stamped = Timed::<()>::stamp(b"data");
         assert_eq!(timed.fresh(stamped.clone()), Some(b"data".to_vec()));
         let old = [(now() - 11).to_be_bytes().as_slice(), b"data"].concat();
         assert_eq!((timed.fresh(old), timed.fresh(b"short".to_vec())), (None, None));
-        let tickets = Timed(rustls::crypto::ring::Ticketer::new().unwrap(), 10);
+        let tickets = Timed(Rotated { rotate: None, file: Vec::new(), keys: Mutex::new(None) }, 10);
         use rustls::server::ProducesTickets;
         assert!(tickets.enabled() && tickets.lifetime() == 10);
         assert_eq!(tickets.decrypt(&tickets.encrypt(b"t").unwrap()), Some(b"t".to_vec()));
+    }
+
+    #[test]
+    fn rejects_handshakes_and_lends_the_default_certificate() {
+        let dir = dir();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; }} server {{ listen {addr}; server_name virtual1; }} server {{ listen {addr}; server_name virtual2; ssl_reject_handshake on; }} }}");
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+        let accepted = std::thread::spawn(move || (0..2).map(|_| accept(l.accept().unwrap().0, &config, addr).map(|a| a.1.server_name)).collect::<Vec<_>>());
+        let tls = client((false, true), None, None).unwrap();
+        let ok = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), Some("virtual1")), Duration::from_secs(5), &tls).unwrap();
+        drop(ok);
+        let refused = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), Some("virtual2")), Duration::from_secs(5), &tls).err().unwrap();
+        assert!(format!("{refused:?}").contains("UnrecognisedName"), "{refused:?}");
+        assert_eq!(accepted.join().unwrap(), [Some("virtual1".to_string()), None]);
     }
 
     #[test]

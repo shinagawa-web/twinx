@@ -24,7 +24,7 @@ const REASONS: &[(u16, &str)] = &[
     (403, "Forbidden"), (404, "Not Found"), (405, "Not Allowed"), (406, "Not Acceptable"),
     (408, "Request Time-out"), (409, "Conflict"), (410, "Gone"), (411, "Length Required"),
     (412, "Precondition Failed"), (413, "Request Entity Too Large"), (414, "Request-URI Too Large"),
-    (415, "Unsupported Media Type"), (416, "Requested Range Not Satisfiable"), (429, "Too Many Requests"),
+    (415, "Unsupported Media Type"), (416, "Requested Range Not Satisfiable"), (421, "Misdirected Request"), (429, "Too Many Requests"),
     (500, "Internal Server Error"), (501, "Not Implemented"), (502, "Bad Gateway"),
     (503, "Service Temporarily Unavailable"), (504, "Gateway Time-out"), (505, "HTTP Version Not Supported"),
 ];
@@ -32,8 +32,8 @@ const REASONS: &[(u16, &str)] = &[
 /// Binds every address the servers listen on and accepts connections on each in a thread.
 /// Opens the listening sockets: the master does this, so that bind errors stop it and every worker shares them.
 pub fn bind(config: &Config, open: &[(TcpListener, SocketAddr)]) -> Result<Vec<(TcpListener, SocketAddr)>, String> {
-    let mut addrs: Vec<SocketAddr> = config.servers.iter().flat_map(|s| s.listen.clone()).collect();
-    addrs.dedup();
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    for addr in config.servers.iter().flat_map(|s| &s.listen) { if !addrs.contains(addr) { addrs.push(*addr) } }
     // On a reload, a socket already open on the address is kept. accept() on
     // it gives up after a while, so that a worker shutting down stops accepting.
     let get = |addr| open.iter().find(|o| o.1 == addr).map_or_else(|| TcpListener::bind(addr), |o| o.0.try_clone());
@@ -174,6 +174,8 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl)
         let (server, captures) = server(config, listen, r.host.as_deref());
         r.captures = captures;
         let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
+        let parsed = parsed.and_then(|()| if misdirected(r.ssl.as_ref(), r.host.as_deref(), server.level.ssl_verify_client) { Err(421) } else { Ok(()) });
+        let parsed = parsed.and_then(|()| cert_error(server.level.ssl_verify_client, r.ssl.as_ref()));
         r.server_name = server.name.clone();
         let found = located(server, &r, &r.uri);
         let level = found.1;
@@ -213,7 +215,7 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl)
         };
         let busy = Busy::new();
         drop(fresh.take());
-        idle = exchange(&mut stream, server, &r, parsed, found, local);
+        idle = exchange(&mut stream, server, &r, parsed, found, local, &buf);
         drop(busy);
         // What of an unbuffered body was not passed on is read and dropped.
         // What came after a chunked one is the next request.
@@ -414,12 +416,35 @@ fn finish(resp: &mut Response) {
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
 }
 
+/// Whether a request is misdirected (421), as nginx finds it: its Host is not
+/// the name the client asked for with SNI, and the server the Host selects
+/// asks clients for their certificates (ssl_verify_client).
+fn misdirected(ssl: Option<&crate::tls::Session>, host: Option<&str>, verify: u8) -> bool {
+    let sni = ssl.map(|s| s.server_name.as_str()).filter(|n| !n.is_empty());
+    sni.zip(host).is_some_and(|(sni, host)| !sni.eq_ignore_ascii_case(host) && verify > 0)
+}
+
+/// What nginx answers a request on a connection whose client's certificate
+/// it asked for (ssl_verify_client): 495 when it did not verify, but for the
+/// errors optional_no_ca lets through, and with ssl_verify_client on, 496 without one.
+fn cert_error(mode: u8, ssl: Option<&crate::tls::Session>) -> Result<(), u16> {
+    const OPTIONAL: &[&str] = &["self-signed certificate", "self-signed certificate in certificate chain", "unable to get issuer certificate", "unable to get local issuer certificate", "unable to verify the first certificate"];
+    let Some(verify) = ssl.filter(|_| mode > 0).map(|s| s.verify.as_str()) else { return Ok(()) };
+    match verify.strip_prefix("FAILED:") {
+        Some(e) if !(mode == 3 && OPTIONAL.contains(&e)) => Err(495),
+        _ if mode == 1 && verify == "NONE" => Err(496),
+        _ => Ok(()),
+    }
+}
+
 /// The page nginx generates for an error status.
 fn special(status: u16) -> Response {
     let ctype = Some("text/html".to_string());
     // 494, a header line too long, is answered as 400 with a page of its own.
     let (status, body) = match status {
         494 => (400, page_with(400, "Request Header Or Cookie Too Large", "<center>Request Header Or Cookie Too Large</center>\r\n")),
+        // A client's certificate that did not verify (495), or none (496).
+        495 | 496 => { let text = ["The SSL certificate error", "No required SSL certificate was sent"][usize::from(status == 496)]; (400, page_with(400, text, &format!("<center>{text}</center>\r\n"))) }
         _ => (status, page(status)),
     };
     Response { status, ctype, body: body.into_bytes(), generated: true, ..Response::default() }
@@ -569,7 +594,7 @@ fn args(r: &Request) -> &str {
 
 /// Answers one request; when the connection stays open for the next one, how
 /// long it waits for it (keepalive_timeout).
-fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr) -> Option<Duration> {
+fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr, ahead: &[u8]) -> Option<Duration> {
     let (mut resp, mut level, mut last) = answer(server, r, parsed, found);
     let intercepted = !resp.proxied || level.proxy_intercept_errors;
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)).filter(|_| intercepted) {
@@ -698,9 +723,11 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
     let size = |t: &Template| crate::conf::size(&t.render(r, &Sent::default())).unwrap_or(0);
     let rate = r.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
+    let _ = stream.set_write_timeout(Some(level.send_timeout).filter(|t| !t.is_zero()));
     let written = send(stream, &out, rate, size(&level.limit_rate_after), r.started);
-    if let Some(up) = resp.tunnel.take().filter(|_| written) { tunnel(stream, up); }
-    let sent = Sent { bytes: out.len(), body: body_len, ..so_far(&resp, &trailers) };
+    // What was passed from the proxied server through an upgraded connection counts as sent, as body.
+    let tunneled = resp.tunnel.take().filter(|_| written).map_or(0, |up| tunnel(stream, up, ahead));
+    let sent = Sent { bytes: out.len() + tunneled, body: body_len + tunneled, ..so_far(&resp, &trailers) };
     if written { post_action(server, r, level); }
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     (written && keepalive && !silent).then_some(level.keepalive_timeout)
@@ -709,13 +736,17 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
 /// Passes data both ways between a client and the proxied server its
 /// connection was upgraded to, until either closes it or sends nothing for
 /// proxy_read_timeout.
-fn tunnel(client: &TcpStream, up: TcpStream) {
+fn tunnel(client: &TcpStream, up: TcpStream, ahead: &[u8]) -> usize {
     let _ = client.set_read_timeout(up.read_timeout().ok().flatten());
-    let (Ok(mut from_client), Ok(mut to_up)) = (client.try_clone(), up.try_clone()) else { return };
-    let other = thread::spawn(move || { let _ = std::io::copy(&mut from_client, &mut to_up); let _ = to_up.shutdown(Shutdown::Both); });
-    let _ = std::io::copy(&mut &up, &mut &*client);
+    let (Ok(mut from_client), Ok(mut to_up)) = (client.try_clone(), up.try_clone()) else { return 0 };
+    // What the client sent after the request's head goes first.
+    let ahead = ahead.to_vec();
+    let other = thread::spawn(move || { if to_up.write_all(&ahead).is_ok() { let _ = std::io::copy(&mut from_client, &mut to_up); } let _ = to_up.shutdown(Shutdown::Both); });
+    let (mut passed, mut chunk) = (0, [0u8; 16384]);
+    while let Ok(n @ 1..) = (&up).read(&mut chunk) { if (&*client).write_all(&chunk[..n]).is_err() { break } passed += n; }
     let _ = client.shutdown(Shutdown::Both);
     let _ = other.join();
+    passed
 }
 
 /// post_action: once the answer is sent, the request is redirected internally
@@ -1571,7 +1602,14 @@ pub fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) ->
         ServerName::Regex(re) => re.captures(host).map(|c| (s, re.capture_names().flatten().filter_map(|name| Some((name.to_string(), c.name(name)?.as_str().to_string()))).collect())),
         _ => None,
     });
-    regex.unwrap_or_else(|| (on().next().unwrap_or(&config.servers[0]), Vec::new()))
+    regex.unwrap_or_else(|| (default_server(config, listen), Vec::new()))
+}
+
+/// The default server of a listening address: the one listening there with
+/// default_server, else the first server listening there.
+pub fn default_server(config: &Config, listen: SocketAddr) -> &Server {
+    let on = || config.servers.iter().filter(|s| s.listen.contains(&listen));
+    on().find(|s| s.defaults.contains(&listen)).or_else(|| on().next()).unwrap_or(&config.servers[0])
 }
 
 /// The host as $host gives it: lower case, without the port or a trailing
@@ -1675,8 +1713,11 @@ mod tests {
         let addr = l.local_addr().unwrap();
         let (mut client, accepted) = (TcpStream::connect(addr).unwrap(), l.accept().unwrap().0);
         let (mut server, up) = (TcpStream::connect(addr).unwrap(), l.accept().unwrap().0);
-        let t = thread::spawn(move || tunnel(&accepted, up));
+        let t = thread::spawn(move || tunnel(&accepted, up, b"early"));
         let mut buf = [0u8; 4];
+        let mut early = [0u8; 5];
+        server.read_exact(&mut early).unwrap();
+        assert_eq!(&early, b"early");
         client.write_all(b"ping").unwrap();
         server.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"ping");
@@ -1686,7 +1727,7 @@ mod tests {
         // The proxied server closing ends the client's connection too.
         drop(server);
         assert_eq!(client.read(&mut buf).unwrap(), 0);
-        t.join().unwrap();
+        assert_eq!(t.join().unwrap(), 4);
     }
 
     #[test]
@@ -1699,6 +1740,18 @@ mod tests {
         assert!(bind(&config, &[]).unwrap_err().starts_with(&format!("bind() to {addr} failed")));
         let open = vec![(open.into_iter().next().unwrap().0, addr)];
         assert_eq!(bind(&config, &open).unwrap()[0].0.local_addr().unwrap(), addr);
+    }
+
+    #[test]
+    fn binds_each_address_once_and_finds_its_default_server() {
+        let (a, b) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+        let (a, b) = ((a.local_addr().unwrap(), a), (b.local_addr().unwrap(), b));
+        let text = format!("http {{ server {{ listen {}; listen {}; server_name one; }} server {{ listen {}; listen {} default_server; server_name two; }} }}", a.0, b.0, a.0, b.0);
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let open = vec![(a.1, a.0), (b.1, b.0)];
+        assert_eq!(bind(&config, &open).unwrap().iter().map(|l| l.1).collect::<Vec<_>>(), [a.0, b.0]);
+        assert_eq!((default_server(&config, a.0).name.as_str(), default_server(&config, b.0).name.as_str()), ("one", "two"));
+        assert_eq!(server(&config, b.0, Some("other")).0.name, "two");
     }
 
     #[test]
@@ -1873,7 +1926,7 @@ mod tests {
             let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
             let (mut stream, _) = client.accept().unwrap();
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]);
             drop(stream);
             let mut text = String::new();
             out.read_to_string(&mut text).unwrap();
@@ -1887,6 +1940,32 @@ mod tests {
     }
 
     #[test]
+    fn answers_certificate_errors() {
+        let ssl = |verify: &str| Some(crate::tls::Session { verify: verify.to_string(), ..Default::default() });
+        assert_eq!(cert_error(1, ssl("FAILED:certificate revoked").as_ref()), Err(495));
+        assert_eq!(cert_error(3, ssl("FAILED:self-signed certificate").as_ref()), Ok(()));
+        assert_eq!(cert_error(3, ssl("FAILED:certificate has expired").as_ref()), Err(495));
+        assert_eq!(cert_error(1, ssl("NONE").as_ref()), Err(496));
+        assert_eq!(cert_error(2, ssl("NONE").as_ref()), Ok(()));
+        assert_eq!(cert_error(0, ssl("FAILED:certificate revoked").as_ref()), Ok(()));
+        assert_eq!(cert_error(1, None), Ok(()));
+        assert_eq!(special(495).status, 400);
+        assert!(String::from_utf8(special(496).body).unwrap().contains("<center>No required SSL certificate was sent</center>"));
+    }
+
+    #[test]
+    fn finds_misdirected_requests() {
+        let ssl = |name: &str| Some(crate::tls::Session { server_name: name.to_string(), ..Default::default() });
+        assert!(misdirected(ssl("a").as_ref(), Some("b"), 2));
+        assert!(!misdirected(ssl("A").as_ref(), Some("a"), 2));
+        assert!(!misdirected(ssl("a").as_ref(), Some("b"), 0));
+        assert!(!misdirected(ssl("").as_ref(), Some("b"), 1));
+        assert!(!misdirected(None, Some("b"), 1));
+        assert!(!misdirected(ssl("a").as_ref(), None, 1));
+        assert!(String::from_utf8(special(421).body).unwrap().contains("<title>421 Misdirected Request</title>"));
+    }
+
+    #[test]
     fn server_tokens() {
         let text = "http { server { location /a { return 404; } location /b { server_tokens off; return 404; } } }";
         let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
@@ -1896,7 +1975,7 @@ mod tests {
             let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
             let (mut stream, _) = client.accept().unwrap();
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]);
             drop(stream);
             let mut text = String::new();
             out.read_to_string(&mut text).unwrap();
@@ -1922,7 +2001,7 @@ mod tests {
             let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
             let (mut stream, _) = client.accept().unwrap();
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]);
             drop(stream);
             let mut text = String::new();
             out.read_to_string(&mut text).unwrap();
