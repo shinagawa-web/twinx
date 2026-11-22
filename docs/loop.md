@@ -1,6 +1,6 @@
 # One run of the loop
 
-The schedule is paused since 2026-11-22T03:59Z, after stage 2 was done (2026-11-21T05:54Z), until the next stage is decided. A human may start a run by hand; a run that has started goes ahead.
+The schedule runs again since 2026-11-22T04:50Z, for twinx's own tests added to stage 2 (#119), after a pause from 2026-11-22T03:59Z. A human may also start a run by hand; a run that has started goes ahead.
 
 A scheduled Claude Code session runs the loop as the Fixer, with model `claude-opus-5-5`, following `docs/fixer.md`.
 
