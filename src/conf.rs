@@ -88,6 +88,9 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_certificate_key", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_compression", HTTP | SRV, 1, 1, false),
     ("ssl_ciphers", HTTP | SRV, 1, 1, false),
+    ("ssl_protocols", HTTP | SRV, 1, usize::MAX, false),
+    ("ssl_prefer_server_ciphers", HTTP | SRV, 1, 1, false),
+    ("ssl_conf_command", HTTP | SRV, 2, 2, false),
     ("ssl_session_cache", HTTP | SRV, 1, 2, false),
     ("ssl_session_tickets", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_cache", HTTP | SRV, 1, 3, false),
@@ -443,6 +446,13 @@ pub struct Level {
     pub ssl_certificate_compression: bool,
     /// ssl_ciphers: the TLS 1.2 cipher suites taken, in OpenSSL's terms; None takes all.
     pub ssl_ciphers: Option<String>,
+    /// ssl_protocols: whether TLS 1.2 and TLS 1.3 are taken, in that order.
+    pub ssl_protocols: [bool; 2],
+    /// ssl_prefer_server_ciphers: the server's order of cipher suites wins over the client's.
+    pub ssl_prefer_server_ciphers: bool,
+    /// ssl_conf_command: OpenSSL's commands and their values, files named in
+    /// full; those of a level replace those inherited as a whole.
+    pub ssl_conf_command: Vec<(String, String)>,
     /// limit_except: the methods allowed (HEAD with GET), and the settings of
     /// the block, which requests with any other method get instead of the
     /// location's. Nested locations and if blocks do not inherit it.
@@ -638,7 +648,7 @@ impl Builder<'_> {
         // Without root, files come from html under the prefix, as nginx's default root is.
         let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -682,9 +692,11 @@ impl Builder<'_> {
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
         let l = &s.level;
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
-        let files: Vec<(&Path, &Path)> = l.ssl_certificate.iter().map(PathBuf::as_path).zip(l.ssl_certificate_key.iter().map(PathBuf::as_path)).collect();
+        let mut options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers };
+        let extra = conf_commands(&l.ssl_conf_command, &mut options)?;
+        let pairs = l.ssl_certificate.iter().zip(&l.ssl_certificate_key).chain(extra[0].iter().zip(&extra[1]));
+        let files: Vec<(&Path, &Path)> = pairs.map(|(cert, key)| (cert.as_path(), key.as_path())).collect();
         let named = files.iter().any(|(cert, key)| [cert, key].iter().any(|p| p.to_string_lossy().contains('$')));
-        let options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone() };
         s.tls = (!files.is_empty()).then(|| crate::tls::server((&files, l.ssl_password_file.as_deref()), named.then(|| l.ssl_certificate_cache.clone()), &trust, options)).transpose()?;
         let level = s.level.clone();
         self.locations(block, &level, &mut s.locations)?;
@@ -714,6 +726,7 @@ impl Builder<'_> {
         let mut pages: Option<Vec<ErrorPage>> = None;
         // ssl_certificate and ssl_certificate_key of this level, which replace those inherited.
         let mut certs: [Option<Vec<PathBuf>>; 2] = [None, None];
+        let mut commands: Option<Vec<(String, String)>> = None;
         let mut proxy_headers: Option<Vec<(String, Template)>> = None;
         let mut hidden: Option<Vec<String>> = None;
         // proxy_cookie_domain and proxy_cookie_path of this level: Some(None) once "off".
@@ -780,6 +793,10 @@ impl Builder<'_> {
                 "ssl_certificate" | "ssl_certificate_key" => certs[usize::from(d.name == "ssl_certificate_key")].get_or_insert_default().push(self.path(&d.args[0])),
                 "ssl_certificate_compression" => level.ssl_certificate_compression = flag(d).map_err(at)?,
                 "ssl_ciphers" => level.ssl_ciphers = Some(d.args[0].clone()),
+                "ssl_protocols" => level.ssl_protocols = protocols(&d.args).map_err(at)?,
+                "ssl_prefer_server_ciphers" => level.ssl_prefer_server_ciphers = flag(d).map_err(at)?,
+                // OpenSSL's commands that take a file are given its name in full, as nginx does.
+                "ssl_conf_command" => commands.get_or_insert_default().push((d.args[0].clone(), if ["Certificate", "PrivateKey"].contains(&d.args[0].as_str()) { self.path(&d.args[1]).to_string_lossy().into_owned() } else { d.args[1].clone() })),
                 // The sessions are kept in memory of each server, whatever the cache.
                 "ssl_session_cache" => {
                     if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
@@ -910,6 +927,7 @@ impl Builder<'_> {
         let [certificates, keys] = certs;
         if let Some(c) = certificates { level.ssl_certificate = c; }
         if let Some(k) = keys { level.ssl_certificate_key = k; }
+        if let Some(c) = commands { level.ssl_conf_command = c; }
         if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
         if let Some(hidden) = hidden { level.proxy_hide_header = hidden; }
         let [domain, path] = cookies;
@@ -1190,6 +1208,33 @@ fn pcre(p: &str) -> String {
 }
 
 /// "on" or "off".
+/// ssl_protocols: whether TLS 1.2 and TLS 1.3 are among the protocols
+/// listed; the older ones nginx knows are taken but twinx has none of them.
+fn protocols(args: &[String]) -> Result<[bool; 2], String> {
+    if let Some(a) = args.iter().find(|a| !["SSLv2", "SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"].iter().any(|p| p.eq_ignore_ascii_case(a))) { return Err(format!("invalid value \"{a}\"")) }
+    Ok(["TLSv1.2", "TLSv1.3"].map(|p| args.iter().any(|a| a.eq_ignore_ascii_case(p))))
+}
+
+/// ssl_conf_command, run as OpenSSL's SSL_CONF_cmd runs them, after the
+/// other ssl_* directives: Options turns the options it lists, separated by
+/// commas, on, or off when they begin with "-" (SessionTicket, the tickets of
+/// ssl_session_tickets, and ServerPreference, ssl_prefer_server_ciphers);
+/// Certificate and PrivateKey add a certificate and its key, given back in
+/// that order, which replaces one of the same type of key.
+fn conf_commands(commands: &[(String, String)], options: &mut crate::tls::Options) -> Result<[Vec<PathBuf>; 2], String> {
+    let mut files = [Vec::new(), Vec::new()];
+    for (name, value) in commands {
+        match name.as_str() {
+            "Options" => for o in value.split(',').map(str::trim) {
+                let (on, option) = o.strip_prefix('-').map_or((true, o), |o| (false, o));
+                match option { "SessionTicket" => options.sessions.tickets = on, "ServerPreference" => options.prefer = on, _ => return Err(format!("SSL_CONF_cmd(\"{name}\", \"{value}\") failed")) }
+            },
+            "Certificate" | "PrivateKey" => files[usize::from(name == "PrivateKey")].push(PathBuf::from(value)), _ => return Err(format!("SSL_CONF_cmd(\"{name}\", \"{value}\") failed")),
+        }
+    }
+    Ok(files)
+}
+
 fn flag(d: &Directive) -> Result<bool, String> {
     let (value, name) = (&d.args[0], &d.name);
     let found = [("on", true), ("off", false)].into_iter().find(|f| f.0 == value.to_ascii_lowercase()).map(|f| f.1);
@@ -1802,5 +1847,32 @@ mod tests {
         assert!(c.servers[0].level.proxy_ssl_certificate_vars.is_some());
         let c = build_text("http { server { listen 127.0.0.1:8080; proxy_ssl_certificate \"\"; proxy_ssl_certificate_key \"\"; location / { } } }").unwrap();
         assert!(c.servers[0].level.proxy_ssl_certificate_vars.is_none());
+    }
+
+    #[test]
+    fn ssl_protocols() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(protocols(&args(&["TLSv1", "TLSv1.2"])).unwrap(), [true, false]);
+        assert_eq!(protocols(&args(&["tlsv1.3"])).unwrap(), [false, true]);
+        assert_eq!(protocols(&args(&["TLSv1.4"])).unwrap_err(), "invalid value \"TLSv1.4\"");
+        let c = build_text("http { ssl_protocols TLSv1.2; server { listen 127.0.0.1:8080; } }").unwrap();
+        assert_eq!(c.servers[0].level.ssl_protocols, [true, false]);
+    }
+
+    #[test]
+    fn ssl_conf_commands() {
+        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true };
+        let commands = |c: &[(&str, &str)]| c.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let files = conf_commands(&commands(&[("Options", "-SessionTicket, -ServerPreference"), ("Certificate", "/c.crt"), ("PrivateKey", "/c.key")]), &mut options).unwrap();
+        assert!(!options.sessions.tickets && !options.prefer);
+        assert_eq!(files, [vec![PathBuf::from("/c.crt")], vec![PathBuf::from("/c.key")]]);
+        conf_commands(&commands(&[("Options", "SessionTicket,ServerPreference")]), &mut options).unwrap();
+        assert!(options.sessions.tickets && options.prefer);
+        assert_eq!(conf_commands(&commands(&[("Options", "Bugs")]), &mut options).unwrap_err(), "SSL_CONF_cmd(\"Options\", \"Bugs\") failed");
+        assert_eq!(conf_commands(&commands(&[("Protocol", "TLSv1.2")]), &mut options).unwrap_err(), "SSL_CONF_cmd(\"Protocol\", \"TLSv1.2\") failed");
+        let c = build_text("http { ssl_conf_command Options SessionTicket; server { listen 127.0.0.1:8080; ssl_conf_command Certificate c.crt; } }").unwrap();
+        let level = &c.servers[0].level;
+        assert_eq!(level.ssl_conf_command.len(), 1);
+        assert!(level.ssl_conf_command[0].1.ends_with("/c.crt") && level.ssl_conf_command[0].1.len() > "/c.crt".len());
     }
 }
