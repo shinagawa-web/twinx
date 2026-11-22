@@ -17,6 +17,10 @@ RUN apt-get update -q \
 
 COPY tap.pl /nginx-tests/tap.pl
 
+# twinx's own tests, beside nginx-tests' files: behaviour nginx-tests does not
+# check, written in its style and checked against nginx 1.30.6.
+COPY extra/*.t /nginx-tests/
+
 FROM nginx AS twinx
 RUN rm -rf /usr/sbin/nginx /usr/sbin/nginx-debug /usr/lib/nginx /etc/nginx /docker-entrypoint.sh /docker-entrypoint.d
 COPY rename.pl /tmp/rename.pl
