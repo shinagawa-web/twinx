@@ -172,6 +172,8 @@ pub enum Var {
     ProxyAddXForwardedFor,
     Pid,
     ServerName,
+    /// The scheme of the request: http, as twinx listens only for plain HTTP.
+    Scheme,
     LimitRate,
     /// A named capture of the server name's regular expression.
     Capture(String),
@@ -201,7 +203,7 @@ impl Var {
             ("upstream_connect_time", Var::UpstreamTime(0)), ("upstream_header_time", Var::UpstreamTime(1)), ("upstream_response_time", Var::UpstreamTime(2)),
             ("upstream_response_length", Var::UpstreamBytes(0)), ("upstream_bytes_received", Var::UpstreamBytes(1)), ("upstream_bytes_sent", Var::UpstreamBytes(2)),
             ("proxy_host", Var::ProxyHost), ("proxy_port", Var::ProxyPort), ("proxy_add_x_forwarded_for", Var::ProxyAddXForwardedFor),
-            ("server_name", Var::ServerName), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
+            ("server_name", Var::ServerName), ("scheme", Var::Scheme), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -245,6 +247,7 @@ impl Var {
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
             Var::Pid => std::process::id().to_string(),
             Var::ServerName => r.server_name.clone(),
+            Var::Scheme => "http".to_string(),
             Var::LimitRate => r.limit_rate.get().unwrap_or(0).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
             Var::User(name) => r.vars.lock().unwrap().iter().find(|v| v.0 == *name)?.1.clone(),
@@ -518,6 +521,7 @@ mod tests {
         assert_eq!(t.render(&r, &Sent::default()), format!("{}|a", std::process::id()));
         r.method = "PUT".into();
         assert_eq!(Template::parse("$request_method").unwrap().render(&r, &Sent::default()), "PUT");
+        assert_eq!(Template::parse("$scheme://x").unwrap().render(&r, &Sent::default()), "http://x");
         assert_eq!(t.render(&r, &Sent { upstream_addr: Some("b".into()), ..Sent::default() }), format!("{}|b", std::process::id()));
         r.upstream_status = Some("404, 404".into());
         assert_eq!(Template::parse("x${upstream_status}x").unwrap().render(&r, &Sent::default()), "x404, 404x");
