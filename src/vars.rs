@@ -181,6 +181,11 @@ pub enum Var {
     SslSessionReused,
     SslClientVerify,
     SslClientSDn,
+    SslSessionId,
+    SslCipher,
+    SslCiphers,
+    /// $ssl_client_i_dn and the others of the client's certificate, by what follows "ssl_client_".
+    SslClient(&'static str),
     LimitRate,
     /// A named capture of the server name's regular expression.
     Capture(String),
@@ -213,6 +218,9 @@ impl Var {
             ("server_name", Var::ServerName), ("scheme", Var::Scheme), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
             ("ssl_protocol", Var::SslProtocol), ("ssl_server_name", Var::SslServerName), ("ssl_session_reused", Var::SslSessionReused),
             ("ssl_client_verify", Var::SslClientVerify), ("ssl_client_s_dn", Var::SslClientSDn),
+            ("ssl_session_id", Var::SslSessionId), ("ssl_cipher", Var::SslCipher), ("ssl_ciphers", Var::SslCiphers),
+            ("ssl_client_i_dn", Var::SslClient("i_dn")), ("ssl_client_s_dn_legacy", Var::SslClient("s_dn_legacy")), ("ssl_client_i_dn_legacy", Var::SslClient("i_dn_legacy")),
+            ("ssl_client_v_start", Var::SslClient("v_start")), ("ssl_client_v_end", Var::SslClient("v_end")), ("ssl_client_v_remain", Var::SslClient("v_remain")),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -262,6 +270,10 @@ impl Var {
             Var::SslSessionReused => (if r.ssl.as_ref()?.reused { "r" } else { "." }).to_string(),
             Var::SslClientVerify => r.ssl.as_ref()?.verify.clone(),
             Var::SslClientSDn => r.ssl.as_ref()?.subject.clone()?,
+            Var::SslSessionId => r.ssl.as_ref()?.id.clone(),
+            Var::SslCipher => r.ssl.as_ref()?.cipher.clone(),
+            Var::SslCiphers => r.ssl.as_ref()?.ciphers.clone(),
+            Var::SslClient(var) => r.ssl.as_ref()?.client_var(var),
             Var::LimitRate => r.limit_rate.get().unwrap_or(0).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
             Var::User(name) => r.vars.lock().unwrap().iter().find(|v| v.0 == *name)?.1.clone(),

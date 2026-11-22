@@ -86,6 +86,8 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_key", HTTP | SRV, 1, 1, false),
     ("ssl_session_cache", HTTP | SRV, 1, 2, false),
+    ("ssl_session_tickets", HTTP | SRV, 1, 1, false),
+    ("ssl_session_timeout", HTTP | SRV, 1, 1, false),
     ("proxy_ssl_session_reuse", HSL, 1, 1, false),
     ("ssl_password_file", HTTP | SRV, 1, 1, false),
     ("ssl_verify_client", HTTP | SRV, 1, 1, false),
@@ -437,6 +439,9 @@ pub struct Level {
     pub limit_except: Option<(Vec<String>, Arc<Level>)>,
     /// proxy_ssl_session_reuse: TLS sessions to proxied servers are reused.
     pub proxy_ssl_session_reuse: bool,
+    /// ssl_session_tickets, ssl_session_cache (whether it keeps sessions: not
+    /// off or none) and ssl_session_timeout: how clients' sessions are resumed.
+    pub ssl_sessions: crate::tls::Sessions,
     /// ssl_password_file: the passwords an encrypted ssl_certificate_key is tried with.
     pub ssl_password_file: Option<PathBuf>,
     /// ssl_verify_client: whether clients are asked for a certificate (not "off").
@@ -659,7 +664,7 @@ impl Builder<'_> {
         let l = &s.level;
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
         let files = l.ssl_certificate.as_deref().zip(l.ssl_certificate_key.as_deref());
-        s.tls = files.map(|(cert, key)| crate::tls::server(cert, key, l.ssl_password_file.as_deref(), l.ssl_verify_client, &trust)).transpose()?;
+        s.tls = files.map(|(cert, key)| crate::tls::server(cert, key, l.ssl_password_file.as_deref(), l.ssl_verify_client, &trust, l.ssl_sessions)).transpose()?;
         let level = s.level.clone();
         self.locations(block, &level, &mut s.locations)?;
         Ok(s)
@@ -751,8 +756,13 @@ impl Builder<'_> {
                 }
                 "ssl_certificate" => level.ssl_certificate = Some(self.path(&d.args[0])),
                 "ssl_certificate_key" => level.ssl_certificate_key = Some(self.path(&d.args[0])),
-                // Sessions are kept in memory whatever the cache: the value is only checked.
-                "ssl_session_cache" => if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
+                // The sessions are kept in memory of each server, whatever the cache.
+                "ssl_session_cache" => {
+                    if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
+                    level.ssl_sessions.cache = d.args.iter().all(|a| a != "off" && a != "none");
+                }
+                "ssl_session_tickets" => level.ssl_sessions.tickets = flag(d).map_err(at)?,
+                "ssl_session_timeout" => level.ssl_sessions.timeout = seconds(&d.args[0]).map_err(at)?.as_secs(),
                 "proxy_ssl_session_reuse" => (level.proxy_ssl_session_reuse, own_tls) = (flag(d).map_err(at)?, true),
                 "ssl_password_file" => level.ssl_password_file = Some(self.path(&d.args[0])),
                 "ssl_verify_client" => level.ssl_verify_client = ["off", "on", "optional", "optional_no_ca"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_verify_client\" directive, it must be \"on\", \"off\", \"optional\" or \"optional_no_ca\"", d.args[0])))? > 0,
