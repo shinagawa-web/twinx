@@ -214,7 +214,7 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl)
         };
         let busy = Busy::new();
         drop(fresh.take());
-        idle = exchange(&mut stream, server, &r, parsed, found, local);
+        idle = exchange(&mut stream, server, &r, parsed, found, local, &buf);
         drop(busy);
         // What of an unbuffered body was not passed on is read and dropped.
         // What came after a chunked one is the next request.
@@ -585,7 +585,7 @@ fn args(r: &Request) -> &str {
 
 /// Answers one request; when the connection stays open for the next one, how
 /// long it waits for it (keepalive_timeout).
-fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr) -> Option<Duration> {
+fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr, ahead: &[u8]) -> Option<Duration> {
     let (mut resp, mut level, mut last) = answer(server, r, parsed, found);
     let intercepted = !resp.proxied || level.proxy_intercept_errors;
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)).filter(|_| intercepted) {
@@ -714,9 +714,11 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
     let size = |t: &Template| crate::conf::size(&t.render(r, &Sent::default())).unwrap_or(0);
     let rate = r.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
+    let _ = stream.set_write_timeout(Some(level.send_timeout).filter(|t| !t.is_zero()));
     let written = send(stream, &out, rate, size(&level.limit_rate_after), r.started);
-    if let Some(up) = resp.tunnel.take().filter(|_| written) { tunnel(stream, up); }
-    let sent = Sent { bytes: out.len(), body: body_len, ..so_far(&resp, &trailers) };
+    // What was passed from the proxied server through an upgraded connection counts as sent, as body.
+    let tunneled = resp.tunnel.take().filter(|_| written).map_or(0, |up| tunnel(stream, up, ahead));
+    let sent = Sent { bytes: out.len() + tunneled, body: body_len + tunneled, ..so_far(&resp, &trailers) };
     if written { post_action(server, r, level); }
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     (written && keepalive && !silent).then_some(level.keepalive_timeout)
@@ -725,13 +727,17 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
 /// Passes data both ways between a client and the proxied server its
 /// connection was upgraded to, until either closes it or sends nothing for
 /// proxy_read_timeout.
-fn tunnel(client: &TcpStream, up: TcpStream) {
+fn tunnel(client: &TcpStream, up: TcpStream, ahead: &[u8]) -> usize {
     let _ = client.set_read_timeout(up.read_timeout().ok().flatten());
-    let (Ok(mut from_client), Ok(mut to_up)) = (client.try_clone(), up.try_clone()) else { return };
-    let other = thread::spawn(move || { let _ = std::io::copy(&mut from_client, &mut to_up); let _ = to_up.shutdown(Shutdown::Both); });
-    let _ = std::io::copy(&mut &up, &mut &*client);
+    let (Ok(mut from_client), Ok(mut to_up)) = (client.try_clone(), up.try_clone()) else { return 0 };
+    // What the client sent after the request's head goes first.
+    let ahead = ahead.to_vec();
+    let other = thread::spawn(move || { if to_up.write_all(&ahead).is_ok() { let _ = std::io::copy(&mut from_client, &mut to_up); } let _ = to_up.shutdown(Shutdown::Both); });
+    let (mut passed, mut chunk) = (0, [0u8; 16384]);
+    while let Ok(n @ 1..) = (&up).read(&mut chunk) { if (&*client).write_all(&chunk[..n]).is_err() { break } passed += n; }
     let _ = client.shutdown(Shutdown::Both);
     let _ = other.join();
+    passed
 }
 
 /// post_action: once the answer is sent, the request is redirected internally
@@ -1691,8 +1697,11 @@ mod tests {
         let addr = l.local_addr().unwrap();
         let (mut client, accepted) = (TcpStream::connect(addr).unwrap(), l.accept().unwrap().0);
         let (mut server, up) = (TcpStream::connect(addr).unwrap(), l.accept().unwrap().0);
-        let t = thread::spawn(move || tunnel(&accepted, up));
+        let t = thread::spawn(move || tunnel(&accepted, up, b"early"));
         let mut buf = [0u8; 4];
+        let mut early = [0u8; 5];
+        server.read_exact(&mut early).unwrap();
+        assert_eq!(&early, b"early");
         client.write_all(b"ping").unwrap();
         server.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"ping");
@@ -1702,7 +1711,7 @@ mod tests {
         // The proxied server closing ends the client's connection too.
         drop(server);
         assert_eq!(client.read(&mut buf).unwrap(), 0);
-        t.join().unwrap();
+        assert_eq!(t.join().unwrap(), 4);
     }
 
     #[test]
@@ -1889,7 +1898,7 @@ mod tests {
             let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
             let (mut stream, _) = client.accept().unwrap();
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]);
             drop(stream);
             let mut text = String::new();
             out.read_to_string(&mut text).unwrap();
@@ -1926,7 +1935,7 @@ mod tests {
             let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
             let (mut stream, _) = client.accept().unwrap();
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]);
             drop(stream);
             let mut text = String::new();
             out.read_to_string(&mut text).unwrap();
@@ -1952,7 +1961,7 @@ mod tests {
             let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
             let (mut stream, _) = client.accept().unwrap();
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap());
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]);
             drop(stream);
             let mut text = String::new();
             out.read_to_string(&mut text).unwrap();

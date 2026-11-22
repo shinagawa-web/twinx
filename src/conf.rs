@@ -137,6 +137,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_pass_request_body", HSL, 1, 1, false),
     ("proxy_connect_timeout", HSL, 1, 1, false),
     ("proxy_read_timeout", HSL, 1, 1, false),
+    ("send_timeout", HSL, 1, 1, false),
     ("proxy_buffer_size", HSL, 1, 1, false),
     ("proxy_buffering", HSL, 1, 1, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
@@ -423,6 +424,8 @@ pub struct Level {
     pub resolver_timeout: Duration,
     pub proxy_connect_timeout: Duration,
     pub proxy_read_timeout: Duration,
+    /// send_timeout: how long a write to the client may wait (60s).
+    pub send_timeout: Duration,
     /// proxy_bind: the local address, which may have variables, that
     /// connections to proxied servers are made from, and whether it may be
     /// a foreign one ("transparent"); None when off.
@@ -666,7 +669,7 @@ impl Builder<'_> {
         // Without root, files come from html under the prefix, as nginx's default root is.
         let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -902,6 +905,7 @@ impl Builder<'_> {
                 "resolver_timeout" => level.resolver_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_connect_timeout" => level.proxy_connect_timeout = millis(&d.args[0]).map_err(at)?,
                 "proxy_read_timeout" => level.proxy_read_timeout = seconds(&d.args[0]).map_err(at)?,
+                "send_timeout" => level.send_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_intercept_errors" => level.proxy_intercept_errors = flag(d).map_err(at)?,
                 "proxy_pass_request_headers" => level.proxy_pass_request_headers = flag(d).map_err(at)?,
                 "proxy_pass_request_body" => level.proxy_pass_request_body = flag(d).map_err(at)?,
@@ -1888,6 +1892,13 @@ mod tests {
         assert_eq!(protocols(&args(&["TLSv1.4"])).unwrap_err(), "invalid value \"TLSv1.4\"");
         let c = build_text("http { ssl_protocols TLSv1.2; server { listen 127.0.0.1:8080; } }").unwrap();
         assert_eq!(c.servers[0].level.ssl_protocols, [true, false]);
+    }
+
+    #[test]
+    fn send_timeout() {
+        let c = build_text("http { send_timeout 2s; server { listen 127.0.0.1:8080; } server { listen 127.0.0.1:8081; send_timeout 0; } }").unwrap();
+        assert_eq!((c.servers[0].level.send_timeout, c.servers[1].level.send_timeout), (Duration::from_secs(2), Duration::ZERO));
+        assert_eq!(build_text("http { }").unwrap().servers.first().map(|s| s.level.send_timeout), None);
     }
 
     #[test]
