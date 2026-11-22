@@ -361,6 +361,8 @@ pub struct Level {
     /// proxy_http_version 1.1: requests are passed as HTTP/1.1, and a chunked
     /// body that is not buffered is passed chunked as it comes.
     pub proxy_http_11: bool,
+    /// proxy_buffer_size: the buffer the proxied server's response head must fit in.
+    pub proxy_buffer_size: usize,
     /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
     pub proxy_next_upstream: Vec<String>,
     /// proxy_next_upstream_tries: how many servers a request may try, 0 for any.
@@ -541,7 +543,7 @@ impl Builder<'_> {
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
         // Without root, files come from html under the prefix, as nginx's default root is.
-        let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
+        let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -701,8 +703,8 @@ impl Builder<'_> {
                 "merge_slashes" => level.merge_slashes = flag(d).map_err(at)?,
                 "chunked_transfer_encoding" => level.chunked = flag(d).map_err(at)?,
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
-                // How the proxied answer is read changes nothing that is sent: the values are only checked.
-                "proxy_buffer_size" => { size(&d.args[0]).map_err(at)?; }
+                "proxy_buffer_size" => level.proxy_buffer_size = size(&d.args[0]).map_err(at)? as usize,
+                // How the proxied answer's body is read changes nothing that is sent: the value is only checked.
                 "proxy_buffering" => { flag(d).map_err(at)?; }
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
                 "proxy_http_version" => level.proxy_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\" or \"1.1\"", d.args[0])))? == 1,
@@ -1366,6 +1368,8 @@ mod tests {
     #[test]
     fn checks_proxy_buffering() {
         assert!(build_text("http { server { location / { proxy_buffer_size 512; proxy_buffering off; } } }").is_ok());
+        let c = build_text("http { server { location /a { proxy_buffer_size 8k; } location /b { } } }").unwrap();
+        assert_eq!(c.servers[0].locations.iter().map(|l| (l.level.proxy_buffer_size, l.level.proxy_http_11)).collect::<Vec<_>>(), [(8192, true), (4096, true)]);
         assert!(build_text("http { proxy_buffer_size 5x; }").unwrap_err().starts_with("\"5x\" is invalid"));
         assert!(build_text("http { proxy_max_temp_file_size 0; server { proxy_max_temp_file_size 4k; } }").is_ok());
         assert!(build_text("http { proxy_max_temp_file_size 1x; }").unwrap_err().starts_with("\"1x\" is invalid"));
