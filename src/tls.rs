@@ -268,12 +268,36 @@ impl rustls::server::ResolvesServerCert for Fixed {
 
 /// How a server takes connections: whether clients are asked for a
 /// certificate (ssl_verify_client not off), how their sessions are resumed,
-/// and whether certificates are sent compressed (ssl_certificate_compression).
-#[derive(Debug, Clone, Copy)]
+/// whether certificates are sent compressed (ssl_certificate_compression),
+/// and the TLS 1.2 cipher suites it takes (ssl_ciphers; None takes them all).
+#[derive(Debug, Clone)]
 pub struct Options {
     pub verify: bool,
     pub sessions: Sessions,
     pub compress: bool,
+    pub ciphers: Option<String>,
+}
+
+/// The OpenSSL names of the TLS 1.2 cipher suites twinx has.
+const CIPHER_NAMES: &[(rustls::CipherSuite, &str)] = &[
+    (rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, "ECDHE-ECDSA-AES256-GCM-SHA384"),
+    (rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, "ECDHE-ECDSA-AES128-GCM-SHA256"),
+    (rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, "ECDHE-ECDSA-CHACHA20-POLY1305"),
+    (rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, "ECDHE-RSA-AES256-GCM-SHA384"),
+    (rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, "ECDHE-RSA-AES128-GCM-SHA256"),
+    (rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, "ECDHE-RSA-CHACHA20-POLY1305"),
+];
+
+/// The cipher suites a list of ssl_ciphers takes, as OpenSSL reads it: the
+/// elements, separated by colons, spaces or commas, name suites, or all of
+/// them (DEFAULT, ALL, HIGH); elements naming none are left out. TLS 1.3
+/// suites are taken whatever the list, and a list taking no TLS 1.2 suite is refused.
+fn ciphers(list: &str) -> Result<Vec<rustls::SupportedCipherSuite>, String> {
+    let all = rustls::crypto::ring::DEFAULT_CIPHER_SUITES;
+    let named = |s: &rustls::SupportedCipherSuite, e: &str| ["DEFAULT", "ALL", "HIGH"].contains(&e) || CIPHER_NAMES.iter().any(|n| n.0 == s.suite() && n.1 == e);
+    let tls12: Vec<_> = all.iter().filter(|s| s.tls13().is_none() && list.split([':', ' ', ',']).any(|e| named(s, e))).copied().collect();
+    if tls12.is_empty() { return Err(format!("SSL_CTX_set_cipher_list(\"{list}\") failed")) }
+    Ok(all.iter().filter(|s| s.tls13().is_some()).copied().chain(tls12).collect())
 }
 
 /// ssl_certificate and ssl_certificate_key with variables: their names, made
@@ -319,7 +343,9 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     let templates = || files.iter().map(|(c, k)| Ok((template(c)?, template(k)?))).collect::<Result<Vec<_>, String>>();
     let named = named.map(|cache| Ok::<_, String>(Named { files: templates()?, passwords: passwords.map(Path::to_path_buf), cache })).transpose()?;
     let trusted = trust.iter().map(|p| trusted(p)).collect::<Result<Vec<_>, _>>()?.concat();
-    let builder = ServerConfig::builder();
+    let suites = options.ciphers.as_deref().map(ciphers).transpose()?;
+    let suites = CryptoProvider { cipher_suites: suites.unwrap_or_else(|| provider().cipher_suites.clone()), ..(*provider()).clone() };
+    let builder = ServerConfig::builder_with_provider(Arc::new(suites)).with_safe_default_protocol_versions().map_err(|e| e.to_string())?;
     let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
     let mut config = builder.with_cert_resolver(Arc::new(Fixed::new(fixed)));
     // Certificates are compressed with zlib, for TLS 1.3 clients that offer it.
@@ -852,6 +878,16 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 ";
 
     #[test]
+    fn takes_the_cipher_suites_of_ssl_ciphers() {
+        let names = |list: &str| ciphers(list).map(|s| s.iter().map(|s| s.suite().as_str().unwrap_or_default().to_string()).collect::<Vec<_>>());
+        assert_eq!(names("DEFAULT:ECCdraft").unwrap().len(), rustls::crypto::ring::DEFAULT_CIPHER_SUITES.len());
+        let one = names("ECDHE-RSA-AES128-GCM-SHA256 unknown").unwrap();
+        assert_eq!(one.iter().filter(|n| !n.starts_with("TLS13")).collect::<Vec<_>>(), ["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]);
+        assert!(one.iter().any(|n| n.starts_with("TLS13")));
+        assert_eq!(names("ECCdraft").unwrap_err(), "SSL_CTX_set_cipher_list(\"ECCdraft\") failed");
+    }
+
+    #[test]
     fn presents_the_certificate_the_client_can_verify() {
         let key = |cert: &str, key: &str| certified(vec![der(cert)], PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap()).unwrap();
         let (ec, ed) = (key(CERT, KEY), key(ED_CERT, ED_KEY));
@@ -871,8 +907,8 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = dir();
         let names = [(&*dir.join("$ssl_server_name"), &*dir.join("k.pem"))];
         let files = (&names[..], None);
-        let options = Options { verify: false, sessions: Sessions::default(), compress: false };
-        let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), &[], options).unwrap();
+        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None };
+        let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), &[], options.clone()).unwrap();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         assert!(tls.for_connection(&tcp, "c.pem").is_some());

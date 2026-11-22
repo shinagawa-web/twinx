@@ -87,6 +87,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_key", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_compression", HTTP | SRV, 1, 1, false),
+    ("ssl_ciphers", HTTP | SRV, 1, 1, false),
     ("ssl_session_cache", HTTP | SRV, 1, 2, false),
     ("ssl_session_tickets", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_cache", HTTP | SRV, 1, 3, false),
@@ -440,6 +441,8 @@ pub struct Level {
     /// ssl_certificate_compression: certificates are sent compressed to
     /// clients that ask for it.
     pub ssl_certificate_compression: bool,
+    /// ssl_ciphers: the TLS 1.2 cipher suites taken, in OpenSSL's terms; None takes all.
+    pub ssl_ciphers: Option<String>,
     /// limit_except: the methods allowed (HEAD with GET), and the settings of
     /// the block, which requests with any other method get instead of the
     /// location's. Nested locations and if blocks do not inherit it.
@@ -681,7 +684,7 @@ impl Builder<'_> {
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
         let files: Vec<(&Path, &Path)> = l.ssl_certificate.iter().map(PathBuf::as_path).zip(l.ssl_certificate_key.iter().map(PathBuf::as_path)).collect();
         let named = files.iter().any(|(cert, key)| [cert, key].iter().any(|p| p.to_string_lossy().contains('$')));
-        let options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression };
+        let options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone() };
         s.tls = (!files.is_empty()).then(|| crate::tls::server((&files, l.ssl_password_file.as_deref()), named.then(|| l.ssl_certificate_cache.clone()), &trust, options)).transpose()?;
         let level = s.level.clone();
         self.locations(block, &level, &mut s.locations)?;
@@ -776,6 +779,7 @@ impl Builder<'_> {
                 }
                 "ssl_certificate" | "ssl_certificate_key" => certs[usize::from(d.name == "ssl_certificate_key")].get_or_insert_default().push(self.path(&d.args[0])),
                 "ssl_certificate_compression" => level.ssl_certificate_compression = flag(d).map_err(at)?,
+                "ssl_ciphers" => level.ssl_ciphers = Some(d.args[0].clone()),
                 // The sessions are kept in memory of each server, whatever the cache.
                 "ssl_session_cache" => {
                     if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
