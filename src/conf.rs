@@ -79,6 +79,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("chunked_transfer_encoding", HSL, 1, 1, false),
     ("keepalive_requests", HSL, 1, 1, false),
     ("keepalive_timeout", HSL, 1, 2, false),
+    ("lingering_close", HSL, 1, 1, false),
     ("keepalive_time", HSL, 1, 1, false),
     ("keepalive_disable", HSL, 1, usize::MAX, false),
     ("error_page", HSL | LIF, 2, usize::MAX, false),
@@ -780,6 +781,8 @@ impl Builder<'_> {
                 "try_files" => level.try_files = Some(Arc::new(try_files(&d.args).map_err(at)?)),
                 "absolute_redirect" => level.absolute_redirect = flag(d).map_err(at)?,
                 "server_tokens" => level.server_tokens = d.args[0] == "build" || flag(d).map_err(|_| at(format!("invalid value \"{}\" in \"server_tokens\" directive, it must be \"on\", \"off\" or \"build\"", d.args[0])))?,
+                // twinx reads what the client still sends after every answer it closes, as nginx does with "always".
+                "lingering_close" => if !["off", "on", "always"].contains(&d.args[0].as_str()) { return Err(at(format!("invalid value \"{}\" in \"lingering_close\" directive, it must be \"off\", \"on\" or \"always\"", d.args[0]))) },
                 "server_name_in_redirect" => level.server_name_in_redirect = flag(d).map_err(at)?,
                 "port_in_redirect" => level.port_in_redirect = flag(d).map_err(at)?,
                 "log_format" => {
@@ -1230,7 +1233,9 @@ fn protocols(args: &[String]) -> Result<[bool; 2], String> {
 /// ssl_conf_command, run as OpenSSL's SSL_CONF_cmd runs them, after the
 /// other ssl_* directives: Options turns the options it lists, separated by
 /// commas, on, or off when they begin with "-" (SessionTicket, the tickets of
-/// ssl_session_tickets, and ServerPreference, ssl_prefer_server_ciphers);
+/// ssl_session_tickets, ServerPreference, ssl_prefer_server_ciphers, and KTLS,
+/// which changes nothing: twinx keeps TLS in user space, as OpenSSL does where
+/// the kernel cannot take it);
 /// Certificate and PrivateKey add a certificate and its key, given back in
 /// that order, which replaces one of the same type of key.
 fn conf_commands(commands: &[(String, String)], options: &mut crate::tls::Options) -> Result<[Vec<PathBuf>; 2], String> {
@@ -1239,7 +1244,7 @@ fn conf_commands(commands: &[(String, String)], options: &mut crate::tls::Option
         match name.as_str() {
             "Options" => for o in value.split(',').map(str::trim) {
                 let (on, option) = o.strip_prefix('-').map_or((true, o), |o| (false, o));
-                match option { "SessionTicket" => options.sessions.tickets = on, "ServerPreference" => options.prefer = on, _ => return Err(format!("SSL_CONF_cmd(\"{name}\", \"{value}\") failed")) }
+                match option { "SessionTicket" => options.sessions.tickets = on, "ServerPreference" => options.prefer = on, "KTLS" => {}, _ => return Err(format!("SSL_CONF_cmd(\"{name}\", \"{value}\") failed")) }
             },
             "Certificate" | "PrivateKey" => files[usize::from(name == "PrivateKey")].push(PathBuf::from(value)), _ => return Err(format!("SSL_CONF_cmd(\"{name}\", \"{value}\") failed")),
         }
@@ -1872,13 +1877,19 @@ mod tests {
     }
 
     #[test]
+    fn lingering_close() {
+        assert!(build_text("http { lingering_close always; server { listen 127.0.0.1:8080; lingering_close off; location / { lingering_close on; } } }").is_ok());
+        assert_eq!(build_text("http { lingering_close yes; }").unwrap_err(), "invalid value \"yes\" in \"lingering_close\" directive, it must be \"off\", \"on\" or \"always\" in t.conf:1");
+    }
+
+    #[test]
     fn ssl_conf_commands() {
         let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, curves: None, crl: None, depth: 1 };
         let commands = |c: &[(&str, &str)]| c.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
         let files = conf_commands(&commands(&[("Options", "-SessionTicket, -ServerPreference"), ("Certificate", "/c.crt"), ("PrivateKey", "/c.key")]), &mut options).unwrap();
         assert!(!options.sessions.tickets && !options.prefer);
         assert_eq!(files, [vec![PathBuf::from("/c.crt")], vec![PathBuf::from("/c.key")]]);
-        conf_commands(&commands(&[("Options", "SessionTicket,ServerPreference")]), &mut options).unwrap();
+        conf_commands(&commands(&[("Options", "SessionTicket,ServerPreference,KTLS")]), &mut options).unwrap();
         assert!(options.sessions.tickets && options.prefer);
         assert_eq!(conf_commands(&commands(&[("Options", "Bugs")]), &mut options).unwrap_err(), "SSL_CONF_cmd(\"Options\", \"Bugs\") failed");
         assert_eq!(conf_commands(&commands(&[("Protocol", "TLSv1.2")]), &mut options).unwrap_err(), "SSL_CONF_cmd(\"Protocol\", \"TLSv1.2\") failed");
