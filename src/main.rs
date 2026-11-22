@@ -99,8 +99,10 @@ fn run(a: &Args) -> Result<(), String> {
         let Ok((config, open)) = load(a).map(Arc::new).and_then(|c| Ok((c.clone(), http::bind(&c, &listeners)?))).map_err(|e| emerg(&e, Some(&a.prefix.join(&a.error_log)))) else { continue };
         let old = std::mem::replace(&mut worker, spawn(&config, &open, &set)?);
         listeners = open;
+        let mut status = 0;
         // SAFETY: plain system calls on the old worker's process id: shut it down and wait for it.
-        unsafe { libc::kill(old, SIGQUIT); libc::waitpid(old, std::ptr::null_mut(), 0) };
+        unsafe { libc::kill(old, SIGQUIT); libc::waitpid(old, &mut status, 0) };
+        log(&config.notice_logs, "notice", &format!("worker process {old} exited with code {}", libc::WEXITSTATUS(status)));
     };
     // SAFETY: plain system calls on the worker's process id: pass the signal on and wait for the worker.
     unsafe { libc::kill(worker, sig); libc::waitpid(worker, std::ptr::null_mut(), 0) };
@@ -162,9 +164,14 @@ fn fail(msg: &str, log: Option<&Path>) -> ! {
 
 /// Writes an alert to the error logs of the main block.
 fn alert(config: &conf::Config, msg: &str) {
+    log(&config.alert_logs, "alert", msg)
+}
+
+/// Writes a message of a level to error logs.
+fn log(logs: &[Arc<std::fs::File>], level: &str, msg: &str) {
     let time = chrono::Local::now().format("%Y/%m/%d %H:%M:%S");
-    let line = format!("{time} [alert] {}#0: {msg}\n", std::process::id());
-    config.alert_logs.iter().for_each(|f| { let _ = (&**f).write_all(line.as_bytes()); });
+    let line = format!("{time} [{level}] {}#0: {msg}\n", std::process::id());
+    logs.iter().for_each(|f| { let _ = (&**f).write_all(line.as_bytes()); });
 }
 
 /// Reports an error on standard error and in the error log.

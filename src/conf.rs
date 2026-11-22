@@ -35,6 +35,7 @@ const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "a
 const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("daemon", MAIN, 1, 1, false),
     ("pid", MAIN, 1, 1, false),
+    ("ssl_object_cache_inheritable", MAIN, 1, 1, false),
     ("worker_rlimit_nofile", MAIN, 1, 1, false),
     ("working_directory", MAIN, 1, 1, false),
     ("worker_shutdown_timeout", MAIN, 1, 1, false),
@@ -547,8 +548,9 @@ pub struct Config {
     pub shutdown_timeout: Option<Duration>,
     /// working_directory: where a worker changes to when it starts, as given, not relative to the prefix.
     pub working_directory: Option<PathBuf>,
-    /// The error_log files of the main block that take alerts.
+    /// The error_log files of the main block that take alerts, and those that take notices.
     pub alert_logs: Vec<Arc<File>>,
+    pub notice_logs: Vec<Arc<File>>,
     pub servers: Vec<Server>,
 }
 
@@ -568,7 +570,10 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), implicit: Implicit::default(), location: String::new() };
-    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), servers: Vec::new() };
+    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), servers: Vec::new() };
+    // Read first: the http block loads its certificates as it says.
+    let inheritable = main.iter().rev().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
+    crate::tls::INHERITABLE.store(inheritable, std::sync::atomic::Ordering::Relaxed);
     for d in main {
         b.check(d, MAIN)?;
         match d.name.as_str() {
@@ -578,7 +583,9 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
             "working_directory" => config.working_directory = Some(d.args[0].clone().into()),
             "error_log" => {
                 let file = b.open(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
-                if d.args.get(1).is_none_or(|l| LEVELS.iter().position(|v| v == l) <= Some(6)) { config.alert_logs.push(file) }
+                let level = d.args.get(1).map(|l| LEVELS.iter().position(|v| v == l));
+                if level.is_none_or(|l| l <= Some(6)) { config.alert_logs.push(file.clone()) }
+                if level.is_none_or(|l| l <= Some(2)) { config.notice_logs.push(file) }
             }
             "events" => d.block.iter().flatten().try_for_each(|e| b.check(e, EVENTS))?,
             "http" => config.servers = b.http(d.block.as_deref().unwrap_or_default())?,
@@ -1421,7 +1428,8 @@ mod tests {
     fn working_directory_and_alert_logs() {
         let c = build_text("working_directory wd; error_log a.log; error_log b.log emerg; error_log c.log alert; http { }").unwrap();
         assert_eq!(c.working_directory, Some(PathBuf::from("wd")));
-        assert_eq!(c.alert_logs.len(), 2);
+        assert_eq!((c.alert_logs.len(), c.notice_logs.len()), (2, 1));
+        assert_eq!(build_text("ssl_object_cache_inheritable x;").unwrap_err(), "invalid value \"x\" in \"ssl_object_cache_inheritable\" directive, it must be \"on\" or \"off\" in t.conf:1");
         assert_eq!(build_text("http { }").unwrap().working_directory, None);
         assert!(build_text("working_directory;").is_err());
         assert!(build_text("http { working_directory wd; }").is_err());
