@@ -285,6 +285,11 @@ pub struct Level {
     pub max_body: u64,
     /// max_headers: the header lines a request may have; one more is refused with 400.
     pub max_headers: usize,
+    /// client_header_buffer_size: the buffer a request's head is read into first.
+    pub header_buffer: usize,
+    /// large_client_header_buffers: how many larger buffers a head may take
+    /// when it does not fit, and their size, which a line must fit in.
+    pub large_header_buffers: (usize, usize),
     /// ignore_invalid_headers: header lines whose names have other characters
     /// than letters, digits and "-" (and "_" with underscores_in_headers) are dropped.
     pub ignore_invalid_headers: bool,
@@ -536,7 +541,7 @@ impl Builder<'_> {
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let temp = self.path("client_body_temp");
         // Without root, files come from html under the prefix, as nginx's default root is.
-        let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
+        let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -674,10 +679,15 @@ impl Builder<'_> {
                 }
                 // 0 is no limit.
                 "client_max_body_size" => level.max_body = Some(offset(&d.args[0]).map_err(at)?).filter(|&n| n > 0).unwrap_or(u64::MAX),
-                // Headers are read whole whatever the buffers, so these are only checked.
-                "large_client_header_buffers" | "connection_pool_size" => {
+                "large_client_header_buffers" | "connection_pool_size" | "client_header_buffer_size" => {
                     let number = d.args.len() == 1 || d.args[0].parse::<u64>().is_ok_and(|n| n > 0);
-                    if !number || size(d.args.last().unwrap()).is_err() { return Err(at(format!("\"{}\" directive invalid value", d.name))); }
+                    let bytes = size(d.args.last().unwrap()).ok().filter(|_| number);
+                    let bytes = bytes.ok_or_else(|| at(format!("\"{}\" directive invalid value", d.name)))? as usize;
+                    match d.name.as_str() {
+                        "large_client_header_buffers" => level.large_header_buffers = (d.args[0].parse().unwrap_or(0), bytes),
+                        "client_header_buffer_size" => level.header_buffer = bytes,
+                        _ => {}
+                    }
                 }
                 "max_headers" => level.max_headers = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
                 "index" => level.index = d.args.iter().map(|a| Template::parse(a)).collect::<Result<_, _>>().map_err(at)?,
@@ -1516,7 +1526,8 @@ mod tests {
 
     #[test]
     fn header_buffers() {
-        assert!(build_text("http { connection_pool_size 128; server { large_client_header_buffers 5 256; } }").is_ok());
+        let c = build_text("http { connection_pool_size 128; client_header_buffer_size 128; server { large_client_header_buffers 5 256; } }").unwrap();
+        assert_eq!((c.servers[0].level.header_buffer, c.servers[0].level.large_header_buffers), (128, (5, 256)));
         let e = build_text("http { large_client_header_buffers 0 1k; }").unwrap_err();
         assert_eq!(e, "\"large_client_header_buffers\" directive invalid value in t.conf:1");
         assert!(build_text("http { connection_pool_size 1x; }").is_err());

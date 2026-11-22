@@ -113,8 +113,14 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr, fresh:
     loop {
         let (pipelined, started) = (!buf.is_empty(), Instant::now());
         requests += 1;
-        let end = loop {
-            if let Some(end) = head_end(&buf) { break end; }
+        // Header lines are read with the settings of the default server of the address.
+        let default = config.servers.iter().find(|s| s.listen.contains(&listen)).unwrap_or(&config.servers[0]);
+        let buffers = |host: Option<&str>| server(config, listen, host).0.level.large_header_buffers;
+        // A head that overflows its buffers is answered with what of it came whole.
+        let (end, overflowed) = loop {
+            let end = head_end(&buf);
+            if let Some((status, at)) = overflow(&buf[..end.unwrap_or(buf.len())], default.level.header_buffer, buffers) { break (at, Some(status)); }
+            if let Some(end) = end { break (end, None); }
             let _ = stream.set_read_timeout(idle.filter(|_| buf.is_empty()));
             let n = stream.read(&mut chunk).unwrap_or(0);
             if n == 0 { return; }
@@ -148,9 +154,8 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr, fresh:
             unread: Default::default(),
             client: std::os::fd::AsRawFd::as_raw_fd(&stream),
         };
-        // Header lines are read with the settings of the default server of the address.
-        let default = config.servers.iter().find(|s| s.listen.contains(&listen)).unwrap_or(&config.servers[0]);
         let parsed = parse(&mut r, &head, &default.level);
+        let parsed = overflowed.map_or(parsed, Err);
         let (server, captures) = server(config, listen, r.host.as_deref());
         r.captures = captures;
         let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
@@ -204,6 +209,33 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr, fresh:
         if !level.body_in_file_only || level.body_clean { r.body_file.map(std::fs::remove_file); }
         if idle.is_none() || SHUTTING.load(Ordering::SeqCst) { return linger(&mut stream); }
     }
+}
+
+/// Whether a head (what of it has come) overflows the buffers nginx reads it
+/// into, as ngx_http_alloc_large_header_buffer() decides: the first buffer
+/// is client_header_buffer_size; when it is full in the middle of a line,
+/// the line moves to a new large buffer, if one of large_client_header_buffers
+/// is left and the line so far is shorter than one. The large buffers are
+/// those of the server the Host header selects, once it has come. The status,
+/// 414 for the request line and 494 for a header line, and where that line starts.
+fn overflow(head: &[u8], first: usize, buffers: impl Fn(Option<&str>) -> (usize, usize)) -> Option<(u16, usize)> {
+    let (mut start, mut cap, mut used, mut host) = (0, first, 0, None);
+    let mut line = 0;
+    while line < head.len() {
+        let end = head[line..].iter().position(|&c| c == b'\n').map(|i| line + i + 1);
+        // The line fits in the buffer, or the buffer is not full yet.
+        if end.unwrap_or(head.len()) <= start + cap && (end.is_some() || head.len() < start + cap) {
+            let text = String::from_utf8_lossy(&head[line..end.unwrap_or(head.len())]).into_owned();
+            if let Some((name, value)) = text.split_once(':').filter(|_| line > 0) {
+                if name.eq_ignore_ascii_case("host") { host = valid_host(value.trim_matches([' ', '\t', '\r', '\n'])); }
+            }
+            match end { Some(end) => { line = end; continue } None => return None }
+        }
+        let (number, size) = buffers(host.as_deref());
+        if start + cap - line >= size || used >= number { return Some((if line == 0 { 414 } else { 494 }, line)); }
+        (start, cap, used) = (line, size, used + 1);
+    }
+    None
 }
 
 /// How the request body is framed: Some(length), or None when it is chunked.
@@ -370,7 +402,12 @@ fn finish(resp: &mut Response) {
 /// The page nginx generates for an error status.
 fn special(status: u16) -> Response {
     let ctype = Some("text/html".to_string());
-    Response { status, ctype, body: page(status).into_bytes(), generated: true, ..Response::default() }
+    // 494, a header line too long, is answered as 400 with a page of its own.
+    let (status, body) = match status {
+        494 => (400, page_with(400, "Request Header Or Cookie Too Large", "<center>Request Header Or Cookie Too Large</center>\r\n")),
+        _ => (status, page(status)),
+    };
+    Response { status, ctype, body: body.into_bytes(), generated: true, ..Response::default() }
 }
 
 const REDIRECTS: &[u16] = &[301, 302, 303, 307, 308];
@@ -1519,16 +1556,46 @@ fn location<'a>(server: &'a Server, uri: &str) -> Found<'a> {
 
 /// The page nginx generates for an error status.
 fn page(status: u16) -> String {
-    let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
+    page_with(status, reason(status), "")
+}
+
+fn reason(status: u16) -> &'static str {
+    REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r)
+}
+
+/// An error page with its own title and lines after the heading.
+fn page_with(status: u16, title: &str, more: &str) -> String {
+    let reason = reason(status);
     format!(
-        "<html>\r\n<head><title>{status} {reason}</title></head>\r\n<body>\r\n\
-         <center><h1>{status} {reason}</h1></center>\r\n<hr><center>{NAME}</center>\r\n</body>\r\n</html>\r\n"
+        "<html>\r\n<head><title>{status} {title}</title></head>\r\n<body>\r\n\
+         <center><h1>{status} {reason}</h1></center>\r\n{more}<hr><center>{NAME}</center>\r\n</body>\r\n</html>\r\n"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_buffers_overflow() {
+        let four = |_: Option<&str>| (4, 16);
+        // Lines that fit in the first buffer, or move whole to a large one.
+        assert_eq!(overflow(b"GET / HTTP/1.0\r\nA: b\r\n\r\n", 8, four), None);
+        assert_eq!(overflow(b"GET /12345678901 HTTP/1.0\r\n", 8, four), Some((414, 0)));
+        assert_eq!(overflow(b"GET / HTTP/1.0\r\nX: 123456789012345\r\n", 32, four), Some((494, 16)));
+        // A line that has not filled its buffer yet is waited for.
+        assert_eq!(overflow(b"GET / HTTP/1.0\r\nX: 12", 32, four), None);
+        // Out of large buffers.
+        let one = |_: Option<&str>| (1, 16);
+        assert_eq!(overflow(b"GET / HTTP/1.0\r\nA: 1234567\r\nB: 1234567\r\n", 8, one), Some((494, 16)));
+        // The large buffers of the server Host selects, once it has come.
+        let by_host = |h: Option<&str>| if h == Some("big") { (4, 64) } else { (4, 16) };
+        assert_eq!(overflow(b"GET / HTTP/1.0\r\nHost: big\r\nX: 123456789012345\r\n", 8, by_host), None);
+        let page = String::from_utf8(special(494).body).unwrap();
+        assert_eq!(special(494).status, 400);
+        assert!(page.starts_with("<html>\r\n<head><title>400 Request Header Or Cookie Too Large</title></head>\r\n<body>\r\n\
+            <center><h1>400 Bad Request</h1></center>\r\n<center>Request Header Or Cookie Too Large</center>\r\n<hr>"));
+    }
 
     #[test]
     fn tunnel_passes_data_both_ways() {
