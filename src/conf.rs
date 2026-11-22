@@ -88,6 +88,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_certificate_key", HTTP | SRV, 1, 1, false),
     ("ssl_session_cache", HTTP | SRV, 1, 2, false),
     ("ssl_session_tickets", HTTP | SRV, 1, 1, false),
+    ("ssl_certificate_cache", HTTP | SRV, 1, 3, false),
     ("ssl_session_timeout", HTTP | SRV, 1, 1, false),
     ("proxy_ssl_session_reuse", HSL, 1, 1, false),
     ("ssl_password_file", HTTP | SRV, 1, 1, false),
@@ -443,6 +444,9 @@ pub struct Level {
     /// ssl_session_tickets, ssl_session_cache (whether it keeps sessions: not
     /// off or none) and ssl_session_timeout: how clients' sessions are resumed.
     pub ssl_sessions: crate::tls::Sessions,
+    /// ssl_certificate_cache: what connections keep loaded of the files
+    /// ssl_certificate and ssl_certificate_key name with variables.
+    pub ssl_certificate_cache: Option<Arc<crate::tls::CertCache>>,
     /// ssl_password_file: the passwords an encrypted ssl_certificate_key is tried with.
     pub ssl_password_file: Option<PathBuf>,
     /// ssl_verify_client: whether clients are asked for a certificate (not "off").
@@ -671,7 +675,8 @@ impl Builder<'_> {
         let l = &s.level;
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
         let files = l.ssl_certificate.as_deref().zip(l.ssl_certificate_key.as_deref());
-        s.tls = files.map(|(cert, key)| crate::tls::server(cert, key, l.ssl_password_file.as_deref(), l.ssl_verify_client, &trust, l.ssl_sessions)).transpose()?;
+        let named = |p: &Path| p.to_string_lossy().contains('$');
+        s.tls = files.map(|(cert, key)| crate::tls::server((cert, key, l.ssl_password_file.as_deref()), (named(cert) || named(key)).then(|| l.ssl_certificate_cache.clone()), l.ssl_verify_client, &trust, l.ssl_sessions)).transpose()?;
         let level = s.level.clone();
         self.locations(block, &level, &mut s.locations)?;
         Ok(s)
@@ -777,7 +782,7 @@ impl Builder<'_> {
                 "ssl_client_certificate" => level.ssl_client_certificate = Some(self.path(&d.args[0])),
                 "proxy_ssl_certificate" => (level.proxy_ssl_certificate, own_tls) = (Some(Template::parse(&d.args[0]).map_err(at)?), true),
                 "proxy_ssl_certificate_key" => (level.proxy_ssl_certificate_key, own_tls) = (Some(Template::parse(&d.args[0]).map_err(at)?), true),
-                "proxy_ssl_certificate_cache" => level.proxy_ssl_certificate_cache = cert_cache(&d.args).map_err(at)?,
+                "proxy_ssl_certificate_cache" | "ssl_certificate_cache" => *if d.name == "ssl_certificate_cache" { &mut level.ssl_certificate_cache } else { &mut level.proxy_ssl_certificate_cache } = cert_cache(&d.name, &d.args).map_err(at)?,
                 "proxy_ssl_password_file" => (level.proxy_ssl_password_file, own_tls) = (Some(self.path(&d.args[0])), true),
                 "proxy_ssl_verify" => (level.proxy_ssl_verify, own_tls) = (flag(d).map_err(at)?, true),
                 "proxy_ssl_trusted_certificate" => (level.proxy_ssl_trusted_certificate, own_tls) = (Some(self.path(&d.args[0])), true),
@@ -1065,7 +1070,7 @@ fn text(t: &Template) -> Option<String> {
 }
 
 /// proxy_ssl_certificate_cache off | max=N [inactive=time] [valid=time]
-fn cert_cache(args: &[String]) -> Result<Option<Arc<crate::tls::CertCache>>, String> {
+fn cert_cache(name: &str, args: &[String]) -> Result<Option<Arc<crate::tls::CertCache>>, String> {
     let mut values = [("max", 0), ("inactive", 10), ("valid", 60)];
     for a in args {
         if a == "off" { return Ok(None); }
@@ -1075,7 +1080,7 @@ fn cert_cache(args: &[String]) -> Result<Option<Arc<crate::tls::CertCache>>, Str
         slot.1 = if name == "max" { value.parse().ok().filter(|v| *v > 0) } else { crate::expires::parse_time(value).filter(|v| *v >= 0) }.ok_or(invalid)?;
     }
     let [max, inactive, valid] = values.map(|v| v.1 as u64);
-    if max == 0 { return Err("\"proxy_ssl_certificate_cache\" must have the \"max\" parameter".into()); }
+    if max == 0 { return Err(format!("\"{name}\" must have the \"max\" parameter")); }
     Ok(Some(Arc::new(crate::tls::CertCache::new(max as usize, valid, inactive))))
 }
 
@@ -1761,11 +1766,12 @@ mod tests {
 
     #[test]
     fn proxy_ssl_certificate_cache() {
-        assert!(cert_cache(&["off".into()]).unwrap().is_none());
-        assert!(cert_cache(&["max=4".into(), "inactive=1s".into(), "valid=2s".into()]).unwrap().is_some());
-        assert_eq!(cert_cache(&["valid=2s".into()]).unwrap_err(), "\"proxy_ssl_certificate_cache\" must have the \"max\" parameter");
-        assert_eq!(cert_cache(&["max=0".into()]).unwrap_err(), "invalid parameter \"max=0\"");
-        assert_eq!(cert_cache(&["size=1".into()]).unwrap_err(), "invalid parameter \"size=1\"");
+        assert!(cert_cache("proxy_ssl_certificate_cache", &["off".into()]).unwrap().is_none());
+        assert!(cert_cache("proxy_ssl_certificate_cache", &["max=4".into(), "inactive=1s".into(), "valid=2s".into()]).unwrap().is_some());
+        assert_eq!(cert_cache("proxy_ssl_certificate_cache", &["valid=2s".into()]).unwrap_err(), "\"proxy_ssl_certificate_cache\" must have the \"max\" parameter");
+        assert_eq!(cert_cache("ssl_certificate_cache", &[]).unwrap_err(), "\"ssl_certificate_cache\" must have the \"max\" parameter");
+        assert_eq!(cert_cache("proxy_ssl_certificate_cache", &["max=0".into()]).unwrap_err(), "invalid parameter \"max=0\"");
+        assert_eq!(cert_cache("proxy_ssl_certificate_cache", &["size=1".into()]).unwrap_err(), "invalid parameter \"size=1\"");
         let c = build_text("http { server { listen 127.0.0.1:8080; proxy_ssl_certificate $arg_c.crt; proxy_ssl_certificate_key k.key; location / { } } }").unwrap();
         assert!(c.servers[0].level.proxy_ssl_certificate_vars.is_some());
         let c = build_text("http { server { listen 127.0.0.1:8080; proxy_ssl_certificate \"\"; proxy_ssl_certificate_key \"\"; location / { } } }").unwrap();
