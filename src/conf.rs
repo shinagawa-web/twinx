@@ -96,6 +96,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_conf_command", HTTP | SRV, 2, 2, false),
     ("ssl_session_cache", HTTP | SRV, 1, 2, false),
     ("ssl_session_tickets", HTTP | SRV, 1, 1, false),
+    ("ssl_session_ticket_key", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_cache", HTTP | SRV, 1, 3, false),
     ("ssl_session_timeout", HTTP | SRV, 1, 1, false),
     ("proxy_ssl_session_reuse", HSL, 1, 1, false),
@@ -466,6 +467,9 @@ pub struct Level {
     pub ssl_reject_handshake: bool,
     /// ssl_ecdh_curve: the groups keys are exchanged with; None takes the default ones.
     pub ssl_ecdh_curve: Option<String>,
+    /// ssl_session_ticket_key: the files of the keys tickets are encrypted
+    /// with; those of a level replace those inherited as a whole.
+    pub ssl_session_ticket_key: Vec<PathBuf>,
     /// ssl_conf_command: OpenSSL's commands and their values, files named in
     /// full; those of a level replace those inherited as a whole.
     pub ssl_conf_command: Vec<(String, String)>,
@@ -723,7 +727,7 @@ impl Builder<'_> {
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
         let l = &s.level;
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
-        let mut options = crate::tls::Options { verify: l.ssl_verify_client > 0, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, curves: l.ssl_ecdh_curve.clone(), crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth, ocsp: l.ssl_ocsp.map(|leaf| crate::ocsp::Ocsp { leaf, responder: l.ssl_ocsp_responder.clone(), cache: l.ssl_ocsp_cache.clone() }) };
+        let mut options = crate::tls::Options { verify: l.ssl_verify_client > 0, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, curves: l.ssl_ecdh_curve.clone(), crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth, ocsp: l.ssl_ocsp.map(|leaf| crate::ocsp::Ocsp { leaf, responder: l.ssl_ocsp_responder.clone(), cache: l.ssl_ocsp_cache.clone() }), ticket_keys: l.ssl_session_ticket_key.clone() };
         let extra = conf_commands(&l.ssl_conf_command, &mut options)?;
         let pairs = l.ssl_certificate.iter().zip(&l.ssl_certificate_key).chain(extra[0].iter().zip(&extra[1]));
         let files: Vec<(&Path, &Path)> = pairs.map(|(cert, key)| (cert.as_path(), key.as_path())).collect();
@@ -758,6 +762,7 @@ impl Builder<'_> {
         // ssl_certificate and ssl_certificate_key of this level, which replace those inherited.
         let mut certs: [Option<Vec<PathBuf>>; 2] = [None, None];
         let mut commands: Option<Vec<(String, String)>> = None;
+        let mut ticket_keys: Option<Vec<PathBuf>> = None;
         let mut proxy_headers: Option<Vec<(String, Template)>> = None;
         let mut hidden: Option<Vec<String>> = None;
         // proxy_cookie_domain and proxy_cookie_path of this level: Some(None) once "off".
@@ -836,6 +841,7 @@ impl Builder<'_> {
                     level.ssl_sessions.cache = d.args.iter().all(|a| a != "off" && a != "none");
                     level.ssl_sessions.shared = level.ssl_sessions.cache && d.args.iter().any(|a| a.starts_with("shared:"));
                 }
+                "ssl_session_ticket_key" => ticket_keys.get_or_insert_default().push(self.path(&d.args[0])),
                 "ssl_session_tickets" => level.ssl_sessions.tickets = flag(d).map_err(at)?,
                 "ssl_session_timeout" => level.ssl_sessions.timeout = seconds(&d.args[0]).map_err(at)?.as_secs(),
                 "proxy_ssl_session_reuse" => (level.proxy_ssl_session_reuse, own_tls) = (flag(d).map_err(at)?, true),
@@ -968,6 +974,7 @@ impl Builder<'_> {
         if let Some(c) = certificates { level.ssl_certificate = c; }
         if let Some(k) = keys { level.ssl_certificate_key = k; }
         if let Some(c) = commands { level.ssl_conf_command = c; }
+        if let Some(k) = ticket_keys { level.ssl_session_ticket_key = k; }
         if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
         if let Some(hidden) = hidden { level.proxy_hide_header = hidden; }
         let [domain, path] = cookies;
@@ -1937,8 +1944,15 @@ mod tests {
     }
 
     #[test]
+    fn ssl_session_ticket_keys_replace_those_inherited() {
+        let c = build_text("http { ssl_session_ticket_key a; ssl_session_ticket_key b; server { } server { ssl_session_ticket_key c; } }").unwrap();
+        let names = |i: usize| c.servers[i].level.ssl_session_ticket_key.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!((names(0), names(1)), (vec!["a".to_string(), "b".to_string()], vec!["c".to_string()]));
+    }
+
+    #[test]
     fn ssl_conf_commands() {
-        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, curves: None, crl: None, depth: 1, ocsp: None };
+        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, curves: None, crl: None, depth: 1, ocsp: None, ticket_keys: Vec::new() };
         let commands = |c: &[(&str, &str)]| c.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
         let files = conf_commands(&commands(&[("Options", "-SessionTicket, -ServerPreference"), ("Certificate", "/c.crt"), ("PrivateKey", "/c.key")]), &mut options).unwrap();
         assert!(!options.sessions.tickets && !options.prefer);
