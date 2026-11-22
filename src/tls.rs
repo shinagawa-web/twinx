@@ -193,18 +193,59 @@ pub struct ServerTls {
 }
 
 /// How a server resumes clients' sessions: with tickets (ssl_session_tickets),
-/// from sessions it keeps (ssl_session_cache not off or none), and for how
-/// many seconds after they began (ssl_session_timeout).
+/// from sessions it keeps (ssl_session_cache not off or none; shared when a
+/// shared cache is among them), and for how many seconds after they began
+/// (ssl_session_timeout).
 #[derive(Debug, Clone, Copy)]
 pub struct Sessions {
     pub tickets: bool,
     pub cache: bool,
+    pub shared: bool,
     pub timeout: u64,
 }
 
 impl Default for Sessions {
     fn default() -> Sessions {
-        Sessions { tickets: true, cache: false, timeout: 300 }
+        Sessions { tickets: true, cache: false, shared: false, timeout: 300 }
+    }
+}
+
+/// The ticket keys of a server with a shared session cache, rotated as nginx
+/// rotates those it keeps in the cache: the first ticket made gets a key that
+/// encrypts tickets for ssl_session_timeout seconds; the first one made after
+/// that gets a new key, and the key before still decrypts tickets.
+#[derive(Debug)]
+struct Rotated {
+    timeout: u64,
+    /// When the current key stops encrypting, the current key, and the one before.
+    keys: Mutex<Option<(u64, Arc<dyn rustls::server::ProducesTickets>, Option<Arc<dyn rustls::server::ProducesTickets>>)>>,
+}
+
+impl Rotated {
+    fn current(&self) -> Option<Arc<dyn rustls::server::ProducesTickets>> {
+        let mut keys = self.keys.lock().unwrap();
+        let now = now();
+        if keys.as_ref().is_none_or(|k| now >= k.0) { *keys = Some((now + self.timeout, rustls::crypto::ring::Ticketer::new().ok()?, keys.take().map(|k| k.1))); }
+        keys.as_ref().map(|k| k.1.clone())
+    }
+}
+
+impl rustls::server::ProducesTickets for Rotated {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn lifetime(&self) -> u32 {
+        self.timeout.min(u32::MAX.into()) as u32
+    }
+
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        self.current()?.encrypt(plain)
+    }
+
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        let keys = self.keys.lock().unwrap();
+        keys.iter().flat_map(|k| std::iter::once(&k.1).chain(&k.2)).find_map(|k| k.decrypt(cipher))
     }
 }
 
@@ -375,7 +416,8 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     config.cert_compressors = if options.compress { vec![rustls::compress::ZLIB_COMPRESSOR] } else { Vec::new() };
     let sessions = options.sessions;
     config.session_storage = if sessions.cache { rustls::server::ServerSessionMemoryCache::new(20480) } else { Arc::new(rustls::server::NoServerSessionStorage {}) };
-    if sessions.tickets { config.ticketer = Arc::new(Timed(rustls::crypto::ring::Ticketer::new().map_err(|e| e.to_string())?, sessions.timeout)); }
+    let keys: Arc<dyn rustls::server::ProducesTickets> = if sessions.shared { Arc::new(Rotated { timeout: sessions.timeout, keys: Mutex::new(None) }) } else { rustls::crypto::ring::Ticketer::new().map_err(|e| e.to_string())? };
+    if sessions.tickets { config.ticketer = Arc::new(Timed(keys, sessions.timeout)); }
     Ok(ServerTls { config: Arc::new(config), trusted, crls: options.crl.as_deref().map(crls).transpose()?, depth: options.depth, named, ocsp: options.ocsp })
 }
 
@@ -1059,6 +1101,18 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(vars, ["CN=int", "/CN=end", "/CN=int", "Nov 22 09:45:34 2026 GMT", "Oct 29 09:45:34 2126 GMT"]);
         assert!(session.client_var("v_remain").parse::<u64>().unwrap() > 36000);
         assert_eq!(Session::default().client_var("i_dn"), "");
+    }
+
+    #[test]
+    fn shared_ticket_keys_rotate_after_the_timeout() {
+        use rustls::server::ProducesTickets;
+        let keys = Rotated { timeout: 10, keys: Mutex::new(None) };
+        let first = keys.encrypt(b"a").unwrap();
+        assert_eq!((keys.lifetime(), &keys.encrypt(b"b").unwrap()[..16]), (10, &first[..16]));
+        keys.keys.lock().unwrap().as_mut().unwrap().0 = now();
+        let next = keys.encrypt(b"c").unwrap();
+        assert_ne!(&next[..16], &first[..16]);
+        assert_eq!((keys.decrypt(&first), keys.decrypt(&next), keys.decrypt(b"x")), (Some(b"a".to_vec()), Some(b"c".to_vec()), None));
     }
 
     #[test]

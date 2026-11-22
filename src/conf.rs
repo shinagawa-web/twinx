@@ -37,6 +37,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("pid", MAIN, 1, 1, false),
     ("ssl_object_cache_inheritable", MAIN, 1, 1, false),
     ("worker_rlimit_nofile", MAIN, 1, 1, false),
+    ("worker_processes", MAIN, 1, 1, false),
     ("working_directory", MAIN, 1, 1, false),
     ("worker_shutdown_timeout", MAIN, 1, 1, false),
     ("error_log", MAIN | HSL, 1, usize::MAX, false),
@@ -626,6 +627,8 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
         match d.name.as_str() {
             "pid" => config.pid = b.path(&d.args[0]),
             "worker_rlimit_nofile" => config.rlimit_nofile = Some(d.args[0].parse().map_err(|_| format!("invalid number in {}", d.at))?),
+            // twinx serves every connection from one process, however many workers are asked for.
+            "worker_processes" => if d.args[0] != "auto" && d.args[0].parse::<u32>().is_err() { return Err(format!("invalid value \"{}\" in \"worker_processes\" directive in {}", d.args[0], d.at)) },
             "worker_shutdown_timeout" => config.shutdown_timeout = Some(millis(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?),
             "working_directory" => config.working_directory = Some(d.args[0].clone().into()),
             "error_log" => {
@@ -828,6 +831,7 @@ impl Builder<'_> {
                 "ssl_session_cache" => {
                     if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
                     level.ssl_sessions.cache = d.args.iter().all(|a| a != "off" && a != "none");
+                    level.ssl_sessions.shared = level.ssl_sessions.cache && d.args.iter().any(|a| a.starts_with("shared:"));
                 }
                 "ssl_session_tickets" => level.ssl_sessions.tickets = flag(d).map_err(at)?,
                 "ssl_session_timeout" => level.ssl_sessions.timeout = seconds(&d.args[0]).map_err(at)?.as_secs(),
@@ -1545,6 +1549,18 @@ mod tests {
         assert_eq!(build_text("worker_rlimit_nofile 32; http { }").unwrap().rlimit_nofile, Some(32));
         assert_eq!(build_text("http { }").unwrap().rlimit_nofile, None);
         assert_eq!(build_text("worker_rlimit_nofile x;").unwrap_err(), "invalid number in t.conf:1");
+    }
+
+    #[test]
+    fn worker_processes() {
+        assert!(build_text("worker_processes 2; http { }").is_ok() && build_text("worker_processes auto; http { }").is_ok());
+        assert_eq!(build_text("worker_processes x;").unwrap_err(), "invalid value \"x\" in \"worker_processes\" directive in t.conf:1");
+    }
+
+    #[test]
+    fn shared_session_caches() {
+        let c = build_text("http { server { ssl_session_cache builtin shared:SSL:1m; } server { ssl_session_cache builtin; } server { ssl_session_cache none; } }").unwrap();
+        assert_eq!(c.servers.iter().map(|s| s.level.ssl_sessions.shared).collect::<Vec<_>>(), [true, false, false]);
     }
 
     #[test]
