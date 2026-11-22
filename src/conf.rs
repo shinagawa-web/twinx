@@ -666,7 +666,7 @@ impl Builder<'_> {
                     }
                 }
                 // 0 is no limit.
-                "client_max_body_size" => level.max_body = Some(size(&d.args[0]).map_err(at)?).filter(|&n| n > 0).unwrap_or(u64::MAX),
+                "client_max_body_size" => level.max_body = Some(offset(&d.args[0]).map_err(at)?).filter(|&n| n > 0).unwrap_or(u64::MAX),
                 // Headers are read whole whatever the buffers, so these are only checked.
                 "large_client_header_buffers" | "connection_pool_size" => {
                     let number = d.args.len() == 1 || d.args[0].parse::<u64>().is_ok_and(|n| n > 0);
@@ -1071,9 +1071,20 @@ fn temp_levels(args: &[String]) -> Option<Vec<usize>> {
 
 /// A size such as "512", "8k" or "1m".
 pub fn size(s: &str) -> Result<u64, String> {
+    scaled(s, &[("", 1), ("k", 1 << 10), ("K", 1 << 10), ("m", 1 << 20), ("M", 1 << 20)])
+}
+
+/// A file offset, as client_max_body_size takes it: a size that may also be in
+/// gigabytes ("1g"), up to 2^63 - 1.
+fn offset(s: &str) -> Result<u64, String> {
+    scaled(s, &[("", 1), ("k", 1 << 10), ("K", 1 << 10), ("m", 1 << 20), ("M", 1 << 20), ("g", 1 << 30), ("G", 1 << 30)])
+}
+
+/// A number of digits and one of the units, scaled, up to 2^63 - 1.
+fn scaled(s: &str, units: &[(&str, u64)]) -> Result<u64, String> {
     let (digits, unit) = s.find(|c: char| !c.is_ascii_digit()).map_or((s, ""), |i| s.split_at(i));
-    let scale = [("", 1), ("k", 1 << 10), ("K", 1 << 10), ("m", 1 << 20), ("M", 1 << 20)].into_iter().find(|u| u.0 == unit);
-    digits.parse::<u64>().ok().zip(scale).map(|(n, (_, scale))| n * scale).ok_or_else(|| format!("\"{s}\" is invalid"))
+    let scale = units.iter().find(|u| u.0 == unit);
+    digits.parse::<u64>().ok().zip(scale).and_then(|(n, (_, scale))| n.checked_mul(*scale)).filter(|&n| n <= i64::MAX as u64).ok_or_else(|| format!("\"{s}\" is invalid"))
 }
 
 fn add_header(args: &[String]) -> Result<(String, Template, bool), String> {
@@ -1350,6 +1361,8 @@ mod tests {
         assert_eq!(size("1M"), Ok(1 << 20));
         assert_eq!(size("10"), Ok(10));
         assert_eq!(size("1x"), Err("\"1x\" is invalid".into()));
+        assert_eq!((size("1g"), offset("1g"), offset("2G")), (Err("\"1g\" is invalid".into()), Ok(1 << 30), Ok(2 << 30)));
+        assert_eq!(offset("8589934592g"), Err("\"8589934592g\" is invalid".into()));
         assert_eq!(error_page(&["200".into(), "http://e/".into()]).unwrap_err(), "value \"200\" must be between 300 and 599");
         assert!(error_page(&["404".into(), "@named".into()]).is_ok());
         assert!(matches!(location(&["@named".into()]).unwrap().0, Match::Named));
