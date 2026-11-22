@@ -68,9 +68,23 @@ fn read(path: &Path, kept: bool) -> std::io::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// The certificates of PEM, as OpenSSL's PEM_read_bio_X509_AUX reads them:
+/// those of "CERTIFICATE" blocks and those of "TRUSTED CERTIFICATE" blocks,
+/// whose trust settings after the certificate are left out. Other blocks
+/// are skipped.
+fn certificates(pem: &[u8]) -> Option<Vec<CertificateDer<'static>>> {
+    let mut certs = Vec::new();
+    for block in x509_parser::pem::Pem::iter_from_buffer(pem) {
+        let block = block.ok()?;
+        let rest = match block.label.as_str() { "CERTIFICATE" => 0, "TRUSTED CERTIFICATE" => X509Certificate::from_der(&block.contents).ok()?.0.len(), _ => continue };
+        certs.push(CertificateDer::from(block.contents[..block.contents.len() - rest].to_vec()));
+    }
+    Some(certs)
+}
+
 /// The certificates of a certificate file, in PEM.
 fn chain(cert: &Path, kept: bool) -> Result<Vec<CertificateDer<'static>>, String> {
-    let chain = read(cert, kept).ok().and_then(|pem| CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>().ok()).filter(|c| !c.is_empty());
+    let chain = read(cert, kept).ok().and_then(|pem| certificates(&pem)).filter(|c| !c.is_empty());
     chain.ok_or_else(|| format!("cannot load certificate \"{}\"", cert.display()))
 }
 
@@ -179,7 +193,7 @@ impl CertCache {
 
 /// The certificates of a file, in PEM, that clients' certificates are verified with.
 fn trusted(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let certs = read(path, true).ok().and_then(|pem| CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>().ok());
+    let certs = read(path, true).ok().and_then(|pem| certificates(&pem));
     certs.ok_or_else(|| format!("SSL_CTX_load_verify_locations(\"{}\") failed", path.display()))
 }
 
@@ -1199,6 +1213,17 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert!(tls.for_connection(&tcp, "c.pem").is_some());
         assert!(tls.for_connection(&tcp, "none").is_none());
         assert!(server(files, None, &[], options).is_err());
+    }
+
+    #[test]
+    fn reads_trusted_certificates_without_their_trust_settings() {
+        let cert = CertificateDer::pem_slice_iter(CERT.as_bytes()).next().unwrap().unwrap();
+        // X509_CERT_AUX trusting the certificate for serverAuth, as "openssl x509 -addtrust serverAuth -trustout" adds it.
+        let aux = [0x30, 0x0c, 0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        let trusted = pem(&[cert.as_ref(), &aux].concat()).replace("CERTIFICATE", "TRUSTED CERTIFICATE");
+        let certs = certificates(format!("{KEY}{trusted}{CERT}").as_bytes()).unwrap();
+        assert_eq!(certs, [cert.clone(), cert]);
+        assert_eq!(certificates(b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n-----END TRUSTED CERTIFICATE-----\n"), None);
     }
 
     #[test]
