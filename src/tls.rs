@@ -9,6 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,19 +29,41 @@ const HANDSHAKE: Duration = Duration::from_secs(60);
 /// A certificate chain and its private key, in PEM. An encrypted key (PKCS #8)
 /// is decrypted with the first of the passwords that works, as
 /// ssl_password_file has them, one on each line.
-fn load(cert: &Path, key: &Path, passwords: Option<&Path>) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
-    Ok((chain(cert)?, private_key(key, passwords)?.0))
+/// The files are read through the objects kept from the configuration before (kept).
+fn load(cert: &Path, key: &Path, passwords: Option<&Path>, kept: bool) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+    Ok((chain(cert, kept)?, private_key(key, passwords, kept)?.0))
+}
+
+/// ssl_object_cache_inheritable: whether a configuration takes the
+/// certificates and keys the one before it loaded.
+pub static INHERITABLE: AtomicBool = AtomicBool::new(true);
+
+/// The certificate and key files configurations loaded, by name, with the
+/// modification time and inode they had then. As nginx's cache of SSL objects,
+/// a configuration loaded again (a reload) takes a file whose time and inode
+/// did not change as it was loaded, not as it is now, while
+/// ssl_object_cache_inheritable is on.
+static LOADED: Mutex<Vec<(PathBuf, (i64, u64), Vec<u8>)>> = Mutex::new(Vec::new());
+
+/// A file's contents, those loaded before when kept and they may be inherited.
+fn read(path: &Path, kept: bool) -> std::io::Result<Vec<u8>> {
+    let (meta, mut loaded) = (file(path), LOADED.lock().unwrap());
+    let inherit = kept && INHERITABLE.load(Ordering::Relaxed);
+    if let Some(old) = loaded.iter().find(|l| inherit && l.0 == path && Some(l.1) == meta) { return Ok(old.2.clone()) }
+    let data = std::fs::read(path)?;
+    if let Some(meta) = meta.filter(|_| kept) { loaded.retain(|l| l.0 != path); loaded.push((path.to_path_buf(), meta, data.clone())); }
+    Ok(data)
 }
 
 /// The certificates of a certificate file, in PEM.
-fn chain(cert: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let chain = CertificateDer::pem_file_iter(cert).and_then(|certs| certs.collect::<Result<Vec<_>, _>>()).ok().filter(|c| !c.is_empty());
+fn chain(cert: &Path, kept: bool) -> Result<Vec<CertificateDer<'static>>, String> {
+    let chain = read(cert, kept).ok().and_then(|pem| CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>().ok()).filter(|c| !c.is_empty());
     chain.ok_or_else(|| format!("cannot load certificate \"{}\"", cert.display()))
 }
 
 /// The private key of a key file, in PEM, and whether it was encrypted.
-fn private_key(key: &Path, passwords: Option<&Path>) -> Result<(PrivateKeyDer<'static>, bool), String> {
-    let text = std::fs::read_to_string(key).unwrap_or_default();
+fn private_key(key: &Path, passwords: Option<&Path>, kept: bool) -> Result<(PrivateKeyDer<'static>, bool), String> {
+    let text = String::from_utf8(read(key, kept).unwrap_or_default()).unwrap_or_default();
     let passwords = passwords.map(|p| std::fs::read_to_string(p).map_err(|e| format!("open() \"{}\" failed ({e})", p.display()))).transpose()?.unwrap_or_default();
     let encrypted = pkcs8::der::Document::from_pem(&text).ok().filter(|(label, _)| *label == "ENCRYPTED PRIVATE KEY").map(|(_, doc)| doc);
     let decrypt = |doc: &pkcs8::der::Document| passwords.lines().find_map(|p| pkcs8::EncryptedPrivateKeyInfoRef::try_from(doc.as_bytes()).ok()?.decrypt(p).ok());
@@ -216,7 +239,7 @@ impl rustls::server::ProducesTickets for Timed<Arc<dyn rustls::server::ProducesT
 /// the files of the certificates theirs are verified with, and how their
 /// sessions are resumed.
 pub fn server(cert: &Path, key: &Path, passwords: Option<&Path>, verify: bool, trust: &[&Path], sessions: Sessions) -> Result<ServerTls, String> {
-    let (chain, key) = load(cert, key, passwords)?;
+    let (chain, key) = load(cert, key, passwords, true)?;
     let trusted = trust.iter().map(|p| trusted(p)).collect::<Result<Vec<_>, _>>()?.concat();
     let builder = ServerConfig::builder();
     let builder = if verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
@@ -477,7 +500,7 @@ fn host_matches(pattern: &str, name: &str) -> bool {
 /// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file, if any;
 /// verifying their certificates with verify, if any (proxy_ssl_verify on).
 pub fn client((reuse, sni): (bool, bool), cert: Option<(&Path, &Path, Option<&Path>)>, verify: Option<Verify>) -> Result<Arc<ClientConfig>, String> {
-    let mut c = match cert.map(|(c, k, p)| load(c, k, p)).transpose()? {
+    let mut c = match cert.map(|(c, k, p)| load(c, k, p, true)).transpose()? {
         Some((chain, key)) => proxied(verify).with_client_auth_cert(chain, key).map_err(|e| e.to_string())?,
         None => proxied(verify).with_no_client_auth(),
     };
@@ -500,8 +523,8 @@ pub fn client_cert(base: &Arc<ClientConfig>, (cert, key, passwords): (&Path, &Pa
     let fetch = |key: bool, path: &Path, invalidate: bool, create: &dyn Fn() -> Result<(Object, bool), String>| match cache { Some(c) => c.fetch(key, path, invalidate, create), None => create().map(|o| o.0) };
     let mut invalidate = false;
     loop {
-        let chain = fetch(false, cert, invalidate, &|| Ok((Object { chain: chain(cert)?, key: None }, false)))?.chain;
-        let pkey = fetch(true, key, invalidate, &|| private_key(key, passwords).map(|(k, encrypted)| (Object { chain: Vec::new(), key: Some(k) }, encrypted)))?.key;
+        let chain = fetch(false, cert, invalidate, &|| Ok((Object { chain: chain(cert, false)?, key: None }, false)))?.chain;
+        let pkey = fetch(true, key, invalidate, &|| private_key(key, passwords, false).map(|(k, encrypted)| (Object { chain: Vec::new(), key: Some(k) }, encrypted)))?.key;
         let config = proxied(None).with_client_auth_cert(chain, pkey.ok_or("no key")?);
         if !invalidate && matches!(config, Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch))) { invalidate = true; continue }
         let mut c = (**base).clone();
@@ -717,11 +740,26 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
     #[test]
     fn loads_certificates() {
         let dir = dir();
-        assert_eq!(load(&dir.join("c.pem"), &dir.join("k.pem"), None).unwrap().0.len(), 1);
-        assert_eq!(load(&dir.join("none"), &dir.join("k.pem"), None).unwrap_err(), format!("cannot load certificate \"{}\"", dir.join("none").display()));
-        assert_eq!(load(&dir.join("c.pem"), &dir.join("c.pem"), None).unwrap_err(), format!("cannot load certificate key \"{}\"", dir.join("c.pem").display()));
-        assert!(load(&dir.join("c.pem"), &dir.join("k.pem"), Some(&dir.join("none"))).unwrap_err().starts_with("open() "));
+        assert_eq!(load(&dir.join("c.pem"), &dir.join("k.pem"), None, false).unwrap().0.len(), 1);
+        assert_eq!(load(&dir.join("none"), &dir.join("k.pem"), None, false).unwrap_err(), format!("cannot load certificate \"{}\"", dir.join("none").display()));
+        assert_eq!(load(&dir.join("c.pem"), &dir.join("c.pem"), None, false).unwrap_err(), format!("cannot load certificate key \"{}\"", dir.join("c.pem").display()));
+        assert!(load(&dir.join("c.pem"), &dir.join("k.pem"), Some(&dir.join("none")), false).unwrap_err().starts_with("open() "));
         assert_eq!(trusted(&dir.join("c.pem")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn takes_files_loaded_before_while_their_time_and_inode_stay() {
+        let path = dir().join(format!("kept-{}", std::process::id()));
+        std::fs::write(&path, "a").unwrap();
+        assert_eq!(read(&path, true).unwrap(), b"a");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "b").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(mtime).unwrap();
+        assert_eq!((read(&path, true).unwrap(), read(&path, false).unwrap()), (b"a".to_vec(), b"b".to_vec()));
+        let new = path.with_extension("new");
+        std::fs::write(&new, "c").unwrap();
+        std::fs::rename(&new, &path).unwrap();
+        assert_eq!(read(&path, true).unwrap(), b"c");
     }
 
     #[test]
@@ -732,8 +770,8 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         std::fs::write(dir.join("e.pem"), encrypted).unwrap();
         std::fs::write(dir.join("passwords"), "wrong\nright\n").unwrap();
         std::fs::write(dir.join("wrong"), "wrong").unwrap();
-        assert!(load(&dir.join("c.pem"), &dir.join("e.pem"), Some(&dir.join("passwords"))).is_ok());
-        assert!(load(&dir.join("c.pem"), &dir.join("e.pem"), Some(&dir.join("wrong"))).is_err());
+        assert!(load(&dir.join("c.pem"), &dir.join("e.pem"), Some(&dir.join("passwords")), false).is_ok());
+        assert!(load(&dir.join("c.pem"), &dir.join("e.pem"), Some(&dir.join("wrong")), false).is_err());
     }
 
     #[test]
