@@ -25,7 +25,8 @@ const CONFIGURE: &str = "--with-http_ssl_module --without-http_fastcgi_module --
 /// The TLS library line of `-V`. twinx does TLS with rustls; nginx-tests reads
 /// "with OpenSSL <version>" to tell which TLS features there are, so it names
 /// the version of the reference nginx, whose features twinx takes after.
-const TLS_LIBRARY: &str = "built with TLS by rustls, compatible with OpenSSL 3.5.7";
+/// Servers are selected by the name clients send with SNI, as nginx says it does.
+const TLS_LIBRARY: &str = "built with TLS by rustls, compatible with OpenSSL 3.5.7\nTLS SNI support enabled";
 
 /// The command line, as nginx takes it.
 #[derive(Debug, PartialEq)]
