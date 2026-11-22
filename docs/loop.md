@@ -12,7 +12,9 @@ Before twinx started over on nginx-tests (2026-11-20), a second session, the Fin
 
 ## Which files fail on main
 
-Find them yourself on a fresh `origin/main`; nothing else records them:
+The judge decides, not your own runs. The judge's comment on the most recently merged pull request lists them on its "Failing:" line and gives the passing counts. Your session's environment differs from the judge's (it has no IPv6, for one), so a file your own run skips or passes may still fail there; never take your own results as what passes on main.
+
+Your own runs are for working on a file:
 
 ```
 scripts/run.sh cargo build --release
@@ -20,9 +22,9 @@ scripts/run.sh python3 harness/run_tests.py --nginx --out results/nginx.json
 scripts/run.sh python3 harness/run_tests.py --twinx target/release/twinx --reference results/nginx.json --out results/twinx.json
 ```
 
-A file fails when a subtest that passes on nginx does not pass on twinx; the last command prints `FAIL` and those subtests. With no `Cargo.toml` on main there is no twinx yet, and every file fails.
+A file fails when a subtest that passes on nginx does not pass on twinx; the last command prints `FAIL` and those subtests. A file skipped here can only be checked by the judge.
 
-An open failing file is one that fails on main, has no open pull request from its branch (`claude/fix-<stage>-<file>`, without `.t`) and no open issue labelled `blocked` for it.
+An open failing file is one on the judge's "Failing:" line that has no open pull request from its branch (`claude/fix-<stage>-<file>`, without `.t`) and no open issue labelled `blocked` for it. The stage is done only when that line says `none`.
 
 ## Pull requests
 
@@ -69,7 +71,7 @@ pull requests: opened <#…>, merged <#…>
 passing on main: <files> of <files> files, <subtests> of <subtests> subtests
 ```
 
-The tokens come from `python3 harness/usage.py`, which reads this session's own transcript. The passing counts are those of the judge's comment on the most recently merged pull request, or the run's own results when nothing merged.
+The tokens come from `python3 harness/usage.py`, which reads this session's own transcript. The passing counts are always those of the judge's comment on the most recently merged pull request, never your own results.
 
 ## What you never do
 
