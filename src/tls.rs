@@ -107,16 +107,15 @@ impl CertCache {
         if let Some(i) = nodes.iter().position(|n| n.key == key && n.path == path) {
             // One that fails to load or must not be kept is no longer kept.
             let mut node = nodes.remove(i);
-            if invalidate || now.saturating_sub(node.created) > self.valid {
-                let changed = file(path);
-                if invalidate || changed != Some(node.file) {
-                    node.file = changed.unwrap_or_default();
-                    let (value, uncached) = create()?;
-                    if uncached { return Ok(value) }
-                    node.value = value;
-                }
-                node.created = now;
+            let stale = invalidate || now.saturating_sub(node.created) > self.valid;
+            let changed = if stale { file(path) } else { Some(node.file) };
+            if invalidate || changed != Some(node.file) {
+                node.file = changed.unwrap_or_default();
+                let (value, uncached) = create()?;
+                if uncached { return Ok(value) }
+                node.value = value;
             }
+            if stale { node.created = now; }
             node.accessed = now;
             let value = node.value.copy();
             nodes.push(node);
@@ -306,14 +305,11 @@ pub fn client_cert(base: &Arc<ClientConfig>, (cert, key, passwords): (&Path, &Pa
     loop {
         let chain = fetch(false, cert, invalidate, &|| Ok((Object { chain: chain(cert)?, key: None }, false)))?.chain;
         let pkey = fetch(true, key, invalidate, &|| private_key(key, passwords).map(|(k, encrypted)| (Object { chain: Vec::new(), key: Some(k) }, encrypted)))?.key;
-        match unverified().with_client_auth_cert(chain, pkey.ok_or("no key")?) {
-            Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)) if !invalidate => invalidate = true,
-            Err(e) => return Err(format!("SSL_use_PrivateKey(\"{}\") failed ({e})", key.display())),
-            Ok(mut c) => {
-                (c.enable_sni, c.resumption) = (false, base.resumption.clone());
-                return Ok(Arc::new(c));
-            }
-        }
+        let config = unverified().with_client_auth_cert(chain, pkey.ok_or("no key")?);
+        if !invalidate && matches!(config, Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch))) { invalidate = true; continue }
+        let mut c = config.map_err(|e| format!("SSL_use_PrivateKey(\"{}\") failed ({e})", key.display()))?;
+        (c.enable_sni, c.resumption) = (false, base.resumption.clone());
+        return Ok(Arc::new(c));
     }
 }
 
