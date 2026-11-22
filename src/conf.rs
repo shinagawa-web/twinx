@@ -14,23 +14,25 @@ use crate::resolver::Resolver;
 use crate::upstream::{Peer, Upstream};
 use crate::vars::{Escape, Part, Template};
 
-const MAIN: u8 = 1;
-const EVENTS: u8 = 2;
-const HTTP: u8 = 4;
-const SRV: u8 = 8;
-const LOC: u8 = 16;
-const UPS: u8 = 32;
+const MAIN: u16 = 1;
+const EVENTS: u16 = 2;
+const HTTP: u16 = 4;
+const SRV: u16 = 8;
+const LOC: u16 = 16;
+const UPS: u16 = 32;
 /// An "if" block in a location, and in a server.
-const LIF: u8 = 64;
-const SIF: u8 = 128;
-const HSL: u8 = HTTP | SRV | LOC;
+const LIF: u16 = 64;
+const SIF: u16 = 128;
+/// A limit_except block.
+const LMT: u16 = 256;
+const HSL: u16 = HTTP | SRV | LOC;
 
 /// Every directive twinx knows: where it may appear, its argument counts, and
 /// whether it takes a block.
 /// The levels of error_log, from the lowest.
 const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
 
-const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
+const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("daemon", MAIN, 1, 1, false),
     ("pid", MAIN, 1, 1, false),
     ("worker_rlimit_nofile", MAIN, 1, 1, false),
@@ -79,7 +81,10 @@ const DIRECTIVES: &[(&str, u8, usize, usize, bool)] = &[
     ("keepalive_time", HSL, 1, 1, false),
     ("keepalive_disable", HSL, 1, usize::MAX, false),
     ("error_page", HSL | LIF, 2, usize::MAX, false),
-    ("proxy_pass", LOC | LIF, 1, 1, false),
+    ("proxy_pass", LOC | LIF | LMT, 1, 1, false),
+    ("limit_except", LOC, 1, usize::MAX, true),
+    ("ssl_certificate", HTTP | SRV, 1, 1, false),
+    ("ssl_certificate_key", HTTP | SRV, 1, 1, false),
     ("proxy_method", HSL, 1, 1, false),
     ("proxy_set_body", HSL, 1, 1, false),
     ("expires", HSL | LIF, 1, 2, false),
@@ -136,6 +141,8 @@ const COMBINED: &str =
 #[derive(Debug, Clone)]
 pub struct Proxy {
     pub host: String,
+    /// Whether the URL is "https://": requests go over TLS.
+    pub ssl: bool,
     pub upstream: Arc<Upstream>,
     pub uri: Option<String>,
     pub url: Option<Template>,
@@ -405,6 +412,13 @@ pub struct Level {
     /// if_modified_since: None when off; Some(true) for "before", where an
     /// If-Modified-Since time after Last-Modified holds too, not only an equal one.
     pub if_modified_since: Option<bool>,
+    /// ssl_certificate and ssl_certificate_key: the files of the server's certificate and its key.
+    pub ssl_certificate: Option<PathBuf>,
+    pub ssl_certificate_key: Option<PathBuf>,
+    /// limit_except: the methods allowed (HEAD with GET), and the settings of
+    /// the block, which requests with any other method get instead of the
+    /// location's. Nested locations and if blocks do not inherit it.
+    pub limit_except: Option<(Vec<String>, Arc<Level>)>,
 }
 
 /// try_files: the files tried in order, each a directory when its parameter
@@ -462,6 +476,9 @@ pub struct Server {
     pub name: String,
     pub level: Level,
     pub locations: Vec<Location>,
+    /// The addresses it listens on with "ssl", and the certificate it presents there.
+    pub ssl: Vec<SocketAddr>,
+    pub certificate: Option<Arc<rustls::sign::CertifiedKey>>,
 }
 
 #[derive(Debug)]
@@ -515,7 +532,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
 }
 
 impl Builder<'_> {
-    fn check(&self, d: &Directive, ctx: u8) -> Result<(), String> {
+    fn check(&self, d: &Directive, ctx: u16) -> Result<(), String> {
         let at = &d.at;
         let named = || DIRECTIVES.iter().filter(|s| s.0 == d.name);
         let spec = named().find(|s| s.1 & ctx != 0).or_else(|| named().next());
@@ -570,11 +587,15 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new() };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), certificate: None };
         self.level(block, SRV, &mut s.level)?;
         for d in block {
             match d.name.as_str() {
-                "listen" => s.listen.extend(listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?),
+                "listen" => {
+                    let addrs = listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
+                    if d.args[1..].iter().any(|a| a == "ssl") { s.ssl.extend(&addrs); }
+                    s.listen.extend(addrs);
+                }
                 "server_name" => {
                     if s.names.is_empty() { s.name = d.args[0].strip_prefix('.').unwrap_or(&d.args[0]).to_string(); }
                     for n in &d.args { s.names.extend(server_name(n).map_err(|e| format!("{e} in {}", d.at))?); }
@@ -583,6 +604,8 @@ impl Builder<'_> {
             }
         }
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
+        let files = s.level.ssl_certificate.as_deref().zip(s.level.ssl_certificate_key.as_deref());
+        s.certificate = files.map(|(cert, key)| crate::tls::certificate(cert, key)).transpose()?;
         let level = s.level.clone();
         self.locations(block, &level, &mut s.locations)?;
         Ok(s)
@@ -590,7 +613,7 @@ impl Builder<'_> {
 
     fn locations(&mut self, block: &[Directive], parent: &Level, out: &mut Vec<Location>) -> Result<(), String> {
         for d in block.iter().filter(|d| d.name == "location") {
-            let mut level = Level { proxy: None, try_files: None, script: Vec::new(), ..parent.clone() };
+            let mut level = Level { proxy: None, try_files: None, script: Vec::new(), limit_except: None, ..parent.clone() };
             let inner = d.block.as_deref().unwrap_or_default();
             let (kind, path) = location(&d.args).map_err(|e| format!("{e} in {}", d.at))?;
             self.location = d.args.last().cloned().unwrap_or_default();
@@ -605,7 +628,7 @@ impl Builder<'_> {
 
     /// Applies the directives of one level that are not blocks of their own;
     /// access_log replaces what the level above set as a whole.
-    fn level(&mut self, block: &[Directive], ctx: u8, level: &mut Level) -> Result<(), String> {
+    fn level(&mut self, block: &[Directive], ctx: u16, level: &mut Level) -> Result<(), String> {
         let mut logs: Option<Vec<Arc<AccessLog>>> = None;
         let (mut headers, mut trailers): (Option<Vec<(String, Template, bool)>>, Option<Vec<_>>) = (None, None);
         let mut pages: Option<Vec<ErrorPage>> = None;
@@ -616,7 +639,7 @@ impl Builder<'_> {
         let mut flags: Option<Option<Vec<CookieFlags>>> = None;
         // proxy_redirect of this level, Some(None) once "off"; and whether proxy_pass is here.
         let (mut redirects, mut own_proxy): (Option<Option<Vec<CookieRewrite>>>, bool) = (None, false);
-        let mut ifs = Vec::new();
+        let (mut ifs, mut limit) = (Vec::new(), None);
         for d in block {
             self.check(d, ctx)?;
             let at = |e: String| format!("{e} in {}", d.at);
@@ -666,6 +689,14 @@ impl Builder<'_> {
                 "add_trailer" => trailers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
                 "error_page" => pages.get_or_insert_default().push(error_page(&d.args).map_err(at)?),
                 "proxy_pass" => (level.proxy, own_proxy) = (Some(Arc::new(self.proxy(&d.args[0]).map_err(at)?)), true),
+                "limit_except" => {
+                    const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "DELETE", "MKCOL", "COPY", "MOVE", "OPTIONS", "PROPFIND", "PROPPATCH", "LOCK", "UNLOCK", "PATCH"];
+                    if let Some(m) = d.args.iter().find(|m| !METHODS.contains(&m.as_str())) { return Err(at(format!("invalid method \"{m}\""))); }
+                    let get = d.args.iter().any(|m| m == "GET").then(|| "HEAD".to_string());
+                    limit = Some((d.args.iter().cloned().chain(get).collect::<Vec<_>>(), d));
+                }
+                "ssl_certificate" => level.ssl_certificate = Some(self.path(&d.args[0])),
+                "ssl_certificate_key" => level.ssl_certificate_key = Some(self.path(&d.args[0])),
                 "proxy_redirect" => {
                     let rule = if d.args == ["default"] {
                         let proxy = level.proxy.as_ref().filter(|_| own_proxy).ok_or_else(|| at("\"proxy_redirect default\" should be placed after the \"proxy_pass\" directive".into()))?;
@@ -790,6 +821,12 @@ impl Builder<'_> {
             let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
             if let Op::If(_, body, to) = &mut script[i] { (*body, *to) = (std::mem::take(&mut inner.script), (ctx != SRV || inner.rewrite.iter().any(|s| matches!(s, Step::Return(..)))).then(|| Arc::new(inner))); }
         }
+        // A limit_except block inherits the location's settings, but not its set and if, which do not run there.
+        if let Some((methods, d)) = limit {
+            let mut inner = Level { script: Vec::new(), ..level.clone() };
+            self.level(d.block.as_deref().unwrap_or_default(), LMT, &mut inner)?;
+            level.limit_except = Some((methods, Arc::new(inner)));
+        }
         Ok(())
     }
 
@@ -821,22 +858,22 @@ impl Builder<'_> {
     /// None for a URL with variables.
     fn default_redirect(&self, p: &Proxy) -> Option<CookieRewrite> {
         let text = |s: String| Template(vec![Part::Text(s)]);
-        let url = format!("http://{}{}", p.host, p.uri.as_deref().unwrap_or("/"));
+        let url = format!("{}://{}{}", if p.ssl { "https" } else { "http" }, p.host, p.uri.as_deref().unwrap_or("/"));
         let replacement = if p.uri.is_some() { self.location.clone() } else { "/".to_string() };
         p.url.is_none().then(|| CookieRewrite { pattern: CookiePattern::Text(text(url)), replacement: text(replacement) })
     }
 
     /// proxy_pass http://host[:port][/uri], where host may name an upstream block.
     fn proxy(&self, url: &str) -> Result<Proxy, String> {
-        let rest = url.strip_prefix("http://").ok_or_else(|| format!("invalid URL prefix in \"{url}\""))?;
+        let (rest, ssl) = url.strip_prefix("http://").map(|r| (r, false)).or_else(|| Some((url.strip_prefix("https://")?, true))).ok_or_else(|| format!("invalid URL prefix in \"{url}\""))?;
         let template = Template::parse(url)?;
         if template.0.iter().any(|p| matches!(p, Part::Var(_))) {
-            return Ok(Proxy { host: String::new(), upstream: Arc::new(Upstream::new(Vec::new())), uri: None, url: Some(template), groups: self.upstreams.clone(), implicit: self.implicit.clone() });
+            return Ok(Proxy { host: String::new(), ssl: false, upstream: Arc::new(Upstream::new(Vec::new())), uri: None, url: Some(template), groups: self.upstreams.clone(), implicit: self.implicit.clone() });
         }
         let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
         // Any other host is an implicit upstream of all its addresses, one for each host and port.
         let implicit = || {
-            let (name, port) = host_port(host).ok_or(())?;
+            let (name, port) = host_port(host, if ssl { 443 } else { 80 }).ok_or(())?;
             let key = format!("{}:{port}", name.to_ascii_lowercase());
             let mut implicit = self.implicit.lock().unwrap();
             if let Some(up) = implicit.get(&key) { return Ok(up.clone()); }
@@ -847,14 +884,14 @@ impl Builder<'_> {
         };
         let upstream = self.upstreams.get(host).cloned().map_or_else(implicit, Ok);
         let upstream = upstream.map_err(|_| format!("host not found in upstream \"{host}\""))?;
-        Ok(Proxy { host: host.to_string(), upstream, uri, url: None, groups: HashMap::new(), implicit: Implicit::default() })
+        Ok(Proxy { host: host.to_string(), ssl, upstream, uri, url: None, groups: HashMap::new(), implicit: Implicit::default() })
     }
 }
 
-/// The name and port of host[:port], port 80 when it has none; an IPv6
-/// address is written in brackets, which are left out.
-pub fn host_port(host: &str) -> Option<(&str, u16)> {
-    let (name, port) = match host.rsplit_once(':') { Some((n, p)) if !p.contains(']') => (n, p.parse().ok()?), _ => (host, 80) };
+/// The name and port of host[:port], the default port when it has none; an
+/// IPv6 address is written in brackets, which are left out.
+pub fn host_port(host: &str, default: u16) -> Option<(&str, u16)> {
+    let (name, port) = match host.rsplit_once(':') { Some((n, p)) if !p.contains(']') => (n, p.parse().ok()?), _ => (host, default) };
     Some((name.strip_prefix('[').and_then(|n| n.strip_suffix(']')).unwrap_or(name), port))
 }
 
@@ -1180,11 +1217,11 @@ mod tests {
 
     #[test]
     fn hosts_and_ports() {
-        assert_eq!(host_port("a:81"), Some(("a", 81)));
-        assert_eq!(host_port("a"), Some(("a", 80)));
-        assert_eq!(host_port("[::1]:81"), Some(("::1", 81)));
-        assert_eq!(host_port("[::1]"), Some(("::1", 80)));
-        assert_eq!(host_port("a:x"), None);
+        assert_eq!(host_port("a:81", 80), Some(("a", 81)));
+        assert_eq!(host_port("a", 80), Some(("a", 80)));
+        assert_eq!(host_port("[::1]:81", 80), Some(("::1", 81)));
+        assert_eq!(host_port("[::1]", 80), Some(("::1", 80)));
+        assert_eq!(host_port("a:x", 80), None);
     }
 
     #[test]
@@ -1574,5 +1611,21 @@ mod tests {
         assert_eq!(e, "the duplicate \"remote_addr\" variable in t.conf:1");
         let e = build_text("http { access_log a.log nope; }").unwrap_err();
         assert_eq!(e, "unknown log format \"nope\" in t.conf:1");
+        let e = build_text("http { server { location / { limit_except GET NOPE { } } } }").unwrap_err();
+        assert_eq!(e, "invalid method \"NOPE\" in t.conf:1");
+    }
+
+    #[test]
+    fn https_and_limit_except() {
+        let c = build_text("http { server { listen 127.0.0.1:8443 ssl; location / { proxy_pass https://127.0.0.1/u; } \
+                            location /l { limit_except GET { } } } }").unwrap();
+        let s = &c.servers[0];
+        assert_eq!(s.ssl, ["127.0.0.1:8443".parse().unwrap()]);
+        let p = s.locations[0].level.proxy.as_ref().unwrap();
+        assert!(p.ssl);
+        assert_eq!(p.upstream.peers[0].addr, "127.0.0.1:443".parse().unwrap());
+        let redirect = s.locations[0].level.proxy_redirect.as_ref().unwrap();
+        assert!(matches!(&redirect[0].pattern, CookiePattern::Text(t) if matches!(&t.0[..], [Part::Text(u)] if u == "https://127.0.0.1/u")));
+        assert_eq!(s.locations[1].level.limit_except.as_ref().unwrap().0, ["GET", "HEAD"]);
     }
 }
