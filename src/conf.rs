@@ -314,6 +314,8 @@ pub struct Level {
     /// The length of the location prefix that alias replaces; None when alias is
     /// in a regular expression location, where it names the whole path.
     pub alias_len: Option<usize>,
+    /// alias with variables (as captures of the location), under the prefix.
+    pub alias_vars: Option<Template>,
     /// try_files, which locations do not inherit.
     pub try_files: Option<Arc<TryFiles>>,
     /// How a Location that starts with "/" is sent: made absolute with
@@ -640,8 +642,12 @@ impl Builder<'_> {
                     if rule.is_none() && flags.is_some() || matches!(flags, Some(None)) { return Err(at("\"proxy_cookie_flags\" directive is duplicate".into())); }
                     flags = Some(rule.map(|rule| flags.take().flatten().unwrap_or_default().into_iter().chain([rule]).collect()));
                 }
-                "root" => (level.root, level.alias) = (self.path(&d.args[0]), None),
-                "alias" => level.alias = Some(self.path(&d.args[0])),
+                "root" => (level.root, level.alias, level.alias_vars) = (self.path(&d.args[0]), None, None),
+                "alias" => {
+                    let path = self.path(&d.args[0]);
+                    level.alias_vars = d.args[0].contains('$').then(|| Template::parse(&path.to_string_lossy())).transpose().map_err(at)?;
+                    level.alias = Some(path);
+                }
                 "try_files" => level.try_files = Some(Arc::new(try_files(&d.args).map_err(at)?)),
                 "absolute_redirect" => level.absolute_redirect = flag(d).map_err(at)?,
                 "server_tokens" => level.server_tokens = d.args[0] == "build" || flag(d).map_err(|_| at(format!("invalid value \"{}\" in \"server_tokens\" directive, it must be \"on\", \"off\" or \"build\"", d.args[0])))?,

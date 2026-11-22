@@ -160,7 +160,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr, fresh:
         r.captures = captures;
         let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
         r.server_name = server.name.clone();
-        let found = location(server, &r.uri);
+        let found = located(server, &r, &r.uri);
         let level = found.1;
         let framing = parsed.and_then(|()| framing(&r)).and_then(|n| if n.unwrap_or(0) > level.max_body { Err(413) } else { Ok(n) });
         let expect = header(&r, "expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue"));
@@ -578,7 +578,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
             // The answer is sent with the error's status ("=code" replaces it, "=" leaves the
             // answer's own), unless it is a page generated for its own error or redirect.
             let status = ep.status.unwrap_or(resp.status);
-            let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
+            let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
             (resp, level, last) = answer(server, &to, Ok(()), found);
             if !resp.generated && status != 0 { resp.status = status; }
             // A redirect the new answer makes replaces the Location kept.
@@ -712,7 +712,7 @@ fn post_action(server: &Server, r: &Request, level: &Level) {
     // A named location answers the request as it is; a URI replaces the request's.
     let uri = || url.split('?').next().unwrap_or_default().to_string();
     let to = if named.is_some() { r.clone() } else { Request { uri: uri(), target: url.clone(), ..r.clone() } };
-    let found = named.map_or_else(|| location(server, &to.uri), |l| (l.path.as_str(), &l.level, false));
+    let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
     answer(server, &to, Ok(()), found);
 }
 
@@ -830,7 +830,7 @@ fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix,
             if resp.as_get && to.method != "HEAD" { to.method = "GET".to_string(); }
             to.uri = target.split('?').next().unwrap_or_default().to_string();
             to.target = target.clone();
-            location(server, &to.uri)
+            located(server, &to, &to.uri)
         };
         level = run(&to, &found.script, if named.is_some() { found } else { run(&to, &found.server_script, found) });
         resp = if redirects > 10 || (target.starts_with('@') && named.is_none()) { special(500) } else { respond(&to, Ok(()), (prefix, level, auto)) };
@@ -881,6 +881,8 @@ fn holds(r: &Request, cond: &Condition) -> bool {
 fn file(level: &Level, r: &Request, prefix: &str) -> Response {
     if !matches!(r.method.as_str(), "GET" | "HEAD" | "POST") { return special(405); }
     let path = match &level.alias {
+        // In a regular expression location, alias with captures names the whole path.
+        Some(_) if let (Some(t), None) = (&level.alias_vars, level.alias_len) => PathBuf::from(t.render(r, &Sent::default())),
         Some(alias) => std::path::PathBuf::from(format!("{}{}", alias.display(), r.uri.get(prefix.len()..).unwrap_or_default())),
         None => level.root.join(r.uri.trim_start_matches('/')),
     };
@@ -1530,6 +1532,15 @@ type Found<'a> = (&'a str, &'a Level, bool);
 /// whose path is the URI with "/" added and that redirects to it, else the
 /// longest prefix if it is "^~", else the first regular expression that
 /// matches, else the longest prefix; the server's own settings when nothing matches.
+/// The location of a URI, as location() finds it, with the captures of a
+/// regular expression location set for the request.
+fn located<'a>(server: &'a Server, r: &Request, uri: &str) -> Found<'a> {
+    let found = location(server, uri);
+    let kind = server.locations.iter().find(|l| std::ptr::eq(&l.level, found.1)).map(|l| &l.kind);
+    if let Some(caps) = kind.and_then(|k| if let Match::Regex(re) = k { re.captures(uri) } else { None }) { r.set_captures(&caps); }
+    found
+}
+
 fn location<'a>(server: &'a Server, uri: &str) -> Found<'a> {
     let locs = &server.locations;
     let exact = locs.iter().find(|l| matches!(l.kind, Match::Exact) && l.path == uri);
@@ -2127,6 +2138,22 @@ mod tests {
         assert_eq!((location(s, "/p/x").0, location(s, "/p/x").2), ("/p/", false));
         assert_eq!((location(s, "/q").0, location(s, "/q").2), ("/q", false));
         assert!(!location(s, "").2);
+    }
+
+    #[test]
+    fn regex_locations_set_their_captures() {
+        let dir = std::env::temp_dir().join(format!("twinx-captures-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/f.txt"), "F").unwrap();
+        let text = format!("http {{ server {{ location ~ ^/c/(\\w+)$ {{ return 200 $1; }} location ~ ^/a/(.+)$ {{ alias {}/sub/$1; }} }} }}", dir.display());
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &dir).unwrap();
+        let s = &config.servers[0];
+        let body = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            String::from_utf8(answer(s, &r, Ok(()), located(s, &r, &r.uri)).0.body).unwrap()
+        };
+        assert_eq!(body("/c/xyz"), "xyz");
+        assert_eq!(body("/a/f.txt"), "F");
     }
 
     #[test]
