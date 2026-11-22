@@ -276,6 +276,10 @@ pub struct Options {
     pub sessions: Sessions,
     pub compress: bool,
     pub ciphers: Option<String>,
+    /// ssl_protocols: whether TLS 1.2 and TLS 1.3 are taken.
+    pub protocols: [bool; 2],
+    /// ssl_prefer_server_ciphers: the server's order of cipher suites wins.
+    pub prefer: bool,
 }
 
 /// The OpenSSL names of the TLS 1.2 cipher suites twinx has.
@@ -345,10 +349,12 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     let trusted = trust.iter().map(|p| trusted(p)).collect::<Result<Vec<_>, _>>()?.concat();
     let suites = options.ciphers.as_deref().map(ciphers).transpose()?;
     let suites = CryptoProvider { cipher_suites: suites.unwrap_or_else(|| provider().cipher_suites.clone()), ..(*provider()).clone() };
-    let builder = ServerConfig::builder_with_provider(Arc::new(suites)).with_safe_default_protocol_versions().map_err(|e| e.to_string())?;
+    let versions: Vec<_> = [&rustls::version::TLS12, &rustls::version::TLS13].into_iter().zip(options.protocols).filter_map(|(v, on)| on.then_some(v)).collect();
+    let builder = ServerConfig::builder_with_provider(Arc::new(suites)).with_protocol_versions(&versions).map_err(|e| e.to_string())?;
     let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
     let mut config = builder.with_cert_resolver(Arc::new(Fixed::new(fixed)));
     // Certificates are compressed with zlib, for TLS 1.3 clients that offer it.
+    config.ignore_client_order = options.prefer;
     config.cert_compressors = if options.compress { vec![rustls::compress::ZLIB_COMPRESSOR] } else { Vec::new() };
     let sessions = options.sessions;
     config.session_storage = if sessions.cache { rustls::server::ServerSessionMemoryCache::new(20480) } else { Arc::new(rustls::server::NoServerSessionStorage {}) };
@@ -930,7 +936,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = dir();
         let names = [(&*dir.join("$ssl_server_name"), &*dir.join("k.pem"))];
         let files = (&names[..], None);
-        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None };
+        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: false };
         let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), &[], options.clone()).unwrap();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
