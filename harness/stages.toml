@@ -51,7 +51,7 @@ files = [
   "working_directory.t", "access_log.t", "gunzip.t", "gunzip_static.t", "gzip.t",
 ]
 
-# Stage 3: TLS. Files that need, besides the modules of stages 1 and 2, only
+# Stage 3, done at v0.3.0 (2026-11-23): TLS. Files that need, besides the modules of stages 1 and 2, only
 # http_ssl and the TLS features of the test client (socket_ssl*, sni, openssl
 # versions, cryptx); files that also need HTTP/2, HTTP/3, stream or mail wait
 # for their stages.
