@@ -24,7 +24,7 @@ const REASONS: &[(u16, &str)] = &[
     (403, "Forbidden"), (404, "Not Found"), (405, "Not Allowed"), (406, "Not Acceptable"),
     (408, "Request Time-out"), (409, "Conflict"), (410, "Gone"), (411, "Length Required"),
     (412, "Precondition Failed"), (413, "Request Entity Too Large"), (414, "Request-URI Too Large"),
-    (415, "Unsupported Media Type"), (416, "Requested Range Not Satisfiable"), (429, "Too Many Requests"),
+    (415, "Unsupported Media Type"), (416, "Requested Range Not Satisfiable"), (421, "Misdirected Request"), (429, "Too Many Requests"),
     (500, "Internal Server Error"), (501, "Not Implemented"), (502, "Bad Gateway"),
     (503, "Service Temporarily Unavailable"), (504, "Gateway Time-out"), (505, "HTTP Version Not Supported"),
 ];
@@ -174,6 +174,7 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl)
         let (server, captures) = server(config, listen, r.host.as_deref());
         r.captures = captures;
         let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
+        let parsed = parsed.and_then(|()| if misdirected(r.ssl.as_ref(), r.host.as_deref(), server.level.ssl_verify_client) { Err(421) } else { Ok(()) });
         let parsed = parsed.and_then(|()| cert_error(server.level.ssl_verify_client, r.ssl.as_ref()));
         r.server_name = server.name.clone();
         let found = located(server, &r, &r.uri);
@@ -413,6 +414,14 @@ fn finish(resp: &mut Response) {
     resp.body = body;
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
+}
+
+/// Whether a request is misdirected (421), as nginx finds it: its Host is not
+/// the name the client asked for with SNI, and the server the Host selects
+/// asks clients for their certificates (ssl_verify_client).
+fn misdirected(ssl: Option<&crate::tls::Session>, host: Option<&str>, verify: u8) -> bool {
+    let sni = ssl.map(|s| s.server_name.as_str()).filter(|n| !n.is_empty());
+    sni.zip(host).is_some_and(|(sni, host)| !sni.eq_ignore_ascii_case(host) && verify > 0)
 }
 
 /// What nginx answers a request on a connection whose client's certificate
@@ -1942,6 +1951,18 @@ mod tests {
         assert_eq!(cert_error(1, None), Ok(()));
         assert_eq!(special(495).status, 400);
         assert!(String::from_utf8(special(496).body).unwrap().contains("<center>No required SSL certificate was sent</center>"));
+    }
+
+    #[test]
+    fn finds_misdirected_requests() {
+        let ssl = |name: &str| Some(crate::tls::Session { server_name: name.to_string(), ..Default::default() });
+        assert!(misdirected(ssl("a").as_ref(), Some("b"), 2));
+        assert!(!misdirected(ssl("A").as_ref(), Some("a"), 2));
+        assert!(!misdirected(ssl("a").as_ref(), Some("b"), 0));
+        assert!(!misdirected(ssl("").as_ref(), Some("b"), 1));
+        assert!(!misdirected(None, Some("b"), 1));
+        assert!(!misdirected(ssl("a").as_ref(), None, 1));
+        assert!(String::from_utf8(special(421).body).unwrap().contains("<title>421 Misdirected Request</title>"));
     }
 
     #[test]

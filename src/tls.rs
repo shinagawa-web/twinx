@@ -428,6 +428,9 @@ pub struct Options {
     pub ticket_keys: Vec<PathBuf>,
     /// ssl_stapling: how OCSP responses are stapled to the certificates; None does not.
     pub stapling: Option<Stapling>,
+    /// ssl_client_certificate: the file whose certificates' names clients are
+    /// sent when asked for theirs (those of ssl_trusted_certificate are not).
+    pub client_ca: Option<PathBuf>,
 }
 
 /// The OpenSSL names of the TLS 1.2 cipher suites twinx has.
@@ -500,7 +503,7 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     let suites = CryptoProvider { cipher_suites: suites.unwrap_or_else(|| provider().cipher_suites.clone()), kx_groups: groups.unwrap_or_else(|| provider().kx_groups.clone()), ..(*provider()).clone() };
     let versions: Vec<_> = [&rustls::version::TLS12, &rustls::version::TLS13].into_iter().zip(options.protocols).filter_map(|(v, on)| on.then_some(v)).collect();
     let builder = ServerConfig::builder_with_provider(Arc::new(suites)).with_protocol_versions(&versions).map_err(|e| e.to_string())?;
-    let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
+    let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms, ca_names(options.client_ca.as_deref())?))) } else { builder.with_no_client_auth() };
     let mut fixed = Fixed::new(fixed);
     if let Some(stapling) = &options.stapling { fixed.1 = fixed.0.iter().map(|k| Staple::new(k, stapling, &trusted)).collect::<Result<_, _>>()?; }
     let mut config = builder.with_cert_resolver(Arc::new(fixed));
@@ -644,6 +647,8 @@ impl Session {
             "v_end" => time(cert.validity().not_after),
             "raw_cert" => pem(self.cert.as_deref().unwrap_or_default()),
             "escaped_cert" => escape(&pem(self.cert.as_deref().unwrap_or_default())),
+            // $ssl_client_cert: each line but the first begins with a tab, as in a folded header.
+            "cert" => { let pem = pem(self.cert.as_deref().unwrap_or_default()); format!("{}\n", pem.trim_end().replace('\n', "\n\t")) }
             _ => ((cert.validity().not_after.timestamp() - now() as i64) / 86400).max(0).to_string(),
         }
     }
@@ -680,7 +685,18 @@ pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option
 /// Clients may send a certificate, which the handshake takes whatever it is;
 /// whether it verifies is told by $ssl_client_verify.
 #[derive(Debug)]
-struct AnyClient(WebPkiSupportedAlgorithms);
+struct AnyClient(WebPkiSupportedAlgorithms, Vec<DistinguishedName>);
+
+/// The subjects of the certificates of a file, each once, in their order, as
+/// OpenSSL's SSL_load_client_CA_file gives them.
+fn ca_names(file: Option<&Path>) -> Result<Vec<DistinguishedName>, String> {
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    for cert in file.map(trusted).transpose()?.unwrap_or_default() {
+        let name = X509Certificate::from_der(&cert).map_err(|e| e.to_string())?.1.subject().as_raw().to_vec();
+        if !names.contains(&name) { names.push(name) }
+    }
+    Ok(names.into_iter().map(DistinguishedName::from).collect())
+}
 
 impl ClientCertVerifier for AnyClient {
     fn client_auth_mandatory(&self) -> bool {
@@ -688,7 +704,7 @@ impl ClientCertVerifier for AnyClient {
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
+        &self.1
     }
 
     fn verify_client_cert(&self, _: &CertificateDer, _: &[CertificateDer], _: UnixTime) -> Result<ClientCertVerified, rustls::Error> {
@@ -1092,6 +1108,17 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 ";
 
     #[test]
+    fn names_each_client_ca_once() {
+        let dir = dir();
+        std::fs::write(dir.join("dup.pem"), format!("{CERT}{CERT}")).unwrap();
+        let names = ca_names(Some(&dir.join("dup.pem"))).unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].as_ref(), X509Certificate::from_der(&der(CERT)).unwrap().1.subject().as_raw());
+        assert!(ca_names(None).unwrap().is_empty());
+        assert!(ca_names(Some(&dir.join("none"))).is_err());
+    }
+
+    #[test]
     fn staples_the_response_of_a_file_or_fetched() {
         let dir = dir();
         std::fs::write(dir.join("resp.der"), b"response").unwrap();
@@ -1118,6 +1145,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert!(escaped.ends_with("wYWN%0A-----END%20CERTIFICATE-----%0A"));
         assert_eq!(pem(b"ab"), "-----BEGIN CERTIFICATE-----\nYWI=\n-----END CERTIFICATE-----\n");
         assert_eq!(Session::default().client_var("raw_cert"), "");
+        assert_eq!(session.client_var("cert"), format!("{}\n", CERT.trim_end().replace('\n', "\n\t")));
     }
 
     #[test]
@@ -1150,7 +1178,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = dir();
         let names = [(&*dir.join("$ssl_server_name"), &*dir.join("k.pem"))];
         let files = (&names[..], None);
-        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: false, curves: None, crl: None, depth: 1, ocsp: None, ticket_keys: Vec::new(), stapling: None };
+        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: false, curves: None, crl: None, depth: 1, ocsp: None, ticket_keys: Vec::new(), stapling: None, client_ca: None };
         let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), &[], options.clone()).unwrap();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
