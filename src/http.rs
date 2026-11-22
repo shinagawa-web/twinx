@@ -104,9 +104,17 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
 
 /// The end of the request head (after the empty line), if it has arrived.
 fn head_end(buf: &[u8]) -> Option<usize> {
+    let first = buf.iter().position(|&c| c == b'\n').map(|i| i + 1);
+    if let Some(end) = first.filter(|&end| http09(&buf[..end])) { return Some(end) }
     let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
     let crlf = buf.windows(3).position(|w| w == b"\n\r\n").map(|i| i + 3);
     lf.into_iter().chain(crlf).min()
+}
+
+/// Whether a request line is of HTTP/0.9: a method and a URI, without a
+/// version. Such a request has no headers, and its answer is the body alone.
+fn http09(line: &[u8]) -> bool {
+    line.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty()).count() == 2
 }
 
 /// Serves the requests of a connection accepted on a listening address,
@@ -659,7 +667,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let mut out = Vec::new();
     // 444 closes the connection without an answer; 499 is the status of a client that closed it.
     let silent = [444, 499].contains(&status);
-    if !silent {
+    if !silent && !http09(r.line.as_bytes()) {
         let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
         let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
         let ctype = resp.ctype.as_ref().map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
@@ -747,7 +755,7 @@ fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
 /// or its Last-Modified time. A range that starts past the end is 416.
 /// Several ranges (multipart), which no test needs, are not done yet.
 fn range(r: &Request, resp: &mut Response) {
-    let ok = resp.status == 200 && resp.ranges && !resp.unknown_length && !r.line.ends_with("HTTP/0.9");
+    let ok = resp.status == 200 && resp.ranges && !resp.unknown_length && !http09(r.line.as_bytes());
     let Some(spec) = header(r, "range").filter(|v| ok && v.len() > 6 && v[..6].eq_ignore_ascii_case("bytes=")).map(|v| v[6..].trim()) else { return };
     let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     let same = |v: &str| if v.len() >= 2 && v.ends_with('"') { sent("etag").as_deref() == Some(v) } else { sent("last-modified").and_then(|t| expires::http_time(&t)).is_some_and(|t| expires::http_time(v) == Some(t)) };
@@ -1440,10 +1448,11 @@ fn parse(r: &mut Request, head: &[u8], level: &Level) -> Result<(), u16> {
     let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     r.line = lines.next().unwrap_or_default().to_string();
     let words: Vec<&str> = r.line.split(' ').filter(|w| !w.is_empty()).collect();
-    let [method, target, version] = words[..] else { return Err(400) };
+    // HTTP/0.9, which has no version, has only GET.
+    let (method, target, version) = match words[..] { [m, t, v] => (m, t, v), [m @ "GET", t] => (m, t, ""), _ => return Err(400) };
     r.method = method.to_string();
     let valid_method = method.bytes().all(|c| c.is_ascii_uppercase() || c == b'_' || c == b'-');
-    if !valid_method || !matches!(version, "HTTP/1.0" | "HTTP/1.1") { return Err(400); }
+    if !valid_method || !matches!(version, "HTTP/1.0" | "HTTP/1.1" | "") { return Err(400); }
     for line in lines.filter(|l| !l.is_empty()) {
         let Some((name, value)) = header_line(line, level)? else { continue };
         r.headers.push((name.to_string(), value.trim_matches([' ', '\t']).to_string()));
@@ -1772,6 +1781,14 @@ mod tests {
         assert_eq!(head_end(b"GET / HTTP/1.0\nHost: a\n\nrest"), Some(24));
         assert_eq!(head_end(b"GET / HTTP/1.0\r\n\r\n"), Some(18));
         assert_eq!(head_end(b"GET / HTTP/1.0\r\n"), None);
+        assert_eq!(head_end(b"GET /\r\nextra"), Some(7));
+    }
+
+    #[test]
+    fn parses_http09_requests_of_get_only() {
+        let (res, r) = request("GET /a\r\n");
+        assert_eq!((res, r.uri.as_str(), keepalive(&r)), (Ok(()), "/a", false));
+        assert_eq!(request("POST /a\r\n").0, Err(400));
     }
 
     #[test]
@@ -1788,7 +1805,7 @@ mod tests {
     #[test]
     fn refuses_bad_requests() {
         assert_eq!(request("GET / HTTP/1.1\n\n").0, Err(400));
-        assert_eq!(request("GET /\n\n").0, Err(400));
+        assert_eq!(request("GET\n\n").0, Err(400));
         assert_eq!(request("TRACE / HTTP/1.0\n\n").0, Err(405));
         assert_eq!(request("CONNECT a:1 HTTP/1.0\n\n").0, Err(405));
         assert_eq!(request("CONNECT a HTTP/1.0\n\n").0, Err(400));

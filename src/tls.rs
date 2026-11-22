@@ -160,30 +160,141 @@ pub struct ServerTls {
     trusted: Vec<CertificateDer<'static>>,
 }
 
+/// How a server resumes clients' sessions: with tickets (ssl_session_tickets),
+/// from sessions it keeps (ssl_session_cache not off or none), and for how
+/// many seconds after they began (ssl_session_timeout).
+#[derive(Debug, Clone, Copy)]
+pub struct Sessions {
+    pub tickets: bool,
+    pub cache: bool,
+    pub timeout: u64,
+}
+
+impl Default for Sessions {
+    fn default() -> Sessions {
+        Sessions { tickets: true, cache: false, timeout: 300 }
+    }
+}
+
+/// Tickets that resume a session only until ssl_session_timeout passed since
+/// it began: each is stamped with the time it was made. Sessions kept in the
+/// cache, which TLS 1.3 clients do not use while tickets are on, do not expire yet.
+#[derive(Debug)]
+struct Timed<T>(T, u64);
+
+impl<T> Timed<T> {
+    fn stamp(data: &[u8]) -> Vec<u8> {
+        now().to_be_bytes().iter().chain(data).copied().collect()
+    }
+
+    fn fresh(&self, data: Vec<u8>) -> Option<Vec<u8>> {
+        let (made, rest) = data.split_at_checked(8)?;
+        (now() <= u64::from_be_bytes(made.try_into().ok()?) + self.1).then(|| rest.to_vec())
+    }
+}
+
+impl rustls::server::ProducesTickets for Timed<Arc<dyn rustls::server::ProducesTickets>> {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn lifetime(&self) -> u32 {
+        self.1.min(u32::MAX.into()) as u32
+    }
+
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        self.0.encrypt(&Self::stamp(plain))
+    }
+
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        self.fresh(self.0.decrypt(cipher)?)
+    }
+}
+
 /// The files of ssl_certificate, ssl_certificate_key and ssl_password_file;
 /// whether clients are asked for a certificate (ssl_verify_client not off),
-/// and the files of the certificates theirs are verified with.
-pub fn server(cert: &Path, key: &Path, passwords: Option<&Path>, verify: bool, trust: &[&Path]) -> Result<ServerTls, String> {
+/// the files of the certificates theirs are verified with, and how their
+/// sessions are resumed.
+pub fn server(cert: &Path, key: &Path, passwords: Option<&Path>, verify: bool, trust: &[&Path], sessions: Sessions) -> Result<ServerTls, String> {
     let (chain, key) = load(cert, key, passwords)?;
     let trusted = trust.iter().map(|p| trusted(p)).collect::<Result<Vec<_>, _>>()?.concat();
     let builder = ServerConfig::builder();
     let builder = if verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
-    let config = Arc::new(builder.with_single_cert(chain, key).map_err(|e| format!("cannot load certificate \"{}\" ({e})", cert.display()))?);
-    Ok(ServerTls { config, trusted })
+    let mut config = builder.with_single_cert(chain, key).map_err(|e| format!("cannot load certificate \"{}\" ({e})", cert.display()))?;
+    config.session_storage = if sessions.cache { rustls::server::ServerSessionMemoryCache::new(20480) } else { Arc::new(rustls::server::NoServerSessionStorage {}) };
+    if sessions.tickets { config.ticketer = Arc::new(Timed(rustls::crypto::ring::Ticketer::new().map_err(|e| e.to_string())?, sessions.timeout)); }
+    Ok(ServerTls { config: Arc::new(config), trusted })
 }
 
 /// What the variables tell of a TLS connection: the protocol ($ssl_protocol,
 /// "TLSv1.3"), whether its session was reused ($ssl_session_reused), how the
 /// client's certificate was verified ($ssl_client_verify: NONE, SUCCESS or
 /// FAILED:reason), its subject ($ssl_client_s_dn) and the name the client
-/// asked for with SNI ($ssl_server_name, empty without one).
-#[derive(Debug, Clone, PartialEq)]
+/// asked for with SNI ($ssl_server_name, empty without one); the session's
+/// identifier ($ssl_session_id), the cipher suite ($ssl_cipher) and those the
+/// client offered ($ssl_ciphers), and the client's certificate.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Session {
     pub protocol: String,
     pub server_name: String,
     pub reused: bool,
     pub verify: String,
     pub subject: Option<String>,
+    pub id: String,
+    pub cipher: String,
+    pub ciphers: String,
+    pub cert: Option<CertificateDer<'static>>,
+}
+
+/// OpenSSL's names of cipher suites, as $ssl_cipher and $ssl_ciphers give them.
+const CIPHERS: &[(u16, &str)] = &[
+    (0x1301, "TLS_AES_128_GCM_SHA256"), (0x1302, "TLS_AES_256_GCM_SHA384"), (0x1303, "TLS_CHACHA20_POLY1305_SHA256"),
+    (0x1304, "TLS_AES_128_CCM_SHA256"), (0x1305, "TLS_AES_128_CCM_8_SHA256"),
+    (0xc02b, "ECDHE-ECDSA-AES128-GCM-SHA256"), (0xc02c, "ECDHE-ECDSA-AES256-GCM-SHA384"), (0xc02f, "ECDHE-RSA-AES128-GCM-SHA256"),
+    (0xc030, "ECDHE-RSA-AES256-GCM-SHA384"), (0xcca8, "ECDHE-RSA-CHACHA20-POLY1305"), (0xcca9, "ECDHE-ECDSA-CHACHA20-POLY1305"),
+    (0xccaa, "DHE-RSA-CHACHA20-POLY1305"), (0x009e, "DHE-RSA-AES128-GCM-SHA256"), (0x009f, "DHE-RSA-AES256-GCM-SHA384"),
+    (0xc023, "ECDHE-ECDSA-AES128-SHA256"), (0xc024, "ECDHE-ECDSA-AES256-SHA384"), (0xc027, "ECDHE-RSA-AES128-SHA256"),
+    (0xc028, "ECDHE-RSA-AES256-SHA384"), (0x0067, "DHE-RSA-AES128-SHA256"), (0x006b, "DHE-RSA-AES256-SHA256"),
+    (0xc009, "ECDHE-ECDSA-AES128-SHA"), (0xc00a, "ECDHE-ECDSA-AES256-SHA"), (0xc013, "ECDHE-RSA-AES128-SHA"),
+    (0xc014, "ECDHE-RSA-AES256-SHA"), (0x0033, "DHE-RSA-AES128-SHA"), (0x0039, "DHE-RSA-AES256-SHA"),
+    (0x009c, "AES128-GCM-SHA256"), (0x009d, "AES256-GCM-SHA384"), (0x003c, "AES128-SHA256"), (0x003d, "AES256-SHA256"),
+    (0x002f, "AES128-SHA"), (0x0035, "AES256-SHA"), (0xc0ad, "ECDHE-ECDSA-AES256-CCM"), (0xc0ac, "ECDHE-ECDSA-AES128-CCM"),
+    (0xc09f, "DHE-RSA-AES256-CCM"), (0xc09e, "DHE-RSA-AES128-CCM"), (0xc09d, "AES256-CCM"), (0xc09c, "AES128-CCM"),
+    (0x00ff, "TLS_EMPTY_RENEGOTIATION_INFO_SCSV"), (0x5600, "TLS_FALLBACK_SCSV"),
+];
+
+/// The name OpenSSL gives a cipher suite; one it does not know is "0x" and its number.
+fn cipher(id: u16) -> String {
+    CIPHERS.iter().find(|c| c.0 == id).map_or_else(|| format!("0x{id:04x}"), |c| c.1.to_string())
+}
+
+/// A name as OpenSSL writes it: RFC 2253, the last attribute first
+/// ("CN=name,O=organization"), or legacy, the first first ("/O=organization/CN=name").
+fn name(name: &x509_parser::x509::X509Name, legacy: bool) -> String {
+    let registry = x509_parser::objects::oid_registry();
+    let attr = |a: &x509_parser::x509::AttributeTypeAndValue| format!("{}={}", x509_parser::objects::oid2abbrev(a.attr_type(), registry).map_or_else(|_| a.attr_type().to_id_string(), str::to_string), a.as_str().unwrap_or_default());
+    let rdns = name.iter_rdn().map(|rdn| rdn.iter().map(attr).collect::<Vec<_>>());
+    if legacy { return rdns.flatten().map(|a| format!("/{a}")).collect() }
+    rdns.map(|a| a.join("+")).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(",")
+}
+
+impl Session {
+    /// The variables of the client's certificate: $ssl_client_i_dn (its issuer),
+    /// $ssl_client_s_dn_legacy and $ssl_client_i_dn_legacy, $ssl_client_v_start
+    /// and $ssl_client_v_end (when it is valid, as "Nov 22 10:00:00 2026 GMT"),
+    /// and $ssl_client_v_remain (the days left); empty without a certificate.
+    pub fn client_var(&self, var: &str) -> String {
+        let Some((_, cert)) = self.cert.as_ref().and_then(|c| x509_parser::parse_x509_certificate(c).ok()) else { return String::new() };
+        let time = |t: ASN1Time| chrono::DateTime::from_timestamp(t.timestamp(), 0).map(|t| t.format("%b %e %H:%M:%S %Y GMT").to_string()).unwrap_or_default();
+        match var {
+            "i_dn" => name(cert.issuer(), false),
+            "s_dn_legacy" => name(cert.subject(), true),
+            "i_dn_legacy" => name(cert.issuer(), true),
+            "v_start" => time(cert.validity().not_before),
+            "v_end" => time(cert.validity().not_after),
+            _ => ((cert.validity().not_after.timestamp() - now() as i64) / 86400).max(0).to_string(),
+        }
+    }
 }
 
 /// Takes a TLS connection from a client on a listening address: the server
@@ -198,9 +309,14 @@ pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option
     };
     let name = hello.client_hello().server_name().unwrap_or_default().to_string();
     let tls = crate::http::server(config, listen, hello.client_hello().server_name()).0.tls.as_ref()?;
-    let conn = hello.into_connection(tls.config.clone()).ok()?;
+    let ciphers = hello.client_hello().cipher_suites().iter().map(|c| cipher(u16::from(*c))).collect::<Vec<_>>().join(":");
+    let mut conn = hello.into_connection(tls.config.clone()).ok()?;
+    // A session keeps its identifier when it is resumed, as OpenSSL's does.
+    let id = conn.received_resumption_data().map_or_else(|| { let mut id = [0u8; 32]; provider().secure_random.fill(&mut id).map(|_| id.to_vec()) }, |id| Ok(id.to_vec())).ok()?;
+    conn.set_resumption_data(&id);
     let (stream, mut session, chain) = pipe(tcp, conn.into(), HANDSHAKE).ok()?;
     (session.server_name, session.verify, session.subject) = (name, verified(&chain, &tls.trusted), chain.first().and_then(|c| subject(c)));
+    (session.id, session.ciphers, session.cert) = (id.iter().map(|b| format!("{b:02x}")).collect(), ciphers, chain.first().cloned());
     Some((stream, session))
 }
 
@@ -250,11 +366,7 @@ fn verified(chain: &[CertificateDer<'static>], trusted: &[CertificateDer<'static
 /// The subject of a certificate as RFC 2253 writes it, as $ssl_client_s_dn
 /// gives it: the last attribute first, "CN=name,O=organization".
 fn subject(der: &[u8]) -> Option<String> {
-    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
-    let registry = x509_parser::objects::oid_registry();
-    let attr = |a: &x509_parser::x509::AttributeTypeAndValue| format!("{}={}", x509_parser::objects::oid2abbrev(a.attr_type(), registry).map_or_else(|_| a.attr_type().to_id_string(), str::to_string), a.as_str().unwrap_or_default());
-    let rdns: Vec<String> = cert.subject().iter_rdn().map(|rdn| rdn.iter().map(attr).collect::<Vec<_>>().join("+")).collect();
-    Some(rdns.into_iter().rev().collect::<Vec<_>>().join(","))
+    Some(name(x509_parser::parse_x509_certificate(der).ok()?.1.subject(), false))
 }
 
 /// A proxied server's certificate is verified with proxy_ssl_verify on, and
@@ -416,7 +528,8 @@ fn pipe(mut tcp: TcpStream, mut tls: Connection, timeout: Duration) -> std::io::
     while tls.is_handshaking() { tls.complete_io(&mut tcp)?; }
     let _ = tcp.set_read_timeout(None);
     let protocol = tls.protocol_version().map(|v| format!("{v:?}").replace('_', ".")).unwrap_or_default();
-    let session = Session { protocol, server_name: String::new(), reused: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed), verify: String::new(), subject: None };
+    let cipher = tls.negotiated_cipher_suite().map(|c| cipher(u16::from(c.suite()))).unwrap_or_default();
+    let session = Session { protocol, reused: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed), cipher, ..Session::default() };
     let chain = tls.peer_certificates().map(<[_]>::to_vec).unwrap_or_default();
     let (ours, theirs) = UnixStream::pair()?;
     std::thread::spawn(move || pump(tcp, tls, theirs));
@@ -633,6 +746,29 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
     }
 
     #[test]
+    fn names_ciphers_and_certificates_as_openssl() {
+        assert_eq!((cipher(0x1302), cipher(0xc030), cipher(0x00ff), cipher(0xabcd)), ("TLS_AES_256_GCM_SHA384".into(), "ECDHE-RSA-AES256-GCM-SHA384".into(), "TLS_EMPTY_RENEGOTIATION_INFO_SCSV".into(), "0xabcd".into()));
+        let session = Session { cert: Some(der(END)), ..Session::default() };
+        let vars = ["i_dn", "s_dn_legacy", "i_dn_legacy", "v_start", "v_end"].map(|v| session.client_var(v));
+        assert_eq!(vars, ["CN=int", "/CN=end", "/CN=int", "Nov 22 09:45:34 2026 GMT", "Oct 29 09:45:34 2126 GMT"]);
+        assert!(session.client_var("v_remain").parse::<u64>().unwrap() > 36000);
+        assert_eq!(Session::default().client_var("i_dn"), "");
+    }
+
+    #[test]
+    fn sessions_last_for_the_timeout() {
+        let timed = Timed((), 10);
+        let stamped = Timed::<()>::stamp(b"data");
+        assert_eq!(timed.fresh(stamped.clone()), Some(b"data".to_vec()));
+        let old = [(now() - 11).to_be_bytes().as_slice(), b"data"].concat();
+        assert_eq!((timed.fresh(old), timed.fresh(b"short".to_vec())), (None, None));
+        let tickets = Timed(rustls::crypto::ring::Ticketer::new().unwrap(), 10);
+        use rustls::server::ProducesTickets;
+        assert!(tickets.enabled() && tickets.lifetime() == 10);
+        assert_eq!(tickets.decrypt(&tickets.encrypt(b"t").unwrap()), Some(b"t".to_vec()));
+    }
+
+    #[test]
     fn passes_data_both_ways_until_closed() {
         let dir = dir();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -644,7 +780,10 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         let c = dir.join("c.pem");
         let mut client = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), Some("localhost")), Duration::from_secs(5), &client((false, true), Some((&c, &dir.join("k.pem"), None)), None).unwrap()).unwrap();
         let (mut server, session) = accepted.join().unwrap();
-        assert_eq!(session, Session { protocol: "TLSv1.3".into(), server_name: "localhost".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()) });
+        assert_eq!((session.id.len(), session.cipher.as_str(), session.cert.as_ref()), (64, "TLS_AES_256_GCM_SHA384", Some(&der(CERT))));
+        assert!(session.ciphers.starts_with("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:"), "{}", session.ciphers);
+        let session = Session { id: String::new(), cipher: String::new(), ciphers: String::new(), cert: None, ..session };
+        assert_eq!(session, Session { protocol: "TLSv1.3".into(), server_name: "localhost".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()), ..Session::default() });
         let mut buf = [0u8; 4];
         client.write_all(b"ping").unwrap();
         server.read_exact(&mut buf).unwrap();
