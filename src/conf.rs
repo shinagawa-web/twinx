@@ -585,6 +585,8 @@ pub struct Server {
     /// connections with, when it has a certificate.
     pub ssl: Vec<SocketAddr>,
     pub tls: Option<crate::tls::ServerTls>,
+    /// The addresses it is the default server of ("listen ... default_server").
+    pub defaults: Vec<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -701,13 +703,14 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new() };
         self.level(block, SRV, &mut s.level)?;
         for d in block {
             match d.name.as_str() {
                 "listen" => {
                     let addrs = listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
                     if d.args[1..].iter().any(|a| a == "ssl") { s.ssl.extend(&addrs); }
+                    if d.args[1..].iter().any(|a| a == "default_server" || a == "default") { s.defaults.extend(&addrs); }
                     s.listen.extend(addrs);
                 }
                 "server_name" => {
