@@ -82,13 +82,19 @@ pub fn shut_down(timeout: Option<Duration>) {
 pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> Result<(), String> {
     for (listener, addr) in listeners {
         let (listener, addr, config) = (listener.try_clone().map_err(|e| e.to_string())?, *addr, config.clone());
+        // An address any server listens on with "ssl" takes TLS connections.
+        let tls = config.servers.iter().any(|s| s.ssl.contains(&addr)).then(|| crate::tls::server(config.clone(), addr));
         ACCEPTING.fetch_add(1, Ordering::SeqCst);
         thread::spawn(move || {
             while !SHUTTING.load(Ordering::SeqCst) {
-                let Ok((stream, _)) = listener.accept() else { continue };
+                let Ok((stream, peer)) = listener.accept() else { continue };
                 // Until its first request has arrived, a new connection is busy too.
-                let (config, fresh) = (config.clone(), Busy::new());
-                thread::spawn(move || connection(&config, stream, addr, fresh));
+                let (config, fresh, tls) = (config.clone(), Busy::new(), tls.clone());
+                let local = stream.local_addr().unwrap_or(addr);
+                thread::spawn(move || {
+                    let Some(stream) = (match tls { Some(t) => crate::tls::accept(stream, &t), None => Some(stream) }) else { return };
+                    connection(&config, stream, (addr, local, peer), fresh)
+                });
             }
             ACCEPTING.fetch_sub(1, Ordering::SeqCst);
         });
@@ -103,10 +109,10 @@ fn head_end(buf: &[u8]) -> Option<usize> {
     lf.into_iter().chain(crlf).min()
 }
 
-fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr, fresh: Busy) {
+/// Serves the requests of a connection accepted on a listening address,
+/// with its local and remote addresses.
+fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer): (SocketAddr, SocketAddr, SocketAddr), fresh: Busy) {
     let mut fresh = Some(fresh);
-    let local = stream.local_addr().unwrap_or(listen);
-    let peer = stream.peer_addr().unwrap_or(local);
     let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
     // After a kept-alive answer: how long the connection waits for the next request.
     let (connected, mut requests, mut idle) = (Instant::now(), 0, None);
@@ -815,8 +821,12 @@ fn browser(ua: &str) -> (bool, bool) {
 /// The answer of the location found, after the internal redirects of the
 /// index module, and the settings of the location that gave it.
 fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>) -> (Response, &'a Level, Request) {
-    if parsed.is_ok() { level = run(r, &level.script, run(r, &level.server_script, level)); }
-    let mut resp = respond(r, parsed, (prefix, level, auto));
+    // Once the location or an if block that applied has proxy_pass, the request
+    // is proxied: when the last if block that applied has no proxy_pass to
+    // inherit, nginx has no upstream for it and answers 500.
+    let mut proxied = level.proxy.is_some();
+    if parsed.is_ok() { level = run(r, &level.script, run(r, &level.server_script, level, &mut proxied), &mut proxied); }
+    let mut resp = if proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration"); special(500) } else { respond(r, parsed, (prefix, level, auto)) };
     let (mut redirects, mut to) = (0, r.clone());
     while let Some(target) = resp.internal.take() {
         // nginx gives up after 10 internal redirects.
@@ -832,7 +842,8 @@ fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix,
             to.target = target.clone();
             located(server, &to, &to.uri)
         };
-        level = run(&to, &found.script, if named.is_some() { found } else { run(&to, &found.server_script, found) });
+        let proxied = &mut false;
+        level = run(&to, &found.script, if named.is_some() { found } else { run(&to, &found.server_script, found, proxied) }, proxied);
         resp = if redirects > 10 || (target.starts_with('@') && named.is_none()) { special(500) } else { respond(&to, Ok(()), (prefix, level, auto)) };
         if let Some((headers, ctype)) = kept {
             resp.headers.splice(0..0, headers);
@@ -845,13 +856,18 @@ fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix,
 
 /// Runs set and if in order, and gives the settings the request goes on with:
 /// those of the last if block whose condition held, else the level's own.
-fn run<'a>(r: &Request, ops: &'a [Op], mut level: &'a Level) -> &'a Level {
+/// Notes whether one of those had proxy_pass.
+fn run<'a>(r: &Request, ops: &'a [Op], mut level: &'a Level, proxied: &mut bool) -> &'a Level {
     for op in ops {
         match op {
             // set $limit_rate: a value that is not a size leaves it as it was.
             Op::Set(name, value) if name == "limit_rate" => if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.limit_rate.set(rate); },
             Op::Set(name, value) => r.set_var(name, value.render(r, &Sent::default())),
-            Op::If(cond, body, to) => if holds(r, cond) { level = run(r, body, to.as_deref().unwrap_or(level)); },
+            Op::If(cond, body, to) => if holds(r, cond) {
+                level = to.as_deref().unwrap_or(level);
+                *proxied |= level.proxy.is_some();
+                level = run(r, body, level, proxied);
+            },
         }
     }
     level
@@ -928,10 +944,15 @@ fn index_error(level: &Level, r: &Request, path: &std::path::Path, err: &std::io
 /// Writes an error of the request to the error_log of its level, as nginx's
 /// lines are: the time, the level, the process, the message and the request.
 fn error_log(level: &Level, r: &Request, msg: &str) {
+    log_at(level, r, "error", msg)
+}
+
+/// Writes an error of the request at a level of error_log ("error", "alert").
+fn log_at(level: &Level, r: &Request, severity: &str, msg: &str) {
     let Some(mut log) = level.error_log.as_deref() else { return };
     let time = chrono::Local::now().format("%Y/%m/%d %H:%M:%S");
     let host = r.host.as_ref().map(|h| format!(", host: \"{h}\"")).unwrap_or_default();
-    let line = format!("{time} [error] {}#0: {msg}, client: {}, server: {}, request: \"{}\"{host}\n", std::process::id(), r.peer.ip(), r.server_name, r.line);
+    let line = format!("{time} [{severity}] {}#0: {msg}, client: {}, server: {}, request: \"{}\"{host}\n", std::process::id(), r.peer.ip(), r.server_name, r.line);
     let _ = log.write_all(line.as_bytes());
 }
 
@@ -1067,7 +1088,7 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
         let socket = bind.map(|b| bound(&up.peers[i].addr, b));
         if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
         let (start, mut time, mut counted) = (Instant::now(), [None; 3], [0; 3]);
-        answer = fetch(&up.peers[i].addr, socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade);
+        answer = fetch((&up.peers[i].addr, p.ssl), socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade);
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
@@ -1194,7 +1215,7 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
     let rest = url.strip_prefix("http://")?;
     let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
     if let Some(up) = p.groups.get(host) { return Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), up.clone())); }
-    let (name, port) = crate::conf::host_port(host)?;
+    let (name, port) = crate::conf::host_port(host, 80)?;
     // As in nginx, the implicit upstream of a proxy_pass with this host and port comes before the resolver.
     let implicit = p.implicit.lock().unwrap().get(&format!("{}:{port}", name.to_ascii_lowercase())).cloned();
     if let Some(up) = implicit { return Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), up)); }
@@ -1208,12 +1229,14 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
 /// it took to connect and to send the response head. While it waits for the
 /// head, the client closing the connection ends the request with 499, as
 /// proxy_ignore_client_abort off does.
-fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
+fn fetch((peer, ssl): (&SocketAddr, bool), socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
     let start = Instant::now();
-    let mut s = match socket {
+    let s = match socket {
         Some(socket) => socket.connect_timeout(&(*peer).into(), level.proxy_connect_timeout).ok().map(|()| TcpStream::from(socket))?,
         None => TcpStream::connect_timeout(peer, level.proxy_connect_timeout).ok()?,
     };
+    // proxy_pass https://: the TLS handshake is part of connecting.
+    let mut s = if ssl { crate::tls::connect(s, peer.ip(), level.proxy_connect_timeout)? } else { s };
     time[0] = Some(start.elapsed().as_millis());
     let _ = s.set_read_timeout(Some(level.proxy_read_timeout));
     let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
@@ -1496,7 +1519,7 @@ fn escape_uri(s: &str) -> String {
 /// its name: the one with the host as its name, else the longest "*.name"
 /// that matches, else the longest "name.*", else the first regular expression
 /// that matches, else the first server listening there. No host is "".
-fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) -> (&'a Server, Vec<(String, String)>) {
+pub fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) -> (&'a Server, Vec<(String, String)>) {
     let on = || config.servers.iter().filter(|s| s.listen.contains(&listen));
     let host = host.unwrap_or_default();
     let mut best: Option<(u8, std::cmp::Reverse<usize>, &Server)> = None;
@@ -1552,7 +1575,9 @@ fn located<'a>(server: &'a Server, r: &Request, uri: &str) -> Found<'a> {
     let found = location(server, uri);
     let kind = server.locations.iter().find(|l| std::ptr::eq(&l.level, found.1)).map(|l| &l.kind);
     if let Some(caps) = kind.and_then(|k| if let Match::Regex(re) = k { re.captures(uri) } else { None }) { r.set_captures(&caps); }
-    found
+    // A method limit_except does not allow gets the settings of its block.
+    let limited = found.1.limit_except.as_ref().filter(|(methods, _)| !methods.contains(&r.method)).map(|(_, l)| &**l);
+    (found.0, limited.unwrap_or(found.1), found.2)
 }
 
 fn location<'a>(server: &'a Server, uri: &str) -> Found<'a> {
@@ -1768,7 +1793,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (mut time, mut bytes) = ([None; 3], [0; 3]);
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0, false).unwrap();
+        let resp = fetch((&addr, false), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0, false).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
         // The body, the whole answer and the request, in bytes.
         assert_eq!(bytes, [4, 80, 18]);
@@ -1873,7 +1898,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
-        assert_eq!(fetch(&addr, socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap().status, 200);
+        assert_eq!(fetch((&addr, false), socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
@@ -1892,7 +1917,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
-        let mut resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).unwrap();
+        let mut resp = fetch((&addr, false), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).unwrap();
         // The body is read after the head, 4000 bytes (what came with the head too)
         // in each second of the clock: it ends in the third second.
         assert!(resp.body.is_empty() && resp.rest.is_some());
@@ -1933,10 +1958,10 @@ mod tests {
             }
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap();
+        let resp = fetch((&addr, false), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(fetch(&addr, None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).is_none());
+            assert!(fetch((&addr, false), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).is_none());
         }
     }
 
@@ -1960,7 +1985,7 @@ mod tests {
             thread::sleep(Duration::from_secs(5));
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
-        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
+        let p = Proxy { host: "h".into(), ssl: false, upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("POST /a HTTP/1.0\n\n");
         let resp = proxy(&p, &level, &r, "");
@@ -2044,7 +2069,7 @@ mod tests {
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: a/b\r\nX-Location: 1\r\nX-B: 2\r\n\r\n").unwrap();
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
-        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
+        let p = Proxy { host: "h".into(), ssl: false, upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
         let level = Level { proxy_hide_header: vec!["x-location".into(), "content-type".into()], proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("GET / HTTP/1.0\n\n");
         let resp = proxy(&p, &level, &r, "/");
@@ -2056,7 +2081,7 @@ mod tests {
     fn urls_with_variables() {
         let (_, r) = request("GET /a?b HTTP/1.0\n\n");
         let group = Arc::new(Upstream::new(Vec::new()));
-        let p = Proxy { host: String::new(), upstream: group.clone(), uri: None, url: None, groups: [("u".to_string(), group)].into(), implicit: Default::default() };
+        let p = Proxy { host: String::new(), ssl: false, upstream: group.clone(), uri: None, url: None, groups: [("u".to_string(), group)].into(), implicit: Default::default() };
         assert_eq!(resolved("http://u/y", &p, &Level::default(), &r).map(|t| (t.0, t.1)), Some(("u".into(), "/y".into())));
         let (host, uri, up) = resolved("http://127.0.0.2:81/x", &p, &Level::default(), &r).unwrap();
         assert_eq!((host.as_str(), uri.as_str(), up.peers[0].addr.to_string()), ("127.0.0.2:81", "/x", "127.0.0.2:81".to_string()));
@@ -2175,6 +2200,24 @@ mod tests {
         };
         assert_eq!(body("/c/xyz"), "xyz");
         assert_eq!(body("/a/f.txt"), "F");
+    }
+
+    #[test]
+    fn limit_except_and_proxy_pass_in_if() {
+        let text = "http { server { location /lg { limit_except GET { proxy_pass http://127.0.0.1:1; } } \
+                    location /i { set $t 1; if ($t) { proxy_pass http://127.0.0.1:1; } if ($t) { } } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let status = |line: &str| {
+            let (_, r) = request(&format!("{line} HTTP/1.0\n\n"));
+            let found = located(s, &r, &r.uri);
+            (answer(s, &r, Ok(()), found).0.status, found.1.proxy.is_some())
+        };
+        // GET allows HEAD too.
+        assert_eq!(status("HEAD /lg"), (404, false));
+        assert_eq!(status("PUT /lg").1, true);
+        // The last if has no proxy_pass to inherit, after one that had.
+        assert_eq!(status("GET /i"), (500, false));
     }
 
     #[test]
@@ -2340,7 +2383,7 @@ mod tests {
             String::from_utf8_lossy(&buf[..n]).into_owned()
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
-        let p = Proxy { host: "h".into(), upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
+        let p = Proxy { host: "h".into(), ssl: false, upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
         let set = Some(Template::parse("b=$arg_a").unwrap());
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), proxy_set_body: set, ..Level::default() };
         let (_, mut r) = request("POST /a?a=1 HTTP/1.0\nContent-Length: 3\n\n");

@@ -9,4 +9,5 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 flate2 = "1.1.11"
 libc = "0.2"
 regex = { version = "1.13.2", default-features = false, features = ["std", "unicode-case", "unicode-gencat", "unicode-perl"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 socket2 = "0.6"
