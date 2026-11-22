@@ -426,6 +426,15 @@ fn name(name: &x509_parser::x509::X509Name, legacy: bool) -> String {
     rdns.map(|a| a.join("+")).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(",")
 }
 
+/// A certificate in PEM, as OpenSSL writes it: base64 in lines of 64 characters.
+fn pem(der: &[u8]) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let quad = |c: &[u8]| { let (n, len) = (c.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)) << (8 * (3 - c.len())), c.len()); (0..4).map(move |i| if i <= len { DIGITS[(n >> (18 - 6 * i) & 63) as usize] } else { b'=' }) };
+    let base64: Vec<u8> = der.chunks(3).flat_map(quad).collect();
+    let lines: Vec<&str> = base64.chunks(64).map(|l| std::str::from_utf8(l).unwrap_or_default()).collect();
+    format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", lines.join("\n"))
+}
+
 impl Session {
     /// The variables of the client's certificate: $ssl_client_i_dn (its issuer),
     /// $ssl_client_s_dn_legacy and $ssl_client_i_dn_legacy, $ssl_client_v_start
@@ -440,6 +449,9 @@ impl Session {
             "i_dn_legacy" => name(cert.issuer(), true),
             "v_start" => time(cert.validity().not_before),
             "v_end" => time(cert.validity().not_after),
+            "raw_cert" => pem(self.cert.as_deref().unwrap_or_default()),
+            // As nginx's NGX_ESCAPE_URI_COMPONENT: all but letters, digits and "-._~".
+            "escaped_cert" => pem(self.cert.as_deref().unwrap_or_default()).bytes().map(|c| if c.is_ascii_alphanumeric() || b"-._~".contains(&c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect(),
             _ => ((cert.validity().not_after.timestamp() - now() as i64) / 86400).max(0).to_string(),
         }
     }
@@ -876,6 +888,17 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 4q04yOy8aX97GVjXKn4C5xldyA0=
 -----END CERTIFICATE-----
 ";
+
+    #[test]
+    fn gives_the_client_certificate_in_pem() {
+        let session = Session { cert: Some(der(CERT)), ..Session::default() };
+        assert_eq!(session.client_var("raw_cert"), CERT);
+        let escaped = session.client_var("escaped_cert");
+        assert!(escaped.starts_with("-----BEGIN%20CERTIFICATE-----%0AMIIBfzCCASWgAwIBAgIUL%2Fk6"));
+        assert!(escaped.ends_with("wYWN%0A-----END%20CERTIFICATE-----%0A"));
+        assert_eq!(pem(b"ab"), "-----BEGIN CERTIFICATE-----\nYWI=\n-----END CERTIFICATE-----\n");
+        assert_eq!(Session::default().client_var("raw_cert"), "");
+    }
 
     #[test]
     fn takes_the_cipher_suites_of_ssl_ciphers() {
