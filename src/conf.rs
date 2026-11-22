@@ -85,6 +85,8 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("limit_except", LOC, 1, usize::MAX, true),
     ("ssl_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_key", HTTP | SRV, 1, 1, false),
+    ("ssl_session_cache", HTTP | SRV, 1, 2, false),
+    ("proxy_ssl_session_reuse", HSL, 1, 1, false),
     ("proxy_method", HSL, 1, 1, false),
     ("proxy_set_body", HSL, 1, 1, false),
     ("expires", HSL | LIF, 1, 2, false),
@@ -419,6 +421,8 @@ pub struct Level {
     /// the block, which requests with any other method get instead of the
     /// location's. Nested locations and if blocks do not inherit it.
     pub limit_except: Option<(Vec<String>, Arc<Level>)>,
+    /// proxy_ssl_session_reuse: TLS sessions to proxied servers are reused.
+    pub proxy_ssl_session_reuse: bool,
 }
 
 /// try_files: the files tried in order, each a directory when its parameter
@@ -562,7 +566,7 @@ impl Builder<'_> {
         // Without root, files come from html under the prefix, as nginx's default root is.
         let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let servers = d.block.as_deref().unwrap_or_default();
             servers.iter().try_for_each(|s| self.check(s, UPS))?;
@@ -697,6 +701,9 @@ impl Builder<'_> {
                 }
                 "ssl_certificate" => level.ssl_certificate = Some(self.path(&d.args[0])),
                 "ssl_certificate_key" => level.ssl_certificate_key = Some(self.path(&d.args[0])),
+                // Sessions are kept in memory whatever the cache: the value is only checked.
+                "ssl_session_cache" => if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
+                "proxy_ssl_session_reuse" => level.proxy_ssl_session_reuse = flag(d).map_err(at)?,
                 "proxy_redirect" => {
                     let rule = if d.args == ["default"] {
                         let proxy = level.proxy.as_ref().filter(|_| own_proxy).ok_or_else(|| at("\"proxy_redirect default\" should be placed after the \"proxy_pass\" directive".into()))?;
