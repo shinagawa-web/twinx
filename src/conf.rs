@@ -89,6 +89,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_certificate_compression", HTTP | SRV, 1, 1, false),
     ("ssl_ciphers", HTTP | SRV, 1, 1, false),
     ("ssl_protocols", HTTP | SRV, 1, usize::MAX, false),
+    ("ssl_ecdh_curve", HTTP | SRV, 1, 1, false),
     ("ssl_prefer_server_ciphers", HTTP | SRV, 1, 1, false),
     ("ssl_conf_command", HTTP | SRV, 2, 2, false),
     ("ssl_session_cache", HTTP | SRV, 1, 2, false),
@@ -452,6 +453,8 @@ pub struct Level {
     pub ssl_protocols: [bool; 2],
     /// ssl_prefer_server_ciphers: the server's order of cipher suites wins over the client's.
     pub ssl_prefer_server_ciphers: bool,
+    /// ssl_ecdh_curve: the groups keys are exchanged with; None takes the default ones.
+    pub ssl_ecdh_curve: Option<String>,
     /// ssl_conf_command: OpenSSL's commands and their values, files named in
     /// full; those of a level replace those inherited as a whole.
     pub ssl_conf_command: Vec<(String, String)>,
@@ -698,7 +701,7 @@ impl Builder<'_> {
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
         let l = &s.level;
         let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
-        let mut options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth };
+        let mut options = crate::tls::Options { verify: l.ssl_verify_client, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, curves: l.ssl_ecdh_curve.clone(), crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth };
         let extra = conf_commands(&l.ssl_conf_command, &mut options)?;
         let pairs = l.ssl_certificate.iter().zip(&l.ssl_certificate_key).chain(extra[0].iter().zip(&extra[1]));
         let files: Vec<(&Path, &Path)> = pairs.map(|(cert, key)| (cert.as_path(), key.as_path())).collect();
@@ -800,6 +803,7 @@ impl Builder<'_> {
                 "ssl_certificate_compression" => level.ssl_certificate_compression = flag(d).map_err(at)?,
                 "ssl_ciphers" => level.ssl_ciphers = Some(d.args[0].clone()),
                 "ssl_protocols" => level.ssl_protocols = protocols(&d.args).map_err(at)?,
+                "ssl_ecdh_curve" => level.ssl_ecdh_curve = Some(d.args[0].clone()),
                 "ssl_prefer_server_ciphers" => level.ssl_prefer_server_ciphers = flag(d).map_err(at)?,
                 // OpenSSL's commands that take a file are given its name in full, as nginx does.
                 "ssl_conf_command" => commands.get_or_insert_default().push((d.args[0].clone(), if ["Certificate", "PrivateKey"].contains(&d.args[0].as_str()) { self.path(&d.args[1]).to_string_lossy().into_owned() } else { d.args[1].clone() })),
@@ -1869,7 +1873,7 @@ mod tests {
 
     #[test]
     fn ssl_conf_commands() {
-        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, crl: None, depth: 1 };
+        let mut options = crate::tls::Options { verify: false, sessions: crate::tls::Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: true, curves: None, crl: None, depth: 1 };
         let commands = |c: &[(&str, &str)]| c.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
         let files = conf_commands(&commands(&[("Options", "-SessionTicket, -ServerPreference"), ("Certificate", "/c.crt"), ("PrivateKey", "/c.key")]), &mut options).unwrap();
         assert!(!options.sessions.tickets && !options.prefer);
