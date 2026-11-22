@@ -22,7 +22,7 @@ files = [
   "proxy_websocket.t",
 ]
 
-# Stage 2: what stage 1 left (files that need only the http, rewrite and proxy
+# Stage 2, done at v0.2.0 (2026-11-22): what stage 1 left (files that need only the http, rewrite and proxy
 # modules), and gzip: files that need only those and the gzip, gunzip or
 # gzip_static modules. The twinx_*.t files are twinx's own tests
 # (harness/nginx-tests/extra): behaviour of those files that nginx-tests does not
