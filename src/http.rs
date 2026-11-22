@@ -498,7 +498,7 @@ fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Template)>
         (Some((code, text)), _, _) if text.0.is_empty() && code >= 400 => special(code),
         (Some((code, text)), _, _) => {
             let ctype = Some("text/plain".to_string());
-            Response { status: code, ctype, body: text.render(r, &Sent::default()).into_bytes(), ..Response::default() }
+            Response { status: code, ctype, body: crate::vars::bytes(&text.render(r, &Sent::default())), ..Response::default() }
         }
         (None, _, Some(tf)) => try_files(tf, level, r, prefix),
         (None, Some(p), None) => proxy(p, level, r, prefix),
@@ -664,7 +664,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         let server = if level.server_tokens { NAME } else { "twinx" };
         let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {server}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{header}{vary}");
         resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
-        out = (head + "\r\n").into_bytes();
+        out = crate::vars::bytes(&(head + "\r\n"));
     }
     let body_len = if r.method == "HEAD" || silent { 0 } else { resp.body.len() };
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
@@ -677,7 +677,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     }
     if chunked {
         out.extend_from_slice(if body_len > 0 { b"\r\n0\r\n" } else { b"0\r\n" });
-        trailers.iter().for_each(|(n, v)| out.extend_from_slice(format!("{n}: {v}\r\n").as_bytes()));
+        trailers.iter().for_each(|(n, v)| out.extend(crate::vars::bytes(&format!("{n}: {v}\r\n"))));
         out.extend_from_slice(b"\r\n");
     }
     // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
@@ -1050,7 +1050,7 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
     // proxy_pass_request_headers off passes none of the client's headers.
     let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()) && !is_set(n));
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
-    let mut req = (req + "\r\n").into_bytes();
+    let mut req = crate::vars::bytes(&(req + "\r\n"));
     req.extend_from_slice(&body);
     // proxy_bind: an empty value binds to nothing; a value that is no address fails the request.
     let bind = level.proxy_bind.as_ref().map(|(a, t)| (a.render(r, &Sent::default()), *t)).filter(|(a, _)| !a.is_empty());
@@ -1231,7 +1231,7 @@ fn fetch(peer: &SocketAddr, socket: Option<socket2::Socket>, req: &[u8], level: 
         bytes[1] = answer.len() as u64;
     };
     time[1] = Some(start.elapsed().as_millis());
-    let head = String::from_utf8_lossy(&answer[..end]).into_owned();
+    let head = crate::vars::text(&answer[..end]);
     let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
     let status = lines.next()?.strip_prefix("HTTP/1.")?.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()?;
     let mut resp = Response { status, proxied: true, ..Response::default() };
@@ -1389,7 +1389,7 @@ fn client_closed(s: &TcpStream, client: i32, timeout: Duration) -> Option<bool> 
 
 /// Fills the request from its head, or gives the status nginx refuses it with.
 fn parse(r: &mut Request, head: &[u8], level: &Level) -> Result<(), u16> {
-    let text = String::from_utf8_lossy(head);
+    let text = crate::vars::text(head);
     let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     r.line = lines.next().unwrap_or_default().to_string();
     let words: Vec<&str> = r.line.split(' ').filter(|w| !w.is_empty()).collect();
