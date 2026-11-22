@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 
 # An extra test for twinx, not part of nginx-tests: behaviour nginx-tests does
-# not check, found by the security checks (twinx-gauntlet) in twinx v0.1.1.
+# not check, found by security checks in twinx v0.1.1.
 # Written in nginx-tests' style and checked against nginx 1.30.6.
 
 ###############################################################################
