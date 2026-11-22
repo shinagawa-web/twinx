@@ -237,7 +237,7 @@ fn decode_chunked(buf: &[u8], max: u64) -> Result<(Vec<u8>, Option<usize>), u16>
     let line = |at: usize| buf[at..].iter().position(|&c| c == b'\n').map(|n| (String::from_utf8_lossy(&buf[at..at + n]).trim_end_matches('\r').to_string(), at + n + 1));
     loop {
         let Some((size, next)) = line(at) else { return Ok((body, None)) };
-        let size = u64::from_str_radix(size.split(';').next().unwrap_or_default().trim(), 16).map_err(|_| 400u16)?;
+        let size = chunk_size(&size).ok_or(400u16)?;
         at = next;
         if size == 0 { break; }
         if (body.len() as u64).saturating_add(size) > max { return Err(413); }
@@ -253,6 +253,15 @@ fn decode_chunked(buf: &[u8], max: u64) -> Result<(Vec<u8>, Option<usize>), u16>
         at = next;
         if trailer.is_empty() { return Ok((body, Some(at))); }
     }
+}
+
+/// A chunk's size as nginx reads it: hex digits from the start of the line, up
+/// to 2^63 - 1, then nothing or an extension after ";", a space or a tab.
+fn chunk_size(line: &str) -> Option<u64> {
+    let digits = line.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(line.len());
+    let (hex, rest) = line.split_at(digits);
+    let extension = rest.is_empty() || rest.starts_with([';', ' ', '\t']);
+    (digits > 0 && extension).then(|| i64::from_str_radix(hex, 16).ok()).flatten().map(|n| n as u64)
 }
 
 /// Closes the connection as nginx's lingering close does: stops sending, then
@@ -1979,6 +1988,13 @@ mod tests {
         let dir = std::path::Path::new("/t");
         assert_eq!(temp_file(dir, &[], 2), PathBuf::from("/t/0000000002"));
         assert_eq!(temp_file(dir, &[1, 2], 1234), PathBuf::from("/t/4/23/0000001234"));
+    }
+
+    #[test]
+    fn chunk_sizes() {
+        assert_eq!((chunk_size("a"), chunk_size("00"), chunk_size("5;x=1"), chunk_size("5 ")), (Some(10), Some(0), Some(5), Some(5)));
+        assert_eq!((chunk_size("7fffffffffffffff"), chunk_size("8000000000000000")), (Some(i64::MAX as u64), None));
+        assert_eq!((chunk_size("+5"), chunk_size(" 5"), chunk_size(""), chunk_size("5x")), (None, None, None, None));
     }
 
     #[test]
