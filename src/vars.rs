@@ -178,6 +178,8 @@ pub enum Var {
     Scheme,
     SslProtocol,
     SslSessionReused,
+    SslClientVerify,
+    SslClientSDn,
     LimitRate,
     /// A named capture of the server name's regular expression.
     Capture(String),
@@ -209,6 +211,7 @@ impl Var {
             ("proxy_host", Var::ProxyHost), ("proxy_port", Var::ProxyPort), ("proxy_add_x_forwarded_for", Var::ProxyAddXForwardedFor),
             ("server_name", Var::ServerName), ("scheme", Var::Scheme), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
             ("ssl_protocol", Var::SslProtocol), ("ssl_session_reused", Var::SslSessionReused),
+            ("ssl_client_verify", Var::SslClientVerify), ("ssl_client_s_dn", Var::SslClientSDn),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -255,6 +258,8 @@ impl Var {
             Var::Scheme => (if r.ssl.is_some() { "https" } else { "http" }).to_string(),
             Var::SslProtocol => r.ssl.as_ref()?.protocol.clone(),
             Var::SslSessionReused => (if r.ssl.as_ref()?.reused { "r" } else { "." }).to_string(),
+            Var::SslClientVerify => r.ssl.as_ref()?.client_verify.clone(),
+            Var::SslClientSDn => r.ssl.as_ref()?.client_s_dn.clone()?,
             Var::LimitRate => r.limit_rate.get().unwrap_or(0).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
             Var::User(name) => r.vars.lock().unwrap().iter().find(|v| v.0 == *name)?.1.clone(),

@@ -92,7 +92,7 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
                 let (config, fresh, tls) = (config.clone(), Busy::new(), tls.clone());
                 let local = stream.local_addr().unwrap_or(addr);
                 thread::spawn(move || {
-                    let Some((stream, ssl)) = (match tls { Some(t) => crate::tls::accept(stream, &t).map(|(s, ssl)| (s, Some(ssl))), None => Some((stream, None)) }) else { return };
+                    let Some((stream, ssl)) = (match tls { Some(t) => crate::tls::accept(stream, &t, &config, addr).map(|(s, ssl)| (s, Some(ssl))), None => Some((stream, None)) }) else { return };
                     connection(&config, stream, (addr, local, peer, ssl), fresh)
                 });
             }
@@ -1240,7 +1240,7 @@ fn fetch((peer, ssl): (&SocketAddr, bool), socket: Option<socket2::Socket>, req:
     };
     // proxy_pass https://: the TLS handshake is part of connecting.
     // A handshake that does not end within proxy_connect_timeout is a timeout, answered with 504.
-    let tls = |s| crate::tls::connect(s, peer.ip(), level.proxy_connect_timeout, level.proxy_ssl_session_reuse);
+    let tls = |s| crate::tls::connect(s, peer.ip(), level.proxy_connect_timeout, level.proxy_ssl_session_reuse, level.proxy_ssl_certificate.as_ref());
     let mut s = if ssl { match tls(s) { Ok(s) => s, Err(e) => return (e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504)) } } else { s };
     time[0] = Some(start.elapsed().as_millis());
     let _ = s.set_read_timeout(Some(level.proxy_read_timeout));
