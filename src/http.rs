@@ -182,8 +182,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr, fresh:
                     Ok(Some((body, used))) => {
                         r.length += used;
                         buf.drain(..used);
-                        keep_body(&mut r, level, body);
-                        break Ok(());
+                        break keep_body(&mut r, level, body);
                     }
                     Err(status) => break Err(status),
                 }
@@ -202,7 +201,7 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr, fresh:
             if pass_body(&mut u, level.max_body, &mut std::io::sink()).is_none() { return; }
             buf = u.rest;
         }
-        if !level.body_in_file_only { r.body_file.map(std::fs::remove_file); }
+        if !level.body_in_file_only || level.body_clean { r.body_file.map(std::fs::remove_file); }
         if idle.is_none() || SHUTTING.load(Ordering::SeqCst) { return linger(&mut stream); }
     }
 }
@@ -211,7 +210,9 @@ fn connection(config: &Config, mut stream: TcpStream, listen: SocketAddr, fresh:
 fn framing(r: &Request) -> Result<Option<u64>, u16> {
     let te: Vec<&String> = r.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("transfer-encoding")).map(|(_, v)| v).collect();
     let length = header(r, "content-length");
-    if te.is_empty() { return length.map_or(Ok(Some(0)), |v| v.parse().map(Some).map_err(|_| 400)); }
+    // Digits only, up to the largest file offset (2^63 - 1).
+    let digits = |v: &str| v.bytes().all(|c| c.is_ascii_digit()).then(|| v.parse::<i64>().ok()).flatten().map(|n| n as u64);
+    if te.is_empty() { return length.map_or(Ok(Some(0)), |v| digits(v).map(Some).ok_or(400)); }
     if te.len() > 1 || length.is_some() || !r.line.ends_with("HTTP/1.1") { return Err(400); }
     if te[0].eq_ignore_ascii_case("chunked") { Ok(None) } else { Err(501) }
 }
@@ -239,7 +240,7 @@ fn decode_chunked(buf: &[u8], max: u64) -> Result<(Vec<u8>, Option<usize>), u16>
         let size = u64::from_str_radix(size.split(';').next().unwrap_or_default().trim(), 16).map_err(|_| 400u16)?;
         at = next;
         if size == 0 { break; }
-        if body.len() as u64 + size > max { return Err(413); }
+        if (body.len() as u64).saturating_add(size) > max { return Err(413); }
         let end = at + size as usize;
         let after = buf.get(end..).unwrap_or_default();
         if after.is_empty() || after == b"\r" { body.extend_from_slice(&buf[at..end.min(buf.len())]); return Ok((body, None)); }
@@ -264,14 +265,27 @@ fn linger(stream: &mut TcpStream) {
 }
 
 /// Keeps the request body in memory, or in a file under client_body_temp_path
-/// when it does not fit client_body_buffer_size or client_body_in_file_only is on.
-fn keep_body(r: &mut Request, level: &Level, body: Vec<u8>) {
+/// when it does not fit client_body_buffer_size or client_body_in_file_only is on;
+/// 500 when the file cannot be written.
+fn keep_body(r: &mut Request, level: &Level, body: Vec<u8>) -> Result<(), u16> {
     static NEXT: AtomicU32 = AtomicU32::new(1);
     let to_file = !body.is_empty() && (level.body_in_file_only || body.len() as u64 > level.body_buffer);
-    if !to_file { return r.body = body; }
-    let path = level.body_temp_path.join(format!("{:010}", NEXT.fetch_add(1, Ordering::Relaxed)));
-    let _ = std::fs::create_dir_all(&level.body_temp_path);
-    r.body_file = std::fs::write(&path, &body).is_ok().then_some(path);
+    if !to_file { r.body = body; return Ok(()); }
+    let path = temp_file(&level.body_temp_path, &level.body_temp_levels, NEXT.fetch_add(1, Ordering::Relaxed));
+    let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, &body));
+    if let Err(e) = written { error_log(level, r, &format!("open() \"{}\" failed ({e})", path.display())); return Err(500); }
+    r.body_file = Some(path);
+    Ok(())
+}
+
+/// A temporary file's path: the number in ten digits, in the subdirectories
+/// the levels name, each taken from the end of the name (levels 1 2: 2/00/0000000002).
+fn temp_file(dir: &std::path::Path, levels: &[usize], n: u32) -> PathBuf {
+    let name = format!("{n:010}");
+    let mut end = name.len();
+    let mut path = dir.to_path_buf();
+    for &l in levels { path.push(&name[end - l..end]); end -= l; }
+    path.join(name)
 }
 
 fn header<'a>(r: &'a Request, name: &str) -> Option<&'a str> {
@@ -1949,11 +1963,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("twinx-body-{}", std::process::id()));
         let level = Level { body_buffer: 4, body_temp_path: dir, ..Level::default() };
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
-        keep_body(&mut r, &level, b"abc".to_vec());
+        keep_body(&mut r, &level, b"abc".to_vec()).unwrap();
         assert_eq!((r.body.as_slice(), r.body_file.is_none()), (&b"abc"[..], true));
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
-        keep_body(&mut r, &level, b"abcde".to_vec());
+        keep_body(&mut r, &level, b"abcde".to_vec()).unwrap();
         assert_eq!(std::fs::read(r.body_file.unwrap()).unwrap(), b"abcde");
+        // A file that cannot be written (its directory is a file) is 500.
+        let level = Level { body_buffer: 4, body_temp_path: std::env::current_exe().unwrap(), ..Level::default() };
+        let (_, mut r) = request("GET / HTTP/1.0\n\n");
+        assert_eq!(keep_body(&mut r, &level, b"abcde".to_vec()), Err(500));
+    }
+
+    #[test]
+    fn temp_files_under_levels() {
+        let dir = std::path::Path::new("/t");
+        assert_eq!(temp_file(dir, &[], 2), PathBuf::from("/t/0000000002"));
+        assert_eq!(temp_file(dir, &[1, 2], 1234), PathBuf::from("/t/4/23/0000001234"));
+    }
+
+    #[test]
+    fn content_length_digits_only() {
+        let length = |v: &str| framing(&request(&format!("POST / HTTP/1.0\nContent-Length: {v}\n\n")).1);
+        assert_eq!(length("9223372036854775807"), Ok(Some(i64::MAX as u64)));
+        assert_eq!((length("+0"), length("9223372036854775808"), length("")), (Err(400), Err(400), Err(400)));
     }
 
     #[test]

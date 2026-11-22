@@ -293,7 +293,12 @@ pub struct Level {
     pub merge_slashes: bool,
     pub body_buffer: u64,
     pub body_in_file_only: bool,
+    /// client_body_in_file_only clean: the file is removed after the request.
+    pub body_clean: bool,
     pub body_temp_path: PathBuf,
+    /// The levels of client_body_temp_path: the lengths of the subdirectory
+    /// names, taken from the end of the file name.
+    pub body_temp_levels: Vec<usize>,
     /// expires, as written ("modified 1h", "$arg_e"): parsed for each response.
     pub expires: Option<Template>,
     /// post_action: the URI (or named location) asked for after the answer is
@@ -660,7 +665,8 @@ impl Builder<'_> {
                         (Some(Some(list)), Some(rule)) => list.push(rule), _ => return Err(at("\"proxy_redirect\" directive is duplicate".into())),
                     }
                 }
-                "client_max_body_size" => level.max_body = size(&d.args[0]).map_err(at)?,
+                // 0 is no limit.
+                "client_max_body_size" => level.max_body = Some(size(&d.args[0]).map_err(at)?).filter(|&n| n > 0).unwrap_or(u64::MAX),
                 // Headers are read whole whatever the buffers, so these are only checked.
                 "large_client_header_buffers" | "connection_pool_size" => {
                     let number = d.args.len() == 1 || d.args[0].parse::<u64>().is_ok_and(|n| n > 0);
@@ -686,8 +692,14 @@ impl Builder<'_> {
                 "proxy_max_temp_file_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
                 "proxy_buffers" => if d.args[0].parse::<u64>().map_or(true, |n| n == 0) || size(&d.args[1]).map_or(true, |n| n == 0) { return Err(at("\"proxy_buffers\" directive invalid value".into())); }
-                "client_body_in_file_only" => level.body_in_file_only = d.args[0] != "off",
-                "client_body_temp_path" => level.body_temp_path = self.path(&d.args[0]),
+                "client_body_in_file_only" => {
+                    let value = ["off", "on", "clean"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))?;
+                    (level.body_in_file_only, level.body_clean) = (value > 0, value == 2);
+                }
+                "client_body_temp_path" => {
+                    level.body_temp_path = self.path(&d.args[0]);
+                    level.body_temp_levels = temp_levels(&d.args[1..]).ok_or_else(|| at("invalid value".into()))?;
+                }
                 "default_type" => level.default_type = d.args[0].clone(),
                 "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
                 "resolver" => level.resolver = Some(Arc::new(Resolver::parse(&d.args).map_err(at)?)),
@@ -1051,6 +1063,12 @@ fn size_value(s: &str) -> Result<Template, String> {
     Ok(t)
 }
 
+/// The levels of a temporary path: each a number above 0, ten digits at most in all.
+fn temp_levels(args: &[String]) -> Option<Vec<usize>> {
+    let levels: Vec<usize> = args.iter().map(|a| a.parse().ok().filter(|&n| n > 0 && a.bytes().all(|c| c.is_ascii_digit()))).collect::<Option<_>>()?;
+    (levels.iter().sum::<usize>() <= 10).then_some(levels)
+}
+
 /// A size such as "512", "8k" or "1m".
 pub fn size(s: &str) -> Result<u64, String> {
     let (digits, unit) = s.find(|c: char| !c.is_ascii_digit()).map_or((s, ""), |i| s.split_at(i));
@@ -1244,6 +1262,16 @@ mod tests {
     }
 
     #[test]
+    fn body_files_and_no_limit() {
+        let c = build_text("http { server { client_max_body_size 0; client_body_in_file_only clean; client_body_temp_path /t 1 2; } }").unwrap();
+        let l = &c.servers[0].level;
+        assert_eq!((l.max_body, l.body_in_file_only, l.body_clean, l.body_temp_levels.as_slice()), (u64::MAX, true, true, &[1, 2][..]));
+        assert_eq!(build_text("http { client_body_in_file_only yes; }").unwrap_err(), "invalid value \"yes\" in t.conf:1");
+        assert_eq!(build_text("http { client_body_temp_path /t 0; }").unwrap_err(), "invalid value in t.conf:1");
+        assert_eq!(build_text("http { client_body_temp_path /t 5 6; }").unwrap_err(), "invalid value in t.conf:1");
+    }
+
+    #[test]
     fn proxy_upstream_and_body_settings() {
         let c = build_text(
             "http { upstream u { server 127.0.0.1:8082 backup; server 127.0.0.1:8081 weight=2; } \
@@ -1257,7 +1285,7 @@ mod tests {
         assert_eq!((p.host.as_str(), p.uri.as_deref()), ("u", Some("/x")));
         let addrs: Vec<String> = p.upstream.peers.iter().map(|p| format!("{} {} {}", p.addr, p.weight, p.backup)).collect();
         assert_eq!(addrs, vec!["127.0.0.1:8082 1 true", "127.0.0.1:8081 2 false"]);
-        assert_eq!((a.max_body, a.body_buffer, a.body_in_file_only), (1024, 2048, true));
+        assert_eq!((a.max_body, a.body_buffer, a.body_in_file_only, a.body_clean), (1024, 2048, true, false));
         assert_eq!(a.add_header[0].0, "X");
         assert_eq!((a.add_trailer[0].0.as_str(), a.add_trailer[0].2, b.add_trailer[0].0.as_str()), ("U", true, "T"));
         assert_eq!(b.proxy.as_ref().unwrap().host, "127.0.0.1:8083");
