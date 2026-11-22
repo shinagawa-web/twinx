@@ -858,8 +858,8 @@ impl Builder<'_> {
         if let Some(flags) = flags { level.proxy_cookie_flags = flags; }
         if let Some(redirects) = redirects { level.proxy_redirect = redirects; }
         if own_tls {
-            // Names without variables are loaded once, here.
-            let names = level.proxy_ssl_certificate.clone().zip(level.proxy_ssl_certificate_key.clone());
+            // Names without variables are loaded once, here; an empty certificate is none.
+            let names = level.proxy_ssl_certificate.clone().zip(level.proxy_ssl_certificate_key.clone()).filter(|(c, _)| !c.0.is_empty());
             let fixed = names.as_ref().and_then(|(c, k)| text(c).zip(text(k))).map(|(c, k)| (self.path(&c), self.path(&k)));
             level.proxy_ssl_certificate_vars = names.filter(|_| fixed.is_none()).map(|(c, k)| (c, k, self.prefix.to_path_buf()));
             let cert = fixed.as_ref().map(|(c, k)| (c.as_path(), k.as_path(), level.proxy_ssl_password_file.as_deref()));
@@ -1714,5 +1714,7 @@ mod tests {
         assert_eq!(cert_cache(&["size=1".into()]).unwrap_err(), "invalid parameter \"size=1\"");
         let c = build_text("http { server { listen 127.0.0.1:8080; proxy_ssl_certificate $arg_c.crt; proxy_ssl_certificate_key k.key; location / { } } }").unwrap();
         assert!(c.servers[0].level.proxy_ssl_certificate_vars.is_some());
+        let c = build_text("http { server { listen 127.0.0.1:8080; proxy_ssl_certificate \"\"; proxy_ssl_certificate_key \"\"; location / { } } }").unwrap();
+        assert!(c.servers[0].level.proxy_ssl_certificate_vars.is_none());
     }
 }
