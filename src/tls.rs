@@ -287,6 +287,8 @@ pub struct Options {
     pub protocols: [bool; 2],
     /// ssl_prefer_server_ciphers: the server's order of cipher suites wins.
     pub prefer: bool,
+    /// ssl_ecdh_curve: the groups keys are exchanged with; None takes the default ones.
+    pub curves: Option<String>,
     /// ssl_crl and ssl_verify_depth: the CRLs clients' certificates are
     /// checked against, and how many issuers their chains may have.
     pub crl: Option<PathBuf>,
@@ -359,7 +361,8 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     let named = named.map(|cache| Ok::<_, String>(Named { files: templates()?, passwords: passwords.map(Path::to_path_buf), cache })).transpose()?;
     let trusted = trust.iter().map(|p| trusted(p)).collect::<Result<Vec<_>, _>>()?.concat();
     let suites = options.ciphers.as_deref().map(ciphers).transpose()?;
-    let suites = CryptoProvider { cipher_suites: suites.unwrap_or_else(|| provider().cipher_suites.clone()), ..(*provider()).clone() };
+    let groups = options.curves.as_deref().map(curves).transpose()?;
+    let suites = CryptoProvider { cipher_suites: suites.unwrap_or_else(|| provider().cipher_suites.clone()), kx_groups: groups.unwrap_or_else(|| provider().kx_groups.clone()), ..(*provider()).clone() };
     let versions: Vec<_> = [&rustls::version::TLS12, &rustls::version::TLS13].into_iter().zip(options.protocols).filter_map(|(v, on)| on.then_some(v)).collect();
     let builder = ServerConfig::builder_with_provider(Arc::new(suites)).with_protocol_versions(&versions).map_err(|e| e.to_string())?;
     let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms))) } else { builder.with_no_client_auth() };
@@ -409,6 +412,10 @@ pub struct Session {
     pub cipher: String,
     pub ciphers: String,
     pub cert: Option<CertificateDer<'static>>,
+    /// The group the keys were exchanged with ($ssl_curve) and those the
+    /// client offered ($ssl_curves), by OpenSSL's names.
+    pub curve: String,
+    pub curves: String,
 }
 
 /// OpenSSL's names of cipher suites, as $ssl_cipher and $ssl_ciphers give them.
@@ -427,6 +434,26 @@ const CIPHERS: &[(u16, &str)] = &[
     (0xc09f, "DHE-RSA-AES256-CCM"), (0xc09e, "DHE-RSA-AES128-CCM"), (0xc09d, "AES256-CCM"), (0xc09c, "AES128-CCM"),
     (0x00ff, "TLS_EMPTY_RENEGOTIATION_INFO_SCSV"), (0x5600, "TLS_FALLBACK_SCSV"),
 ];
+
+/// The names OpenSSL gives the groups keys are exchanged with, and those
+/// ssl_ecdh_curve takes for the ones twinx has.
+const CURVES: &[(u16, &str)] = &[
+    (0x0017, "prime256v1"), (0x0018, "secp384r1"), (0x0019, "secp521r1"), (0x001d, "X25519"), (0x001e, "X448"),
+    (0x0100, "ffdhe2048"), (0x0101, "ffdhe3072"), (0x0102, "ffdhe4096"), (0x0103, "ffdhe6144"), (0x0104, "ffdhe8192"),
+];
+
+/// The name OpenSSL gives a group; one it does not know is "0x" and its number.
+fn curve(id: u16) -> String {
+    CURVES.iter().find(|c| c.0 == id).map_or_else(|| format!("0x{id:04x}"), |c| c.1.to_string())
+}
+
+/// The groups of ssl_ecdh_curve, separated by colons, by OpenSSL's names or
+/// their NIST ones (P-256, P-384); "auto" takes those twinx has by default.
+fn curves(list: &str) -> Result<Vec<&'static dyn rustls::crypto::SupportedKxGroup>, String> {
+    if list == "auto" { return Ok(provider().kx_groups.clone()) }
+    let named = |n: &str| rustls::crypto::ring::ALL_KX_GROUPS.iter().copied().find(|g| [curve(u16::from(g.name())), format!("{:?}", g.name())].iter().any(|c| c.eq_ignore_ascii_case(n)) || [("P-256", 0x0017), ("P-384", 0x0018)].contains(&(n, u16::from(g.name()))));
+    list.split(':').map(|n| named(n).ok_or_else(|| format!("SSL_CTX_set1_curves_list(\"{list}\") failed"))).collect()
+}
 
 /// The name OpenSSL gives a cipher suite; one it does not know is "0x" and its number.
 fn cipher(id: u16) -> String {
@@ -487,13 +514,14 @@ pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option
     let name = hello.client_hello().server_name().unwrap_or_default().to_string();
     let tls = crate::http::server(config, listen, hello.client_hello().server_name()).0.tls.as_ref()?;
     let ciphers = hello.client_hello().cipher_suites().iter().map(|c| cipher(u16::from(*c))).collect::<Vec<_>>().join(":");
+    let curves = hello.client_hello().named_groups().unwrap_or_default().iter().map(|g| curve(u16::from(*g))).collect::<Vec<_>>().join(":");
     let mut conn = hello.into_connection(tls.for_connection(&tcp, &name)?).ok()?;
     // A session keeps its identifier when it is resumed, as OpenSSL's does.
     let id = conn.received_resumption_data().map_or_else(|| { let mut id = [0u8; 32]; provider().secure_random.fill(&mut id).map(|_| id.to_vec()) }, |id| Ok(id.to_vec())).ok()?;
     conn.set_resumption_data(&id);
     let (stream, mut session, chain) = pipe(tcp, conn.into(), HANDSHAKE).ok()?;
     (session.server_name, session.verify, session.subject) = (name, verified(&chain, (&tls.trusted, tls.crls.as_deref(), tls.depth)), chain.first().and_then(|c| subject(c)));
-    (session.id, session.ciphers, session.cert) = (id.iter().map(|b| format!("{b:02x}")).collect(), ciphers, chain.first().cloned());
+    (session.id, session.ciphers, session.cert, session.curves) = (id.iter().map(|b| format!("{b:02x}")).collect(), ciphers, chain.first().cloned(), curves);
     Some((stream, session))
 }
 
@@ -695,7 +723,8 @@ fn pipe(mut tcp: TcpStream, mut tls: Connection, timeout: Duration) -> std::io::
     let _ = tcp.set_read_timeout(None);
     let protocol = tls.protocol_version().map(|v| format!("{v:?}").replace('_', ".")).unwrap_or_default();
     let cipher = tls.negotiated_cipher_suite().map(|c| cipher(u16::from(c.suite()))).unwrap_or_default();
-    let session = Session { protocol, reused: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed), cipher, ..Session::default() };
+    let curve = tls.negotiated_key_exchange_group().map(|g| curve(u16::from(g.name()))).unwrap_or_default();
+    let session = Session { protocol, reused: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed), cipher, curve, ..Session::default() };
     let chain = tls.peer_certificates().map(<[_]>::to_vec).unwrap_or_default();
     let (ours, theirs) = UnixStream::pair()?;
     std::thread::spawn(move || pump(tcp, tls, theirs));
@@ -949,7 +978,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = dir();
         let names = [(&*dir.join("$ssl_server_name"), &*dir.join("k.pem"))];
         let files = (&names[..], None);
-        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: false, crl: None, depth: 1 };
+        let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: false, curves: None, crl: None, depth: 1 };
         let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), &[], options.clone()).unwrap();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
@@ -995,6 +1024,16 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     }
 
     #[test]
+    fn names_and_takes_curves_as_openssl() {
+        assert_eq!((curve(0x0017), curve(0x001d), curve(0x11ec)), ("prime256v1".into(), "X25519".into(), "0x11ec".into()));
+        let names = |l: &str| curves(l).map(|g| g.iter().map(|g| curve(u16::from(g.name()))).collect::<Vec<_>>().join(":"));
+        assert_eq!(names("prime256v1").unwrap(), "prime256v1");
+        assert_eq!(names("x25519:P-384:secp256r1").unwrap(), "X25519:secp384r1:prime256v1");
+        assert_eq!(names("auto").unwrap(), "X25519:prime256v1:secp384r1");
+        assert_eq!(names("prime256v1:nope").unwrap_err(), "SSL_CTX_set1_curves_list(\"prime256v1:nope\") failed");
+    }
+
+    #[test]
     fn names_ciphers_and_certificates_as_openssl() {
         assert_eq!((cipher(0x1302), cipher(0xc030), cipher(0x00ff), cipher(0xabcd)), ("TLS_AES_256_GCM_SHA384".into(), "ECDHE-RSA-AES256-GCM-SHA384".into(), "TLS_EMPTY_RENEGOTIATION_INFO_SCSV".into(), "0xabcd".into()));
         let session = Session { cert: Some(der(END)), ..Session::default() };
@@ -1032,7 +1071,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!((session.id.len(), session.cipher.as_str(), session.cert.as_ref()), (64, "TLS_AES_256_GCM_SHA384", Some(&der(CERT))));
         assert!(session.ciphers.starts_with("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:"), "{}", session.ciphers);
         let session = Session { id: String::new(), cipher: String::new(), ciphers: String::new(), cert: None, ..session };
-        assert_eq!(session, Session { protocol: "TLSv1.3".into(), server_name: "localhost".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()), ..Session::default() });
+        assert_eq!(session, Session { protocol: "TLSv1.3".into(), server_name: "localhost".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()), curve: "X25519".into(), curves: "X25519:prime256v1:secp384r1".into(), ..Session::default() });
         let mut buf = [0u8; 4];
         client.write_all(b"ping").unwrap();
         server.read_exact(&mut buf).unwrap();
