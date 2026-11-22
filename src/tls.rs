@@ -341,12 +341,22 @@ fn verify_chain<'a>(end: &'a [u8], sent: &'a [CertificateDer], trusted: &'a [Cer
 
 /// Whether a certificate is for a name, as X509_check_host checks it:
 /// against the DNS names of subjectAltName, or without them, the subject's
-/// last common name, ignoring case.
+/// last common name (see host_matches).
 fn for_name(cert: &X509Certificate, name: &str) -> bool {
     let names = cert.subject_alternative_name().ok().flatten().map(|e| e.value.general_names.clone()).unwrap_or_default();
     let mut dns: Vec<&str> = names.iter().filter_map(|g| if let GeneralName::DNSName(d) = g { Some(*d) } else { None }).collect();
     if dns.is_empty() { dns.extend(cert.subject().iter_common_name().last().and_then(|a| a.as_str().ok())); }
-    dns.iter().any(|p| p.eq_ignore_ascii_case(name))
+    dns.iter().any(|p| host_matches(p, name))
+}
+
+/// Whether a name matches a name of a certificate, ignoring case. A "*" in
+/// its leftmost label, when two labels or more follow, stands for any
+/// characters within one label (at least one when it is the whole label).
+fn host_matches(pattern: &str, name: &str) -> bool {
+    let (Some((p, rest)), Some((n, nrest))) = (pattern.split_once('.'), name.split_once('.')) else { return pattern.eq_ignore_ascii_case(name) };
+    let Some((pre, post)) = p.split_once('*').filter(|(_, post)| rest.contains('.') && !post.contains('*')) else { return pattern.eq_ignore_ascii_case(name) };
+    let n = n.as_bytes();
+    rest.eq_ignore_ascii_case(nrest) && n.len() >= (pre.len() + post.len()).max(1) && n[..pre.len()].eq_ignore_ascii_case(pre.as_bytes()) && n[n.len() - post.len()..].eq_ignore_ascii_case(post.as_bytes())
 }
 
 /// What connections to proxied servers are made with: with SNI when
@@ -553,6 +563,20 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert!(verify_chain(&root, &[], &[root.clone()], None, 0).is_ok());
         assert_eq!(verify_chain(&root, &[], &[], None, 0).map(|_| ()), Err("self-signed certificate"));
         assert_eq!(verify_chain(&int, &[root.clone()], &[], None, 1).map(|_| ()), Err("self-signed certificate in certificate chain"));
+    }
+
+    #[test]
+    fn matches_wildcard_names() {
+        assert!(host_matches("example.com", "EXAMPLE.com"));
+        assert!(host_matches("*.example.com", "foo.example.com"));
+        assert!(!host_matches("*.example.com", "no.match.example.com"));
+        assert!(!host_matches("*.example.com", "example.com"));
+        assert!(!host_matches("*.com", "example.com"));
+        assert!(host_matches("f*o.example.com", "fo.example.com"));
+        assert!(host_matches("f*o.example.com", "FOOO.example.com"));
+        assert!(!host_matches("f*o.example.com", "bar.example.com"));
+        assert!(!host_matches("**.example.com", "foo.example.com"));
+        assert!(!host_matches("*.example.com", "localhost"));
     }
 
     #[test]
