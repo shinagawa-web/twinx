@@ -476,9 +476,13 @@ struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, ch
 /// Reads the rest of a proxied answer's body, noting how long the whole answer took.
 async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
-    let (body, read, ended, _) = read_body(&mut rest.conn.stream, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await;
+    let (body, read, ended, cut) = read_body(&mut rest.conn.stream, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await;
     if let Some((up, addr, tag)) = rest.home.filter(|_| rest.keep && ended) { up.put(rest.conn, addr, tag); }
     resp.body = body;
+    if let Some(part) = cut {
+        resp.body.extend(part);
+        resp.cut = Some(Box::new(Cut { length: rest.length }));
+    }
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
 }
@@ -1579,12 +1583,11 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 
 /// Reads a proxied answer's body up to its length, up to its last chunk, or
 /// until the server closes the connection; what follows the last chunk is
-/// dropped, but without a rate it is read up to the empty line after the trailer
-/// lines, where the body ends for nginx. With a rate it is read
-/// as ngx_event_pipe_read_upstream() paces proxy_limit_rate: by the end of each
-/// second since the body started (counted in whole seconds of the clock) up to
-/// the rate for each second has been read, and when that much has, it waits for
-/// the time it is worth.
+/// dropped, but read up to the empty line after the trailer lines, where the
+/// body ends for nginx. With a rate it is read as ngx_event_pipe_read_upstream()
+/// paces proxy_limit_rate: by the end of each second since the body started
+/// (counted in whole seconds of the clock) up to the rate for each second has
+/// been read, and when that much has, it waits for the time it is worth.
 /// Returns the body, the bytes of the whole answer read, whether they end
 /// where the body does, and, when the server closed the connection before the
 /// body's end, or a read failed or waited longer than the time, what came of the
@@ -1592,7 +1595,7 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> (Vec<u8>, usize, bool, Option<Vec<u8>>) {
     let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let (start, rate, mut chunk, mut closed, mut failed) = (secs(), rate as i64, vec![0u8; 4096], false, false);
-    while length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1 && (rate > 0 || cut_off(&answer[end..]).is_none())) {
+    while length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1 && cut_off(&answer[end..]).is_none()) {
         let limit = if rate == 0 { chunk.len() as i64 } else { rate * (secs() - start + 1) - (answer.len() - end) as i64 };
         if limit <= 0 { tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await; continue; }
         let Some(Ok(n)) = within(wait, s.read(&mut chunk[..(limit as usize).min(4096)])).await else { failed = true; break };
@@ -2604,6 +2607,10 @@ mod tests {
     const LENGTH: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 30000\r\n\r\n";
     const CHUNKED: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n";
 
+    /// What a location has besides, if anything, for its answers to be read without
+    /// and with a rate.
+    const RATES: [&str; 2] = ["", "proxy_limit_rate 1m;"];
+
     /// The head of an answer with the Content-Length or Transfer-Encoding line, if
     /// any, and the Connection header.
     fn head(line: &str, connection: &str) -> String {
@@ -2635,9 +2642,9 @@ mod tests {
             (format!("{LENGTH}ab").replace("Content-Length", "Content-Encoding: gzip\r\nContent-Length"), "gunzip on;", http11, chunked.clone()),
         ] {
             // Nothing more comes, not even the answer to a second request.
-            for requests in [request.to_string(), request.repeat(2)] {
-                let (got, came) = passed_on(&answer, directives, &requests);
-                assert_eq!((String::from_utf8(got).unwrap(), came), (want.clone(), 1), "{answer} {directives} {requests}");
+            for (requests, rate) in [request.to_string(), request.repeat(2)].iter().flat_map(|r| RATES.map(|rate| (r, rate))) {
+                let (got, came) = passed_on(&answer, &format!("{directives} {rate}"), requests);
+                assert_eq!((String::from_utf8(got).unwrap(), came), (want.clone(), 1), "{answer} {directives} {rate} {requests}");
             }
         }
     }
@@ -2653,8 +2660,10 @@ mod tests {
             // Malformed.
             format!("{CHUNKED}2\r\nab\r\nzz\r\n"),
         ] {
-            let (got, _) = passed_on(&answer, "", http11);
-            assert_eq!(String::from_utf8(got).unwrap(), format!("{whole}ab"), "{answer}");
+            for rate in RATES {
+                let (got, _) = passed_on(&answer, rate, http11);
+                assert_eq!(String::from_utf8(got).unwrap(), format!("{whole}ab"), "{answer} {rate}");
+            }
         }
         // Requests on one connection are all answered. A page or a head instead of the
         // answer cut off is whole too.
@@ -2668,11 +2677,13 @@ mod tests {
             (format!("{CHUNKED}2\r\nab\r\n"), "proxy_method GET;", &two.replace("GET", "HEAD"), 200, "\r\n\r\n"),
             (LENGTH.replace("\r\n\r\n", "\r\nX-Accel-Redirect: /e\r\n\r\n"), "", &two, 200, "\r\n\r\ne"),
         ] {
-            let (got, came) = passed_on(&answer, directives, &(requests.to_string() + "GET /e HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"));
-            let got = String::from_utf8(got).unwrap();
-            let answers: Vec<_> = got.split("HTTP/1.1 ").collect();
-            assert_eq!((answers.len(), came), (4, 2), "{got}");
-            for a in &answers[1..3] { assert!(a.starts_with(&status.to_string()) && a.contains("Connection: keep-alive") && !a.contains("chunked") && a.ends_with(ends), "{got}"); }
+            for rate in RATES {
+                let (got, came) = passed_on(&answer, &format!("{directives} {rate}"), &(requests.to_string() + "GET /e HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"));
+                let got = String::from_utf8(got).unwrap();
+                let answers: Vec<_> = got.split("HTTP/1.1 ").collect();
+                assert_eq!((answers.len(), came), (4, 2), "{got}");
+                for a in &answers[1..3] { assert!(a.starts_with(&status.to_string()) && a.contains("Connection: keep-alive") && !a.contains("chunked") && a.ends_with(ends), "{got}"); }
+            }
         }
     }
 
@@ -2771,8 +2782,9 @@ mod tests {
         ];
         block_on(async {
             // At once, as each waits for the timeout.
-            let all: Vec<_> = cases.into_iter().flat_map(|c| [(c.clone(), false), (c, true)]).map(|((answer, request, want), resets)| tokio::task::spawn_local(async move {
-                assert_eq!(failed_on(&answer, resets, "", request).await, want, "{answer} {resets}");
+            let ways = [false, true].into_iter().flat_map(|resets| RATES.map(|rate| (resets, rate)));
+            let all: Vec<_> = ways.flat_map(|way| cases.iter().cloned().map(move |c| (c, way))).map(|((answer, request, want), (resets, rate))| tokio::task::spawn_local(async move {
+                assert_eq!(failed_on(&answer, resets, rate, request).await, want, "{answer} {resets} {rate}");
             })).collect();
             for task in all { task.await.unwrap(); }
         });
@@ -2783,9 +2795,9 @@ mod tests {
         let _busy = counted();
         let log = std::env::temp_dir().join(format!("twinx-failed-{}", std::process::id()));
         let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n{}", "x".repeat(100));
-        for resets in [false, true] {
+        for (resets, rate) in [false, true].into_iter().flat_map(|resets| RATES.map(|rate| (resets, rate))) {
             let _ = std::fs::remove_file(&log);
-            let got = block_on(failed_on(&answer, resets, &format!("access_log {} f;", log.display()), "GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
+            let got = block_on(failed_on(&answer, resets, &format!("access_log {} f; {rate}", log.display()), "GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
             assert!(got.ends_with(&"x".repeat(100)), "{got}");
             assert_eq!(std::fs::read_to_string(&log).unwrap(), "200 200 142 100\n");
         }
