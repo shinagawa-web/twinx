@@ -411,33 +411,34 @@ impl Connection {
     }
 
     fn frame(&mut self, kind: u8, flags: u8, sid: u32, p: &[u8]) -> Result<(), u32> {
-        if let Some((id, first, mut block, refused)) = self.block.take() {
-            if kind != CONTINUATION || sid != id { return Err(PROTOCOL_ERROR) }
-            block.extend_from_slice(p);
-            self.block = Some((id, first | flags, block, refused));
-            return if flags & END_HEADERS != 0 { self.headers_done() } else { Ok(()) };
-        }
+        // A header block goes on only in CONTINUATION frames of its stream.
+        if self.block.as_ref().is_some_and(|b| kind != CONTINUATION || b.0 != sid) { return Err(PROTOCOL_ERROR) }
+        if self.block.is_some() { return self.header_block(flags, p) }
+        let size = match kind { PRIORITY => p.len() == 5, RST_STREAM | WINDOW_UPDATE => p.len() == 4, PING => p.len() == 8, GOAWAY => p.len() >= 8, _ => true };
+        if !size { return Err(FRAME_SIZE_ERROR) }
+        // Frames of a stream, of the connection, and those a client does not send.
+        let stray = matches!(kind, PRIORITY | RST_STREAM) && sid == 0 || matches!(kind, PING | GOAWAY) && sid != 0 || matches!(kind, PUSH_PROMISE | CONTINUATION);
         let word = |at: usize| u32::from_be_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]);
+        if stray || kind == PRIORITY && word(0) & 0x7fff_ffff == sid { return Err(PROTOCOL_ERROR) }
         match kind {
             DATA => self.data(flags, sid, p),
             HEADERS => self.headers(flags, sid, p),
-            PRIORITY if p.len() != 5 => Err(FRAME_SIZE_ERROR),
-            PRIORITY if sid == 0 || word(0) & 0x7fff_ffff == sid => Err(PROTOCOL_ERROR),
             PRIORITY => { self.depend(sid, word(0), u16::from(p[4]) + 1); Ok(()) }
-            RST_STREAM if p.len() != 4 => Err(FRAME_SIZE_ERROR),
-            RST_STREAM if sid == 0 => Err(PROTOCOL_ERROR),
-            RST_STREAM => { self.streams.remove(&sid); Ok(()) }
             SETTINGS => self.settings(flags, sid, p),
-            PUSH_PROMISE | CONTINUATION => Err(PROTOCOL_ERROR),
-            PING if p.len() != 8 => Err(FRAME_SIZE_ERROR),
-            PING if sid != 0 => Err(PROTOCOL_ERROR),
-            PING if flags & ACK == 0 => { frame(&mut self.out, PING, ACK, 0, p); Ok(()) }
-            GOAWAY if p.len() < 8 => Err(FRAME_SIZE_ERROR),
-            GOAWAY if sid != 0 => Err(PROTOCOL_ERROR),
-            WINDOW_UPDATE if p.len() != 4 => Err(FRAME_SIZE_ERROR),
             WINDOW_UPDATE => self.window_update(sid, i64::from(word(0) & 0x7fff_ffff)),
-            _ => Ok(()),
+            _ => {
+                if kind == RST_STREAM { self.streams.remove(&sid); }
+                if kind == PING && flags & ACK == 0 { frame(&mut self.out, PING, ACK, 0, p); }
+                Ok(())
+            }
         }
+    }
+
+    /// Adds a frame's part of the header block, and takes the request once it has come whole.
+    fn header_block(&mut self, flags: u8, p: &[u8]) -> Result<(), u32> {
+        let Some((sid, first, block, refused)) = self.block.take() else { return Ok(()) };
+        self.block = Some((sid, first | flags, [&block[..], p].concat(), refused));
+        if flags & END_HEADERS != 0 { self.headers_done() } else { Ok(()) }
     }
 
     fn headers(&mut self, flags: u8, sid: u32, p: &[u8]) -> Result<(), u32> {
@@ -451,8 +452,8 @@ impl Connection {
         self.last_sid = sid;
         if depends.is_some() || !self.nodes.contains_key(&sid) { let (on, weight) = depends.unwrap_or((0, 16)); self.depend(sid, on, weight); }
         let refused = self.streams.len() >= CONCURRENT;
-        self.block = Some((sid, flags, p[pad + priority..p.len() - padding].to_vec(), refused));
-        if flags & END_HEADERS != 0 { self.headers_done() } else { Ok(()) }
+        self.block = Some((sid, flags, Vec::new(), refused));
+        self.header_block(flags, &p[pad + priority..p.len() - padding])
     }
 
     /// Takes a request once its header block has come whole.
@@ -488,16 +489,12 @@ impl Connection {
         if p.len() % 6 != 0 { return Err(FRAME_SIZE_ERROR) }
         let mut delta = 0;
         for s in p.chunks(6) {
-            let value = u32::from_be_bytes([s[2], s[3], s[4], s[5]]);
-            match u16::from_be_bytes([s[0], s[1]]) {
-                1 => self.table_update = true,
-                2 if value > 1 => return Err(PROTOCOL_ERROR),
-                4 if i64::from(value) > MAX_WINDOW => return Err(FLOW_CONTROL_ERROR),
-                4 => delta = i64::from(value) - self.window,
-                5 if !(1 << 14..1 << 24).contains(&value) => return Err(PROTOCOL_ERROR),
-                5 => self.frame_size = value as usize,
-                _ => {}
-            }
+            let (id, value) = (u16::from_be_bytes([s[0], s[1]]), u32::from_be_bytes([s[2], s[3], s[4], s[5]]));
+            if id == 2 && value > 1 || id == 5 && !(1 << 14..1 << 24).contains(&value) { return Err(PROTOCOL_ERROR) }
+            if id == 4 && i64::from(value) > MAX_WINDOW { return Err(FLOW_CONTROL_ERROR) }
+            self.table_update |= id == 1;
+            if id == 4 { delta = i64::from(value) - self.window; }
+            if id == 5 { self.frame_size = value as usize; }
         }
         frame(&mut self.out, SETTINGS, ACK, 0, &[]);
         self.window += delta;
