@@ -454,8 +454,9 @@ struct Response {
     /// What is left to read of a proxied answer's body that proxy_limit_rate
     /// paces: it is read once the head is made, as nginx sends the head first.
     rest: Option<Box<Rest>>,
-    /// Set when the body is only what came of a proxied answer's, its server
-    /// having closed the connection before the end of it.
+    /// Set when the body is only what came of a proxied answer's, its server having
+    /// closed the connection before the end of it, or a read of it having failed or
+    /// waited longer than proxy_read_timeout.
     cut: Option<Box<Cut>>,
 }
 
@@ -475,8 +476,7 @@ struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, ch
 /// Reads the rest of a proxied answer's body, noting how long the whole answer took.
 async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
-    let (body, read, ended, _) = read_body(&mut rest.conn.stream, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await.unwrap_or_default();
-    // A read that failed gave no body, and no end of it.
+    let (body, read, ended, _) = read_body(&mut rest.conn.stream, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await;
     if let Some((up, addr, tag)) = rest.home.filter(|_| rest.keep && ended) { up.put(rest.conn, addr, tag); }
     resp.body = body;
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
@@ -1485,8 +1485,8 @@ async fn secure(mut conn: Conn, peer: &SocketAddr, (tls, name): (&Arc<rustls::Cl
 enum NoAnswer {
     /// The connection failed or was closed before the whole head came.
     Closed,
-    /// The answer is invalid, or did not come in time or to its end; or the
-    /// request's body could not be passed.
+    /// The answer's head is invalid or did not come in time; or the request's
+    /// body could not be passed.
     Other,
 }
 
@@ -1557,7 +1557,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
     if rate > 0 { return Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None })), ..resp }, None)); }
-    let (body, read, ended, cut) = read_body(s, answer, end, length, chunked, 0, wait).await.ok_or(Other)?;
+    let (body, read, ended, cut) = read_body(s, answer, end, length, chunked, 0, wait).await;
     (resp.body, bytes[0], bytes[1]) = (body, (read - end) as u64, read as u64);
     if let Some(part) = cut {
         resp.body.extend(part);
@@ -1587,25 +1587,23 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// the time it is worth.
 /// Returns the body, the bytes of the whole answer read, whether they end
 /// where the body does, and, when the server closed the connection before the
-/// body's end, what came of the chunk it did so in (nothing without chunks); None
-/// when a read fails or waits longer than the time, but after the last chunk.
-async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> Option<(Vec<u8>, usize, bool, Option<Vec<u8>>)> {
+/// body's end, or a read failed or waited longer than the time, what came of the
+/// chunk it did so in (nothing without chunks).
+async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> (Vec<u8>, usize, bool, Option<Vec<u8>>) {
     let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    let (start, rate, mut chunk, mut closed) = (secs(), rate as i64, vec![0u8; 4096], false);
+    let (start, rate, mut chunk, mut closed, mut failed) = (secs(), rate as i64, vec![0u8; 4096], false, false);
     while length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1 && (rate > 0 || cut_off(&answer[end..]).is_none())) {
         let limit = if rate == 0 { chunk.len() as i64 } else { rate * (secs() - start + 1) - (answer.len() - end) as i64 };
         if limit <= 0 { tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await; continue; }
-        let n = match within(wait, s.read(&mut chunk[..(limit as usize).min(4096)])).await {
-            Some(Ok(n)) => n,
-            _ if chunked && unchunk(&answer[end..]).1 => break,
-            _ => return None,
-        };
+        let Some(Ok(n)) = within(wait, s.read(&mut chunk[..(limit as usize).min(4096)])).await else { failed = true; break };
         if n == 0 { closed = true; break; }
         answer.extend_from_slice(&chunk[..n]);
     }
     let body = &answer[end..];
-    let cut = if chunked { cut_off(body).filter(|_| closed) } else { length.filter(|n| body.len() < *n).map(|_| &body[..0]) }.map(<[u8]>::to_vec);
-    Some((if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() }, answer.len(), ended(body, length, chunked), cut))
+    let cut = if chunked { cut_off(body).filter(|_| closed || failed) } else { length.filter(|n| body.len() < *n).map(|_| &body[..0]) };
+    // Nor is a body whole that only the connection's end delimits, or a malformed one, when a read of more fails.
+    let cut = cut.or(failed.then_some(&body[..0])).map(<[u8]>::to_vec);
+    (if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() }, answer.len(), ended(body, length, chunked), cut)
 }
 
 /// When more must follow what came of a chunked body, which is well-formed so
@@ -2076,7 +2074,12 @@ mod tests {
     /// Serves a connection, which counts in BUSY, for a server with the
     /// directives: the client's end, and the task.
     async fn served(directives: &str) -> (tokio::net::TcpStream, JoinHandle<()>) {
-        let text = format!("http {{ server {{ {directives} }} }}");
+        served_by(&format!("server {{ {directives} }}")).await
+    }
+
+    /// The same for the http block's directives, with the server.
+    async fn served_by(directives: &str) -> (tokio::net::TcpStream, JoinHandle<()>) {
+        let text = format!("http {{ {directives} }}");
         let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let (Stream::Tcp(stream), client) = pair().await else { unreachable!() };
         let addr = "127.0.0.1:80".parse().unwrap();
@@ -2579,19 +2582,23 @@ mod tests {
         // A test of shutting down leaves it set, which closes connections.
         SHUTTING.store(false, Ordering::SeqCst);
         let (addr, came) = closing(answer.to_string().leak());
-        let got = block_on(async {
-            let (mut client, task) = served(&format!("location /e {{ return 200 e; }} location / {{ proxy_pass http://{addr}; {directives} }}")).await;
-            client.write_all(requests.as_bytes()).await.unwrap();
-            let mut got = Vec::new();
-            within(Some(Duration::from_secs(4)), client.read_to_end(&mut got)).await.unwrap().unwrap();
-            drop(client);
-            within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
-            got
-        });
-        let mut text = Vec::new();
-        for line in got.split_inclusive(|&c| c == b'\n').filter(|l| !l.starts_with(b"Date: ")) { text.extend_from_slice(line); }
+        let text = block_on(received(&format!("server {{ location /e {{ return 200 e; }} location / {{ proxy_pass http://{addr}; {directives} }} }}"), requests));
         let came = *came.lock().unwrap();
         (text, came)
+    }
+
+    /// What comes back for the requests sent at once on a connection, until it is
+    /// closed, without the Date lines, with the http block's directives.
+    async fn received(directives: &str, requests: &str) -> Vec<u8> {
+        let (mut client, task) = served_by(directives).await;
+        client.write_all(requests.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        within(Some(Duration::from_secs(4)), client.read_to_end(&mut got)).await.unwrap().unwrap();
+        drop(client);
+        within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
+        let mut text = Vec::new();
+        for line in got.split_inclusive(|&c| c == b'\n').filter(|l| !l.starts_with(b"Date: ")) { text.extend_from_slice(line); }
+        text
     }
 
     const LENGTH: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 30000\r\n\r\n";
@@ -2698,6 +2705,90 @@ mod tests {
         // The status and $body_bytes_sent, with what makes it a chunk.
         let lines = std::fs::read_to_string(&log).unwrap();
         assert_eq!(lines.lines().map(|l| l.split(' ').skip(8).take(2).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>(), ["200 7", "200 2", "200 2"], "{lines}");
+    }
+
+    /// A server that reads a request, sends the answer and then nothing until the
+    /// connection is closed, or resets it; and how many connections came.
+    fn failing(answer: &str, resets: bool) -> (SocketAddr, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
+        let (all, answer) = (came.clone(), answer.to_string());
+        thread::spawn(move || {
+            for s in listener.incoming() {
+                *all.lock().unwrap() += 1;
+                let mut s = s.unwrap();
+                assert!(s.read(&mut [0u8; 1024]).unwrap() > 0);
+                s.write_all(answer.as_bytes()).unwrap();
+                if resets {
+                    // After what was sent has come.
+                    thread::sleep(Duration::from_millis(50));
+                    socket2::SockRef::from(&s).set_linger(Some(Duration::ZERO)).unwrap();
+                } else {
+                    let _ = s.read(&mut [0u8; 1]);
+                }
+            }
+        });
+        (addr, came)
+    }
+
+    /// What received() gives for a request when a server has the directives and passes
+    /// it to an upstream of two servers that fail so after the answer; it is not sent to
+    /// the second one.
+    async fn failed_on(answer: &str, resets: bool, directives: &str, request: &str) -> String {
+        let ((a, came_a), (b, came_b)) = (failing(answer, resets), failing(answer, resets));
+        let http = format!("log_format f '$status $upstream_status $upstream_bytes_received $upstream_response_length'; access_log off; upstream u {{ server {a}; server {b}; }} \
+                            server {{ proxy_read_timeout 1s; proxy_next_upstream error timeout; {directives} location / {{ proxy_pass http://u; }} }}");
+        let got = received(&http, request).await;
+        assert_eq!((*came_a.lock().unwrap(), *came_b.lock().unwrap()), (1, 0), "{answer} {resets} {directives}");
+        String::from_utf8(got).unwrap()
+    }
+
+    #[test]
+    fn answers_whose_reading_fails_are_cut_off() {
+        let (http11, http10) = ("GET / HTTP/1.1\r\nHost: a\r\n\r\n", "GET / HTTP/1.0\r\n\r\n");
+        let (length, chunked) = (head("Content-Length: 30000\r\n", "keep-alive"), head("Transfer-Encoding: chunked\r\n", "keep-alive"));
+        let _busy = counted();
+        // A test of shutting down leaves it set, which closes connections.
+        SHUTTING.store(false, Ordering::SeqCst);
+        let (big, delimited) = ("x".repeat(20000), LENGTH.replace("Content-Length: 30000\r\n", ""));
+        let cases = [
+            (format!("{LENGTH}ab"), http11, format!("{length}ab")),
+            (LENGTH.to_string(), http11, length.clone()),
+            (format!("{LENGTH}{big}"), http11, format!("{length}{big}")),
+            // After a chunk, in one, before any, and after the last one.
+            (format!("{CHUNKED}2\r\nab\r\n"), http11, format!("{chunked}2\r\nab\r\n")),
+            (format!("{CHUNKED}2\r\nab\r\n5\r\ncd"), http11, format!("{chunked}4\r\nabcd\r\n")),
+            (CHUNKED.to_string(), http11, chunked.clone()),
+            (format!("{CHUNKED}2\r\nab\r\n0\r\n"), http11, format!("{chunked}2\r\nab\r\n")),
+            (format!("{CHUNKED}2\r\nab\r\n"), http10, format!("{}ab", head("", "close"))),
+            // In what cannot become a chunk.
+            (format!("{CHUNKED}2\r\nab\r\nzz"), http11, format!("{chunked}2\r\nab\r\n")),
+            // A body that only the connection's end delimits.
+            (format!("{delimited}ab"), http11, format!("{chunked}2\r\nab\r\n")),
+            (format!("{delimited}ab"), http10, format!("{}ab", head("", "close"))),
+            // After a whole body nothing more is read.
+            (format!("{}ab", LENGTH.replace("30000", "2")), http10, format!("{}ab", head("Content-Length: 2\r\n", "close"))),
+        ];
+        block_on(async {
+            // At once, as each waits for the timeout.
+            let all: Vec<_> = cases.into_iter().flat_map(|c| [(c.clone(), false), (c, true)]).map(|((answer, request, want), resets)| tokio::task::spawn_local(async move {
+                assert_eq!(failed_on(&answer, resets, "", request).await, want, "{answer} {resets}");
+            })).collect();
+            for task in all { task.await.unwrap(); }
+        });
+    }
+
+    #[test]
+    fn answers_whose_reading_fails_are_logged() {
+        let _busy = counted();
+        let log = std::env::temp_dir().join(format!("twinx-failed-{}", std::process::id()));
+        let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n{}", "x".repeat(100));
+        for resets in [false, true] {
+            let _ = std::fs::remove_file(&log);
+            let got = block_on(failed_on(&answer, resets, &format!("access_log {} f;", log.display()), "GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
+            assert!(got.ends_with(&"x".repeat(100)), "{got}");
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), "200 200 142 100\n");
+        }
     }
 
     #[test]
