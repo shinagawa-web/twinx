@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Peer {
@@ -32,9 +32,30 @@ struct State {
     checked: u64,
 }
 
+/// How an upstream keeps the connections to its servers: at most max idle
+/// ones, each for so many requests, so long in all and so long idle; local
+/// when a connection is not shared between locations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Keepalive {
+    pub max: usize,
+    pub local: bool,
+    pub requests: u64,
+    pub time: Duration,
+    pub timeout: Duration,
+}
+
+impl Default for Keepalive {
+    /// nginx 1.30's defaults.
+    fn default() -> Keepalive {
+        Keepalive { max: 32, local: true, requests: 1000, time: Duration::from_secs(3600), timeout: Duration::from_secs(60) }
+    }
+}
+
 #[derive(Debug)]
 pub struct Upstream {
     pub peers: Vec<Peer>,
+    /// The connections kept to the servers; None means no connection is kept.
+    pub keepalive: Option<Keepalive>,
     state: Mutex<Vec<State>>,
 }
 
@@ -45,7 +66,7 @@ fn now() -> u64 {
 impl Upstream {
     pub fn new(peers: Vec<Peer>) -> Upstream {
         let state = peers.iter().map(|p| State { effective: p.weight, ..State::default() }).collect();
-        Upstream { peers, state: Mutex::new(state) }
+        Upstream { peers, keepalive: None, state: Mutex::new(state) }
     }
 
     /// How many servers a request may try: those not marked down, as
