@@ -7,7 +7,10 @@ use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::io::Interest;
 
 use crate::stream::Stream;
 
@@ -76,8 +79,29 @@ impl Conn {
     /// sent unasked must not be read as its next answer. The socket, which does
     /// not block, is asked itself: tokio may not have seen yet what came.
     fn quiet(&self) -> bool {
-        let peeked = socket2::SockRef::from(self.stream.tcp()).peek(&mut [MaybeUninit::uninit()]);
-        matches!(peeked, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+        matches!(self.peek(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    }
+
+    fn peek(&self) -> std::io::Result<usize> {
+        socket2::SockRef::from(self.stream.tcp()).peek(&mut [MaybeUninit::uninit()])
+    }
+
+    /// Has the task of the waker run on the next event of the connection; false
+    /// when something came on it already. Tokio may take it for readable still,
+    /// after what was read last: a peek that would block corrects that. A task
+    /// that has polled too much (tokio's budget) has nothing registered, but the
+    /// waker's task is run soon, which registers it.
+    fn register(&self, waker: &Waker) -> bool {
+        let tcp = self.stream.tcp();
+        loop {
+            match tcp.poll_read_ready(&mut Context::from_waker(waker)) {
+                Poll::Pending => return true,
+                Poll::Ready(Err(_)) => return false,
+                Poll::Ready(Ok(())) => {}
+            }
+            let peeked = tcp.try_io(Interest::READABLE, || self.peek());
+            if !matches!(peeked, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock) { return false }
+        }
     }
 }
 
@@ -93,9 +117,9 @@ struct Idle {
 }
 
 impl Idle {
-    /// Whether it may be used still.
-    fn usable(&self, now: Instant) -> bool {
-        self.until.is_none_or(|t| now < t) && self.conn.quiet()
+    /// Whether it has not been idle for too long.
+    fn fresh(&self, now: Instant) -> bool {
+        self.until.is_none_or(|t| now < t)
     }
 }
 
@@ -103,8 +127,16 @@ impl Idle {
 struct Cache {
     /// The last kept first.
     idle: VecDeque<Idle>,
-    /// Whether the task that closes idle connections runs.
-    watched: bool,
+    /// What wakes the task that closes idle connections: one that does nothing
+    /// until the task has first run, None when no task runs.
+    waker: Option<Waker>,
+}
+
+impl Drop for Cache {
+    /// The task ends with the upstream.
+    fn drop(&mut self) {
+        if let Some(w) = self.waker.take() { w.wake() }
+    }
 }
 
 thread_local! {
@@ -114,23 +146,43 @@ thread_local! {
     static CACHES: RefCell<Vec<Weak<Upstream>>> = const { RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How often the tasks of the thread's upstreams ran.
+    static POLLS: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Closes the idle connections of every upstream of the worker, which is
 /// shutting down; no more are kept.
 pub fn close_idle() {
     CLOSING.set(true);
     let caches: Vec<Arc<Upstream>> = CACHES.with_borrow(|c| c.iter().filter_map(Weak::upgrade).collect());
-    for u in caches { u.cache.lock().unwrap().idle.clear(); }
+    for u in caches {
+        let mut cache = u.cache.lock().unwrap();
+        cache.idle.clear();
+        let waker = cache.waker.clone();
+        drop(cache);
+        // With none left, the task ends.
+        if let Some(w) = waker { w.wake() }
+    }
 }
 
-/// Closes the idle connections of an upstream that are not usable any more,
-/// until none is left. nginx does this on the event of each connection; here
-/// they are looked at every 100 ms, so one may stay that much longer. It does
-/// not keep the upstream alive.
+/// Closes the idle connections of an upstream that are not usable any more, as
+/// nginx does on the event of each connection: it runs when something comes on
+/// one of them and when the first has been idle for too long, until it finds
+/// none left. It does not keep the upstream alive.
 async fn watch(upstream: Weak<Upstream>) {
-    loop {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if !upstream.upgrade().is_some_and(|u| u.sweep()) { break }
-    }
+    let mut sleep = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
+    std::future::poll_fn(|cx| {
+        #[cfg(test)]
+        POLLS.set(POLLS.get() + 1);
+        loop {
+            let Some(until) = upstream.upgrade().and_then(|u| u.sweep(cx.waker())) else { return Poll::Ready(()) };
+            let Some(until) = until else { return Poll::Pending };
+            sleep.as_mut().reset(until.into());
+            std::task::ready!(sleep.as_mut().poll(cx));
+        }
+    }).await;
     CACHES.with_borrow_mut(|c| c.retain(|u| !u.ptr_eq(&upstream)));
 }
 
@@ -207,7 +259,7 @@ impl Upstream {
         loop {
             from += cache.idle.iter().skip(from).position(|i| i.addr == *addr && (!keepalive.local || i.tag == tag))?;
             let mut idle = cache.idle.remove(from)?;
-            if !idle.usable(now) { continue }
+            if !idle.fresh(now) || !idle.conn.quiet() { continue }
             idle.conn.requests += 1;
             return Some(idle.conn);
         }
@@ -215,28 +267,35 @@ impl Upstream {
 
     /// Keeps a connection whose answer was read to its end, or closes it, as
     /// ngx_http_upstream_free_keepalive_peer() does; the one kept for the longest
-    /// makes room for it.
+    /// makes room for it. The task that closes idle connections is told of it
+    /// without being woken.
     pub fn put(self: &Arc<Self>, conn: Conn, addr: SocketAddr, tag: usize) {
         let Some(keepalive) = &self.keepalive else { return };
         let now = Instant::now();
         if conn.requests >= keepalive.requests || now.duration_since(conn.opened) > keepalive.time { return }
         if CLOSING.get() || !conn.quiet() { return }
         let mut cache = self.cache.lock().unwrap();
+        if cache.waker.as_ref().is_some_and(|w| !conn.register(w)) { return }
         if cache.idle.len() >= keepalive.max { cache.idle.pop_back(); }
         cache.idle.push_front(Idle { conn, addr, tag, until: now.checked_add(keepalive.timeout) });
-        if std::mem::replace(&mut cache.watched, true) { return }
+        if cache.waker.is_some() { return }
+        cache.waker = Some(Waker::noop().clone());
         drop(cache);
         CACHES.with_borrow_mut(|c| c.push(Arc::downgrade(self)));
         tokio::task::spawn_local(watch(Arc::downgrade(self)));
     }
 
-    /// Closes the idle connections that are not usable any more; false when none
-    /// is left, and the task that asks ends.
-    fn sweep(&self) -> bool {
+    /// Closes the idle connections that are not usable any more, and has the
+    /// waker's task run on the events of the others. Gives when the first of them
+    /// will have been idle for too long, Some(None) being never; None when none is
+    /// left, and the task that asks ends.
+    fn sweep(&self, waker: &Waker) -> Option<Option<Instant>> {
         let (mut cache, now) = (self.cache.lock().unwrap(), Instant::now());
-        cache.idle.retain(|i| i.usable(now));
-        cache.watched = !cache.idle.is_empty();
-        cache.watched
+        cache.idle.retain(|i| i.fresh(now) && i.conn.register(waker));
+        // All have the same timeout.
+        let first = cache.idle.back().map(|i| i.until);
+        cache.waker = first.map(|_| waker.clone());
+        first
     }
 }
 
@@ -246,6 +305,7 @@ mod tests {
     use crate::stream::block_on;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn peers(n: usize, max_fails: u64) -> Upstream {
         let peers = (0..n).map(|i| Peer { max_fails, ..Peer::new(SocketAddr::from(([127, 0, 0, 1], 1000 + i as u16))) });
@@ -337,6 +397,22 @@ mod tests {
         panic!("it did not happen");
     }
 
+    /// Lets the tasks of this thread run for so long.
+    async fn run(ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    /// Sends a request and reads its answer.
+    async fn exchange(conn: &mut Conn, mut other: &TcpStream) {
+        conn.stream.write_all(b"q").await.unwrap();
+        other.read_exact(&mut [0]).unwrap();
+        other.write_all(b"a").unwrap();
+        conn.stream.read_exact(&mut [0]).await.unwrap();
+    }
+
+    /// What a server may do to an idle connection: close it or send on it.
+    const ACTS: [fn(&TcpStream); 2] = [|s| s.shutdown(std::net::Shutdown::Write).unwrap(), |mut s| s.write_all(b"x").unwrap()];
+
     /// Lets the time pass on this thread, so that no task runs.
     fn pause(ms: u64) {
         std::thread::sleep(Duration::from_millis(ms));
@@ -418,7 +494,7 @@ mod tests {
             let u = keeping(Keepalive { timeout: Duration::MAX, ..Keepalive::default() });
             let (conn, _other, _) = open(&l).await;
             u.put(conn, addr, 0);
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            run(250).await;
             assert!(u.take(&addr, 0).is_some());
         });
     }
@@ -426,8 +502,7 @@ mod tests {
     #[test]
     fn a_connection_the_server_closes_or_sends_on_is_not_used() {
         block_on(async {
-            let acts: [fn(&TcpStream); 2] = [|s| s.shutdown(std::net::Shutdown::Write).unwrap(), |mut s| s.write_all(b"x").unwrap()];
-            for act in acts {
+            for act in ACTS {
                 let (u, (l, addr)) = (keeping(Keepalive::default()), server());
                 // It is found by take(), which goes on to the next.
                 let ((a, _a, a_port), (b, b_other, _)) = (open(&l).await, open(&l).await);
@@ -464,6 +539,7 @@ mod tests {
             let (u, u2, (l, addr)) = (keeping(Keepalive::default()), keeping(Keepalive::default()), server());
             let ((a, a_other, _), (b, b_other, _), (c, c_other, _)) = (open(&l).await, open(&l).await, open(&l).await);
             u.put(a, addr, 0);
+            run(20).await;
             u2.put(b, addr, 0);
             close_idle();
             assert_eq!((idle(&u), idle(&u2)), (0, 0));
@@ -497,19 +573,113 @@ mod tests {
             assert_eq!(tasks(&u), 1);
             let _a = u.take(&addr, 0).unwrap();
             wait(|| tasks(&u) == 0).await;
-            assert!(!u.cache.lock().unwrap().watched);
+            assert!(!u.cache.lock().unwrap().waker.is_some());
             u.put(b, addr, 0);
             assert_eq!(tasks(&u), 1);
             drop(b_other);
             wait(|| idle(&u) == 0 && tasks(&u) == 0).await;
 
-            // It does not keep the upstream, which closes its connections when dropped.
-            let (c, c_other, _) = open(&l).await;
+            // It does not keep the upstream, which closes its connections when dropped,
+            // whether the task ran already or not.
+            for ms in [0, 20] {
+                let u = keeping(Keepalive { timeout: Duration::MAX, ..Keepalive::default() });
+                let (c, c_other, _) = open(&l).await;
+                u.put(c, addr, 0);
+                if ms > 0 { run(ms).await }
+                let weak = Arc::downgrade(&u);
+                drop(u);
+                assert!(weak.upgrade().is_none() && closed(&c_other));
+                wait(|| CACHES.with_borrow(|c| !c.iter().any(|w| w.ptr_eq(&weak)))).await;
+            }
+        });
+    }
+
+    #[test]
+    fn the_task_sees_what_comes() {
+        block_on(async {
+            for act in ACTS {
+                let (u, (l, addr)) = (keeping(Keepalive::default()), server());
+                let ((a, a_other, _), (b, b_other, _)) = (open(&l).await, open(&l).await);
+                // The task registers the first, put() the second.
+                u.put(a, addr, 0);
+                run(20).await;
+                u.put(b, addr, 0);
+                run(20).await;
+                assert_eq!((idle(&u), tasks(&u)), (2, 1));
+                act(&b_other);
+                wait(|| idle(&u) == 1).await;
+                assert!(closed(&b_other));
+                act(&a_other);
+                wait(|| idle(&u) == 0 && tasks(&u) == 0).await;
+                assert!(closed(&a_other));
+            }
+        });
+    }
+
+    #[test]
+    fn the_task_waits_for_the_first_that_is_left() {
+        block_on(async {
+            let timeout = Duration::from_millis(300);
+            let (u, (l, addr)) = (keeping(Keepalive { timeout, ..Keepalive::default() }), server());
+            let ((a, _a, a_port), (b, b_other, _), (c, _c, c_port)) = (open(&l).await, open(&l).await, open(&l).await);
+            u.put(a, addr, 0);
+            run(100).await;
+            let kept = Instant::now();
+            u.put(b, "127.0.0.1:1".parse().unwrap(), 0);
+            let a = u.take(&addr, 0);
+            assert_eq!((port(&a), idle(&u), tasks(&u)), (Some(a_port), 1, 1));
+            wait(|| idle(&u) == 0).await;
+            assert!((timeout..Duration::from_secs(2)).contains(&kept.elapsed()) && closed(&b_other));
+            wait(|| tasks(&u) == 0).await;
+
+            // Taken, the only one leaves the task running until the time has passed.
             u.put(c, addr, 0);
-            let weak = Arc::downgrade(&u);
-            drop(u);
-            assert!(weak.upgrade().is_none() && closed(&c_other));
-            wait(|| CACHES.with_borrow(|c| !c.iter().any(|w| w.ptr_eq(&weak)))).await;
+            run(20).await;
+            let c = u.take(&addr, 0);
+            assert_eq!((port(&c), idle(&u), tasks(&u)), (Some(c_port), 0, 1));
+            wait(|| tasks(&u) == 0).await;
+        });
+    }
+
+    #[test]
+    fn a_connection_kept_again_is_watched() {
+        block_on(async {
+            for act in ACTS {
+                let (u, (l, addr)) = (keeping(Keepalive::default()), server());
+                let (conn, other, _) = open(&l).await;
+                u.put(conn, addr, 0);
+                run(20).await;
+                let mut conn = u.take(&addr, 0).unwrap();
+                exchange(&mut conn, &other).await;
+                u.put(conn, addr, 0);
+                run(20).await;
+                assert_eq!((idle(&u), tasks(&u)), (1, 1));
+                act(&other);
+                wait(|| idle(&u) == 0 && tasks(&u) == 0).await;
+                assert!(closed(&other));
+            }
+        });
+    }
+
+    #[test]
+    fn the_task_does_not_run_while_nothing_happens() {
+        block_on(async {
+            let (u, (l, addr)) = (keeping(Keepalive::default()), server());
+            let ((a, _a, _), (b, b_other, _)) = (open(&l).await, open(&l).await);
+            u.put(a, addr, 0);
+            u.put(b, addr, 0);
+            run(20).await;
+            let polls = POLLS.get();
+            assert!(polls > 0);
+            run(300).await;
+            assert_eq!(POLLS.get(), polls);
+            for _ in 0..100 {
+                let mut b = u.take(&addr, 0).unwrap();
+                exchange(&mut b, &b_other).await;
+                u.put(b, addr, 0);
+                run(1).await;
+            }
+            assert_eq!((POLLS.get(), idle(&u), tasks(&u)), (polls, 2, 1));
         });
     }
 }
