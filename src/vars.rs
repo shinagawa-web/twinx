@@ -9,6 +9,20 @@ use std::time::Instant;
 
 use chrono::{DateTime, Local};
 
+/// What the internal redirects of a request share with it.
+#[derive(Debug, Default)]
+pub struct Shared {
+    /// With proxy_request_buffering off: the body still to be read from the
+    /// client, sent on to the proxied server as it comes; what the proxy does
+    /// not take is read and dropped afterwards.
+    pub unread: std::sync::Mutex<Option<crate::http::Unread>>,
+    /// $limit_rate, which set changes.
+    pub limit_rate: Rate,
+    /// The variables set gives values to, and the captures of the last regular
+    /// expression matched ("1", "2", ...).
+    pub vars: std::sync::Mutex<Vec<(String, String)>>,
+}
+
 /// What a request carries, as the variables see it.
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -43,15 +57,8 @@ pub struct Request {
     pub upstream: Vec<(String, String)>,
     /// The named captures of the server name that matched the host.
     pub captures: Vec<(String, String)>,
-    /// With proxy_request_buffering off: the body still to be read from the
-    /// client, sent on to the proxied server as it comes; what the proxy does
-    /// not take is read and dropped afterwards.
-    pub unread: std::sync::Arc<std::sync::Mutex<Option<crate::http::Unread>>>,
-    /// $limit_rate, which set changes; shared by the internal redirects of the request.
-    pub limit_rate: std::sync::Arc<Rate>,
-    /// The variables set gives values to, and the captures of the last regular
-    /// expression matched ("1", "2", ...); shared by the internal redirects of the request.
-    pub vars: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// What the internal redirects of the request share.
+    pub shared: std::sync::Arc<Shared>,
     /// The TLS session of a connection accepted with "ssl".
     pub ssl: Option<crate::tls::Session>,
 }
@@ -65,13 +72,13 @@ impl Request {
             method: String::new(), uri: String::new(), target: String::new(), line: String::new(), headers: Vec::new(), host: None,
             server_name: String::new(), peer, local, started: now, pipelined: false, connected: now, requests: 0, length: 0,
             body: Vec::new(), body_file: None, upstream_addr: None, upstream_status: None, upstream: Vec::new(), captures: Vec::new(),
-            limit_rate: Default::default(), vars: Default::default(), unread: Default::default(), ssl,
+            shared: Default::default(), ssl,
         }
     }
 
     /// Gives a variable of set, or a capture, its value for this request.
     pub fn set_var(&self, name: &str, value: String) {
-        let mut vars = self.vars.lock().unwrap();
+        let mut vars = self.shared.vars.lock().unwrap();
         vars.retain(|v| v.0 != name);
         vars.push((name.to_string(), value));
     }
@@ -79,7 +86,7 @@ impl Request {
     /// The captures of a regular expression that matched: "$0" is the whole
     /// match, "$1" the first group; those it does not have are empty.
     pub fn set_captures(&self, caps: &regex::Captures) {
-        self.vars.lock().unwrap().retain(|v| !v.0.bytes().all(|c| c.is_ascii_digit()));
+        self.shared.vars.lock().unwrap().retain(|v| !v.0.bytes().all(|c| c.is_ascii_digit()));
         (0..caps.len()).for_each(|i| self.set_var(&i.to_string(), caps.get(i).map_or("", |m| m.as_str()).to_string()));
     }
 }
@@ -299,9 +306,9 @@ impl Var {
             Var::SslCurve => r.ssl.as_ref()?.curve.clone(),
             Var::SslCurves => r.ssl.as_ref()?.curves.clone(),
             Var::SslClient(var) => r.ssl.as_ref()?.client_var(var),
-            Var::LimitRate => r.limit_rate.get().unwrap_or(0).to_string(),
+            Var::LimitRate => r.shared.limit_rate.get().unwrap_or(0).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
-            Var::User(name) => r.vars.lock().unwrap().iter().find(|v| v.0 == *name)?.1.clone(),
+            Var::User(name) => r.shared.vars.lock().unwrap().iter().find(|v| v.0 == *name)?.1.clone(),
             Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
             Var::UpstreamStatus => s.upstream_status.clone().or_else(|| r.upstream_status.clone())?,
             Var::UpstreamBytes(i) => s.upstream_bytes.as_ref()?.iter().map(|b| b[*i].to_string()).collect::<Vec<_>>().join(", "),
@@ -347,18 +354,18 @@ pub fn text(b: &[u8]) -> String {
 /// The bytes of text made by text(), each character of U+10FF00 to U+10FFFF
 /// the byte it stands for.
 pub fn bytes(s: &str) -> Vec<u8> {
+    if plain(s.as_bytes()) { return s.as_bytes().to_vec() }
     let mut out = Vec::with_capacity(s.len());
-    push_bytes(&mut out, s);
-    out
-}
-
-/// Adds the bytes of text made by text().
-pub fn push_bytes(out: &mut Vec<u8>, s: &str) {
-    // Those characters begin with the byte 0xf4 in UTF-8, which is rare.
-    if !s.as_bytes().contains(&0xf4) { return out.extend_from_slice(s.as_bytes()) }
     for c in s.chars() {
         match c as u32 { n @ 0x10FF00.. => out.push(n as u8), _ => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()) }
     }
+    out
+}
+
+/// Whether text, as its UTF-8, cannot have a character that stands for a
+/// byte: those begin with the byte 0xf4, which is rare.
+pub fn plain(utf8: &[u8]) -> bool {
+    !utf8.contains(&0xf4)
 }
 
 /// The values of every header with the name, joined; None when there is none.
@@ -555,9 +562,7 @@ mod tests {
             upstream_status: None,
             upstream: Vec::new(),
             captures: Vec::new(),
-            limit_rate: Default::default(),
-            vars: Default::default(),
-            unread: Default::default(),
+            shared: Default::default(),
             ssl: None,
         }
     }
@@ -637,7 +642,7 @@ mod tests {
         assert_eq!(Template::parse("$upstream_status").unwrap().render(&r, &Sent { upstream_status: Some("200".into()), ..Sent::default() }), "200");
         let t = Template::parse("$upstream_response_time|$limit_rate").unwrap();
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"-|0");
-        r.limit_rate.set(5);
+        r.shared.limit_rate.set(5);
         assert_eq!(t.render(&r, &Sent { upstream_time: Some(vec![[Some(1), None, Some(1)], [None, None, Some(2040)]]), ..Sent::default() }), "0.001, 2.040|5");
         let t = Template::parse("$upstream_response_length:$upstream_bytes_received:$upstream_bytes_sent").unwrap();
         assert_eq!(t.render(&r, &Sent { upstream_bytes: Some(vec![[0, 0, 0], [23, 68, 45]]), ..Sent::default() }), "0, 23:0, 68:0, 45");

@@ -187,9 +187,7 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
             upstream_status: None,
             upstream: Vec::new(),
             captures: Vec::new(),
-            limit_rate: Default::default(),
-            vars: Default::default(),
-            unread: Default::default(),
+            shared: Default::default(),
             ssl: ssl.clone(),
         };
         let parsed = parse(&mut r, &buf[..end], &default.level);
@@ -213,13 +211,13 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
             Ok(Some(n)) if level.proxy.is_some() && !level.proxy_request_buffering && (buf.len() as u64) < n => {
                 r.length += n as usize;
                 r.body = std::mem::take(&mut buf);
-                *r.unread.lock().unwrap() = Some(Unread { left: n - r.body.len() as u64, chunked: None, rest: Vec::new() });
+                *r.shared.unread.lock().unwrap() = Some(Unread { left: n - r.body.len() as u64, chunked: None, rest: Vec::new() });
                 Ok(())
             }
             // A chunked body only when passed as HTTP/1.1, its data passed in chunks of what has come.
             Ok(None) if level.proxy.is_some() && !level.proxy_request_buffering && level.proxy_http_11 && matches!(dechunk(&buf, level.max_body), Ok(None)) => {
                 r.body = decode_chunked(&buf, level.max_body).unwrap_or_default().0;
-                *r.unread.lock().unwrap() = Some(Unread { left: 0, chunked: Some((std::mem::take(&mut buf), r.body.len())), rest: Vec::new() });
+                *r.shared.unread.lock().unwrap() = Some(Unread { left: 0, chunked: Some((std::mem::take(&mut buf), r.body.len())), rest: Vec::new() });
                 Ok(())
             }
             Ok(length) => loop {
@@ -241,7 +239,7 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
         drop(busy);
         // What of an unbuffered body was not passed on is read and dropped.
         // What came after a chunked one is the next request.
-        let unread = r.unread.lock().unwrap().take();
+        let unread = r.shared.unread.lock().unwrap().take();
         if let Some(mut u) = unread {
             if pass_body(&mut u, &mut stream, level.max_body, &mut tokio::io::sink()).await.is_none() { return; }
             buf = u.rest;
@@ -728,7 +726,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     // 444 closes the connection without an answer; 499 is the status of a client that closed it.
     let silent = [444, 499].contains(&status);
     if !silent && !http09(r.line.as_bytes()) {
-        let mut add = |parts: &[&str]| parts.iter().for_each(|p| crate::vars::push_bytes(&mut out, p));
+        let mut add = |parts: &[&str]| parts.iter().for_each(|p| out.extend_from_slice(p.as_bytes()));
         let server = if level.server_tokens { NAME } else { "twinx" };
         add(&["HTTP/1.1 ", decimal(&mut [0; 20], status.into()), " ", reason(status), "\r\nServer: ", server, "\r\nDate: "]);
         crate::clock::date(|date| add(&[date, "\r\n"]));
@@ -740,6 +738,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         if resp.vary && level.gzip_vary { add(&["Vary: Accept-Encoding\r\n"]); }
         resp.headers.iter().for_each(|(n, v)| add(&[n, ": ", v, "\r\n"]));
         add(&["\r\n"]);
+        if !crate::vars::plain(&out) { out = crate::vars::bytes(&String::from_utf8_lossy(&out)); }
     }
     let body_len = if r.method == "HEAD" || silent { 0 } else { resp.body.len() };
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
@@ -758,7 +757,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     }
     // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
     let size = |t: &Template| if t.0.is_empty() { 0 } else { crate::conf::size(&t.value(r, &Sent::default())).unwrap_or(0) };
-    let rate = r.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
+    let rate = r.shared.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
     let written = send(stream, &[&out, &resp.body[..body_len], &tail], rate, size(&level.limit_rate_after), r.started, send_timeout(level)).await;
     // What was passed from the proxied server through an upgraded connection counts as sent, as body.
     let tunneled = match resp.tunnel.take().filter(|_| written) { Some(up) => tunnel(stream, up, ahead, (Some(level.proxy_read_timeout).filter(|t| !t.is_zero()), send_timeout(level))).await, None => 0 };
@@ -982,7 +981,7 @@ fn run<'a>(r: &Request, ops: &'a [Op], mut level: &'a Level, proxied: &mut bool)
     for op in ops {
         match op {
             // set $limit_rate: a value that is not a size leaves it as it was.
-            Op::Set(name, value) if name == "limit_rate" => if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.limit_rate.set(rate); },
+            Op::Set(name, value) if name == "limit_rate" => if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.shared.limit_rate.set(rate); },
             Op::Set(name, value) => r.set_var(name, value.render(r, &Sent::default())),
             Op::If(cond, body, to) => if holds(r, cond) {
                 level = to.as_deref().unwrap_or(level);
@@ -1183,7 +1182,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     if !is_set("host") { req += &format!("Host: {host}\r\n"); }
     // A body passed as it comes: the rest of one with a Content-Length, or chunks.
-    let mut unread = r.unread.lock().unwrap();
+    let mut unread = r.shared.unread.lock().unwrap();
     let chunked = unread.as_ref().is_some_and(|u| u.chunked.is_some());
     if pass_body && chunked { req += "Transfer-Encoding: chunked\r\n"; }
     if pass_body && !chunked && framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len() as u64 + unread.as_ref().map_or(0, |u| u.left)); }
@@ -1246,7 +1245,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // X-Accel-Limit-Rate sets the rate the answer is sent at; X-Accel-Redirect
     // replaces the answer with an internal redirect to its URI.
     let accel = |name: &str| resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
-    if let Some(rate) = accel("x-accel-limit-rate").and_then(|v| v.parse().ok()) { r.limit_rate.set(rate); }
+    if let Some(rate) = accel("x-accel-limit-rate").and_then(|v| v.parse().ok()) { r.shared.limit_rate.set(rate); }
     // It keeps Content-Type and the headers below; an unsafe URI is 404.
     if let Some(to) = accel("x-accel-redirect") {
         const KEPT: &[&str] = &["set-cookie", "content-disposition", "cache-control", "expires", "accept-ranges"];
@@ -1817,15 +1816,33 @@ mod tests {
 
     /// What exchange() writes to a client for a GET of a server.
     fn exchanged(s: &Server, target: &str) -> String {
+        String::from_utf8(exchanged_bytes(s, target)).unwrap()
+    }
+
+    fn exchanged_bytes(s: &Server, target: &str) -> Vec<u8> {
         block_on(async {
             let (mut stream, mut out) = pair().await;
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
             exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]).await;
             drop(stream);
-            let mut text = String::new();
-            out.read_to_string(&mut text).await.unwrap();
-            text
+            let mut got = Vec::new();
+            out.read_to_end(&mut got).await.unwrap();
+            got
         })
+    }
+
+    #[test]
+    fn writes_the_head() {
+        // A byte that is not UTF-8 is sent as it is, and UTF-8 text too.
+        let byte = crate::vars::text(b"/\xff");
+        let text = format!("http {{ server {{ keepalive_timeout 5 9; location / {{ add_header X \"\u{e9}\"; return 302 {byte}; }} location /a {{ return 200 ok; }} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let got = exchanged_bytes(&config.servers[0], "/");
+        let has = |part: &[u8]| got.windows(part.len()).any(|w| w == part);
+        assert!(has(b"HTTP/1.1 302 Moved Temporarily\r\nServer: ") && has(b":8080/\xff\r\n") && has("X: \u{e9}\r\n\r\n".as_bytes()), "{}", String::from_utf8_lossy(&got));
+        let got = exchanged(&config.servers[0], "/a");
+        let (head, date) = got.split_once("Date: ").unwrap();
+        assert_eq!((head, &date[29..]), (format!("HTTP/1.1 200 OK\r\nServer: {NAME}\r\n").as_str(), "\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"));
     }
 
     /// A connection accepted on the event loop, and the other end.
@@ -1945,9 +1962,7 @@ mod tests {
             upstream_status: None,
             upstream: Vec::new(),
             captures: Vec::new(),
-            limit_rate: Default::default(),
-            vars: Default::default(),
-            unread: Default::default(),
+            shared: Default::default(),
             ssl: None,
         };
         (parse(&mut r, head.as_bytes(), &Level::default()), r)
@@ -2244,7 +2259,7 @@ mod tests {
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("POST /a HTTP/1.0\n\n");
         let resp = block_on(proxy(&p, &level, &r, "", None));
-        assert_eq!((resp.internal.as_deref(), resp.as_get, r.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
+        assert_eq!((resp.internal.as_deref(), resp.as_get, r.shared.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
         assert!(resp.upstream_time.unwrap()[0][2].unwrap() < 1000);
     }
 
