@@ -1221,7 +1221,14 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             },
             (_, tls) => tls.cloned(),
         };
-        answer = fetch((&up.peers[i].addr, tls.as_ref().map(|t| (t, name.as_deref()))), socket.flatten(), &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade).await;
+        let connecting = Instant::now();
+        answer = match connect(&up.peers[i].addr, socket.flatten(), tls.as_ref().map(|t| (t, name.as_deref())), level).await {
+            Ok(s) => {
+                time[0] = Some(connecting.elapsed().as_millis());
+                fetch(s, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade).await.map(|(resp, _)| resp)
+            }
+            Err(resp) => resp,
+        };
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
@@ -1232,7 +1239,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         statuses.push(status.unwrap_or(502).to_string());
         // proxy_next_upstream_tries and proxy_next_upstream_timeout end the tries too.
         let timeout = level.proxy_next_upstream_timeout;
-        // The page fetch() generates for a timeout, rather than an answer of the server.
+        // The page connect() generates for a timeout, rather than an answer of the server.
         let timed_out = answer.as_ref().is_some_and(|a| a.generated);
         let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout);
         up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404)));
@@ -1374,23 +1381,26 @@ fn ssl_name(name: &str) -> &str {
     host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Option<&str>)>), socket: Option<socket2::Socket>, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
-    let start = Instant::now();
+/// Opens a connection to a proxied server, from the bound socket if one is
+/// given. The error is what answers the request instead, if anything does.
+async fn connect(peer: &SocketAddr, socket: Option<socket2::Socket>, tls: Option<(&Arc<rustls::ClientConfig>, Option<&str>)>, level: &Level) -> Result<Stream, Option<Response>> {
     let connect = async {
         match socket {
             Some(socket) => { socket.set_nonblocking(true)?; tokio::net::TcpSocket::from_std_stream(socket.into()).connect(*peer).await }
             None => TcpStream::connect(peer).await,
         }
     };
-    let s = tokio::time::timeout(level.proxy_connect_timeout, connect).await.ok()?.ok()?;
+    let s = tokio::time::timeout(level.proxy_connect_timeout, connect).await.ok().and_then(Result::ok).ok_or(None)?;
     // proxy_pass https://: the TLS handshake is part of connecting.
     // A handshake that does not end within proxy_connect_timeout is a timeout, answered with 504.
-    let mut s = match tls {
-        Some((tls, name)) => match crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls).await { Ok(s) => s, Err(e) => return (e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504)) },
-        None => Stream::Tcp(s),
-    };
-    time[0] = Some(start.elapsed().as_millis());
+    match tls {
+        Some((tls, name)) => match crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls).await { Ok(s) => Ok(s), Err(e) => Err((e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504))) },
+        None => Ok(Stream::Tcp(s)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch(mut s: Stream, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<(Response, Option<Stream>)> {
     // proxy_read_timeout: how long each read may wait.
     let wait = Some(level.proxy_read_timeout).filter(|t| !t.is_zero());
     let (mut answer, mut chunk) = (Vec::new(), vec![0u8; 4096]);
@@ -1405,7 +1415,7 @@ async fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Op
         let closed = async { match client.as_deref() { Some(c) => crate::stream::closed(c.tcp()).await, None => std::future::pending().await } };
         let n = tokio::select! {
             biased;
-            () = closed => return Some(Response { status: 499, ..Response::default() }),
+            () = closed => return Some((Response { status: 499, ..Response::default() }, None)),
             n = within(wait, s.read(&mut chunk)) => n?.ok().filter(|n| *n > 0)?,
         };
         answer.extend_from_slice(&chunk[..n]);
@@ -1427,7 +1437,7 @@ async fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Op
         if !again && !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
     }
     // 101 to a request with Upgrade: what came after the head goes to the client first.
-    if status == 101 && upgrade { return Some(Response { body: answer[end..].to_vec(), tunnel: Some(s), ..resp }); }
+    if status == 101 && upgrade { return Some((Response { body: answer[end..].to_vec(), tunnel: Some(s), ..resp }, None)); }
     // The body's length: one Content-Length of digits, or one "Transfer-Encoding:
     // chunked" without it; any other mix makes the answer invalid. A HEAD, 204
     // or 304 answer has no body.
@@ -1443,10 +1453,10 @@ async fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Op
     let no_body = req.starts_with(b"HEAD ") || [204, 304].contains(&status) || accel;
     let (length, chunked) = if no_body { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
-    if rate > 0 { return Some(Response { rest: Some(Rest { s, answer, end, length, chunked, rate, started: start, wait }), ..resp }); }
+    if rate > 0 { return Some((Response { rest: Some(Rest { s, answer, end, length, chunked, rate, started: start, wait }), ..resp }, None)); }
     let (body, read) = read_body(&mut s, answer, end, length, chunked, 0, wait).await?;
     (resp.body, bytes[0], bytes[1]) = (body, (read - end) as u64, read as u64);
-    Some(resp)
+    Some((resp, Some(s)))
 }
 
 
@@ -2053,6 +2063,14 @@ mod tests {
         assert_eq!(ssl_name("::1"), "");
     }
 
+    /// Connects to a server and fetches its answer to a GET request.
+    async fn fetched(addr: &SocketAddr, socket: Option<socket2::Socket>, level: &Level, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64) -> Option<Response> {
+        let start = Instant::now();
+        let s = match connect(addr, socket, None, level).await { Ok(s) => s, Err(resp) => return resp };
+        time[0] = Some(start.elapsed().as_millis());
+        fetch(s, start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, false).await.map(|(resp, _)| resp)
+    }
+
     #[test]
     fn fetches_from_a_server() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2065,7 +2083,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (mut time, mut bytes) = ([None; 3], [0; 3]);
-        let resp = block_on(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut time, &mut bytes), &|_| 0, None, 0, false)).unwrap();
+        let resp = block_on(fetched(&addr, None, &level, (&mut time, &mut bytes), &|_| 0)).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
         // The body, the whole answer and the request, in bytes.
         assert_eq!(bytes, [4, 80, 18]);
@@ -2166,7 +2184,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
-        assert_eq!(block_on(fetch((&addr, None), socket, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false)).unwrap().status, 200);
+        assert_eq!(block_on(fetched(&addr, socket, &level, (&mut [None; 3], &mut [0; 3]), &|_| 0)).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
@@ -2186,7 +2204,7 @@ mod tests {
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
         block_on(async {
-            let mut resp = fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).await.unwrap();
+            let mut resp = fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &rate).await.unwrap();
             // The body is read after the head, 4000 bytes (what came with the head too)
             // in each second of the clock: it ends in the third second.
             assert!(resp.body.is_empty() && resp.rest.is_some());
@@ -2228,10 +2246,10 @@ mod tests {
             }
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = block_on(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false)).unwrap();
+        let resp = block_on(fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &|_| 0)).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(block_on(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false)).is_none());
+            assert!(block_on(fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &|_| 0)).is_none());
         }
     }
 
