@@ -393,6 +393,10 @@ pub struct Level {
     /// keepalive_disable: no keepalive for POST from MSIE 6 and older, and for Safari.
     pub keepalive_disable_msie6: bool,
     pub keepalive_disable_safari: bool,
+    /// lingering_close: whether what the client still sends is read when its
+    /// connection is closed. None when off; Some(false) for "on", when something
+    /// may be unread; Some(true) for "always".
+    pub lingering_close: Option<bool>,
     /// default_type: the Content-Type of files whose extension has no type.
     pub default_type: String,
     /// proxy_set_header: the headers sent to the proxied server instead of the client's.
@@ -701,7 +705,7 @@ impl Builder<'_> {
         let temp = self.path("client_body_temp");
         // Without root, files come from html under the prefix, as nginx's default root is.
         let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
-            keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
+            keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, lingering_close: Some(false),
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let block = d.block.as_deref().unwrap_or_default();
@@ -832,8 +836,7 @@ impl Builder<'_> {
                 "try_files" => level.try_files = Some(Arc::new(try_files(&d.args).map_err(at)?)),
                 "absolute_redirect" => level.absolute_redirect = flag(d).map_err(at)?,
                 "server_tokens" => level.server_tokens = d.args[0] == "build" || flag(d).map_err(|_| at(format!("invalid value \"{}\" in \"server_tokens\" directive, it must be \"on\", \"off\" or \"build\"", d.args[0])))?,
-                // twinx reads what the client still sends after every answer it closes, as nginx does with "always".
-                "lingering_close" => if !["off", "on", "always"].contains(&d.args[0].as_str()) { return Err(at(format!("invalid value \"{}\" in \"lingering_close\" directive, it must be \"off\", \"on\" or \"always\"", d.args[0]))) },
+                "lingering_close" => level.lingering_close = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"lingering_close\" directive, it must be \"off\", \"on\" or \"always\"", d.args[0])))?.1,
                 "server_name_in_redirect" => level.server_name_in_redirect = flag(d).map_err(at)?,
                 "port_in_redirect" => level.port_in_redirect = flag(d).map_err(at)?,
                 "log_format" => {
@@ -2030,7 +2033,10 @@ mod tests {
 
     #[test]
     fn lingering_close() {
-        assert!(build_text("http { lingering_close always; server { listen 127.0.0.1:8080; lingering_close off; location / { lingering_close on; } } }").is_ok());
+        let c = build_text("http { lingering_close always; server { location /a { lingering_close on; } location /b { } } server { lingering_close off; } }").unwrap();
+        let l = &c.servers[0].locations;
+        assert_eq!((l[0].level.lingering_close, l[1].level.lingering_close, c.servers[1].level.lingering_close), (Some(false), Some(true), None));
+        assert_eq!(build_text("http { server { } }").unwrap().servers[0].level.lingering_close, Some(false));
         assert_eq!(build_text("http { lingering_close yes; }").unwrap_err(), "invalid value \"yes\" in \"lingering_close\" directive, it must be \"off\", \"on\" or \"always\" in t.conf:1");
     }
 

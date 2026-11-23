@@ -60,13 +60,13 @@ pub struct Request {
     /// What the internal redirects of the request share.
     pub shared: std::sync::Arc<Shared>,
     /// The TLS session of a connection accepted with "ssl".
-    pub ssl: Option<crate::tls::Session>,
+    pub ssl: Option<std::sync::Arc<crate::tls::Session>>,
 }
 
 impl Request {
     /// A request of a connection whose head has not been read: for what only
     /// the connection gives, such as $ssl_server_name in ssl_certificate.
-    pub fn connection(peer: SocketAddr, local: SocketAddr, ssl: Option<crate::tls::Session>) -> Request {
+    pub fn connection(peer: SocketAddr, local: SocketAddr, ssl: Option<std::sync::Arc<crate::tls::Session>>) -> Request {
         let now = Instant::now();
         Request {
             method: String::new(), uri: String::new(), target: String::new(), line: String::new(), headers: Vec::new(), host: None,

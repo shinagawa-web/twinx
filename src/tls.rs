@@ -551,7 +551,7 @@ impl ServerTls {
     /// certificate and key they name for it (None when they cannot be loaded).
     fn for_connection(&self, (peer, local): (SocketAddr, SocketAddr), name: &str) -> Option<Arc<ServerConfig>> {
         let Some(n) = &self.named else { return Some(self.config.clone()) };
-        let r = crate::vars::Request::connection(peer, local, Some(Session { server_name: name.to_string(), ..Session::default() }));
+        let r = crate::vars::Request::connection(peer, local, Some(Arc::new(Session { server_name: name.to_string(), ..Session::default() })));
         let sent = crate::vars::Sent::default();
         let mut keys = Vec::new();
         for (cert, key) in &n.files {
