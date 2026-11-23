@@ -71,7 +71,7 @@ files = [
   "ssl_verify_client.t", "ssl_verify_client_trusted.t", "ssl_verify_depth.t",
 ]
 
-# Stage 4: HTTP/2. Files that need, besides the modules and test client features
+# Stage 4, done at v0.4.0 (2026-11-24): HTTP/2. Files that need, besides the modules and test client features
 # of stages 1 to 3, only http_v2; files that also need grpc, HTTP/3, caching or
 # other modules wait for their stages. h2_server_tokens.t checks the name as
 # server_tokens.t does, so for twinx it is renamed the same way.
