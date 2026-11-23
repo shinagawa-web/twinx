@@ -41,9 +41,6 @@ pub struct Request {
     pub upstream: Vec<(String, String)>,
     /// The named captures of the server name that matched the host.
     pub captures: Vec<(String, String)>,
-    /// The client's socket, watched for the client closing the connection while
-    /// a proxied server is answering; -1 when there is none.
-    pub client: i32,
     /// With proxy_request_buffering off: the body still to be read from the
     /// client, sent on to the proxied server as it comes; what the proxy does
     /// not take is read and dropped afterwards.
@@ -66,7 +63,7 @@ impl Request {
             method: String::new(), uri: String::new(), target: String::new(), line: String::new(), headers: Vec::new(), host: None,
             server_name: String::new(), peer, local, started: now, pipelined: false, connected: now, requests: 0, length: 0,
             body: Vec::new(), body_file: None, upstream_addr: None, upstream_status: None, upstream: Vec::new(), captures: Vec::new(),
-            limit_rate: Default::default(), vars: Default::default(), unread: Default::default(), client: -1, ssl,
+            limit_rate: Default::default(), vars: Default::default(), unread: Default::default(), ssl,
         }
     }
 
@@ -533,7 +530,6 @@ mod tests {
             limit_rate: Default::default(),
             vars: Default::default(),
             unread: Default::default(),
-            client: -1,
             ssl: None,
         }
     }

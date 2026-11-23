@@ -7,6 +7,7 @@ mod http;
 mod log;
 mod ocsp;
 mod resolver;
+mod stream;
 mod tls;
 mod upstream;
 mod vars;
@@ -138,13 +139,43 @@ fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], s
         alert(config, &format!("chdir(\"{}\") failed ({}: {reason})", dir.display(), e.raw_os_error().unwrap_or(0)));
         std::process::exit(2)
     }
-    if let Err(e) = http::accept(config.clone(), listeners) { fail(&e, None) }
-    // A worker ignores HUP, which only the master acts on. QUIT shuts it down
-    // gracefully; TERM and INT end it at once.
-    let mut sig = SIGHUP;
-    while sig == SIGHUP { sig = wait_signal(set) }
-    if sig == SIGQUIT { http::shut_down(config.shutdown_timeout) }
+    // The worker's event loop, on this one thread: it is made after fork(), as
+    // the master has to stay single-threaded to fork.
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap_or_else(|e| fail(&e.to_string(), None));
+    tokio::task::LocalSet::new().block_on(&runtime, async {
+        let accepting = http::accept(config.clone(), listeners).unwrap_or_else(|e| fail(&e, None));
+        let signals = signal_fd(set).unwrap_or_else(|e| fail(&format!("signalfd() failed ({e})"), None));
+        // A worker ignores HUP, which only the master acts on. QUIT shuts it down
+        // gracefully; TERM and INT end it at once.
+        let mut sig = SIGHUP;
+        while sig == SIGHUP { sig = next_signal(&signals).await }
+        if sig == SIGQUIT { http::shut_down(accepting, config.shutdown_timeout).await }
+    });
     std::process::exit(0)
+}
+
+/// A signalfd for the signals of the set, which stay blocked: the event loop
+/// reads them from it as they come.
+fn signal_fd(set: &sigset_t) -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: set is a valid signal set; the descriptor returned is owned by nothing else.
+    let fd = unsafe { libc::signalfd(-1, set, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
+    if fd < 0 { return Err(std::io::Error::last_os_error()) }
+    // SAFETY: fd is a new descriptor of this process, which the AsyncFd owns and closes.
+    unsafe { tokio::io::unix::AsyncFd::register_with_interest(std::os::fd::OwnedFd::from_raw_fd(fd), tokio::io::Interest::READABLE) }.map_err(|e| e.into_parts().1)
+}
+
+/// The next signal of a signalfd; TERM when it cannot be read.
+async fn next_signal(fd: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>) -> c_int {
+    use std::os::fd::AsRawFd;
+    loop {
+        let Ok(mut ready) = fd.readable().await else { return SIGTERM };
+        // SAFETY: an all-zero signalfd_siginfo is valid, and the read writes at most its size into it.
+        let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+        let n = unsafe { libc::read(fd.as_raw_fd(), (&mut info as *mut libc::signalfd_siginfo).cast(), size_of::<libc::signalfd_siginfo>()) };
+        if n == size_of::<libc::signalfd_siginfo>() as isize { return info.ssi_signo as c_int }
+        ready.clear_ready();
+    }
 }
 
 fn main() {
@@ -219,5 +250,20 @@ mod tests {
         // Blocked in this thread only, and raised for this thread, so other tests do not see it.
         unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()); libc::raise(SIGINT) };
         assert_eq!(wait_signal(&set), SIGINT);
+    }
+
+    #[test]
+    fn reads_blocked_signals_on_the_event_loop() {
+        let set = signal_set();
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
+        stream::block_on(async {
+            let fd = signal_fd(&set).unwrap();
+            unsafe { libc::raise(SIGHUP) };
+            assert_eq!(next_signal(&fd).await, SIGHUP);
+            // Nothing else is pending until the next one comes.
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(50), next_signal(&fd)).await.is_err());
+            unsafe { libc::raise(SIGQUIT) };
+            assert_eq!(next_signal(&fd).await, SIGQUIT);
+        });
     }
 }
