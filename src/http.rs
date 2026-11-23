@@ -164,7 +164,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
     let mut piped = false;
     // A TLS connection whose client and server agreed on h2 (ALPN) speaks HTTP/2.
     if ssl.as_ref().is_some_and(|s| s.alpn == "h2") && !matches!(stream, Stream::Pipe(_)) {
-        return Box::pin(crate::h2::serve(config.clone(), crate::h2::Rewound::new(buf, stream), (listen, local, peer, ssl), fresh.take())).await;
+        return Box::pin(crate::h2::serve(config.clone(), stream, buf, (listen, local, peer, ssl), fresh.take())).await;
     }
     loop {
         let (pipelined, started) = (!buf.is_empty(), Instant::now());
@@ -185,7 +185,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         // With http2 on in the default server of the address, a connection
         // that starts with the preface of HTTP/2 speaks it, as nginx decides.
         if requests == 1 && ssl.is_none() && http2(config, listen, default) && buf.starts_with(b"PRI * HTTP/2.0\r\n") && !matches!(stream, Stream::Pipe(_)) {
-            return Box::pin(crate::h2::serve(config.clone(), crate::h2::Rewound::new(buf, stream), (listen, local, peer, None), fresh.take())).await;
+            return Box::pin(crate::h2::serve(config.clone(), stream, buf, (listen, local, peer, None), fresh.take())).await;
         }
         let mut r = Request {
             method: String::new(),
