@@ -1,6 +1,7 @@
 //! Variables ($uri, $status, ...) and the strings built from them: the
 //! complex values of directives such as return, and access log formats.
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -334,6 +335,7 @@ impl Var {
 /// keeps them: each becomes a character of the Private Use Area, U+10FF00
 /// plus the byte, which bytes() turns back into the byte when it is sent.
 pub fn text(b: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(b) { return s.to_string() }
     let mut out = String::with_capacity(b.len());
     for chunk in b.utf8_chunks() {
         out.push_str(chunk.valid());
@@ -346,10 +348,17 @@ pub fn text(b: &[u8]) -> String {
 /// the byte it stands for.
 pub fn bytes(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
+    push_bytes(&mut out, s);
+    out
+}
+
+/// Adds the bytes of text made by text().
+pub fn push_bytes(out: &mut Vec<u8>, s: &str) {
+    // Those characters begin with the byte 0xf4 in UTF-8, which is rare.
+    if !s.as_bytes().contains(&0xf4) { return out.extend_from_slice(s.as_bytes()) }
     for c in s.chars() {
         match c as u32 { n @ 0x10FF00.. => out.push(n as u8), _ => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()) }
     }
-    out
 }
 
 /// The values of every header with the name, joined; None when there is none.
@@ -460,6 +469,16 @@ impl Template {
         Ok(Template(parts))
     }
 
+    /// The value when there are no variables in it.
+    pub fn fixed(&self) -> Option<&str> {
+        match &self.0[..] { [] => Some(""), [Part::Text(t)] => Some(t), _ => None }
+    }
+
+    /// The value for a directive, as render() gives it, not copied when it is fixed.
+    pub fn value(&self, r: &Request, s: &Sent) -> Cow<'_, str> {
+        self.fixed().map_or_else(|| Cow::Owned(self.render(r, s)), Cow::Borrowed)
+    }
+
     /// The value for a directive: variables that are not found give "".
     pub fn render(&self, r: &Request, s: &Sent) -> String {
         let now = Now::default();
@@ -548,6 +567,9 @@ mod tests {
         let t = Template::parse("$uri ${status}x $pipe $request_length $http_user_agent").unwrap();
         let s = Sent { status: 200, bytes: 10, body: 2, ..Sent::default() };
         assert_eq!(t.render(&request(), &s), "/a 200x p 39 x\"y");
+        assert_eq!((t.fixed(), t.value(&request(), &s).as_ref()), (None, "/a 200x p 39 x\"y"));
+        let fixed = Template::parse("ok").unwrap();
+        assert_eq!((fixed.fixed(), fixed.value(&request(), &s).as_ref(), Template::default().fixed()), (Some("ok"), "ok", Some("")));
         assert_eq!(t.log_line(&request(), &s, Escape::Default), b"/a 200x p 39 x\\x22y");
     }
 
@@ -580,6 +602,8 @@ mod tests {
         let raw = b"/\xff\xfe?q=\xc3\xa9\xc3";
         assert_eq!(text(raw), "/\u{10ffff}\u{10fffe}?q=\u{e9}\u{10ffc3}");
         assert_eq!(bytes(&text(raw)), raw);
+        // Characters whose UTF-8 begins as theirs does, and text without any.
+        assert_eq!((bytes("\u{10fffd}\u{10fe00}"), bytes("\u{e9}a")), ([&b"\xfd"[..], "\u{10fe00}".as_bytes()].concat(), "\u{e9}a".as_bytes().to_vec()));
         let mut r = request();
         r.target = text(raw);
         assert_eq!(Template::parse("$args").unwrap().log_line(&r, &Sent::default(), Escape::Default), b"q=\\xC3\\xA9\\xC3");

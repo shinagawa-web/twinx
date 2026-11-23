@@ -29,13 +29,13 @@ pub fn coarse() -> Instant {
     *base + read(libc::CLOCK_MONOTONIC_COARSE).saturating_sub(*read_at)
 }
 
-/// Adds the time of day as the Date header has it, formatted once a second.
-pub fn date(out: &mut Vec<u8>) {
+/// Gives the time of day as the Date header has it, formatted once a second.
+pub fn date(give: impl FnOnce(&str)) {
     thread_local! { static DATE: RefCell<(i64, String)> = const { RefCell::new((i64::MIN, String::new())) } }
     let now = seconds();
     DATE.with_borrow_mut(|(at, date)| {
         if *at != now { (*at, *date) = (now, crate::expires::http_date(now)); }
-        out.extend_from_slice(date.as_bytes());
+        give(date);
     })
 }
 
@@ -56,15 +56,11 @@ mod tests {
 
     #[test]
     fn date_is_the_time_of_day() {
-        let mut out = b"Date: ".to_vec();
-        date(&mut out);
-        let text = String::from_utf8(out).unwrap();
-        let time = crate::expires::http_time(text.strip_prefix("Date: ").unwrap()).unwrap();
+        let get = || { let mut text = String::new(); date(|d| text += d); text };
+        let time = crate::expires::http_time(&get()).unwrap();
         assert!((seconds() - time).abs() <= 1);
-        // The same second is not formatted again, and gives the same bytes.
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        date(&mut a);
-        date(&mut b);
-        assert_eq!((a.len(), b.len()), (29, 29));
+        // The same second is not formatted again, and gives the same text.
+        let (a, b) = (get(), get());
+        assert!(a.len() == 29 && (a == b || seconds() > time));
     }
 }

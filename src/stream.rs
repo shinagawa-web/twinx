@@ -1,6 +1,7 @@
 //! The connections twinx reads and writes: a client's or a proxied server's,
 //! over TCP or TLS, on the worker's event loop.
 
+use std::cell::RefCell;
 use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -98,9 +99,34 @@ pub async fn read_into<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, time:
 }
 
 /// Reads what comes into the end of buf before the deadline, as read_into does.
+/// While there is nothing to read, a buffer without memory is not given any.
 pub async fn read_until<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, deadline: impl Fn() -> Option<Instant>) -> usize {
-    buf.reserve(4096);
-    until(deadline, s.read_buf(buf)).await.and_then(Result::ok).unwrap_or(0)
+    let read = std::future::poll_fn(|cx| {
+        let lent = buf.capacity() == 0;
+        if lent { *buf = buffer(); }
+        buf.reserve(4096);
+        let read = std::pin::pin!(s.read_buf(buf)).poll(cx);
+        if lent && read.is_pending() { recycle(std::mem::take(buf)); }
+        read
+    });
+    until(deadline, read).await.and_then(Result::ok).unwrap_or(0)
+}
+
+thread_local! {
+    /// Buffers used before, to use again: a worker, which serves its connections
+    /// on one thread, needs few at a time.
+    static SPARE: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) }
+}
+
+/// An empty buffer, which may have memory.
+pub fn buffer() -> Vec<u8> {
+    SPARE.with_borrow_mut(Vec::pop).unwrap_or_default()
+}
+
+/// Keeps the memory of a buffer for the next that needs one, if it is not large.
+pub fn recycle(mut buf: Vec<u8>) {
+    buf.clear();
+    SPARE.with_borrow_mut(|spare| if (1..=16384).contains(&buf.capacity()) && spare.len() < 16 { spare.push(buf) });
 }
 
 /// Writes data and flushes it (a TLS record may wait in the connection otherwise),
@@ -177,6 +203,26 @@ mod tests {
             other.write_all(b"x").await.unwrap();
             assert_eq!((read_into(&mut s, &mut buf, None).await, buf.as_slice()), (1, &b"x"[..]));
             assert_eq!(within(Some(Duration::from_millis(10)), std::future::pending::<()>()).await, None);
+        });
+    }
+
+    #[test]
+    fn lends_buffers() {
+        block_on(async {
+            let (s, mut other) = pair().await;
+            let (mut s, mut buf) = (Stream::Tcp(s), Vec::new());
+            // A read that gives up keeps no memory, which the next buffer has.
+            assert_eq!(read_into(&mut s, &mut buf, Some(Duration::from_millis(10))).await, 0);
+            assert_eq!(buf.capacity(), 0);
+            let lent = buffer();
+            assert!(lent.is_empty() && lent.capacity() >= 4096);
+            recycle(lent);
+            other.write_all(b"x").await.unwrap();
+            assert_eq!(read_into(&mut s, &mut buf, None).await, 1);
+            assert_eq!((buf.as_slice(), buffer().capacity()), (&b"x"[..], 0));
+            // A large buffer is not kept.
+            recycle(Vec::with_capacity(1 << 20));
+            assert_eq!(buffer().capacity(), 0);
         });
     }
 

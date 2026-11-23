@@ -18,7 +18,7 @@ use crate::vars::{Part, Template};
 use crate::expires;
 use crate::upstream::{Peer, Upstream};
 use crate::vars::{Request, Sent};
-use crate::stream::{Stream, read_into, read_until, within, write_all};
+use crate::stream::{Stream, buffer, read_into, read_until, recycle, within, write_all};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
 
@@ -237,7 +237,7 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
         if !level.body_in_file_only || level.body_clean { r.body_file.map(std::fs::remove_file); }
         if idle.is_none() || SHUTTING.load(Ordering::SeqCst) { return linger(&mut stream).await; }
         // An idle connection keeps no buffer.
-        if buf.is_empty() { buf = Vec::new(); }
+        if buf.is_empty() { recycle(std::mem::take(&mut buf)); }
     }
 }
 
@@ -557,7 +557,7 @@ async fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Temp
         (Some((code, text)), _, _) if text.0.is_empty() && code >= 400 => special(code),
         (Some((code, text)), _, _) => {
             let ctype = Some("text/plain".into());
-            Response { status: code, ctype, body: crate::vars::bytes(&text.render(r, &Sent::default())), ..Response::default() }
+            Response { status: code, ctype, body: crate::vars::bytes(&text.value(r, &Sent::default())), ..Response::default() }
         }
         (None, _, Some(tf)) => try_files(tf, level, r, prefix, client).await,
         (None, Some(p), None) => proxy(p, level, r, prefix, client).await,
@@ -710,24 +710,22 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let upgraded = resp.tunnel.is_some();
     let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1") && level.chunked && !upgraded;
     let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown) && !upgraded;
-    let mut out = Vec::new();
+    let mut out = buffer();
     // 444 closes the connection without an answer; 499 is the status of a client that closed it.
     let silent = [444, 499].contains(&status);
     if !silent && !http09(r.line.as_bytes()) {
-        let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
-        let mut date = Vec::new();
-        crate::clock::date(&mut date);
-        let date = String::from_utf8_lossy(&date);
-        let ctype = resp.ctype.as_ref().map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
-        let connection = if upgraded { "upgrade" } else if keepalive { "keep-alive" } else { "close" };
-        let len = resp.body.len();
-        let length = if chunked { "Transfer-Encoding: chunked\r\n".to_string() } else if !resp.unknown_length && status != 304 && !upgraded { format!("Content-Length: {len}\r\n") } else { String::new() };
-        let header = level.keepalive_header.filter(|_| keepalive).map(|t| format!("Keep-Alive: timeout={t}\r\n")).unwrap_or_default();
-        let vary = if resp.vary && level.gzip_vary { "Vary: Accept-Encoding\r\n" } else { "" };
+        let mut add = |parts: &[&str]| parts.iter().for_each(|p| crate::vars::push_bytes(&mut out, p));
         let server = if level.server_tokens { NAME } else { "twinx" };
-        let mut head = format!("HTTP/1.1 {status} {reason}\r\nServer: {server}\r\nDate: {date}\r\n{ctype}{length}Connection: {connection}\r\n{header}{vary}");
-        resp.headers.iter().for_each(|(n, v)| head += &format!("{n}: {v}\r\n"));
-        out = crate::vars::bytes(&(head + "\r\n"));
+        add(&["HTTP/1.1 ", decimal(&mut [0; 20], status.into()), " ", reason(status), "\r\nServer: ", server, "\r\nDate: "]);
+        crate::clock::date(|date| add(&[date, "\r\n"]));
+        if let Some(ctype) = &resp.ctype { add(&["Content-Type: ", ctype, "\r\n"]); }
+        if chunked { add(&["Transfer-Encoding: chunked\r\n"]); }
+        else if !resp.unknown_length && status != 304 && !upgraded { add(&["Content-Length: ", decimal(&mut [0; 20], resp.body.len() as u64), "\r\n"]); }
+        add(&["Connection: ", if upgraded { "upgrade" } else if keepalive { "keep-alive" } else { "close" }, "\r\n"]);
+        if let Some(t) = level.keepalive_header.filter(|_| keepalive) { add(&["Keep-Alive: timeout=", decimal(&mut [0; 20], t), "\r\n"]); }
+        if resp.vary && level.gzip_vary { add(&["Vary: Accept-Encoding\r\n"]); }
+        resp.headers.iter().for_each(|(n, v)| add(&[n, ": ", v, "\r\n"]));
+        add(&["\r\n"]);
     }
     let body_len = if r.method == "HEAD" || silent { 0 } else { resp.body.len() };
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
@@ -745,7 +743,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         tail.extend_from_slice(b"\r\n");
     }
     // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
-    let size = |t: &Template| crate::conf::size(&t.render(r, &Sent::default())).unwrap_or(0);
+    let size = |t: &Template| if t.0.is_empty() { 0 } else { crate::conf::size(&t.value(r, &Sent::default())).unwrap_or(0) };
     let rate = r.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
     let written = send(stream, &[&out, &resp.body[..body_len], &tail], rate, size(&level.limit_rate_after), r.started, send_timeout(level)).await;
     // What was passed from the proxied server through an upgraded connection counts as sent, as body.
@@ -755,7 +753,20 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         let sent = Sent { bytes: out.len() + body_len + tail.len() + tunneled, body: body_len + tunneled, ..so_far(resp, trailers) };
         level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     }
+    recycle(out);
     (written && keepalive && !silent).then_some(level.keepalive_timeout)
+}
+
+/// A number in decimal digits, written at the end of the space given.
+fn decimal(space: &mut [u8; 20], mut n: u64) -> &str {
+    let mut at = space.len();
+    loop {
+        at -= 1;
+        space[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 { break }
+    }
+    std::str::from_utf8(&space[at..]).unwrap_or_default()
 }
 
 /// Passes data both ways between a client and the proxied server its
@@ -859,7 +870,7 @@ fn etag_match(list: &str, etag: Option<&str>, weak: bool) -> bool {
 /// parts one after another (the head, the body, the end of a chunked body),
 /// written together (writev) without copying them into one buffer. Each
 /// write waits at most the time (send_timeout).
-async fn send<S: AsyncWrite + Unpin>(stream: &mut S, parts: &[&[u8]], rate: u64, after: u64, started: Instant, time: Option<Duration>) -> bool {
+async fn send<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts: &[&[u8]; N], rate: u64, after: u64, started: Instant, time: Option<Duration>) -> bool {
     let total: usize = parts.iter().map(|p| p.len()).sum();
     if rate == 0 { return write_parts(stream, parts, 0, total, time).await; }
     let clock = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
@@ -877,15 +888,17 @@ async fn send<S: AsyncWrite + Unpin>(stream: &mut S, parts: &[&[u8]], rate: u64,
 }
 
 /// Writes the bytes from..to of the parts taken one after another.
-async fn write_parts<S: AsyncWrite + Unpin>(stream: &mut S, parts: &[&[u8]], from: usize, to: usize, time: Option<Duration>) -> bool {
-    let mut at = 0;
-    let mut bufs = Vec::new();
+async fn write_parts<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts: &[&[u8]; N], from: usize, to: usize, time: Option<Duration>) -> bool {
+    let (mut at, mut used, mut bufs) = (0, 0, [std::io::IoSlice::new(&[]); N]);
     for p in parts {
         let (start, end) = (from.max(at), to.min(at + p.len()));
-        if start < end { bufs.push(std::io::IoSlice::new(&p[start - at..end - at])); }
+        if start < end {
+            bufs[used] = std::io::IoSlice::new(&p[start - at..end - at]);
+            used += 1;
+        }
         at += p.len();
     }
-    crate::stream::write_vectored(stream, &mut bufs, time).await
+    crate::stream::write_vectored(stream, &mut bufs[..used], time).await
 }
 
 /// Whether the location lets the connection serve another request, as
@@ -2274,6 +2287,11 @@ mod tests {
             let (mut s, _client) = pair().await;
             assert!(!send(&mut s, &[&vec![b'x'; 1 << 24]], 0, 0, Instant::now(), Some(Duration::from_millis(200))).await);
         });
+    }
+
+    #[test]
+    fn decimal_digits() {
+        assert_eq!([0, 7, 200, u64::MAX].map(|n| decimal(&mut [0; 20], n).to_string()), ["0", "7", "200", "18446744073709551615"]);
     }
 
     #[test]
