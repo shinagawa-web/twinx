@@ -472,11 +472,9 @@ impl Connection {
         let refused = self.streams.len() >= CONCURRENT;
         // As in nginx, a stream that reaches keepalive_requests or keepalive_time,
         // or any with keepalive_timeout 0, is the last the connection takes.
-        if !refused {
-            self.requests += 1;
-            let (requests, timeout, time) = self.keepalive;
-            if timeout.is_zero() || self.requests >= requests || self.started.elapsed() > time { self.goaway(); }
-        }
+        self.requests += u64::from(!refused);
+        let (requests, timeout, time) = self.keepalive;
+        if !refused && (timeout.is_zero() || self.requests >= requests || self.started.elapsed() > time) { self.goaway(); }
         self.block = Some((sid, flags, Vec::new(), refused));
         self.header_block(flags, &p[pad + priority..p.len() - padding])
     }
