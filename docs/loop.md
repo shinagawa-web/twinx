@@ -52,6 +52,8 @@ When a pull request still fails the judge at the end of the iteration you spent 
 
 ## A Fixer run
 
+When a run starts, another may still be working. If a Fixer pull request (`claude/fix-*`) is open, is neither blocked nor labelled `stalled`, and had a commit, a comment or a judge run in the last 30 minutes, another run is on it: start nothing and end the run (below).
+
 As many iterations as fit before the next run, which starts at minute 30 of the hour: start one only while the minute (`date +%M`) is 30 or more, or less than 15. Each one:
 
 1. `git fetch --prune origin` and start from a fresh `origin/main`.
