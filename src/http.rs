@@ -1203,6 +1203,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let (mut tried, mut answer, mut addrs, mut times, mut bytes) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new(), Vec::new());
     let (mut statuses, limit, first) = (Vec::new(), level.proxy_next_upstream_tries, Instant::now());
     let (mut tries, next) = (if limit > 0 { up.tries().min(limit) } else { up.tries() }, |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
+    // Whether a request that a server may have got can go on to another: not one whose
+    // body is passed as it comes, nor, without non_idempotent, one of these methods.
+    let resend = !(pass_body && unread.is_some()) && (!matches!(r.method.as_str(), "POST" | "LOCK" | "PATCH") || next("non_idempotent"));
     let upgrade = r.headers.iter().any(|h| h.0.eq_ignore_ascii_case("upgrade"));
     // The name certificates are verified for (proxy_ssl_verify) and SNI sends
     // (proxy_ssl_server_name): proxy_ssl_name or $proxy_host, without the port.
@@ -1232,6 +1235,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             Some(conn) => Ok(conn),
             None => connect(&addr, socket.flatten(), tls.as_ref().map(|t| (t, name.as_deref())), level).await.map(|s| Conn::new(s, connecting)),
         };
+        let begun = conn.is_ok();
         let kept;
         (answer, kept) = match conn {
             Ok(conn) => {
@@ -1252,7 +1256,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let timeout = level.proxy_next_upstream_timeout;
         // The page connect() generates for a timeout, rather than an answer of the server.
         let timed_out = answer.as_ref().is_some_and(|a| a.generated);
-        let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout);
+        let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout) && (resend || !begun);
         // The connection of an answer that is not used is closed.
         if let Some(conn) = kept.flatten().filter(|_| !again) { up.put(conn, addr, tag); }
         up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404)));
@@ -2472,6 +2476,84 @@ mod tests {
             (0, "POST /a/b HTTP/1.1\r\nHost: u\r\nContent-Length: 3\r\nX: 2\r\n\r\nxyz".to_string()),
             (0, "GET /a?3 HTTP/1.1\r\nHost: u\r\n\r\n".to_string()),
         ]);
+    }
+
+    /// A server that reads a request, sends the answer, if any, and closes the
+    /// connection; and how many connections came.
+    fn closing(answer: &'static str) -> (SocketAddr, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
+        let all = came.clone();
+        thread::spawn(move || {
+            for s in listener.incoming() {
+                *all.lock().unwrap() += 1;
+                let (mut s, mut req, mut chunk) = (s.unwrap(), String::new(), [0u8; 1024]);
+                // The body, if any, is one byte, or ends with the last chunk.
+                let whole = |req: &str| req.split_once("\r\n\r\n").is_some_and(|(head, body)| {
+                    if head.contains("chunked") { body.ends_with("0\r\n\r\n") } else { !head.contains("Content-Length") || !body.is_empty() }
+                });
+                while !whole(&req) {
+                    let n = s.read(&mut chunk).unwrap();
+                    assert!(n > 0, "{req}");
+                    req += std::str::from_utf8(&chunk[..n]).unwrap();
+                }
+                s.write_all(answer.as_bytes()).unwrap();
+            }
+        });
+        (addr, came)
+    }
+
+    /// The status of the answer to a request passed to an upstream of the two
+    /// servers, with the directives in its location and the rest of its body, if
+    /// any, coming from the client as "c".
+    fn passed_to(servers: [SocketAddr; 2], directives: &str, head: &str, rest: Option<Unread>) -> u16 {
+        let [first, second] = servers;
+        let text = format!("http {{ upstream u {{ server {first}; server {second}; }} proxy_read_timeout 1s; server {{ location / {{ proxy_pass http://u; {directives} }} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        block_on(async {
+            let (mut client, mut out) = pair().await;
+            if let Some(u) = &rest { out.write_all(if u.chunked.is_some() { b"1\r\nc\r\n0\r\n\r\n" } else { b"c" }).await.unwrap(); }
+            let (parsed, r) = request(head);
+            *r.shared.unread.lock().unwrap() = rest;
+            let found = located(&config.servers[0], &r, &r.uri);
+            answer(&config.servers[0], &r, parsed, found, Some(&mut client)).await.0.status
+        })
+    }
+
+    #[test]
+    fn requests_sent_are_not_sent_again() {
+        const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+        let (error, any) = ("proxy_next_upstream error;", "proxy_next_upstream error non_idempotent;");
+        let (status, status_any) = ("proxy_next_upstream http_503;", "proxy_next_upstream http_503 non_idempotent;");
+        // What the first server answers, and the status of the answer: 200 when the second server got the request.
+        for (first, directives, method, want) in [
+            ("", "", "GET", 200), ("", "", "PUT", 200),
+            ("", "", "POST", 502), ("", error, "LOCK", 502), ("", error, "PATCH", 502),
+            ("", any, "POST", 200),
+            // It is the client's method that matters.
+            ("", "proxy_method GET;", "POST", 502), ("", "proxy_method POST;", "GET", 200),
+            (UNAVAILABLE, status, "GET", 200), (UNAVAILABLE, status, "POST", 503), (UNAVAILABLE, status_any, "POST", 200),
+        ] {
+            let ((a, sent), (b, again)) = (closing(first), closing(OK));
+            assert_eq!(passed_to([a, b], directives, &format!("{method} / HTTP/1.0\n\n"), None), want, "{method} {directives}");
+            assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, (want == 200) as usize), "{method} {directives}");
+        }
+        // Nothing was sent to a server that refuses the connection: its port is bound, but nothing listens.
+        let refusing = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        refusing.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
+        let a = refusing.local_addr().unwrap().as_socket().unwrap();
+        let (b, again) = closing(OK);
+        assert_eq!((passed_to([a, b], "", "POST / HTTP/1.0\n\n", None), *again.lock().unwrap()), (200, 1));
+        // A body passed as it comes is passed once, whatever the method.
+        for (first, directives, want) in [("", any, 502), (UNAVAILABLE, status_any, 503)] {
+            for (framing, left, chunked) in [("Content-Length: 1", 1, None), ("Transfer-Encoding: chunked", 0, Some((Vec::new(), 0)))] {
+                let ((a, sent), (b, again)) = (closing(first), closing(OK));
+                let directives = format!("proxy_request_buffering off; {directives}");
+                assert_eq!(passed_to([a, b], &directives, &format!("PUT / HTTP/1.1\nHost: h\n{framing}\n\n"), Some(Unread { left, chunked, rest: Vec::new() })), want, "{framing}");
+                assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, 0), "{framing}");
+            }
+        }
     }
 
     #[test]
