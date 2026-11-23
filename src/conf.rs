@@ -168,6 +168,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("gzip_static", HSL, 1, 1, false),
     ("gunzip", HSL, 1, 1, false),
     ("gzip_vary", HSL, 1, 1, false),
+    ("sendfile", HSL | LIF, 1, 1, false),
     ("gzip_http_version", HSL, 1, 1, false),
     ("gzip_types", HSL, 1, usize::MAX, false),
     ("limit_rate", HSL | LIF, 1, 1, false),
@@ -417,6 +418,8 @@ pub struct Level {
     /// proxy_http_version 1.1: requests are passed as HTTP/1.1, and a chunked
     /// body that is not buffered is passed chunked as it comes.
     pub proxy_http_11: bool,
+    /// proxy_http_version 2: requests are passed over HTTP/2 (crate::h2::upstream).
+    pub proxy_h2: bool,
     /// proxy_buffer_size: the buffer the proxied server's response head must fit in.
     pub proxy_buffer_size: usize,
     /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
@@ -948,7 +951,10 @@ impl Builder<'_> {
                 // How the proxied answer's body is read changes nothing that is sent: the value is only checked.
                 "proxy_buffering" => { flag(d).map_err(at)?; }
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
-                "proxy_http_version" => level.proxy_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\" or \"1.1\"", d.args[0])))? == 1,
+                "proxy_http_version" => {
+                    let version = ["1.0", "1.1", "2"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\"", d.args[0])))?;
+                    (level.proxy_http_11, level.proxy_h2) = (version > 0, version == 2);
+                }
                 "proxy_max_temp_file_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
                 "proxy_buffers" => if d.args[0].parse::<u64>().map_or(true, |n| n == 0) || size(&d.args[1]).map_or(true, |n| n == 0) { return Err(at("\"proxy_buffers\" directive invalid value".into())); }
@@ -997,6 +1003,8 @@ impl Builder<'_> {
                 }
                 "gzip_types" => level.gzip_types = d.args.iter().map(|t| t.to_ascii_lowercase()).collect(),
                 "gzip_vary" => level.gzip_vary = flag(d).map_err(at)?,
+                // twinx writes every body itself: sendfile changes nothing of what is sent.
+                "sendfile" => { flag(d).map_err(at)?; }
                 "gzip_http_version" => level.gzip_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))? == 1,
                 "post_action" => level.post_action = Some(d.args[0].clone()).filter(|a| a != "off"),
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
@@ -1593,7 +1601,10 @@ mod tests {
         let c = build_text("http { proxy_http_version 1.1; server { location /a { proxy_http_version 1.0; } location /b { } } }").unwrap();
         let v: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.proxy_http_11).collect();
         assert_eq!(v, [false, true]);
-        assert!(build_text("http { proxy_http_version 2; }").unwrap_err().starts_with("invalid value \"2\" in \"proxy_http_version\" directive, it must be \"1.0\" or \"1.1\""));
+        let c = build_text("http { proxy_http_version 2; server { location /a { proxy_http_version 1.1; } location /b { } } }").unwrap();
+        let v: Vec<_> = c.servers[0].locations.iter().map(|l| (l.level.proxy_http_11, l.level.proxy_h2)).collect();
+        assert_eq!(v, [(true, false), (true, true)]);
+        assert!(build_text("http { proxy_http_version 3; }").unwrap_err().starts_with("invalid value \"3\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\""));
     }
 
     #[test]
