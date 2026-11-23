@@ -1219,16 +1219,19 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     while let Some(i) = up.pick(&mut tried) {
         let addr = up.peers[i].addr;
         addrs.push(addr.to_string());
-        // A kept connection is used wherever it was bound, as in nginx. Those over TLS are not kept.
-        let taken = if p.ssl { None } else { up.take(&addr, tag) };
+        // A kept connection is used wherever it was bound, as in nginx.
+        let taken = up.take(&addr, tag);
         let cached = taken.is_some();
         // A socket that cannot be bound fails the request without trying the next server.
         let socket = bind.filter(|_| taken.is_none()).map(|b| bound(&addr, b));
         if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
         let (start, mut time, mut counted) = (Instant::now(), [None; 3], [0; 3]);
-        // Names of proxy_ssl_certificate with variables are loaded for each connection; failing to is 500.
-        let names = level.proxy_ssl_certificate_vars.as_ref().filter(|_| p.ssl).map(|(c, k, prefix)| (c.render(r, &Sent::default()), k.render(r, &Sent::default()), prefix));
-        let tls = match (names.filter(|(c, ..)| !c.is_empty()), level.proxy_tls.as_ref().filter(|_| p.ssl)) {
+        // As in nginx, one over TLS is used as it is, whatever it was made with, and
+        // one without makes the handshake for https:// now.
+        let handshake = p.ssl && taken.as_ref().is_none_or(|c| matches!(c.stream, Stream::Tcp(_)));
+        // Names of proxy_ssl_certificate with variables are loaded for each handshake; failing to is 500.
+        let names = level.proxy_ssl_certificate_vars.as_ref().filter(|_| handshake).map(|(c, k, prefix)| (c.render(r, &Sent::default()), k.render(r, &Sent::default()), prefix));
+        let tls = match (names.filter(|(c, ..)| !c.is_empty()), level.proxy_tls.as_ref().filter(|_| handshake)) {
             (Some((c, k, prefix)), Some(base)) => match crate::tls::client_cert(base, (&prefix.join(c), &prefix.join(k), level.proxy_ssl_password_file.as_deref()), level.proxy_ssl_certificate_cache.as_deref()) {
                 Ok(tls) => Some(tls),
                 Err(e) => { error_log(level, r, &e); return special(500) }
@@ -1237,11 +1240,16 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         };
         let connecting = Instant::now();
         let conn = match taken {
-            Some(conn) => Ok(conn),
-            None => connect(&addr, socket.flatten(), tls.as_ref().map(|t| (t, name.as_deref())), level).await.map(|s| Conn::new(s, connecting)),
+            Some(conn) => Some(conn),
+            None => connect(&addr, socket.flatten(), level).await.map(|s| Conn::new(Stream::Tcp(s), connecting)),
+        };
+        let conn = match (conn, &tls) {
+            (Some(conn), Some(tls)) => secure(conn, &addr, (tls, name.as_deref()), level).await,
+            (conn, _) => conn.ok_or(None),
         };
         let begun = conn.is_ok();
-        let mut closed = false;
+        // A kept connection whose handshake fails counts as closed, as in nginx; one that times out does not.
+        let mut closed = matches!(conn, Err(None));
         let kept;
         (answer, kept) = match conn {
             Ok(conn) => {
@@ -1264,7 +1272,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         statuses.push(status.unwrap_or(502).to_string());
         // proxy_next_upstream_tries and proxy_next_upstream_timeout end the tries too.
         let timeout = level.proxy_next_upstream_timeout;
-        // The page connect() generates for a timeout, rather than an answer of the server.
+        // The page secure() generates for a timeout, rather than an answer of the server.
         let timed_out = answer.as_ref().is_some_and(|a| a.generated);
         let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout) && (resend || !begun);
         // The connection of an answer that is not used is closed.
@@ -1410,22 +1418,26 @@ fn ssl_name(name: &str) -> &str {
     host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
 }
 
-/// Opens a connection to a proxied server, from the bound socket if one is
-/// given. The error is what answers the request instead, if anything does.
-async fn connect(peer: &SocketAddr, socket: Option<socket2::Socket>, tls: Option<(&Arc<rustls::ClientConfig>, Option<&str>)>, level: &Level) -> Result<Stream, Option<Response>> {
+/// Opens a TCP connection to a proxied server, from the bound socket if one is given.
+async fn connect(peer: &SocketAddr, socket: Option<socket2::Socket>, level: &Level) -> Option<TcpStream> {
     let connect = async {
         match socket {
             Some(socket) => { socket.set_nonblocking(true)?; tokio::net::TcpSocket::from_std_stream(socket.into()).connect(*peer).await }
             None => TcpStream::connect(peer).await,
         }
     };
-    let s = tokio::time::timeout(level.proxy_connect_timeout, connect).await.ok().and_then(Result::ok).ok_or(None)?;
-    // proxy_pass https://: the TLS handshake is part of connecting.
-    // A handshake that does not end within proxy_connect_timeout is a timeout, answered with 504.
-    match tls {
-        Some((tls, name)) => match crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls).await { Ok(s) => Ok(s), Err(e) => Err((e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504))) },
-        None => Ok(Stream::Tcp(s)),
+    tokio::time::timeout(level.proxy_connect_timeout, connect).await.ok().and_then(Result::ok)
+}
+
+/// Makes the TLS handshake of proxy_pass https:// on a TCP connection; one over
+/// TLS stays as it is. The error is what answers the request instead, if anything
+/// does: a handshake that does not end within proxy_connect_timeout is a timeout,
+/// answered with 504.
+async fn secure(mut conn: Conn, peer: &SocketAddr, (tls, name): (&Arc<rustls::ClientConfig>, Option<&str>), level: &Level) -> Result<Conn, Option<Response>> {
+    if let Stream::Tcp(s) = conn.stream {
+        conn.stream = match crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls).await { Ok(s) => s, Err(e) => return Err((e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504))) };
     }
+    Ok(conn)
 }
 
 /// Why there is no answer of a proxied server.
@@ -1438,9 +1450,9 @@ enum NoAnswer {
 }
 
 /// Sends a request to a proxied server and reads its answer. The connection
-/// comes with it only when it may be used for another request: it has no
-/// TLS, the server does not close it, and the answer's body was read to its
-/// end with nothing after it. With a rate it is in the answer's rest.
+/// comes with it only when it may be used for another request: the server
+/// does not close it, and the answer's body was read to its end with nothing
+/// after it. With a rate it is in the answer's rest.
 #[allow(clippy::too_many_arguments)]
 async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Result<(Response, Option<Conn>), NoAnswer> {
     use NoAnswer::{Closed, Other};
@@ -1500,7 +1512,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     // An informational answer (1xx) has another after it; the body that is not
     // read for X-Accel-Redirect would come before the next answer.
     let skipped = accel && !no_body && length != Some(0);
-    let keep = status >= 200 && !closes(version, &values("connection")) && !skipped && matches!(s, Stream::Tcp(_));
+    let keep = status >= 200 && !closes(version, &values("connection")) && !skipped;
     let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
     if rate > 0 { return Ok((Response { rest: Some(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None }), ..resp }, None)); }
@@ -2153,9 +2165,9 @@ mod tests {
     /// Connects to a server and fetches its answer to a GET request.
     async fn fetched(addr: &SocketAddr, socket: Option<socket2::Socket>, level: &Level, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64) -> Option<Response> {
         let start = Instant::now();
-        let s = match connect(addr, socket, None, level).await { Ok(s) => s, Err(resp) => return resp };
+        let s = connect(addr, socket, level).await?;
         time[0] = Some(start.elapsed().as_millis());
-        fetch(Conn::new(s, start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, false).await.ok().map(|(resp, _)| resp)
+        fetch(Conn::new(Stream::Tcp(s), start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, false).await.ok().map(|(resp, _)| resp)
     }
 
     #[test]
@@ -2405,8 +2417,8 @@ mod tests {
         for (method, answer, _, kept) in answers {
             let req = format!("{method} / HTTP/1.1\r\n\r\n");
             let (_, conn) = block_on(async {
-                let s = connect(&addr, None, None, &level).await.ok()?;
-                fetch(Conn::new(s, Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).await.ok()
+                let s = connect(&addr, None, &level).await?;
+                fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).await.ok()
             }).unwrap();
             assert_eq!(conn.is_some(), kept, "{method} {answer}");
         }
@@ -2687,6 +2699,151 @@ mod tests {
             assert_eq!(resp.upstream_addr, joined(&|w| servers[w.0].0.to_string()), "{case}");
             for (i, (_, came)) in servers.iter().enumerate() {
                 assert_eq!(*came.lock().unwrap(), kept / servers.len() + want.iter().filter(|w| w.0 == i).count(), "{case}");
+            }
+        }
+    }
+
+    /// An Ed25519 key and its certificate, made by openssl only for these tests (those of src/tls.rs).
+    const KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIABI8p3dtZAQNO9IIpddv0KdrpTZgBtF07GcXXMRAqlr\n-----END PRIVATE KEY-----\n";
+    const CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBMDCB46ADAgECAhQw6INwvSpRntD3tYuScAjkJthNEDAFBgMrZXAwDTELMAkG
+A1UEAwwCZWQwIBcNMjYxMTIyMTE0MTE3WhgPMjEyNjEwMjkxMTQxMTdaMA0xCzAJ
+BgNVBAMMAmVkMCowBQYDK2VwAyEAL8XKbEjgrlhEUcjM4UHN6toe66wfOnYQD/ra
+ShFX2D6jUzBRMB0GA1UdDgQWBBRx0M5Y4lwOex/ffMorAD1tsQoe8TAfBgNVHSME
+GDAWgBRx0M5Y4lwOex/ffMorAD1tsQoe8TAPBgNVHRMBAf8EBTADAQH/MAUGAytl
+cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
+4q04yOy8aX97GVjXKn4C5xldyA0=
+-----END CERTIFICATE-----
+";
+
+    /// What a server does with a request.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Act {
+        Answer,
+        /// Answers it, with close_notify after the answer.
+        Notify,
+        /// Answers it in so many bytes at least, with more plaintext after them.
+        More(usize),
+        /// Closes the connection, without an answer or a handshake.
+        Close,
+    }
+
+    /// Reads a request and gives its request line.
+    fn request_line(s: &mut impl Read) -> Option<String> {
+        let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
+        while head_end(&buf).is_none() {
+            let n = s.read(&mut chunk).ok().filter(|n| *n > 0)?;
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8(buf).unwrap().lines().next().map(str::to_string)
+    }
+
+    /// The answer to a request, with its request line as the body.
+    fn echo(line: &str, act: Act) -> String {
+        let answer = |pad: usize| format!("HTTP/1.1 200 OK\r\nX: {}\r\nContent-Length: {}\r\n\r\n{line}", "x".repeat(pad), line.len());
+        let Act::More(size) = act else { return answer(1) };
+        answer(size.saturating_sub(answer(0).len())) + "more"
+    }
+
+    /// A server that does what act says with each request of a connection (both
+    /// counted from 0), over TLS of the version once a handshake begins; and the
+    /// requests that came, each with the number of its connection.
+    fn securing(version: &'static rustls::SupportedProtocolVersion, act: fn(usize, usize) -> Act) -> (SocketAddr, Arc<Mutex<Vec<(usize, String)>>>) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+        let key = PrivateKeyDer::from_pem_slice(KEY.as_bytes()).unwrap();
+        let chain = vec![CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap()];
+        let config = Arc::new(rustls::ServerConfig::builder_with_protocol_versions(&[version]).with_no_client_auth().with_single_cert(chain, key).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())));
+        let all = came.clone();
+        thread::spawn(move || {
+            for (i, s) in listener.incoming().enumerate() {
+                let (mut s, came, config, mut tls) = (s.unwrap(), all.clone(), config.clone(), None);
+                thread::spawn(move || {
+                    let mut first = [0];
+                    for n in 0.. {
+                        if s.peek(&mut first).ok() != Some(1) { return }
+                        let act = act(i, n);
+                        if act == Act::Close {
+                            came.lock().unwrap().push((i, "closed".to_string()));
+                            let _ = s.read(&mut [0u8; 4096]);
+                            return;
+                        }
+                        // A handshake record begins with 22.
+                        if tls.is_none() && first[0] == 22 { tls = Some(rustls::ServerConnection::new(config.clone()).unwrap()); }
+                        let Some(tls) = &mut tls else {
+                            let Some(line) = request_line(&mut s) else { return };
+                            s.write_all(echo(&line, act).as_bytes()).unwrap();
+                            came.lock().unwrap().push((i, line));
+                            continue;
+                        };
+                        let Some(line) = request_line(&mut rustls::Stream::new(tls, &mut s)) else { return };
+                        // What is written at once comes at once: the answer is one record.
+                        tls.writer().write_all(echo(&line, act).as_bytes()).unwrap();
+                        if act == Act::Notify { tls.send_close_notify(); }
+                        came.lock().unwrap().push((i, line));
+                        while tls.wants_write() { tls.write_tls(&mut s).unwrap(); }
+                    }
+                });
+            }
+        });
+        (addr, came)
+    }
+
+    /// The answers to the requests, which are sent one after another, each its body
+    /// and $upstream_status, to the locations /s, which passes them over TLS, and
+    /// /p, which does not, to an upstream with the settings and the server.
+    fn secured(settings: &str, addr: SocketAddr, requests: &[&str]) -> Vec<(String, String)> {
+        let text = format!("http {{ upstream u {{ server {addr}; {settings} }} server {{ location /s {{ proxy_pass https://u; }} location /p {{ proxy_pass http://u; }} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        block_on(async {
+            let mut answers = Vec::new();
+            for target in requests {
+                let resp = answered(&config.servers[0], &format!("GET {target} HTTP/1.0\n\n")).await;
+                // $upstream_connect_time of the last try.
+                let times = resp.upstream_time.unwrap();
+                assert!(times.last().unwrap()[0].is_some(), "{times:?}");
+                answers.push((String::from_utf8(resp.body).unwrap(), resp.upstream_status.unwrap()));
+            }
+            answers
+        })
+    }
+
+    #[test]
+    fn connections_over_tls_are_kept() {
+        let all = |_, _| Act::Answer;
+        let second = |i, n| if (i, n) == (0, 1) { Act::Close } else { Act::Answer };
+        let (one, local) = ("keepalive 5;", "keepalive 5 local;");
+        // The requests, and the connection each was answered on; "closed" is one
+        // closed instead, after which the request is tried again.
+        let cases: [(&str, fn(usize, usize) -> Act, &[&str], &[usize]); 11] = [
+            (one, all, &["/s?1", "/s?2"], &[0, 0]),
+            ("keepalive 0;", all, &["/s?1", "/s?2"], &[0, 1]),
+            (one, |_, _| Act::Notify, &["/s?1", "/s?2"], &[0, 1]),
+            (one, |_, _| Act::More(0), &["/s?1", "/s?2"], &[0, 1]),
+            // What comes after the answer is not read with it.
+            (one, |_, _| Act::More(4096), &["/s?1", "/s?2"], &[0, 1]),
+            (one, second, &["/s?1", "/s?2", "/s?3"], &[0, 1, 1]),
+            // The handshake is made on a connection kept without TLS.
+            (one, all, &["/p?1", "/s?2", "/s?3"], &[0, 0, 0]),
+            (one, second, &["/p?1", "/s?2", "/s?3"], &[0, 1, 1]),
+            // One over TLS is used as it is.
+            (one, all, &["/s?1", "/p?2"], &[0, 0]),
+            (local, all, &["/p?1", "/s?2"], &[0, 1]),
+            (local, all, &["/s?1", "/p?2", "/s?3"], &[0, 1, 0]),
+        ];
+        for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+            for (case, (settings, act, requests, connections)) in cases.iter().enumerate() {
+                let (addr, came) = securing(version, *act);
+                let answers = secured(settings, addr, requests);
+                let mut want = Vec::new();
+                for (n, (target, i)) in requests.iter().zip(*connections).enumerate() {
+                    let again = (n, act(0, 1)) == (1, Act::Close);
+                    if again { want.push((0, "closed".to_string())); }
+                    want.push((*i, format!("GET {target} HTTP/1.1")));
+                    assert_eq!(answers[n], (format!("GET {target} HTTP/1.1"), if again { "502, 200" } else { "200" }.to_string()), "{version:?} {case}");
+                }
+                assert_eq!(*came.lock().unwrap(), want, "{version:?} {case}");
             }
         }
     }

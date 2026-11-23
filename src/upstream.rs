@@ -77,9 +77,10 @@ impl Conn {
 
     /// Whether there is nothing to read from it, not even its end: bytes a server
     /// sent unasked must not be read as its next answer. The socket, which does
-    /// not block, is asked itself: tokio may not have seen yet what came.
-    fn quiet(&self) -> bool {
-        matches!(self.peek(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    /// not block, is asked itself: tokio may not have seen yet what came. Over TLS
+    /// any record that waits there counts, as in nginx.
+    fn quiet(&mut self) -> bool {
+        self.stream.drained() && matches!(self.peek(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
     }
 
     fn peek(&self) -> std::io::Result<usize> {
@@ -269,7 +270,7 @@ impl Upstream {
     /// ngx_http_upstream_free_keepalive_peer() does; the one kept for the longest
     /// makes room for it. The task that closes idle connections is told of it
     /// without being woken.
-    pub fn put(self: &Arc<Self>, conn: Conn, addr: SocketAddr, tag: usize) {
+    pub fn put(self: &Arc<Self>, mut conn: Conn, addr: SocketAddr, tag: usize) {
         let Some(keepalive) = &self.keepalive else { return };
         let now = Instant::now();
         if conn.requests >= keepalive.requests || now.duration_since(conn.opened) > keepalive.time { return }
