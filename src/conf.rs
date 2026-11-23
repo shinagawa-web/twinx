@@ -601,7 +601,13 @@ pub struct Server {
     pub tls: Option<crate::tls::ServerTls>,
     /// The addresses it is the default server of ("listen ... default_server").
     pub defaults: Vec<SocketAddr>,
+    /// The listen backlogs it sets ("listen ... backlog=number").
+    pub backlogs: Vec<(SocketAddr, i32)>,
 }
+
+/// The backlog nginx listens with on Linux when "listen" does not set one
+/// (NGX_LISTEN_BACKLOG).
+pub const LISTEN_BACKLOG: i32 = 511;
 
 #[derive(Debug)]
 pub struct Config {
@@ -717,7 +723,7 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new() };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new() };
         self.level(block, SRV, &mut s.level)?;
         for d in block {
             match d.name.as_str() {
@@ -725,6 +731,10 @@ impl Builder<'_> {
                     let addrs = listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
                     if d.args[1..].iter().any(|a| a == "ssl") { s.ssl.extend(&addrs); }
                     if d.args[1..].iter().any(|a| a == "default_server" || a == "default") { s.defaults.extend(&addrs); }
+                    for a in d.args[1..].iter().filter_map(|a| a.strip_prefix("backlog=")) {
+                        let n = a.parse::<i32>().ok().filter(|n| *n != 0).ok_or_else(|| format!("invalid backlog \"{a}\" in {}", d.at))?;
+                        s.backlogs.extend(addrs.iter().map(|addr| (*addr, n)));
+                    }
                     s.listen.extend(addrs);
                 }
                 "server_name" => {
@@ -1471,6 +1481,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         build(&parse(text, Path::new("t.conf")).unwrap(), &dir)
+    }
+
+    #[test]
+    fn listen_backlog() {
+        let c = build_text("events {} http { server { listen 127.0.0.1:8080 backlog=1024; } server { listen 127.0.0.1:8081; } }").unwrap();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(c.servers[0].backlogs, vec![(addr, 1024)]);
+        assert!(c.servers[1].backlogs.is_empty());
+        for bad in ["x", "0"] {
+            let e = build_text(&format!("events {{}} http {{ server {{ listen 127.0.0.1:8080 backlog={bad}; }} }}")).unwrap_err();
+            assert!(e.starts_with(&format!("invalid backlog \"{bad}\" in ")), "{e}");
+        }
     }
 
     #[test]

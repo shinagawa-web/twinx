@@ -36,9 +36,20 @@ pub fn bind(config: &Config, open: &[(TcpListener, SocketAddr)]) -> Result<Vec<(
     for addr in config.servers.iter().flat_map(|s| &s.listen) { if !addrs.contains(addr) { addrs.push(*addr) } }
     // On a reload, a socket already open on the address is kept. accept() on
     // it gives up after a while, so that a worker shutting down stops accepting.
-    let get = |addr| open.iter().find(|o| o.1 == addr).map_or_else(|| TcpListener::bind(addr), |o| o.0.try_clone());
+    let backlog = |addr| config.servers.iter().flat_map(|s| &s.backlogs).find(|b| b.0 == addr).map_or(crate::conf::LISTEN_BACKLOG, |b| b.1);
+    let get = |addr| open.iter().find(|o| o.1 == addr).map_or_else(|| listen(addr, backlog(addr)), |o| o.0.try_clone());
     let timeout = |l: TcpListener| socket2::SockRef::from(&l).set_read_timeout(Some(ACCEPT_WAIT)).map(|()| l);
     addrs.into_iter().map(|addr| get(addr).and_then(timeout).map(|l| (l, addr)).map_err(|e| format!("bind() to {addr} failed ({e})"))).collect()
+}
+
+/// A listening socket as nginx opens it: SO_REUSEADDR, then listen() with the
+/// backlog of "listen" (511 unless it sets one; the standard library's is 128).
+fn listen(addr: SocketAddr, backlog: i32) -> std::io::Result<TcpListener> {
+    let socket = socket2::Socket::new(socket2::Domain::for_address(addr), socket2::Type::STREAM, None)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(backlog)?;
+    Ok(socket.into())
 }
 
 /// How long accept() waits before it looks again whether the worker is shutting down.
@@ -1710,6 +1721,15 @@ fn page_with(status: u16, title: &str, more: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listens_with_the_backlog() {
+        let l = listen("127.0.0.1:0".parse().unwrap(), 511).unwrap();
+        let addr = l.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        assert_eq!(l.accept().unwrap().1.ip(), addr.ip());
+        assert!(listen(addr, 511).is_err());
+    }
 
     #[test]
     fn header_buffers_overflow() {
