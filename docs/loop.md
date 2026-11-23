@@ -52,7 +52,7 @@ When a pull request still fails the judge at the end of the iteration you spent 
 
 ## A Fixer run
 
-Up to three iterations. Each one:
+As many iterations as fit before the next run, which starts at minute 30 of the hour: start one only while the minute (`date +%M`) is 30 or more, or less than 15. Each one:
 
 1. `git fetch --prune origin` and start from a fresh `origin/main`.
 2. If one of your open pull requests says `Blocked by #<issue>` and that issue is closed, update its branch with main, remove the line, and wait for the judge as above. Otherwise:
