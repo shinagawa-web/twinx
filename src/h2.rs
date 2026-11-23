@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::conf::Config;
 use crate::http::Busy;
@@ -323,17 +324,28 @@ fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, sid: u32, payload: &[u8]) {
 }
 
 /// A stream: the windows it sends and receives with, its request until it is
-/// answered (none for one refused with 400) and its body, then the body of
-/// the answer and how much of it has been sent.
+/// passed on (none for one refused with 400), where its body goes as it comes
+/// until it ends, and what is to take it; the length the client declared of
+/// it, how much came, whether it goes in chunks (it has no length), and
+/// whether it turned out longer or shorter; then the body of the answer and
+/// how much of it has been sent. Of the answers it may get, only that of the
+/// exchange so numbered is taken.
 #[derive(Default)]
-struct Open { send: i64, recv: i64, head: Option<(Vec<u8>, bool, usize)>, body: Vec<u8>, ended: bool, answer: Option<Vec<u8>>, sent: usize, number: u64 }
+struct Open {
+    send: i64, recv: i64, head: Option<(Vec<u8>, bool, usize)>, ended: bool,
+    body: Option<UnboundedSender<Vec<u8>>>, taker: Option<UnboundedReceiver<Vec<u8>>>,
+    declared: Option<u64>, got: u64, chunked: bool, bad: bool,
+    answer: Option<Vec<u8>>, sent: usize, number: u64, exchange: u32,
+}
 
 /// The state of an HTTP/2 connection.
 struct Connection {
     out: Vec<u8>,
     streams: BTreeMap<u32, Open>,
-    /// The streams whose requests have come whole, to be answered.
+    /// The streams whose request heads have come whole, to be passed on; those
+    /// whose bodies turned out longer or shorter than declared, to be answered with 400.
     ready: Vec<u32>,
+    bad: Vec<u32>,
     /// A header block that waits for its CONTINUATION frames: its stream, the
     /// flags of its HEADERS frame, what came of it, and whether the stream was refused.
     block: Option<(u32, u8, Vec<u8>, bool)>,
@@ -486,8 +498,13 @@ impl Connection {
         let fields = self.table.decode(&block, block.len(), self.limits)?;
         if refused { self.rst(sid, REFUSED_STREAM); return Ok(()) }
         let ended = flags & END_STREAM != 0;
-        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head: request(&fields, ended), ended, number: self.requests, ..Open::default() });
-        if ended { self.ready.push(sid); }
+        // As nginx does, the request is passed on once its head has come, and its body as it comes.
+        let head = request(&fields, ended);
+        let declared = fields.iter().find(|f| f.0 == b"content-length").and_then(|f| std::str::from_utf8(&f.1).ok()?.parse().ok());
+        let chunked = head.as_ref().is_some_and(|h| !h.1) && !ended;
+        let (body, taker) = tokio::sync::mpsc::unbounded_channel();
+        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head, ended, body: (!ended).then_some(body), taker: Some(taker), declared, chunked, number: self.requests, ..Open::default() });
+        self.ready.push(sid);
         Ok(())
     }
 
@@ -501,9 +518,15 @@ impl Connection {
         let Some(s) = self.streams.get_mut(&sid) else { return Ok(()) };
         if size > s.recv { self.rst(sid, FLOW_CONTROL_ERROR); return Ok(()) }
         if s.ended { self.rst(sid, STREAM_CLOSED); return Ok(()) }
-        s.body.extend_from_slice(&p[usize::from(padding > 0)..p.len() - padding.saturating_sub(1)]);
-        s.ended = flags & END_STREAM != 0;
-        if s.ended { self.ready.push(sid); } else if size > 0 { frame(&mut self.out, WINDOW_UPDATE, 0, sid, &(size as u32).to_be_bytes()); }
+        let data = &p[usize::from(padding > 0)..p.len() - padding.saturating_sub(1)];
+        (s.ended, s.got) = (flags & END_STREAM != 0, s.got + data.len() as u64);
+        // A body longer than declared, or one that ends shorter, is answered with 400, as nginx does.
+        if !s.bad && s.declared.is_some_and(|n| s.got > n || s.ended && s.got < n) { (s.bad, s.body, s.exchange) = (true, None, s.exchange + 1); self.bad.push(sid); }
+        // Without a length, each frame's data is a chunk; the end, the last chunk.
+        let mut part = if s.chunked && !data.is_empty() { [format!("{:x}\r\n", data.len()).as_bytes(), data, b"\r\n"].concat() } else { data.to_vec() };
+        if s.chunked && s.ended { part.extend_from_slice(b"0\r\n\r\n"); }
+        if let Some(body) = &s.body { let _ = body.send(part); }
+        if s.ended { s.body = None; } else if size > 0 { frame(&mut self.out, WINDOW_UPDATE, 0, sid, &(size as u32).to_be_bytes()); }
         Ok(())
     }
 
@@ -585,7 +608,7 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
     // lingering_close on or always: closing, it reads what the client still sends.
     let lingers = level.lingering_close.is_some();
     let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 };
-    let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive };
+    let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive };
     // nginx's settings: the streams at a time, the window of each, the largest frame it takes; and the largest window of the connection.
     frame(&mut c.out, SETTINGS, 0, 0, &[0, 3, 0, 0, 0, CONCURRENT as u8, 0, 4, 0, 1, 0, 0, 0, 5, 0, 0xff, 0xff, 0xff]);
     frame(&mut c.out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
@@ -594,19 +617,19 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
     loop {
         if crate::http::shutting() && !c.goaway { c.goaway(); }
         let read = if preface { c.read(&mut buf) } else if buf.len() < PREFACE.len() { Ok(()) } else if buf.starts_with(PREFACE) { preface = true; buf.drain(..PREFACE.len()); c.read(&mut buf) } else { Err(PROTOCOL_ERROR) };
-        for sid in std::mem::take(&mut c.ready) {
+        let bad = std::mem::take(&mut c.bad).into_iter().map(|sid| (sid, true));
+        for (sid, bad) in std::mem::take(&mut c.ready).into_iter().map(|sid| (sid, false)).chain(bad) {
             let Some(s) = c.streams.get_mut(&sid) else { continue };
-            let (request, made) = match s.head.take() {
-                Some((mut head, length, made)) => {
-                    let unsized_body = !length && !s.body.is_empty();
-                    if unsized_body { head.extend(format!("content-length: {}\r\n", s.body.len()).bytes()); }
-                    ([head, b"\r\n".to_vec(), std::mem::take(&mut s.body)].concat(), made + usize::from(unsized_body))
+            let (request, made, taker) = match s.head.take().filter(|_| !bad) {
+                Some((mut head, _, made)) => {
+                    if s.chunked { head.extend_from_slice(b"transfer-encoding: chunked\r\n"); }
+                    ([head, b"\r\n".to_vec()].concat(), made + usize::from(s.chunked), s.taker.take())
                 }
                 // A line HTTP/1 refuses, for the answer nginx gives with 400.
-                None => (b"-\r\n\r\n".to_vec(), 0),
+                None => (b"-\r\n\r\n".to_vec(), 0, None),
             };
-            let (tx, config, addrs, origin) = (tx.clone(), config.clone(), addrs.clone(), (c.started, s.number, made));
-            tokio::task::spawn_local(async move { let _ = tx.send((sid, exchange(config, request, addrs, origin).await)); });
+            let (tx, config, addrs, origin, number) = (tx.clone(), config.clone(), addrs.clone(), (c.started, s.number, made), s.exchange);
+            tokio::task::spawn_local(async move { let _ = tx.send((sid, number, exchange(config, request, taker, addrs, origin).await)); });
         }
         c.send_data();
         if let Err(code) = read {
@@ -620,7 +643,7 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
         if c.goaway && c.streams.is_empty() { return crate::http::close(&mut stream, lingers).await }
         tokio::select! {
             n = stream.read_buf(&mut buf) => if n.unwrap_or(0) == 0 { return },
-            Some((sid, answer)) = rx.recv() => c.answer(sid, answer),
+            Some((sid, number, answer)) = rx.recv() => if c.streams.get(&sid).is_some_and(|s| s.exchange == number) { c.answer(sid, answer) },
             () = crate::http::SHUTDOWN.notified() => {}
         }
     }
@@ -629,12 +652,20 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
 /// Answers the request of a stream, as a connection of its own answers it,
 /// one made when the HTTP/2 connection was, of which it is the request so
 /// numbered; the request has so many header lines made, not sent by the client.
-async fn exchange(config: Arc<Config>, request: Vec<u8>, (listen, local, peer, ssl): Addrs, origin: (Instant, u64, usize)) -> Answer {
-    let (mut ours, theirs) = tokio::io::duplex(65536);
+/// Its body is passed as it comes, while the answer is read.
+async fn exchange(config: Arc<Config>, request: Vec<u8>, body: Option<UnboundedReceiver<Vec<u8>>>, (listen, local, peer, ssl): Addrs, origin: (Instant, u64, usize)) -> Answer {
+    let (ours, theirs) = tokio::io::duplex(65536);
     tokio::task::spawn_local(async move { crate::http::connection(&config, Stream::Pipe(theirs), (listen, local, peer, ssl), Busy::new(), Some(Box::new(origin))).await });
+    let (mut ours, mut to) = tokio::io::split(ours);
+    tokio::task::spawn_local(async move {
+        let _ = to.write_all(&request).await;
+        let mut body = body;
+        while let Some(part) = match body.as_mut() { Some(b) => b.recv().await, None => None } {
+            if to.write_all(&part).await.is_err() { return }
+        }
+        let _ = to.shutdown().await;
+    });
     let mut answer = Vec::new();
-    let _ = ours.write_all(&request).await;
-    let _ = ours.shutdown().await;
     let _ = ours.read_to_end(&mut answer).await;
     // An answer nginx would not send (444) resets the stream.
     let end = answer.windows(4).position(|w| w == b"\r\n\r\n")?;
@@ -726,7 +757,7 @@ mod tests {
 
     fn connection() -> Connection {
         let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 };
-        Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits: (4, 8192), send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive: (2, Duration::from_secs(75), Duration::from_secs(3600)) }
+        Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits: (4, 8192), send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive: (2, Duration::from_secs(75), Duration::from_secs(3600)) }
     }
 
     #[test]
@@ -778,6 +809,20 @@ mod tests {
     }
 
     #[test]
+    fn declared_lengths() {
+        // A body longer than its Content-Length, or one that ends shorter, is answered anew, with 400.
+        for (data, flags) in [(&b"abc"[..], 0), (&b"a"[..], END_STREAM)] {
+            let mut c = connection();
+            let mut buf = Vec::new();
+            frame(&mut buf, HEADERS, END_HEADERS, 1, &[0x82, 0x86, 0x84, 0x41, 0x01, b'h', 0x5c, 0x01, b'2']);
+            frame(&mut buf, DATA, flags, 1, data);
+            assert_eq!(c.read(&mut buf), Ok(()));
+            let s = &c.streams[&1];
+            assert_eq!((c.bad.clone(), s.bad, s.exchange, s.declared, s.chunked), (vec![1], true, 1, Some(2), false));
+        }
+    }
+
+    #[test]
     fn frames() {
         let mut c = connection();
         let mut buf = Vec::new();
@@ -791,8 +836,11 @@ mod tests {
         buf.extend_from_slice(&[0, 0]);
         assert_eq!(c.read(&mut buf), Ok(()));
         assert_eq!((buf.len(), c.ready.clone(), c.frame_size, c.table_update), (2, vec![1], 16384, true));
-        let s = &c.streams[&1];
-        assert_eq!((s.body.as_slice(), s.send), (&b"ab"[..], 65535 - 65525 + 5));
+        let s = c.streams.get_mut(&1).unwrap();
+        // Without a length, the body goes on in chunks, one of each frame's data, then the last.
+        let mut taker = s.taker.take().unwrap();
+        let parts: Vec<_> = std::iter::from_fn(|| taker.try_recv().ok()).collect();
+        assert_eq!((parts.concat(), s.body.is_none(), s.chunked, s.send), (b"1\r\na\r\n1\r\nb\r\n0\r\n\r\n".to_vec(), true, true, 65535 - 65525 + 5));
         c.answer(1, Some((200, vec![(b"x".to_vec(), vec![b'y'; 20000])], vec![b'z'; 20])));
         c.send_data();
         assert_eq!(c.streams[&1].sent, 15);

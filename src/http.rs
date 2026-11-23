@@ -280,7 +280,8 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             buf = u.rest;
         }
         if !level.body_in_file_only || level.body_clean { r.body_file.map(std::fs::remove_file); }
-        if idle.is_none() || SHUTTING.load(Ordering::SeqCst) {
+        // A stream of HTTP/2 has one request: the rest of the pipe is its body.
+        if idle.is_none() || SHUTTING.load(Ordering::SeqCst) || matches!(stream, Stream::Pipe(_)) {
             // As ngx_http_finalize_connection() decides, but with the location
             // first found, not the one an internal redirect ended in.
             let lingers = match level.lingering_close {
@@ -332,7 +333,8 @@ fn framing(r: &Request) -> Result<Option<u64>, u16> {
     // Digits only, up to the largest file offset (2^63 - 1).
     let digits = |v: &str| v.bytes().all(|c| c.is_ascii_digit()).then(|| v.parse::<i64>().ok()).flatten().map(|n| n as u64);
     if te.is_empty() { return length.map_or(Ok(Some(0)), |v| digits(v).map(Some).ok_or(400)); }
-    if te.len() > 1 || length.is_some() || !r.line.ends_with("HTTP/1.1") { return Err(400); }
+    // A stream of HTTP/2 without a length passes its body in chunks too.
+    if te.len() > 1 || length.is_some() || !(r.line.ends_with("HTTP/1.1") || r.line.ends_with("HTTP/2.0")) { return Err(400); }
     if te[0].eq_ignore_ascii_case("chunked") { Ok(None) } else { Err(501) }
 }
 
