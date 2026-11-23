@@ -586,6 +586,8 @@ pub struct Session {
     /// client offered ($ssl_curves), by OpenSSL's names.
     pub curve: String,
     pub curves: String,
+    /// The protocol the client and server agreed on with ALPN ($ssl_alpn_protocol).
+    pub alpn: String,
 }
 
 /// OpenSSL's names of cipher suites, as $ssl_cipher and $ssl_ciphers give them.
@@ -682,6 +684,15 @@ impl Session {
     }
 }
 
+/// Whether a connection to an address that takes TLS speaks plain HTTP
+/// instead, as nginx tells by its first byte: neither that of a TLS record of
+/// a handshake nor that of SSLv2. None when nothing came within HANDSHAKE.
+pub async fn plain(tcp: &TcpStream) -> Option<bool> {
+    let mut first = [0];
+    let n = tokio::time::timeout(HANDSHAKE, tcp.peek(&mut first)).await.ok()?.ok()?;
+    Some(n == 1 && first[0] != 0x16 && first[0] & 0x80 == 0)
+}
+
 /// Takes a TLS connection from a client on a listening address: the server
 /// its SNI name selects (as the Host header selects one) does the handshake,
 /// which has to end within HANDSHAKE; then the connection, and what the
@@ -722,11 +733,15 @@ async fn handshake<'a>(mut tcp: TcpStream, config: &'a Config, listen: SocketAdd
     let tls = server.tls.as_ref().or(crate::http::default_server(config, listen).tls.as_ref())?;
     let ciphers = hello.cipher_suites().iter().map(|c| cipher(u16::from(*c))).collect::<Vec<_>>().join(":");
     let curves = hello.named_groups().unwrap_or_default().iter().map(|g| curve(u16::from(*g))).collect::<Vec<_>>().join(":");
-    let for_connection = tls.for_connection(addrs, &name)?;
+    // The protocols the server chosen by SNI speaks, most preferred first, as
+    // nginx offers them; a client that asks for none of them is refused.
+    let mut for_connection = (*tls.for_connection(addrs, &name)?).clone();
+    let h2 = crate::http::http2(config, listen, server).then_some(&b"h2"[..]);
+    for_connection.alpn_protocols = h2.into_iter().chain([&b"http/1.1"[..], b"http/1.0", b"http/0.9"]).map(<[u8]>::to_vec).collect();
     // A session keeps its identifier when it is resumed, as OpenSSL's does.
     let mut id = None;
     let start = tokio_rustls::StartHandshake::from_parts(accepted, tcp);
-    let stream = start.into_stream_with(for_connection, |conn| {
+    let stream = start.into_stream_with(Arc::new(for_connection), |conn| {
         let mut new = [0u8; 32];
         id = conn.received_resumption_data().map(<[u8]>::to_vec).or_else(|| provider().secure_random.fill(&mut new).ok().map(|()| new.to_vec()));
         conn.set_resumption_data(id.as_deref().unwrap_or_default());
@@ -737,8 +752,9 @@ async fn handshake<'a>(mut tcp: TcpStream, config: &'a Config, listen: SocketAdd
     let cipher = conn.negotiated_cipher_suite().map(|c| cipher(u16::from(c.suite()))).unwrap_or_default();
     let curve = conn.negotiated_key_exchange_group().map(|g| curve(u16::from(g.name()))).unwrap_or_default();
     let reused = conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed);
+    let alpn = String::from_utf8_lossy(conn.alpn_protocol().unwrap_or_default()).into_owned();
     let id = id.iter().map(|b| format!("{b:02x}")).collect();
-    Some((stream, tls, Session { protocol, server_name: name, reused, id, cipher, ciphers, curve, curves, ..Session::default() }))
+    Some((stream, tls, Session { protocol, server_name: name, reused, id, cipher, ciphers, curve, curves, alpn, ..Session::default() }))
 }
 
 /// Clients may send a certificate, which the handshake takes whatever it is;
@@ -931,6 +947,14 @@ pub fn client_cert(base: &Arc<ClientConfig>, files: (&Path, &Path, Option<&Path>
     let mut c = (**base).clone();
     c.client_auth_cert_resolver = config.map_err(|e| format!("SSL_use_PrivateKey(\"{}\") failed ({e})", files.1.display()))?.client_auth_cert_resolver;
     Ok(Arc::new(c))
+}
+
+/// What a connection to a proxied server spoken to over HTTP/2 (proxy_http_version 2)
+/// is made with: config's settings, offering h2 alone with ALPN, as nginx does.
+pub fn h2(config: &Arc<ClientConfig>) -> Arc<ClientConfig> {
+    let mut c = (**config).clone();
+    c.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(c)
 }
 
 /// Connects to a proxied server over TLS, to the name its certificate is
@@ -1386,6 +1410,45 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     }
 
     #[test]
+    fn offers_h2_only_where_the_server_speaks_it() {
+        let dir = dir();
+        crate::stream::block_on(async {
+            let (l, addr) = listener().await;
+            let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; http2 on; }} server {{ listen {addr}; server_name plain; }} }}");
+            let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+            let accepted = tokio::task::spawn_local(async move {
+                let mut alpn = Vec::new();
+                for _ in 0..2 { alpn.push(accept(l.accept().await.unwrap().0, &config, addr).await.unwrap().1.alpn); }
+                alpn
+            });
+            let mut tls = (*client((false, true), None, None).unwrap()).clone();
+            tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            let tls = Arc::new(tls);
+            // The server with http2 on takes h2; the one without is left with HTTP/1.1.
+            for name in ["localhost", "plain"] {
+                drop(connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), Some(name)), Duration::from_secs(5), &tls).await.unwrap());
+            }
+            assert_eq!(accepted.await.unwrap(), ["h2", "http/1.1"]);
+        });
+    }
+
+    #[test]
+    fn a_client_for_http2_offers_h2_alone() {
+        let base = client((true, false), None, None).unwrap();
+        assert!(base.alpn_protocols.is_empty());
+        assert_eq!(h2(&base).alpn_protocols, [b"h2".to_vec()]);
+        let dir = dir();
+        crate::stream::block_on(async {
+            let (l, addr) = listener().await;
+            let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; http2 on; }} }}");
+            let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+            let accepted = tokio::task::spawn_local(async move { accept(l.accept().await.unwrap().0, &config, addr).await.unwrap().1.alpn });
+            drop(connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_secs(5), &h2(&base)).await.unwrap());
+            assert_eq!(accepted.await.unwrap(), "h2");
+        });
+    }
+
+    #[test]
     fn a_handshake_that_does_not_end_in_time_times_out() {
         crate::stream::block_on(async {
             let (_l, addr) = listener().await;
@@ -1409,6 +1472,20 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             assert!(accept(l.accept().await.unwrap().0, &config, addr).await.is_none());
             drop(TcpStream::connect(addr).await.unwrap());
             assert!(accept(l.accept().await.unwrap().0, &config, addr).await.is_none());
+        });
+    }
+
+    #[test]
+    fn tells_plain_connections_by_their_first_byte() {
+        crate::stream::block_on(async {
+            let (l, addr) = listener().await;
+            let mut open = Vec::new();
+            for (first, expected) in [(&b"GET"[..], Some(true)), (&[0x16, 3, 1][..], Some(false)), (&[0x80][..], Some(false)), (&[][..], Some(false))] {
+                let mut other = TcpStream::connect(addr).await.unwrap();
+                other.write_all(first).await.unwrap();
+                if first.is_empty() { drop(other) } else { open.push(other) }
+                assert_eq!(plain(&l.accept().await.unwrap().0).await, expected);
+            }
         });
     }
 

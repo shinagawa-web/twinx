@@ -129,7 +129,9 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_ssl_verify_depth", HSL, 1, 1, false),
     ("proxy_ssl_name", HSL, 1, 1, false),
     ("proxy_ssl_server_name", HSL, 1, 1, false),
+    ("proxy_pass_trailers", HSL, 1, 1, false),
     ("proxy_method", HSL, 1, 1, false),
+    ("early_hints", HSL, 1, usize::MAX, false),
     ("proxy_set_body", HSL, 1, 1, false),
     ("expires", HSL | LIF, 1, 2, false),
     ("post_action", HSL, 1, 1, false),
@@ -157,6 +159,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_http_version", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
     ("proxy_buffers", HSL, 2, 2, false),
+    ("proxy_busy_buffers_size", HSL, 1, 1, false),
     ("proxy_max_temp_file_size", HSL, 1, 1, false),
     ("proxy_cookie_domain", HSL, 1, 2, false),
     ("proxy_cookie_path", HSL, 1, 2, false),
@@ -168,6 +171,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("gzip_static", HSL, 1, 1, false),
     ("gunzip", HSL, 1, 1, false),
     ("gzip_vary", HSL, 1, 1, false),
+    ("sendfile", HSL | LIF, 1, 1, false),
     ("gzip_http_version", HSL, 1, 1, false),
     ("gzip_types", HSL, 1, usize::MAX, false),
     ("limit_rate", HSL | LIF, 1, 1, false),
@@ -417,6 +421,10 @@ pub struct Level {
     /// proxy_http_version 1.1: requests are passed as HTTP/1.1, and a chunked
     /// body that is not buffered is passed chunked as it comes.
     pub proxy_http_11: bool,
+    /// proxy_http_version 2: requests are passed over HTTP/2 (crate::h2::upstream).
+    pub proxy_h2: bool,
+    /// proxy_pass_trailers: the trailers of a proxied server's answer are passed to the client.
+    pub proxy_pass_trailers: bool,
     /// proxy_buffer_size: the buffer the proxied server's response head must fit in.
     pub proxy_buffer_size: usize,
     /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
@@ -454,6 +462,9 @@ pub struct Level {
     /// proxy_method: the method, which may have variables, sent to proxied
     /// servers instead of the request's.
     pub proxy_method: Option<Template>,
+    /// early_hints: the values, which may have variables, of which one not
+    /// empty and not "0" lets the early hints of proxied servers (103) go to the client.
+    pub early_hints: Vec<Template>,
     /// proxy_set_body: the body, which may have variables, sent to proxied
     /// servers instead of the client's.
     pub proxy_set_body: Option<Template>,
@@ -614,6 +625,8 @@ pub struct Server {
     pub defaults: Vec<SocketAddr>,
     /// The listen backlogs it sets ("listen ... backlog=number").
     pub backlogs: Vec<(SocketAddr, i32)>,
+    /// The addresses it listens on with "http2", which speak HTTP/2 whatever http2 says.
+    pub http2: Vec<SocketAddr>,
 }
 
 /// The backlog nginx listens with on Linux when "listen" does not set one
@@ -735,13 +748,14 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new() };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), http2: Vec::new() };
         self.level(block, SRV, &mut s.level)?;
         for d in block {
             match d.name.as_str() {
                 "listen" => {
                     let addrs = listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
                     if d.args[1..].iter().any(|a| a == "ssl") { s.ssl.extend(&addrs); }
+                    if d.args[1..].iter().any(|a| a == "http2") { s.http2.extend(&addrs); }
                     if d.args[1..].iter().any(|a| a == "default_server" || a == "default") { s.defaults.extend(&addrs); }
                     for a in d.args[1..].iter().filter_map(|a| a.strip_prefix("backlog=")) {
                         let n = a.parse::<i32>().ok().filter(|n| *n != 0).ok_or_else(|| format!("invalid backlog \"{a}\" in {}", d.at))?;
@@ -902,6 +916,7 @@ impl Builder<'_> {
                 "proxy_ssl_trusted_certificate" => (level.proxy_ssl_trusted_certificate, own_tls) = (Some(self.path(&d.args[0])), true),
                 "proxy_ssl_crl" => (level.proxy_ssl_crl, own_tls) = (Some(self.path(&d.args[0])), true),
                 "proxy_ssl_verify_depth" => (level.proxy_ssl_verify_depth, own_tls) = (d.args[0].parse().map_err(|_| at(format!("invalid value \"{}\" in \"proxy_ssl_verify_depth\" directive", d.args[0])))?, true),
+                "proxy_pass_trailers" => level.proxy_pass_trailers = flag(d).map_err(at)?,
                 "proxy_ssl_server_name" => (level.proxy_ssl_server_name, own_tls) = (flag(d).map_err(at)?, true),
                 "proxy_ssl_name" => level.proxy_ssl_name = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_redirect" => {
@@ -942,10 +957,15 @@ impl Builder<'_> {
                 "chunked_transfer_encoding" => level.chunked = flag(d).map_err(at)?,
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
                 "proxy_buffer_size" => level.proxy_buffer_size = size(&d.args[0]).map_err(at)? as usize,
+                // Answers are not kept in buffers while they are sent: only the size is checked.
+                "proxy_busy_buffers_size" => { size(&d.args[0]).map_err(at)?; }
                 // How the proxied answer's body is read changes nothing that is sent: the value is only checked.
                 "proxy_buffering" => { flag(d).map_err(at)?; }
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
-                "proxy_http_version" => level.proxy_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\" or \"1.1\"", d.args[0])))? == 1,
+                "proxy_http_version" => {
+                    let version = ["1.0", "1.1", "2"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\"", d.args[0])))?;
+                    (level.proxy_http_11, level.proxy_h2) = (version > 0, version == 2);
+                }
                 "proxy_max_temp_file_size" => { size(&d.args[0]).map_err(at)?; }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
                 "proxy_buffers" => if d.args[0].parse::<u64>().map_or(true, |n| n == 0) || size(&d.args[1]).map_or(true, |n| n == 0) { return Err(at("\"proxy_buffers\" directive invalid value".into())); }
@@ -994,12 +1014,15 @@ impl Builder<'_> {
                 }
                 "gzip_types" => level.gzip_types = d.args.iter().map(|t| t.to_ascii_lowercase()).collect(),
                 "gzip_vary" => level.gzip_vary = flag(d).map_err(at)?,
+                // twinx writes every body itself: sendfile changes nothing of what is sent.
+                "sendfile" => { flag(d).map_err(at)?; }
                 "gzip_http_version" => level.gzip_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))? == 1,
                 "post_action" => level.post_action = Some(d.args[0].clone()).filter(|a| a != "off"),
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
                 "limit_rate" => level.limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "limit_rate_after" => level.limit_rate_after = size_value(&d.args[0]).map_err(at)?,
                 "proxy_method" => level.proxy_method = Some(Template::parse(&d.args[0]).map_err(at)?),
+                "early_hints" => level.early_hints = d.args.iter().map(|a| Template::parse(a)).collect::<Result<_, _>>().map_err(at)?,
                 "proxy_set_body" => level.proxy_set_body = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_limit_rate" => level.proxy_limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "if_modified_since" => level.if_modified_since = [("off", None), ("exact", Some(false)), ("before", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"if_modified_since\" directive, it must be \"off\", \"exact\" or \"before\"", d.args[0])))?.1,
@@ -1531,6 +1554,16 @@ mod tests {
     }
 
     #[test]
+    fn listen_http2() {
+        let c = build_text("events {} http { server { listen 127.0.0.1:8080 http2; } server { listen 127.0.0.1:8081; http2 on; } server { listen 127.0.0.1:8082; } }").unwrap();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(c.servers[0].http2, [addr]);
+        assert!(!c.servers[0].level.http2);
+        assert!(c.servers[1].http2.is_empty() && c.servers[1].level.http2);
+        assert!(c.servers[2].http2.is_empty() && !c.servers[2].level.http2);
+    }
+
+    #[test]
     fn hosts_and_ports() {
         assert_eq!(host_port("a:81", 80), Some(("a", 81)));
         assert_eq!(host_port("a", 80), Some(("a", 80)));
@@ -1580,7 +1613,13 @@ mod tests {
         let c = build_text("http { proxy_http_version 1.1; server { location /a { proxy_http_version 1.0; } location /b { } } }").unwrap();
         let v: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.proxy_http_11).collect();
         assert_eq!(v, [false, true]);
-        assert!(build_text("http { proxy_http_version 2; }").unwrap_err().starts_with("invalid value \"2\" in \"proxy_http_version\" directive, it must be \"1.0\" or \"1.1\""));
+        let c = build_text("http { proxy_http_version 2; server { location /a { proxy_http_version 1.1; } location /b { } } }").unwrap();
+        let v: Vec<_> = c.servers[0].locations.iter().map(|l| (l.level.proxy_http_11, l.level.proxy_h2)).collect();
+        assert_eq!(v, [(true, false), (true, true)]);
+        let c = build_text("http { proxy_pass_trailers on; server { location /a { proxy_pass_trailers off; } location /b { } } }").unwrap();
+        let v: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.proxy_pass_trailers).collect();
+        assert_eq!(v, [false, true]);
+        assert!(build_text("http { proxy_http_version 3; }").unwrap_err().starts_with("invalid value \"3\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\""));
     }
 
     #[test]
@@ -1698,6 +1737,20 @@ mod tests {
         assert_eq!((c.servers[0].level.max_headers, c.servers[1].level.max_headers), (5, 7));
         assert_eq!(build_text("http { server { } }").unwrap().servers[0].level.max_headers, 1000);
         assert_eq!(build_text("http { max_headers x; }").unwrap_err(), "invalid number in t.conf:1");
+    }
+
+    #[test]
+    fn proxy_busy_buffers_size() {
+        assert!(build_text("http { proxy_busy_buffers_size 65k; server { } }").is_ok());
+        assert!(build_text("http { proxy_busy_buffers_size x; server { } }").is_err());
+    }
+
+    #[test]
+    fn early_hints() {
+        let c = build_text("http { early_hints $uri 1; server { location / { } location /off { early_hints 0; } } }").unwrap();
+        let [on, off] = [0, 1].map(|i| c.servers[0].locations[i].level.early_hints.len());
+        assert_eq!((on, off), (2, 1));
+        assert!(build_text("http { server { early_hints; } }").is_err());
     }
 
     #[test]

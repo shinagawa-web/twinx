@@ -21,6 +21,8 @@ pub struct Shared {
     /// The variables set gives values to, and the captures of the last regular
     /// expression matched ("1", "2", ...).
     pub vars: std::sync::Mutex<Vec<(String, String)>>,
+    /// The trailers of a proxied server's answer that proxy_pass_trailers passes.
+    pub trailers: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 /// What a request carries, as the variables see it.
@@ -202,6 +204,12 @@ pub enum Var {
     ServerName,
     /// The scheme of the request: https on a TLS connection, else http.
     Scheme,
+    /// "on" on a TLS connection, else empty.
+    Https,
+    /// The protocol of an HTTP/2 stream: h2 over TLS, h2c without; else empty.
+    Http2,
+    /// The version the request line gives (HTTP/1.1, HTTP/2.0), empty for HTTP/0.9.
+    ServerProtocol,
     SslProtocol,
     SslServerName,
     SslSessionReused,
@@ -243,7 +251,7 @@ impl Var {
             ("upstream_connect_time", Var::UpstreamTime(0)), ("upstream_header_time", Var::UpstreamTime(1)), ("upstream_response_time", Var::UpstreamTime(2)),
             ("upstream_response_length", Var::UpstreamBytes(0)), ("upstream_bytes_received", Var::UpstreamBytes(1)), ("upstream_bytes_sent", Var::UpstreamBytes(2)),
             ("proxy_host", Var::ProxyHost), ("proxy_port", Var::ProxyPort), ("proxy_add_x_forwarded_for", Var::ProxyAddXForwardedFor),
-            ("server_name", Var::ServerName), ("scheme", Var::Scheme), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
+            ("server_name", Var::ServerName), ("scheme", Var::Scheme), ("https", Var::Https), ("http2", Var::Http2), ("server_protocol", Var::ServerProtocol), ("request_method", Var::RequestMethod), ("limit_rate", Var::LimitRate),
             ("ssl_protocol", Var::SslProtocol), ("ssl_server_name", Var::SslServerName), ("ssl_session_reused", Var::SslSessionReused),
             ("ssl_client_verify", Var::SslClientVerify), ("ssl_client_s_dn", Var::SslClientSDn),
             ("ssl_session_id", Var::SslSessionId), ("ssl_cipher", Var::SslCipher), ("ssl_ciphers", Var::SslCiphers),
@@ -295,6 +303,9 @@ impl Var {
             Var::Pid => std::process::id().to_string(),
             Var::ServerName => r.server_name.clone(),
             Var::Scheme => (if r.ssl.is_some() { "https" } else { "http" }).to_string(),
+            Var::Https => (if r.ssl.is_some() { "on" } else { "" }).to_string(),
+            Var::Http2 => (if !r.line.ends_with(" HTTP/2.0") { "" } else if r.ssl.is_some() { "h2" } else { "h2c" }).to_string(),
+            Var::ServerProtocol => r.line.split(' ').filter(|w| !w.is_empty()).nth(2).unwrap_or_default().to_string(),
             Var::SslProtocol => r.ssl.as_ref()?.protocol.clone(),
             Var::SslServerName => r.ssl.as_ref()?.server_name.clone(),
             Var::SslSessionReused => (if r.ssl.as_ref()?.reused { "r" } else { "." }).to_string(),
@@ -370,7 +381,9 @@ pub fn plain(utf8: &[u8]) -> bool {
 
 /// The values of every header with the name, joined; None when there is none.
 fn joined(headers: &[(String, String)], name: &str, sep: &str) -> Option<String> {
-    let values: Vec<&str> = headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).collect();
+    // As nginx compares them, "_" in a header's name is "-" in the variable's.
+    let same = |n: &str| n.len() == name.len() && n.bytes().zip(name.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b) || a == b'_' && b == b'-');
+    let values: Vec<&str> = headers.iter().filter(|(n, _)| same(n)).map(|(_, v)| v.as_str()).collect();
     (!values.is_empty()).then(|| values.join(sep))
 }
 
@@ -636,6 +649,10 @@ mod tests {
         r.method = "PUT".into();
         assert_eq!(Template::parse("$request_method").unwrap().render(&r, &Sent::default()), "PUT");
         assert_eq!(Template::parse("$scheme://x").unwrap().render(&r, &Sent::default()), "http://x");
+        r.line = "GET /a HTTP/2.0".into();
+        assert_eq!(Template::parse("[$https][$http2][$server_protocol]").unwrap().render(&r, &Sent::default()), "[][h2c][HTTP/2.0]");
+        r.line = "GET /a".into();
+        assert_eq!(Template::parse("[$http2][$server_protocol]").unwrap().render(&r, &Sent::default()), "[][]");
         assert_eq!(t.render(&r, &Sent { upstream_addr: Some("b".into()), ..Sent::default() }), format!("{}|b", std::process::id()));
         r.upstream_status = Some("404, 404".into());
         assert_eq!(Template::parse("x${upstream_status}x").unwrap().render(&r, &Sent::default()), "x404, 404x");
