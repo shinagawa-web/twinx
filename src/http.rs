@@ -128,7 +128,9 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
 /// is awaited.
 fn serving(config: Arc<Config>, stream: TcpStream, tls: bool, (addr, local, peer): (SocketAddr, SocketAddr, SocketAddr), fresh: Busy) -> impl Future<Output = ()> {
     async move {
-        let accepted = if tls { Box::pin(crate::tls::accept(stream, &config, addr)).await.map(|(s, ssl)| (s, Some(Arc::new(ssl)))) } else { Some((Stream::Tcp(stream), None)) };
+        // As nginx does, a connection to an address that takes TLS but does not start with it is served as plain HTTP.
+        let Some(plain) = (if tls { Box::pin(crate::tls::plain(&stream)).await } else { Some(true) }) else { return };
+        let accepted = if !plain { Box::pin(crate::tls::accept(stream, &config, addr)).await.map(|(s, ssl)| (s, Some(Arc::new(ssl)))) } else { Some((Stream::Tcp(stream), None)) };
         let Some((stream, ssl)) = accepted else { return };
         connection(&config, stream, (addr, local, peer, ssl), fresh, None).await
     }
@@ -188,6 +190,8 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
     let ((connected, mut requests), mut idle) = (origin.as_ref().map_or((Instant::now(), 0), |o| (o.connected, o.number - 1)), None);
     // Whether any of its requests was pipelined, as nginx's c->pipeline stays set.
     let mut piped = false;
+    // A plain connection to an address that takes TLS has its requests answered with 497.
+    let to_https = ssl.is_none() && !matches!(stream, Stream::Pipe(_)) && config.servers.iter().any(|s| s.ssl.contains(&listen));
     // A TLS connection whose client and server agreed on h2 (ALPN) speaks HTTP/2.
     if ssl.as_ref().is_some_and(|s| s.alpn == "h2") && !matches!(stream, Stream::Pipe(_)) {
         return Box::pin(crate::h2::serve(config.clone(), stream, buf, (listen, local, peer, ssl), fresh.take())).await;
@@ -210,7 +214,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         };
         // With http2 on in the default server of the address, a connection
         // that starts with the preface of HTTP/2 speaks it, as nginx decides.
-        if requests == 1 && ssl.is_none() && http2(config, listen, default) && buf.starts_with(b"PRI * HTTP/2.0\r\n") && !matches!(stream, Stream::Pipe(_)) {
+        if requests == 1 && ssl.is_none() && !to_https && http2(config, listen, default) && buf.starts_with(b"PRI * HTTP/2.0\r\n") && !matches!(stream, Stream::Pipe(_)) {
             return Box::pin(crate::h2::serve(config.clone(), stream, buf, (listen, local, peer, None), fresh.take())).await;
         }
         let mut r = Request {
@@ -243,6 +247,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         let (server, captures) = server(config, listen, r.host.as_deref());
         r.captures = captures;
         let parsed = parsed.and_then(|()| if r.headers.len().saturating_sub(origin.as_ref().map_or(0, |o| o.made)) > server.level.max_headers { Err(400) } else { Ok(()) });
+        let parsed = parsed.and_then(|()| if to_https { Err(497) } else { Ok(()) });
         let parsed = parsed.and_then(|()| if misdirected(r.ssl.as_deref(), r.host.as_deref(), server.level.ssl_verify_client) { Err(421) } else { Ok(()) });
         // A stream of HTTP/2 asking for a server that does not speak it is misdirected too.
         let parsed = parsed.and_then(|()| if matches!(stream, Stream::Pipe(_)) && !http2(config, listen, server) { Err(421) } else { Ok(()) });
@@ -571,6 +576,7 @@ fn special(status: u16) -> Response {
 }
 
 const REDIRECTS: &[u16] = &[301, 302, 303, 307, 308];
+const TO_HTTPS: &str = "The plain HTTP request was sent to HTTPS port";
 
 /// A redirect: the page nginx generates for the status, with a Location.
 fn redirect(status: u16, location: String) -> Response {
@@ -750,6 +756,8 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             resp = if url.starts_with('@') { special(500) } else { redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url) };
         }
     }
+    // 497, a plain request to an address that takes TLS, is answered as 400 with a page of its own when error_page does not take it.
+    if resp.status == 497 && resp.generated { (resp.status, resp.body) = (400, page_with(400, TO_HTTPS, &format!("<center>{TO_HTTPS}</center>\r\n")).into_bytes()); }
     // The headers and the log see the request as the last internal redirect left it ($uri).
     let r = &*last;
     not_modified(r, level, &mut resp);
