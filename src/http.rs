@@ -138,8 +138,14 @@ fn serving(config: Arc<Config>, stream: TcpStream, tls: bool, (addr, local, peer
 
 /// The end of the request head (after the empty line), if it has arrived.
 fn head_end(buf: &[u8]) -> Option<usize> {
-    let mut at = line_end(buf)?;
+    let at = line_end(buf)?;
     if http09(&buf[..at]) { return Some(at) }
+    lines_end(buf, at)
+}
+
+/// The end of the head whose first line ends at so many bytes, after the empty
+/// line: that of a proxied server's answer, whose status line has no reason at times.
+fn lines_end(buf: &[u8], mut at: usize) -> Option<usize> {
     loop {
         match buf[at..] {
             [b'\n', ..] => return Some(at + 1),
@@ -1320,6 +1326,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // body is passed as it comes, nor, without non_idempotent, one of these methods.
     let resend = !(pass_body && unread.is_some()) && (!matches!(r.method.as_str(), "POST" | "LOCK" | "PATCH") || next("non_idempotent"));
     let upgrade = r.headers.iter().any(|h| h.0.eq_ignore_ascii_case("upgrade"));
+    // early_hints: whether a value is neither empty nor "0", for a client of HTTP/1.1.
+    let hints = r.line.ends_with("HTTP/1.1") && level.early_hints.iter().any(|t| !matches!(t.render(r, &sent).as_str(), "" | "0"));
     // The name certificates are verified for (proxy_ssl_verify) and SNI sends
     // (proxy_ssl_server_name): proxy_ssl_name or $proxy_host, without the port.
     let name = ((level.proxy_ssl_verify || level.proxy_ssl_server_name) && p.ssl).then(|| ssl_name(&level.proxy_ssl_name.as_ref().map_or_else(|| host.clone(), |t| t.render(r, &sent))).to_string());
@@ -1365,7 +1373,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         (answer, kept) = match conn {
             Ok(conn) => {
                 time[0] = Some(connecting.elapsed().as_millis());
-                let fetched = fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade).await;
+                let fetched = fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints)).await;
                 closed = matches!(fetched, Err(NoAnswer::Closed));
                 fetched.ok().unzip()
             }
@@ -1566,7 +1574,7 @@ enum NoAnswer {
 /// does not close it, and the answer's body was read to its end with nothing
 /// after it. With a rate it is in the answer's rest.
 #[allow(clippy::too_many_arguments)]
-async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Result<(Response, Option<Conn>), NoAnswer> {
+async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, (upgrade, hints): (bool, bool)) -> Result<(Response, Option<Conn>), NoAnswer> {
     use NoAnswer::{Closed, Other};
     let s = &mut conn.stream;
     // proxy_read_timeout: how long each read may wait.
@@ -1576,25 +1584,37 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     bytes[2] = req.len() as u64;
     // The rest of a body that is not buffered goes on as the client sends it.
     if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other)?, max, s).await.ok_or(Other)?; }
-    // A head that does not fit in proxy_buffer_size is too big: the answer is invalid.
-    let end = loop {
-        if let Some(end) = head_end(&answer[..answer.len().min(level.proxy_buffer_size)]) { break end; }
-        if answer.len() >= level.proxy_buffer_size { return Err(Other); }
-        let closed = async { match client.as_deref() { Some(c) => match c.tcp() { Some(tcp) => crate::stream::closed(tcp).await, None => std::future::pending().await }, None => std::future::pending().await } };
-        let n = tokio::select! {
-            biased;
-            () = closed => return Ok((Response { status: 499, ..Response::default() }, None)),
-            n = within(wait, s.read(&mut chunk)) => n.ok_or(Other)?.ok().filter(|n| *n > 0).ok_or(Closed)?,
+    let (head, end, status) = loop {
+        // A head that does not fit in proxy_buffer_size is too big: the answer is invalid.
+        let end = loop {
+            let buf = &answer[..answer.len().min(level.proxy_buffer_size)];
+            if let Some(end) = line_end(buf).and_then(|at| lines_end(buf, at)) { break end; }
+            if answer.len() >= level.proxy_buffer_size { return Err(Other); }
+            let closed = async { match client.as_deref() { Some(c) => match c.tcp() { Some(tcp) => crate::stream::closed(tcp).await, None => std::future::pending().await }, None => std::future::pending().await } };
+            let n = tokio::select! {
+                biased;
+                () = closed => return Ok((Response { status: 499, ..Response::default() }, None)),
+                n = within(wait, s.read(&mut chunk)) => n.ok_or(Other)?.ok().filter(|n| *n > 0).ok_or(Closed)?,
+            };
+            answer.extend_from_slice(&chunk[..n]);
+            bytes[1] = answer.len() as u64;
         };
-        answer.extend_from_slice(&chunk[..n]);
-        bytes[1] = answer.len() as u64;
+        let head = crate::vars::text(&answer[..end]);
+        let first = head.split('\n').next().unwrap_or_default();
+        let status: u16 = first.strip_prefix("HTTP/1.").and_then(|f| f.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()).ok_or(Other)?;
+        if status != 103 { break (head, end, status) }
+        // Early hints go to the client, with the headers of the answer that are
+        // not hidden, when early_hints lets them and it has any; the answer comes after.
+        let shown = head.split('\n').skip(1).map(|l| l.trim_end_matches('\r')).filter_map(upstream_header).filter(|(n, _)| !hidden(level, n));
+        let lines: String = shown.map(|(n, v)| format!("{n}: {v}\r\n")).collect();
+        if let Some(c) = client.as_deref_mut().filter(|c| hints && !lines.is_empty() && !matches!(c, Stream::Pipe(_))) {
+            write_all(c, format!("HTTP/1.1 103 Early Hints\r\n{lines}\r\n").as_bytes(), send_timeout(level)).await;
+        }
+        answer.drain(..end);
     };
     time[1] = Some(start.elapsed().as_millis());
-    let head = crate::vars::text(&answer[..end]);
     let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
-    let first = lines.next().ok_or(Other)?;
-    let version = first.split(' ').next().ok_or(Other)?;
-    let status = first.strip_prefix("HTTP/1.").and_then(|f| f.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()).ok_or(Other)?;
+    let version = lines.next().unwrap_or_default().split(' ').next().unwrap_or_default();
     let mut resp = Response { status, proxied: true, ..Response::default() };
     const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
     for line in lines {
@@ -1632,6 +1652,13 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     (resp.body, read, ended, resp.cut) = read_body(s, answer, end, length, chunked, 0, wait).await;
     (bytes[0], bytes[1]) = ((read - end) as u64, read as u64);
     Ok((resp, Some(conn).filter(|_| keep && ended)))
+}
+
+/// Whether a header of a proxied server's early hints is hidden, as those of
+/// proxy_hide_header and those nginx hides by default are.
+fn hidden(level: &Level, name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["date", "server", "x-pad"].contains(&lower.as_str()) || lower.starts_with("x-accel-") || level.proxy_hide_header.contains(&lower)
 }
 
 /// A header line of a proxied server's answer as ngx_http_parse_header_line()
@@ -2386,6 +2413,11 @@ mod tests {
     fn head_end_with_lf_and_crlf() {
         assert_eq!(head_end(b"GET / HTTP/1.0\nHost: a\n\nrest"), Some(24));
         assert_eq!(head_end(b"GET / HTTP/1.0\r\n\r\n"), Some(18));
+        let level = Level { proxy_hide_header: vec!["x-b".into()], ..Level::default() };
+        assert_eq!(["Date", "X-Accel-A", "x-pad", "X-B", "Link"].map(|n| hidden(&level, n)), [true, true, true, true, false]);
+        // A status line without a reason is no HTTP/0.9 request line.
+        let answer = b"HTTP/1.1 103 \r\nLink: a\r\n\r\nHTTP/1.1 200 \r\n";
+        assert_eq!((head_end(answer), line_end(answer).and_then(|at| lines_end(answer, at))), (Some(15), Some(26)));
         assert_eq!(head_end(b"GET / HTTP/1.0\r\n"), None);
         assert_eq!(head_end(b"GET /\r\nextra"), Some(7));
         // The first empty line ends the head, whichever way its lines end.
@@ -2449,7 +2481,7 @@ mod tests {
         let start = Instant::now();
         let s = connect(addr, socket, level).await?;
         time[0] = Some(start.elapsed().as_millis());
-        fetch(Conn::new(Stream::Tcp(s), start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, false).await.ok().map(|(resp, _)| resp)
+        fetch(Conn::new(Stream::Tcp(s), start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, (false, false)).await.ok().map(|(resp, _)| resp)
     }
 
     #[test]
@@ -3030,7 +3062,7 @@ mod tests {
     fn connections_that_may_be_used_again() {
         // Whether the server closes the connection after its answer comes before
         // whether fetch() returns the connection.
-        let answers: [(&str, &str, bool, bool); 18] = [
+        let answers: [(&str, &str, bool, bool); 19] = [
             ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nab", false, true),
             ("GET", "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nab", false, false),
             ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: Close\r\n\r\nab", false, false),
@@ -3043,7 +3075,9 @@ mod tests {
             ("GET", "HTTP/1.1 204 No Content\r\n\r\nab", false, false),
             ("HEAD", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", false, true),
             ("GET", "HTTP/1.1 101 Switching Protocols\r\nContent-Length: 0\r\n\r\n", false, false),
-            ("HEAD", "HTTP/1.1 103 Early Hints\r\n\r\n", false, false),
+            ("HEAD", "HTTP/1.1 102 Processing\r\n\r\n", false, false),
+            // Early hints come before the answer.
+            ("HEAD", "HTTP/1.1 103 \r\nLink: a\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", false, true),
             // The body of an X-Accel-Redirect answer is not read, whether it came or not.
             ("GET", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nContent-Length: 2\r\n\r\nab", false, false),
             ("GET", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nContent-Length: 2\r\n\r\n", false, false),
@@ -3068,7 +3102,7 @@ mod tests {
             let req = format!("{method} / HTTP/1.1\r\n\r\n");
             let (_, conn) = block_on(async {
                 let s = connect(&addr, None, &level).await?;
-                fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).await.ok()
+                fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, (false, false)).await.ok()
             }).unwrap();
             assert_eq!(conn.is_some(), kept, "{method} {answer}");
         }
