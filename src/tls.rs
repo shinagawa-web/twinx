@@ -1090,9 +1090,13 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
 
     fn dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("twinx-tls-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("c.pem"), CERT).unwrap();
-        std::fs::write(dir.join("k.pem"), KEY).unwrap();
+        // Written once: the tests run at the same time, and read them.
+        static WRITTEN: std::sync::Once = std::sync::Once::new();
+        WRITTEN.call_once(|| {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("c.pem"), CERT).unwrap();
+            std::fs::write(dir.join("k.pem"), KEY).unwrap();
+        });
         dir
     }
 
