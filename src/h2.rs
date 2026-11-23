@@ -58,8 +58,9 @@ const TABLE_SIZE: usize = 4096;
 type Fields = Vec<(Vec<u8>, Vec<u8>)>;
 /// The listening, local and remote addresses of a connection, and its TLS session.
 pub type Addrs = (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>);
-/// What a stream is answered with: the status, the headers and the body; none resets it.
-type Answer = Option<(u16, Fields, Vec<u8>)>;
+/// What a stream is answered with: the status, the headers, the body and,
+/// when trailers are expected, those made (add_trailer); none resets it.
+type Answer = Option<(u16, Fields, Vec<u8>, Option<Fields>)>;
 /// What an exchange tells of a stream: how its body is read, then its answer.
 enum Told { Reading(Reading), Answer(Answer) }
 
@@ -309,12 +310,51 @@ fn header_block(status: u16, headers: &[(Vec<u8>, Vec<u8>)], table_update: bool)
         if index == 28 { write_integer(&mut out, 0, 7, headers[i].1.len()); out.extend_from_slice(&headers[i].1); } else { write_string(&mut out, &headers[i].1, false); }
         placed.push(i);
     }
-    for (_, (name, value)) in headers.iter().enumerate().filter(|(i, _)| !placed.contains(i)) {
-        out.push(0);
-        write_string(&mut out, name, true);
-        write_string(&mut out, value, false);
-    }
+    literals(&mut out, headers.iter().enumerate().filter(|(i, _)| !placed.contains(i)).map(|(_, h)| h));
     out
+}
+
+/// Writes fields as literals not added to the table, their names in lower
+/// case, as nginx writes the headers it has no place for and trailers.
+fn literals<'a>(out: &mut Vec<u8>, fields: impl Iterator<Item = &'a (Vec<u8>, Vec<u8>)>) {
+    for (name, value) in fields {
+        out.push(0);
+        write_string(out, name, true);
+        write_string(out, value, false);
+    }
+}
+
+/// Writes a header block in a HEADERS frame and as many CONTINUATION frames
+/// as it takes, none larger than the client takes; the HEADERS frame ends the stream or not.
+fn header_frames(out: &mut Vec<u8>, sid: u32, block: &[u8], frame_size: usize, end: bool) {
+    let mut parts = block.chunks(frame_size).peekable();
+    let mut kind = HEADERS;
+    while let Some(part) = parts.next() {
+        let flags = if parts.peek().is_none() { END_HEADERS } else { 0 } | if kind == HEADERS && end { END_STREAM } else { 0 };
+        frame(out, kind, flags, sid, part);
+        kind = CONTINUATION;
+    }
+}
+
+/// The body of a chunked HTTP/1 answer twinx made, and its trailers.
+fn unchunk(chunked: &[u8]) -> Option<(Vec<u8>, Fields)> {
+    let (mut body, mut trailers, mut at) = (Vec::new(), Vec::new(), 0);
+    let line = |at: &mut usize| -> Option<&[u8]> {
+        let n = chunked.get(*at..)?.windows(2).position(|w| w == b"\r\n")?;
+        *at += n + 2;
+        Some(&chunked[*at - n - 2..*at - 2])
+    };
+    loop {
+        let size = usize::from_str_radix(std::str::from_utf8(line(&mut at)?).ok()?, 16).ok()?;
+        if size == 0 { break }
+        body.extend_from_slice(chunked.get(at..at + size)?);
+        at += size + 2;
+    }
+    while let Some(trailer) = line(&mut at).filter(|l| !l.is_empty()) {
+        let colon = trailer.iter().position(|&c| c == b':')?;
+        trailers.push((trailer[..colon].to_vec(), trailer[colon + 1..].trim_ascii().to_vec()));
+    }
+    Some((body, trailers))
 }
 
 /// Writes a frame.
@@ -329,8 +369,8 @@ fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, sid: u32, payload: &[u8]) {
 /// passed on (none for one refused with 400), where its body goes as it comes
 /// until it ends, and what is to take it; the length the client declared of
 /// it, how much came, whether it goes in chunks (it has no length), and
-/// whether it turned out longer or shorter; then the body of the answer and
-/// how much of it has been sent. Of the answers it may get, only that of the
+/// whether it turned out longer or shorter; then the body of the answer, how
+/// much of it has been sent, and the header block of its trailers, sent after it. Of the answers it may get, only that of the
 /// exchange so numbered is taken. Until how its body is read is known, what
 /// comes of it is preread, and its window is not updated.
 #[derive(Default)]
@@ -338,7 +378,7 @@ struct Open {
     send: i64, recv: i64, head: Option<(Vec<u8>, bool, usize)>, ended: bool, reading: Option<Reading>,
     body: Option<UnboundedSender<Vec<u8>>>, taker: Option<UnboundedReceiver<Vec<u8>>>,
     declared: Option<u64>, got: u64, chunked: bool, bad: bool,
-    answer: Option<Vec<u8>>, sent: usize, number: u64, exchange: u32,
+    answer: Option<Vec<u8>>, sent: usize, number: u64, exchange: u32, trailers: Option<Vec<u8>>,
 }
 
 /// The state of an HTTP/2 connection.
@@ -587,18 +627,17 @@ impl Connection {
 
     /// Sends the head of a stream's answer, in HEADERS and CONTINUATION frames
     /// no larger than the client takes; a stream without an answer is reset.
+    /// With trailers expected, the stream ends with them, after the body; as
+    /// in nginx, when none were made after all, the last DATA frame ends it,
+    /// an empty one for an empty body.
     fn answer(&mut self, sid: u32, answer: Answer) {
         if !self.streams.contains_key(&sid) { return }
-        let Some((status, headers, body)) = answer else { return self.rst(sid, INTERNAL_ERROR) };
+        let Some((status, headers, body, trailers)) = answer else { return self.rst(sid, INTERNAL_ERROR) };
         let block = header_block(status, &headers, std::mem::take(&mut self.table_update));
-        let mut parts = block.chunks(self.frame_size).peekable();
-        let mut kind = HEADERS;
-        while let Some(part) = parts.next() {
-            let flags = if parts.peek().is_none() { END_HEADERS } else { 0 } | if kind == HEADERS && body.is_empty() { END_STREAM } else { 0 };
-            frame(&mut self.out, kind, flags, sid, part);
-            kind = CONTINUATION;
-        }
-        if let Some(s) = self.streams.get_mut(&sid) { s.answer = Some(body); }
+        header_frames(&mut self.out, sid, &block, self.frame_size, body.is_empty() && trailers.is_none());
+        if body.is_empty() && trailers.as_ref().is_some_and(|t| t.is_empty()) { frame(&mut self.out, DATA, END_STREAM, sid, &[]); }
+        let trailers = trailers.filter(|t| !t.is_empty()).map(|t| { let mut block = Vec::new(); literals(&mut block, t.iter()); block });
+        if let Some(s) = self.streams.get_mut(&sid) { (s.answer, s.trailers) = (Some(body), trailers); }
     }
 
     /// Sends what the windows let of the bodies of answers, in DATA frames no
@@ -613,9 +652,10 @@ impl Connection {
                 let n = (body.len() - s.sent).min(self.frame_size).min(s.send.min(self.send).max(0) as usize);
                 if n == 0 { break }
                 let end = s.sent + n == body.len();
-                frame(&mut self.out, DATA, if end { END_STREAM } else { 0 }, sid, &body[s.sent..s.sent + n]);
+                frame(&mut self.out, DATA, if end && s.trailers.is_none() { END_STREAM } else { 0 }, sid, &body[s.sent..s.sent + n]);
                 (s.sent, s.send, self.send) = (s.sent + n, s.send - n as i64, self.send - n as i64);
             }
+            if let Some(block) = s.trailers.take_if(|_| s.sent == body.len()) { header_frames(&mut self.out, sid, &block, self.frame_size, true); }
         }
         // A stream answered whole before its request ended is reset without an error, as nginx does.
         let done: Vec<u32> = self.streams.iter().filter(|(_, s)| s.answer.as_ref().is_some_and(|b| s.sent == b.len())).map(|(&sid, _)| sid).collect();
@@ -705,7 +745,12 @@ async fn exchange(config: Arc<Config>, request: Vec<u8>, body: Option<UnboundedR
     let end = answer.windows(4).position(|w| w == b"\r\n\r\n")?;
     let body = answer.split_off(end + 4);
     let (status, headers) = answer_head(&answer[..end])?;
-    Some((status, headers, body))
+    // An answer with trailers comes chunked.
+    const CHUNKED: &[u8] = b"\r\ntransfer-encoding: chunked";
+    let chunked = answer[..end].windows(CHUNKED.len()).any(|w| w.eq_ignore_ascii_case(CHUNKED));
+    if !chunked { return Some((status, headers, body, None)) }
+    let (body, trailers) = unchunk(&body)?;
+    Some((status, headers, body, Some(trailers)))
 }
 
 #[cfg(test)]
@@ -787,6 +832,31 @@ mod tests {
         let text: Vec<_> = fields.iter().map(|(n, v)| format!("{}: {}", String::from_utf8_lossy(n), String::from_utf8_lossy(v))).collect();
         assert_eq!(text, [":status: 301", "server: twinx", "location: /x", "x-a: b"]);
         assert_eq!(header_block(200, &[(b"Content-Length".to_vec(), b"12".to_vec())], false), [0x88, 0x5c, 0x02, b'1', b'2']);
+    }
+
+    #[test]
+    fn trailers_come_after_the_body() {
+        assert_eq!(unchunk(b"2\r\nab\r\n1\r\nc\r\n0\r\nX-A: b\r\nY:c \r\n\r\n"), Some((b"abc".to_vec(), vec![(b"X-A".to_vec(), b"b".to_vec()), (b"Y".to_vec(), b"c".to_vec())])));
+        assert_eq!(unchunk(b"0\r\n\r\n"), Some((Vec::new(), Vec::new())));
+        for broken in [&b"2\r\nab"[..], b"z\r\n", b"5\r\nab\r\n", b"0\r\nX\r\n\r\n"] { assert_eq!(unchunk(broken), None, "{broken:?}"); }
+        // The kind and flags of each frame sent.
+        let sent = |out: &[u8]| { let mut at = 0; std::iter::from_fn(|| { let len = u32::from_be_bytes([0, *out.get(at)?, out[at + 1], out[at + 2]]) as usize; let f = (out[at + 3], out[at + 4]); at += 9 + len; Some(f) }).collect::<Vec<_>>() };
+        let trailer = |value: &[u8]| Some(vec![(b"X".to_vec(), value.to_vec())]);
+        for (body, trailers, want) in [
+            (&b"ab"[..], trailer(b"1"), vec![(HEADERS, END_HEADERS), (DATA, 0), (HEADERS, END_HEADERS | END_STREAM)]),
+            (b"", trailer(b"1"), vec![(HEADERS, END_HEADERS), (HEADERS, END_HEADERS | END_STREAM)]),
+            (b"", trailer(&[b'x'; 20000]), vec![(HEADERS, END_HEADERS), (HEADERS, END_STREAM), (CONTINUATION, END_HEADERS)]),
+            // Expected, but none made.
+            (b"ab", Some(Vec::new()), vec![(HEADERS, END_HEADERS), (DATA, END_STREAM)]),
+            (b"", Some(Vec::new()), vec![(HEADERS, END_HEADERS), (DATA, END_STREAM)]),
+            (b"", None, vec![(HEADERS, END_HEADERS | END_STREAM)]),
+        ] {
+            let mut c = connection();
+            c.streams.insert(1, Open { send: 65535, ended: true, ..Open::default() });
+            c.answer(1, Some((200, Vec::new(), body.to_vec(), trailers)));
+            c.send_data();
+            assert_eq!((sent(&c.out), c.streams.is_empty()), (want, true), "{body:?}");
+        }
     }
 
     fn connection() -> Connection {
@@ -888,7 +958,7 @@ mod tests {
         c.reading(1, Reading::Discarded);
         assert_eq!(c.data(0, 1, &[0; 7]), Ok(()));
         assert!(c.out.is_empty());
-        c.answer(1, Some((204, Vec::new(), Vec::new())));
+        c.answer(1, Some((204, Vec::new(), Vec::new(), None)));
         c.send_data();
         assert!(c.out.ends_with(&[0, 0, 4, RST_STREAM, 0, 0, 0, 0, 1, 0, 0, 0, 0]) && c.streams.is_empty());
     }
@@ -912,7 +982,7 @@ mod tests {
         let mut taker = s.taker.take().unwrap();
         let parts: Vec<_> = std::iter::from_fn(|| taker.try_recv().ok()).collect();
         assert_eq!((parts.concat(), s.body.is_none(), s.chunked, s.send), (b"1\r\na\r\n1\r\nb\r\n0\r\n\r\n".to_vec(), true, true, 65535 - 65525 + 5));
-        c.answer(1, Some((200, vec![(b"x".to_vec(), vec![b'y'; 20000])], vec![b'z'; 20])));
+        c.answer(1, Some((200, vec![(b"x".to_vec(), vec![b'y'; 20000])], vec![b'z'; 20], None)));
         c.send_data();
         assert_eq!(c.streams[&1].sent, 15);
         assert!(c.window_update(1, 10).is_ok());
