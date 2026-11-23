@@ -1626,8 +1626,7 @@ fn cut_off(after: &[u8]) -> Option<&[u8]> {
     while !rest.is_empty() {
         let (n, next) = line(rest)?;
         let size = std::str::from_utf8(rest[..n].split(|&c| c == b';').next()?).ok()?.trim_end_matches([' ', '\t']);
-        // As in nginx, a size that leaves no room for what follows the chunk is invalid.
-        let size = u64::from_str_radix(size, 16).ok().filter(|s| !size.starts_with('+') && *s <= i64::MAX as u64 - 9)?;
+        let size = u64::from_str_radix(size, 16).ok().filter(|s| !size.starts_with('+') && *s <= MAX_CHUNK)?;
         let Some(next) = next else { break };
         rest = &rest[next..];
         if size == 0 {
@@ -1703,13 +1702,18 @@ fn bound(peer: &SocketAddr, (local, transparent): (SocketAddr, bool)) -> Option<
     Some(s)
 }
 
+/// The largest size of a chunk, NGX_MAX_OFF_T_VALUE / 16: nginx takes nothing
+/// after a larger one (ngx_http_parse_chunked()).
+const MAX_CHUNK: u64 = i64::MAX as u64 / 16;
+
 /// The data of the chunks of a proxied answer read so far, and whether
 /// nothing more is to be read: the last chunk came, or a chunk is invalid.
 fn unchunk(buf: &[u8]) -> (Vec<u8>, bool) {
     let (mut body, mut at) = (Vec::new(), 0);
     while let Some(n) = buf[at..].iter().position(|&c| c == b'\n') {
         let line = String::from_utf8_lossy(&buf[at..at + n]);
-        let Ok(size) = usize::from_str_radix(line.split(';').next().unwrap_or_default().trim(), 16) else { return (body, true) };
+        let size = usize::from_str_radix(line.split(';').next().unwrap_or_default().trim(), 16);
+        let Some(size) = size.ok().filter(|s| *s as u64 <= MAX_CHUNK) else { return (body, true) };
         let (start, end) = (at + n + 1, at + n + 1 + size);
         if size == 0 { return (body, true); }
         let Some(after) = buf.get(end..).filter(|a| a.len() >= 2) else { break };
@@ -2517,6 +2521,49 @@ mod tests {
         assert_eq!(unchunk(b"3\r\nabc"), (Vec::new(), false));
         assert_eq!(unchunk(b"3\r\nabcd\r\n"), (Vec::new(), true));
         assert_eq!(unchunk(b"x\r\n"), (Vec::new(), true));
+        // Sizes up to the largest that nginx takes.
+        assert_eq!(unchunk(b"2\r\nab\r\n7ffffffffffffff\r\ncd\r\n"), (b"ab".to_vec(), false));
+        for size in ["800000000000000", "7fffffffffffffff", "8000000000000000", "fffffffffffffff0", "ffffffffffffffef", "ffffffffffffffff", "10000000000000000"] {
+            for end in ["\n", "\r\n", ";x\r\n"] {
+                assert_eq!(unchunk(format!("{size}{end}ab\n0\n\n").as_bytes()), (Vec::new(), true));
+                assert_eq!(unchunk(format!("2\r\nab\r\n{size}{end}cd\r\n0\r\n\r\n").as_bytes()), (b"ab".to_vec(), true));
+            }
+        }
+    }
+
+    #[test]
+    fn no_chunked_body_panics() {
+        // xorshift64, the same numbers each time.
+        let mut x = 0x2545_f491_4f6c_dd1d_u64;
+        let mut upto = move |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        const PARTS: [&[u8]; 28] = [
+            b"0", b"1", b"2", b"A", b"f", b"10", b"ab", b"\r", b"\n", b"\r\n", b";", b";x=y", b" ", b"\t", b"+", b"-", b"zz", b"\0", b"\xff", "\u{e9}".as_bytes(),
+            b"0\r\n\r\n", b"2\r\nab\r\n", b"X: 1\r\n", b"ffffffffffffffff", b"fffffffffffffff0", b"7fffffffffffffff", b"7ffffffffffffff", b"10000000000000000",
+        ];
+        const WHOLE: [&[u8]; 4] = [b"2\r\nab\r\n0\r\n\r\n", b"A;x=y\r\n0123456789\r\n2\r\nab\r\n0\r\nX: 1\r\n\r\n", b"3\nabc\n0\n\n", b"2\r\nab\r\nffffffffffffffff\r\ncd\r\n0\r\n\r\n"];
+        for i in 0..400_000 {
+            let mut body = Vec::new();
+            if i % 2 == 0 {
+                for _ in 0..upto(12) { body.extend_from_slice(PARTS[upto(PARTS.len())]); }
+            } else {
+                // A part in the place of some bytes, a few times, and the end left out.
+                body.extend_from_slice(WHOLE[upto(WHOLE.len())]);
+                for _ in 0..upto(4) {
+                    let from = upto(body.len() + 1);
+                    let to = (from + upto(4)).min(body.len());
+                    body.splice(from..to, PARTS[upto(PARTS.len())].iter().copied());
+                }
+                if upto(3) == 0 { body.truncate(upto(body.len() + 1)); }
+            }
+            let ((data, done), part, whole) = (unchunk(&body), cut_off(&body), ended(&body, None, true));
+            assert!(data.len() + part.map_or(0, <[u8]>::len) <= body.len(), "{}", body.escape_ascii());
+            assert!(!whole || done && part.is_none(), "{}", body.escape_ascii());
+        }
     }
 
     #[test]
@@ -2559,7 +2606,7 @@ mod tests {
 
     #[test]
     fn bodies_cut_off() {
-        let cases: [(&[u8], Option<&[u8]>); 36] = [
+        let cases: [(&[u8], Option<&[u8]>); 38] = [
             // In or before a size, with what may follow it.
             (b"", Some(b"")), (b"0", Some(b"")), (b"2", Some(b"")), (b"2\r", Some(b"")), (b"2;x=y", Some(b"")), (b"2 ", Some(b"")),
             // In a chunk, what came of it, and after it.
@@ -2572,6 +2619,8 @@ mod tests {
             // Malformed.
             (b"zz", None), (b"\r", None), (b"2\r\nab\r\nzz\r\n", None), (b"2\r\nabc", None), (b"2\r\nab\rc", None), (b"2\rx", None), (b"+2\r\nab", None), (b"2 x\r\nab", None),
             (b"0\r\nX\r: 1", None), (b"7fffffffffffffff\r\nab", None), (b"10000000000000002\r\nab", None),
+            // The largest size and the next.
+            (b"7ffffffffffffff\r\nab", Some(b"ab")), (b"800000000000000\r\nab", None),
         ];
         for (after, part) in cases { assert_eq!(cut_off(after), part, "{}", String::from_utf8_lossy(after)); }
     }
