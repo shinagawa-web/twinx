@@ -741,11 +741,12 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
     let (method, path) = (line.next().unwrap_or_default(), line.next().unwrap_or_default());
     let mut fields = vec![(b":method".to_vec(), method.as_bytes().to_vec()), (b":scheme".to_vec(), scheme.as_bytes().to_vec()), (b":path".to_vec(), path.as_bytes().to_vec())];
     let mut body = Body::Length(0);
-    for (name, value) in lines.filter_map(|l| l.split_once(':')).map(|(n, v)| (n.to_ascii_lowercase(), v.trim())) {
+    // Those only HTTP/1 connections have are not passed.
+    const DROPPED: &[&str] = &["connection", "keep-alive", "proxy-connection", "upgrade", "te"];
+    for (name, value) in lines.filter_map(|l| l.split_once(':')).map(|(n, v)| (n.to_ascii_lowercase(), v.trim())).filter(|(n, _)| !DROPPED.contains(&n.as_str())) {
         match name.as_str() {
             "host" => fields.insert(2, (b":authority".to_vec(), value.as_bytes().to_vec())),
             "transfer-encoding" => body = Body::Chunked(0, false),
-            "connection" | "keep-alive" | "proxy-connection" | "upgrade" | "te" => {}
             _ => { if name == "content-length" { body = Body::Length(value.parse().unwrap_or(0)) } fields.push((name.into_bytes(), value.as_bytes().to_vec())) }
         }
     }
@@ -808,8 +809,8 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
                     // What was taken is given back to the windows.
                     if len > 0 { [0, 1].iter().for_each(|&sid| frame(&mut out, WINDOW_UPDATE, 0, sid, &(len as u32).to_be_bytes())); }
                 }
-                RST_STREAM | GOAWAY => return,
-                _ => {}
+                // The stream reset, or the connection going away, ends the answer.
+                _ => if matches!(kind, RST_STREAM | GOAWAY) { return },
             }
         }
     }
