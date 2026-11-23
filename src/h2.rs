@@ -773,10 +773,16 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
             (window, stream_window) = (window - n as i64, stream_window - n as i64);
         }
         if !out.is_empty() && up.write_all(&std::mem::take(&mut out)).await.is_err() { return }
+        // A read takes as much as a buffer of nginx's proxy_buffer_size would.
+        got.reserve(4096);
         tokio::select! {
             n = pipe.read_buf(&mut buf), if !finished => if n.unwrap_or(0) == 0 { return },
             n = up.read_buf(&mut got) => if n.unwrap_or(0) == 0 { return },
         }
+        // What the frames of a read give is passed only once they all have been taken,
+        // those after the end of the stream too, so that a stream reset with an error
+        // drops what came with it, as nginx does.
+        let (mut to_pipe, mut done, mut reset) = (Vec::new(), false, false);
         while got.len() >= 9 && got.len() >= 9 + (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize) {
             let (len, kind, flags, sid) = (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize, got[3], got[4], u32::from_be_bytes([got[5], got[6], got[7], got[8]]) & 0x7fff_ffff);
             let p: Vec<u8> = got.drain(..9 + len).skip(9).collect();
@@ -801,18 +807,23 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
                     let mut head = format!("HTTP/1.1 {status} \r\n").into_bytes();
                     fields.iter().filter(|f| !f.0.starts_with(b":")).for_each(|(n, v)| head.extend([&n[..], b": ", v, b"\r\n"].concat()));
                     head.extend_from_slice(b"\r\n");
-                    if pipe.write_all(&head).await.is_err() || first & END_STREAM != 0 { return }
+                    to_pipe.extend_from_slice(&head);
+                    done |= first & END_STREAM != 0;
                 }
                 DATA if sid == 1 => {
                     let padding = if flags & PADDED != 0 { usize::from(p[0]) + 1 } else { 0 };
-                    if pipe.write_all(p.get(padding.min(1)..p.len() - padding.saturating_sub(1)).unwrap_or_default()).await.is_err() || flags & END_STREAM != 0 { return }
+                    to_pipe.extend_from_slice(p.get(padding.min(1)..p.len() - padding.saturating_sub(1)).unwrap_or_default());
+                    done |= flags & END_STREAM != 0;
                     // What was taken is given back to the windows.
                     if len > 0 { [0, 1].iter().for_each(|&sid| frame(&mut out, WINDOW_UPDATE, 0, sid, &(len as u32).to_be_bytes())); }
                 }
-                // The stream reset, or the connection going away, ends the answer.
-                _ => if matches!(kind, RST_STREAM | GOAWAY) { return },
+                // A reset with NO_ERROR after the end of the stream is taken once; any other fails the answer.
+                RST_STREAM if sid == 1 => { if p != [0; 4] || reset || !done { return } reset = true }
+                // The connection going away ends the answer.
+                _ => done |= kind == GOAWAY,
             }
         }
+        if pipe.write_all(&to_pipe).await.is_err() || done { return }
     }
 }
 
@@ -995,6 +1006,31 @@ mod tests {
             };
             tokio::join!(bridge, test);
         });
+    }
+
+    #[test]
+    fn resets_after_the_answer() {
+        // What the server sends at once, and what the bridge passes of it.
+        let answered = |rst: &[u32]| crate::stream::block_on(async {
+            let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
+            let bridge = upstream(Stream::Pipe(up), theirs, "http");
+            let test = async {
+                ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
+                let mut out = Vec::new();
+                frame(&mut out, HEADERS, END_HEADERS, 1, &header_block(200, &[], false));
+                frame(&mut out, DATA, END_STREAM, 1, b"ok");
+                rst.iter().for_each(|code| frame(&mut out, RST_STREAM, 0, 1, &code.to_be_bytes()));
+                server.write_all(&out).await.unwrap();
+                let mut answer = Vec::new();
+                ours.read_to_end(&mut answer).await.unwrap();
+                String::from_utf8_lossy(&answer).into_owned()
+            };
+            tokio::join!(bridge, test).1
+        });
+        assert_eq!(answered(&[]), "HTTP/1.1 200 \r\n\r\nok");
+        assert_eq!(answered(&[NO_ERROR]), "HTTP/1.1 200 \r\n\r\nok");
+        assert_eq!(answered(&[NO_ERROR, NO_ERROR]), "");
+        assert_eq!(answered(&[INTERNAL_ERROR]), "");
     }
 
     #[test]
