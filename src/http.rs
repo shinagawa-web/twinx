@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use crate::conf::{Condition, Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, Step, TryFiles};
 use crate::vars::{Part, Template};
 use crate::expires;
-use crate::upstream::{Peer, Upstream};
+use crate::upstream::{Conn, Peer, Upstream};
 use crate::vars::{Request, Sent};
 use crate::stream::{Stream, buffer, read_into, read_until, recycle, within, write_all};
 
@@ -76,13 +76,14 @@ impl Drop for Busy {
 
 /// Shuts the worker down gracefully, as QUIT does: it stops the tasks that
 /// accept, closes each connection once its request is answered, and returns
-/// when no request is left, or once worker_shutdown_timeout has passed. Idle
-/// connections are closed when the worker exits. A connection accepted before
-/// the tasks stopped is counted from its accept on, so its request is
-/// answered, not dropped.
+/// when no request is left, or once worker_shutdown_timeout has passed. Those
+/// kept to proxied servers are closed first, idle ones of clients when the
+/// worker exits. A connection accepted before the tasks stopped is counted
+/// from its accept on, so its request is answered, not dropped.
 pub async fn shut_down(accepting: Vec<JoinHandle<()>>, timeout: Option<Duration>) {
     let start = Instant::now();
     SHUTTING.store(true, Ordering::SeqCst);
+    crate::upstream::close_idle();
     accepting.iter().for_each(JoinHandle::abort);
     for task in accepting { let _ = task.await; }
     while BUSY.load(Ordering::SeqCst) > 0 && timeout.is_none_or(|t| start.elapsed() < t) { tokio::time::sleep(Duration::from_millis(10)).await; }
@@ -434,14 +435,18 @@ struct Response {
 
 /// The connection to a proxied server whose body is still to be read, with
 /// what has been read of the answer, where its head ends, how the body's end
-/// is found, the rate, when the request to it started, and how long a read may wait.
+/// is found, the rate, when the request to it started, and how long a read may wait;
+/// whether the connection may be used again once the body has ended, and where it
+/// goes back to then: the upstream, the server's address and the location's tag.
 #[derive(Debug)]
-struct Rest { s: Stream, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration> }
+struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)> }
 
 /// Reads the rest of a proxied answer's body, noting how long the whole answer took.
 async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
-    let (body, read) = read_body(&mut rest.s, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await.unwrap_or_default();
+    let (body, read, ended) = read_body(&mut rest.conn.stream, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await.unwrap_or_default();
+    // A read that failed gave no body, and no end of it.
+    if let Some((up, addr, tag)) = rest.home.filter(|_| rest.keep && ended) { up.put(rest.conn, addr, tag); }
     resp.body = body;
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
@@ -1202,39 +1207,78 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let (mut tried, mut answer, mut addrs, mut times, mut bytes) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new(), Vec::new());
     let (mut statuses, limit, first) = (Vec::new(), level.proxy_next_upstream_tries, Instant::now());
     let (mut tries, next) = (if limit > 0 { up.tries().min(limit) } else { up.tries() }, |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
+    // Whether a request that a server may have got can go on to another: not one whose
+    // body is passed as it comes, nor, without non_idempotent, one of these methods.
+    let resend = !(pass_body && unread.is_some()) && (!matches!(r.method.as_str(), "POST" | "LOCK" | "PATCH") || next("non_idempotent"));
     let upgrade = r.headers.iter().any(|h| h.0.eq_ignore_ascii_case("upgrade"));
     // The name certificates are verified for (proxy_ssl_verify) and SNI sends
     // (proxy_ssl_server_name): proxy_ssl_name or $proxy_host, without the port.
     let name = ((level.proxy_ssl_verify || level.proxy_ssl_server_name) && p.ssl).then(|| ssl_name(&level.proxy_ssl_name.as_ref().map_or_else(|| host.clone(), |t| t.render(r, &sent))).to_string());
+    // What tells the location from others in the cache of connections: its settings live as long as the worker.
+    let tag = level as *const Level as usize;
     while let Some(i) = up.pick(&mut tried) {
-        addrs.push(up.peers[i].addr.to_string());
+        let addr = up.peers[i].addr;
+        addrs.push(addr.to_string());
+        // A kept connection is used wherever it was bound, as in nginx.
+        let taken = up.take(&addr, tag);
+        let cached = taken.is_some();
         // A socket that cannot be bound fails the request without trying the next server.
-        let socket = bind.map(|b| bound(&up.peers[i].addr, b));
+        let socket = bind.filter(|_| taken.is_none()).map(|b| bound(&addr, b));
         if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
         let (start, mut time, mut counted) = (Instant::now(), [None; 3], [0; 3]);
-        // Names of proxy_ssl_certificate with variables are loaded for each connection; failing to is 500.
-        let names = level.proxy_ssl_certificate_vars.as_ref().filter(|_| p.ssl).map(|(c, k, prefix)| (c.render(r, &Sent::default()), k.render(r, &Sent::default()), prefix));
-        let tls = match (names.filter(|(c, ..)| !c.is_empty()), level.proxy_tls.as_ref().filter(|_| p.ssl)) {
+        // As in nginx, one over TLS is used as it is, whatever it was made with, and
+        // one without makes the handshake for https:// now.
+        let handshake = p.ssl && taken.as_ref().is_none_or(|c| matches!(c.stream, Stream::Tcp(_)));
+        // Names of proxy_ssl_certificate with variables are loaded for each handshake; failing to is 500.
+        let names = level.proxy_ssl_certificate_vars.as_ref().filter(|_| handshake).map(|(c, k, prefix)| (c.render(r, &Sent::default()), k.render(r, &Sent::default()), prefix));
+        let tls = match (names.filter(|(c, ..)| !c.is_empty()), level.proxy_tls.as_ref().filter(|_| handshake)) {
             (Some((c, k, prefix)), Some(base)) => match crate::tls::client_cert(base, (&prefix.join(c), &prefix.join(k), level.proxy_ssl_password_file.as_deref()), level.proxy_ssl_certificate_cache.as_deref()) {
                 Ok(tls) => Some(tls),
                 Err(e) => { error_log(level, r, &e); return special(500) }
             },
             (_, tls) => tls.cloned(),
         };
-        answer = fetch((&up.peers[i].addr, tls.as_ref().map(|t| (t, name.as_deref()))), socket.flatten(), &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade).await;
+        let connecting = Instant::now();
+        let conn = match taken {
+            Some(conn) => Some(conn),
+            None => connect(&addr, socket.flatten(), level).await.map(|s| Conn::new(Stream::Tcp(s), connecting)),
+        };
+        let conn = match (conn, &tls) {
+            (Some(conn), Some(tls)) => secure(conn, &addr, (tls, name.as_deref()), level).await,
+            (conn, _) => conn.ok_or(None),
+        };
+        let begun = conn.is_ok();
+        // A kept connection whose handshake fails counts as closed, as in nginx; one that times out does not.
+        let mut closed = matches!(conn, Err(None));
+        let kept;
+        (answer, kept) = match conn {
+            Ok(conn) => {
+                time[0] = Some(connecting.elapsed().as_millis());
+                let fetched = fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade).await;
+                closed = matches!(fetched, Err(NoAnswer::Closed));
+                fetched.ok().unzip()
+            }
+            Err(resp) => (resp, None),
+        };
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
         // An error, or a status proxy_next_upstream names while servers are
         // left to try, goes on to the next server; 403 and 404 are no failures.
-        tries -= 1;
+        // A kept connection that turns out to be closed, which is in the cache no
+        // more, does not use up a try.
+        if !(cached && closed) { tries -= 1; }
         let status = answer.as_ref().map(|a| a.status);
         statuses.push(status.unwrap_or(502).to_string());
         // proxy_next_upstream_tries and proxy_next_upstream_timeout end the tries too.
         let timeout = level.proxy_next_upstream_timeout;
-        // The page fetch() generates for a timeout, rather than an answer of the server.
+        // The page secure() generates for a timeout, rather than an answer of the server.
         let timed_out = answer.as_ref().is_some_and(|a| a.generated);
-        let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout);
+        let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout) && (resend || !begun);
+        // The connection of an answer that is not used is closed.
+        if let Some(conn) = kept.flatten().filter(|_| !again) { up.put(conn, addr, tag); }
+        // That of one whose body is still to be read goes back after it.
+        if let Some(rest) = answer.as_mut().and_then(|a| a.rest.as_mut()).filter(|_| !again) { rest.home = Some((up.clone(), addr, tag)); }
         up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404)));
         if !again || tries == 0 { break; }
         answer = None;
@@ -1374,39 +1418,61 @@ fn ssl_name(name: &str) -> &str {
     host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Option<&str>)>), socket: Option<socket2::Socket>, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
-    let start = Instant::now();
+/// Opens a TCP connection to a proxied server, from the bound socket if one is given.
+async fn connect(peer: &SocketAddr, socket: Option<socket2::Socket>, level: &Level) -> Option<TcpStream> {
     let connect = async {
         match socket {
             Some(socket) => { socket.set_nonblocking(true)?; tokio::net::TcpSocket::from_std_stream(socket.into()).connect(*peer).await }
             None => TcpStream::connect(peer).await,
         }
     };
-    let s = tokio::time::timeout(level.proxy_connect_timeout, connect).await.ok()?.ok()?;
-    // proxy_pass https://: the TLS handshake is part of connecting.
-    // A handshake that does not end within proxy_connect_timeout is a timeout, answered with 504.
-    let mut s = match tls {
-        Some((tls, name)) => match crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls).await { Ok(s) => s, Err(e) => return (e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504)) },
-        None => Stream::Tcp(s),
-    };
-    time[0] = Some(start.elapsed().as_millis());
+    tokio::time::timeout(level.proxy_connect_timeout, connect).await.ok().and_then(Result::ok)
+}
+
+/// Makes the TLS handshake of proxy_pass https:// on a TCP connection; one over
+/// TLS stays as it is. The error is what answers the request instead, if anything
+/// does: a handshake that does not end within proxy_connect_timeout is a timeout,
+/// answered with 504.
+async fn secure(mut conn: Conn, peer: &SocketAddr, (tls, name): (&Arc<rustls::ClientConfig>, Option<&str>), level: &Level) -> Result<Conn, Option<Response>> {
+    if let Stream::Tcp(s) = conn.stream {
+        conn.stream = match crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls).await { Ok(s) => s, Err(e) => return Err((e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504))) };
+    }
+    Ok(conn)
+}
+
+/// Why there is no answer of a proxied server.
+enum NoAnswer {
+    /// The connection failed or was closed before the whole head came.
+    Closed,
+    /// The answer is invalid, or did not come in time or to its end; or the
+    /// request's body could not be passed.
+    Other,
+}
+
+/// Sends a request to a proxied server and reads its answer. The connection
+/// comes with it only when it may be used for another request: the server
+/// does not close it, and the answer's body was read to its end with nothing
+/// after it. With a rate it is in the answer's rest.
+#[allow(clippy::too_many_arguments)]
+async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Result<(Response, Option<Conn>), NoAnswer> {
+    use NoAnswer::{Closed, Other};
+    let s = &mut conn.stream;
     // proxy_read_timeout: how long each read may wait.
     let wait = Some(level.proxy_read_timeout).filter(|t| !t.is_zero());
     let (mut answer, mut chunk) = (Vec::new(), vec![0u8; 4096]);
-    if !write_all(&mut s, req, None).await { return None }
+    if !write_all(s, req, None).await { return Err(Closed) }
     bytes[2] = req.len() as u64;
     // The rest of a body that is not buffered goes on as the client sends it.
-    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut()?, max, &mut s).await?; }
+    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other)?, max, s).await.ok_or(Other)?; }
     // A head that does not fit in proxy_buffer_size is too big: the answer is invalid.
     let end = loop {
         if let Some(end) = head_end(&answer[..answer.len().min(level.proxy_buffer_size)]) { break end; }
-        if answer.len() >= level.proxy_buffer_size { return None; }
+        if answer.len() >= level.proxy_buffer_size { return Err(Other); }
         let closed = async { match client.as_deref() { Some(c) => crate::stream::closed(c.tcp()).await, None => std::future::pending().await } };
         let n = tokio::select! {
             biased;
-            () = closed => return Some(Response { status: 499, ..Response::default() }),
-            n = within(wait, s.read(&mut chunk)) => n?.ok().filter(|n| *n > 0)?,
+            () = closed => return Ok((Response { status: 499, ..Response::default() }, None)),
+            n = within(wait, s.read(&mut chunk)) => n.ok_or(Other)?.ok().filter(|n| *n > 0).ok_or(Closed)?,
         };
         answer.extend_from_slice(&chunk[..n]);
         bytes[1] = answer.len() as u64;
@@ -1414,11 +1480,13 @@ async fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Op
     time[1] = Some(start.elapsed().as_millis());
     let head = crate::vars::text(&answer[..end]);
     let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
-    let status = lines.next()?.strip_prefix("HTTP/1.")?.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()?;
+    let first = lines.next().ok_or(Other)?;
+    let version = first.split(' ').next().ok_or(Other)?;
+    let status = first.strip_prefix("HTTP/1.").and_then(|f| f.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()).ok_or(Other)?;
     let mut resp = Response { status, proxied: true, ..Response::default() };
     const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
     for line in lines {
-        let (name, value) = upstream_header(line)?;
+        let (name, value) = upstream_header(line).ok_or(Other)?;
         let (lower, value) = (name.to_ascii_lowercase(), value.to_string());
         resp.upstream.push((name.to_string(), value.clone()));
         if lower == "content-type" { resp.ctype = Some(value.into()); continue; }
@@ -1427,28 +1495,31 @@ async fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Op
         if !again && !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
     }
     // 101 to a request with Upgrade: what came after the head goes to the client first.
-    if status == 101 && upgrade { return Some(Response { body: answer[end..].to_vec(), tunnel: Some(s), ..resp }); }
+    if status == 101 && upgrade { return Ok((Response { body: answer[end..].to_vec(), tunnel: Some(conn.stream), ..resp }, None)); }
     // The body's length: one Content-Length of digits, or one "Transfer-Encoding:
     // chunked" without it; any other mix makes the answer invalid. A HEAD, 204
     // or 304 answer has no body.
     let values = |name: &str| resp.upstream.iter().filter(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone()).collect::<Vec<_>>();
     let (length, chunked) = match (&values("content-length")[..], &values("transfer-encoding")[..]) {
         ([], []) => (None, false),
-        ([l], []) => (Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten()?), false),
+        ([l], []) => (Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten().ok_or(Other)?), false),
         ([], [c]) if c.eq_ignore_ascii_case("chunked") => (None, true),
-        _ => return None,
+        _ => return Err(Other),
     };
     // The body of an answer that redirects with X-Accel-Redirect is not read.
     let accel = resp.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect"));
-    let no_body = req.starts_with(b"HEAD ") || [204, 304].contains(&status) || accel;
-    let (length, chunked) = if no_body { (Some(0), false) } else { (length, chunked) };
+    let no_body = req.starts_with(b"HEAD ") || [204, 304].contains(&status);
+    // An informational answer (1xx) has another after it; the body that is not
+    // read for X-Accel-Redirect would come before the next answer.
+    let skipped = accel && !no_body && length != Some(0);
+    let keep = status >= 200 && !closes(version, &values("connection")) && !skipped;
+    let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
-    if rate > 0 { return Some(Response { rest: Some(Rest { s, answer, end, length, chunked, rate, started: start, wait }), ..resp }); }
-    let (body, read) = read_body(&mut s, answer, end, length, chunked, 0, wait).await?;
+    if rate > 0 { return Ok((Response { rest: Some(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None }), ..resp }, None)); }
+    let (body, read, ended) = read_body(s, answer, end, length, chunked, 0, wait).await.ok_or(Other)?;
     (resp.body, bytes[0], bytes[1]) = (body, (read - end) as u64, read as u64);
-    Some(resp)
+    Ok((resp, Some(conn).filter(|_| keep && ended)))
 }
-
 
 /// A header line of a proxied server's answer as ngx_http_parse_header_line()
 /// reads it: a line without ":" is a name with an empty value, and the value
@@ -1467,9 +1538,9 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// proxy_limit_rate: by the end of each second since the body started
 /// (counted in whole seconds of the clock) up to the rate for each second has
 /// been read, and when that much has, it waits for the time it is worth.
-/// Returns the body and the bytes of the whole answer read; None when a read
-/// fails or waits longer than the time.
-async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> Option<(Vec<u8>, usize)> {
+/// Returns the body, the bytes of the whole answer read, and whether they end
+/// where the body does; None when a read fails or waits longer than the time.
+async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> Option<(Vec<u8>, usize, bool)> {
     let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let (start, rate, mut chunk) = (secs(), rate as i64, vec![0u8; 4096]);
     while length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1) {
@@ -1480,7 +1551,44 @@ async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Opti
         answer.extend_from_slice(&chunk[..n]);
     }
     let body = &answer[end..];
-    Some((if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() }, answer.len()))
+    Some((if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() }, answer.len(), ended(body, length, chunked)))
+}
+
+/// Whether what came after the head of a proxied answer is its whole body and
+/// nothing else: as many bytes as its length, or well-formed chunks with the
+/// last one, the trailer lines and the empty line. A body that the closing of
+/// the connection ends has no such end.
+fn ended(after: &[u8], length: Option<usize>, chunked: bool) -> bool {
+    if !chunked { return length == Some(after.len()); }
+    // A line and where the next starts; a CR only ends a line.
+    let line = |at: usize| {
+        let n = after[at..].iter().position(|&c| c == b'\n')?;
+        let line = &after[at..at + n];
+        Some((line.strip_suffix(b"\r").unwrap_or(line), at + n + 1)).filter(|(l, _)| !l.contains(&b'\r'))
+    };
+    let mut at = 0;
+    loop {
+        let Some((size, start)) = line(at) else { return false };
+        let size = size.split(|&c| c == b';').next().unwrap_or_default();
+        let size = std::str::from_utf8(size).ok().filter(|s| s.bytes().all(|c| c.is_ascii_hexdigit())).and_then(|s| usize::from_str_radix(s, 16).ok());
+        let Some(end) = size.and_then(|n| start.checked_add(n)) else { return false };
+        at = start;
+        if end == start { break; }
+        let rest = after.get(end..).unwrap_or_default();
+        at = end + if rest.starts_with(b"\r\n") { 2 } else if rest.starts_with(b"\n") { 1 } else { return false };
+    }
+    loop {
+        let Some((trailer, next)) = line(at) else { return false };
+        at = next;
+        if trailer.is_empty() { return at == after.len(); }
+    }
+}
+
+/// Whether a proxied server closes the connection after its answer, as nginx
+/// finds it: the version of the status line is not HTTP/1.1 or a later 1.x, or
+/// a Connection header has "close" anywhere in it.
+fn closes(version: &str, connection: &[String]) -> bool {
+    !matches!(version.strip_prefix("HTTP/1.").map(str::as_bytes), Some([b'1'..=b'9'])) || connection.iter().any(|v| v.to_ascii_lowercase().contains("close"))
 }
 
 /// A socket for connecting to a proxied server from a local address, set up
@@ -1781,6 +1889,7 @@ mod tests {
     use super::*;
     use crate::stream::block_on;
     use std::net::TcpStream;
+    use std::sync::Mutex;
     use tokio::io::AsyncWriteExt;
     use std::thread;
 
@@ -2053,6 +2162,14 @@ mod tests {
         assert_eq!(ssl_name("::1"), "");
     }
 
+    /// Connects to a server and fetches its answer to a GET request.
+    async fn fetched(addr: &SocketAddr, socket: Option<socket2::Socket>, level: &Level, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64) -> Option<Response> {
+        let start = Instant::now();
+        let s = connect(addr, socket, level).await?;
+        time[0] = Some(start.elapsed().as_millis());
+        fetch(Conn::new(Stream::Tcp(s), start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, false).await.ok().map(|(resp, _)| resp)
+    }
+
     #[test]
     fn fetches_from_a_server() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2065,7 +2182,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (mut time, mut bytes) = ([None; 3], [0; 3]);
-        let resp = block_on(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut time, &mut bytes), &|_| 0, None, 0, false)).unwrap();
+        let resp = block_on(fetched(&addr, None, &level, (&mut time, &mut bytes), &|_| 0)).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
         // The body, the whole answer and the request, in bytes.
         assert_eq!(bytes, [4, 80, 18]);
@@ -2166,7 +2283,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
-        assert_eq!(block_on(fetch((&addr, None), socket, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false)).unwrap().status, 200);
+        assert_eq!(block_on(fetched(&addr, socket, &level, (&mut [None; 3], &mut [0; 3]), &|_| 0)).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
@@ -2186,7 +2303,7 @@ mod tests {
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
         block_on(async {
-            let mut resp = fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).await.unwrap();
+            let mut resp = fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &rate).await.unwrap();
             // The body is read after the head, 4000 bytes (what came with the head too)
             // in each second of the clock: it ends in the third second.
             assert!(resp.body.is_empty() && resp.rest.is_some());
@@ -2209,6 +2326,529 @@ mod tests {
     }
 
     #[test]
+    fn ends_of_answers() {
+        let length: [(&[u8], usize, bool); 5] = [(b"ab", 2, true), (b"", 0, true), (b"a", 2, false), (b"abc", 2, false), (b"a", 0, false)];
+        for (after, n, is) in length { assert_eq!(ended(after, Some(n), false), is, "{after:?} {n}"); }
+        let chunked: [(&[u8], bool); 24] = [
+            (b"3\r\nabc\r\n0\r\n\r\n", true),
+            (b"0\r\n\r\n", true),
+            (b"A\r\n0123456789\r\n000\r\n\r\n", true),
+            // Trailer lines, chunk extensions and LF line ends.
+            (b"3\r\nabc\r\n0\r\nX: 1\r\nY: 2\r\n\r\n", true),
+            (b"3;x=y\r\nabc\r\n0;z\r\n\r\n", true),
+            (b"3\nabc\n0\nX: 1\n\n", true),
+            // Not all of it.
+            (b"", false),
+            (b"3\r\nab", false),
+            (b"3\r\nabc", false),
+            (b"3\r\nabc\r\n", false),
+            (b"3\r\nabc\r\n0\r\n", false),
+            (b"3\r\nabc\r\n0\r\n\r", false),
+            (b"3\r\nabc\r\n0\r\nX: 1\r\n", false),
+            // More than it.
+            (b"3\r\nabc\r\n0\r\n\r\nH", false),
+            (b"0\r\n\r\n\r\n", false),
+            // Malformed.
+            (b"x\r\n\r\n", false),
+            (b"\r\n\r\n", false),
+            (b"3\r\nabcd\r\n0\r\n\r\n", false),
+            (b"+1\r\na\r\n0\r\n\r\n", false),
+            (b"-0\r\n\r\n", false),
+            (b" 0\r\n\r\n", false),
+            (b"0;\rx\r\n\r\n", false),
+            (b"ffffffffffffffff\r\na\r\n0\r\n\r\n", false),
+            (b"10000000000000000\r\na\r\n0\r\n\r\n", false),
+        ];
+        for (after, is) in chunked { assert_eq!(ended(after, None, true), is, "{}", String::from_utf8_lossy(after)); }
+        for after in [&b""[..], b"ab", b"0\r\n\r\n"] { assert!(!ended(after, None, false)); }
+    }
+
+    #[test]
+    fn servers_that_close() {
+        for (version, connection, is) in [
+            ("HTTP/1.1", &[][..], false), ("HTTP/1.2", &[], false), ("HTTP/1.1", &["keep-alive"], false), ("HTTP/1.1", &["clos"], false),
+            ("HTTP/1.0", &[], true), ("HTTP/1.0", &["keep-alive"], true), ("HTTP/2.0", &[], true), ("HTTP/1.x", &[], true), ("HTTP/1.1\t200", &[], true),
+            ("HTTP/1.1", &["close"], true), ("HTTP/1.1", &["Close"], true), ("HTTP/1.1", &["keep-alive, CLOSE"], true), ("HTTP/1.1", &["disclosed"], true),
+            ("HTTP/1.1", &["keep-alive", "close"], true),
+        ] {
+            let values: Vec<String> = connection.iter().map(|v| v.to_string()).collect();
+            assert_eq!(closes(version, &values), is, "{version} {connection:?}");
+        }
+    }
+
+    #[test]
+    fn connections_that_may_be_used_again() {
+        // Whether the server closes the connection after its answer comes before
+        // whether fetch() returns the connection.
+        let answers: [(&str, &str, bool, bool); 18] = [
+            ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nab", false, true),
+            ("GET", "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nab", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: Close\r\n\r\nab", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nabc", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\na", true, false),
+            ("GET", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n", false, true),
+            ("GET", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\n\r\nab", true, false),
+            ("GET", "HTTP/1.1 204 No Content\r\n\r\n", false, true),
+            ("GET", "HTTP/1.1 204 No Content\r\n\r\nab", false, false),
+            ("HEAD", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", false, true),
+            ("GET", "HTTP/1.1 101 Switching Protocols\r\nContent-Length: 0\r\n\r\n", false, false),
+            ("HEAD", "HTTP/1.1 103 Early Hints\r\n\r\n", false, false),
+            // The body of an X-Accel-Redirect answer is not read, whether it came or not.
+            ("GET", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nContent-Length: 2\r\n\r\nab", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nContent-Length: 2\r\n\r\n", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nTransfer-Encoding: chunked\r\n\r\n", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nContent-Length: 0\r\n\r\n", false, true),
+            ("HEAD", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nContent-Length: 2\r\n\r\n", false, true),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut open = Vec::new();
+            for (_, answer, close, _) in answers {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = s.read(&mut [0u8; 1024]).unwrap();
+                s.write_all(answer.as_bytes()).unwrap();
+                if !close { open.push(s); }
+            }
+            thread::sleep(Duration::from_secs(5));
+        });
+        let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
+        for (method, answer, _, kept) in answers {
+            let req = format!("{method} / HTTP/1.1\r\n\r\n");
+            let (_, conn) = block_on(async {
+                let s = connect(&addr, None, &level).await?;
+                fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).await.ok()
+            }).unwrap();
+            assert_eq!(conn.is_some(), kept, "{method} {answer}");
+        }
+    }
+
+    /// A server that answers each request of a connection with the header lines and
+    /// its request line as the body, and leaves the connection open; and the requests
+    /// that came, each with the number of its connection.
+    fn answering(lines: &'static str) -> (SocketAddr, Arc<Mutex<Vec<(usize, String)>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())));
+        let all = came.clone();
+        thread::spawn(move || {
+            for (i, s) in listener.incoming().enumerate() {
+                let (mut s, came) = (s.unwrap(), all.clone());
+                thread::spawn(move || {
+                    let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
+                    loop {
+                        let whole = head_end(&buf).filter(|end| {
+                            let head = String::from_utf8_lossy(&buf[..*end]);
+                            let length = head.split_once("Content-Length: ").map_or(0, |(_, l)| l.lines().next().unwrap().parse().unwrap());
+                            buf.len() - end >= length
+                        });
+                        if whole.is_none() {
+                            let Ok(n @ 1..) = s.read(&mut chunk) else { return };
+                            buf.extend_from_slice(&chunk[..n]);
+                            continue;
+                        }
+                        // Whatever came with the request is taken for a part of it.
+                        let req = String::from_utf8(std::mem::take(&mut buf)).unwrap();
+                        let line = req.lines().next().unwrap().to_string();
+                        came.lock().unwrap().push((i, req));
+                        s.write_all(format!("HTTP/1.1 200 OK\r\n{lines}Content-Length: {}\r\n\r\n{line}", line.len()).as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        (addr, came)
+    }
+
+    /// The bodies that answer the requests, which are sent one after another to the
+    /// locations /a, /b and, with proxy_limit_rate, /c that pass them to an upstream
+    /// with the settings and the server, and the requests that came to it.
+    fn proxied(settings: &str, lines: &'static str, requests: &[(&str, &str)]) -> (Vec<String>, Vec<(usize, String)>) {
+        let (addr, came) = answering(lines);
+        let text = format!("http {{ upstream u {{ server {addr}; {settings} }} server {{ location /a {{ proxy_pass http://u; }} location /b {{ proxy_pass http://u; }} location /c {{ proxy_pass http://u; proxy_limit_rate 1m; }} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let bodies = block_on(async {
+            let mut bodies = Vec::new();
+            for (head, body) in requests {
+                let (parsed, mut r) = request(head);
+                r.body = body.as_bytes().to_vec();
+                let found = located(&config.servers[0], &r, &r.uri);
+                let (mut resp, _, _) = answer(&config.servers[0], &r, parsed, found, None).await;
+                assert_eq!((resp.status, resp.rest.is_some()), (200, r.uri == "/c"));
+                finish(&mut resp).await;
+                assert!(resp.upstream_time.unwrap()[0].iter().all(Option::is_some));
+                bodies.push(String::from_utf8(resp.body).unwrap());
+            }
+            bodies
+        });
+        let came = came.lock().unwrap().clone();
+        (bodies, came)
+    }
+
+    #[test]
+    fn proxied_connections_are_kept() {
+        let (a, b) = (("GET /a HTTP/1.0\n\n", ""), ("GET /b HTTP/1.0\n\n", ""));
+        for (settings, lines, requests, connections) in [
+            ("keepalive 2;", "", [a, a], [0, 0]),
+            ("keepalive 0;", "", [a, a], [0, 1]),
+            ("keepalive 2;", "Connection: close\r\n", [a, a], [0, 1]),
+            // A connection is of the location that opened it only with local.
+            ("keepalive 2 local;", "", [a, a], [0, 0]),
+            ("keepalive 2 local;", "", [a, b], [0, 1]),
+            ("keepalive 2;", "", [a, b], [0, 0]),
+        ] {
+            let (_, came) = proxied(settings, lines, &requests);
+            assert_eq!(came.iter().map(|c| c.0).collect::<Vec<_>>(), connections, "{settings} {lines}");
+        }
+    }
+
+    #[test]
+    fn connections_of_answers_read_at_the_rate_are_kept() {
+        // The bodies are too long to come with the head.
+        let long = "x".repeat(6000);
+        let (one, two) = (format!("GET /c?1{long} HTTP/1.0\n\n"), format!("GET /c?2{long} HTTP/1.0\n\n"));
+        for (lines, connections) in [("", [0, 0]), ("Connection: close\r\n", [0, 1])] {
+            let (bodies, came) = proxied("keepalive 2;", lines, &[(&one, ""), (&two, "")]);
+            assert_eq!(bodies, [format!("GET /c?1{long} HTTP/1.1"), format!("GET /c?2{long} HTTP/1.1")]);
+            assert_eq!(came.iter().map(|c| c.0).collect::<Vec<_>>(), connections, "{lines}");
+        }
+        // A body that is shorter than its length.
+        let (addr, came) = closing("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab");
+        let text = format!("http {{ upstream u {{ server {addr}; keepalive 2; }} server {{ location / {{ proxy_pass http://u; proxy_limit_rate 1m; }} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        block_on(async {
+            for connections in 1..3 {
+                let mut resp = answered(&config.servers[0], "GET / HTTP/1.0\n\n").await;
+                assert!(resp.rest.is_some());
+                finish(&mut resp).await;
+                assert_eq!((resp.body.as_slice(), resp.upstream_status.as_deref()), (&b"ab"[..], Some("200")));
+                assert_eq!(*came.lock().unwrap(), connections);
+            }
+        });
+    }
+
+    #[test]
+    fn requests_on_kept_connections() {
+        let requests = [("GET /a?1 HTTP/1.0\nX: 1\n\n", ""), ("POST /a/b HTTP/1.0\nContent-Length: 3\nX: 2\n\n", "xyz"), ("GET /a?3 HTTP/1.0\n\n", "")];
+        let (bodies, came) = proxied("keepalive 1;", "", &requests);
+        assert_eq!(bodies, ["GET /a?1 HTTP/1.1", "POST /a/b HTTP/1.1", "GET /a?3 HTTP/1.1"]);
+        assert_eq!(came, [
+            (0, "GET /a?1 HTTP/1.1\r\nHost: u\r\nX: 1\r\n\r\n".to_string()),
+            (0, "POST /a/b HTTP/1.1\r\nHost: u\r\nContent-Length: 3\r\nX: 2\r\n\r\nxyz".to_string()),
+            (0, "GET /a?3 HTTP/1.1\r\nHost: u\r\n\r\n".to_string()),
+        ]);
+    }
+
+    /// A server that reads a request, sends the answer, if any, and closes the
+    /// connection; and how many connections came.
+    fn closing(answer: &'static str) -> (SocketAddr, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
+        let all = came.clone();
+        thread::spawn(move || {
+            for s in listener.incoming() {
+                *all.lock().unwrap() += 1;
+                let (mut s, mut req, mut chunk) = (s.unwrap(), String::new(), [0u8; 1024]);
+                // The body, if any, is one byte, or ends with the last chunk.
+                let whole = |req: &str| req.split_once("\r\n\r\n").is_some_and(|(head, body)| {
+                    if head.contains("chunked") { body.ends_with("0\r\n\r\n") } else { !head.contains("Content-Length") || !body.is_empty() }
+                });
+                while !whole(&req) {
+                    let n = s.read(&mut chunk).unwrap();
+                    assert!(n > 0, "{req}");
+                    req += std::str::from_utf8(&chunk[..n]).unwrap();
+                }
+                s.write_all(answer.as_bytes()).unwrap();
+            }
+        });
+        (addr, came)
+    }
+
+    /// The status of the answer to a request passed to an upstream of the two
+    /// servers, with the directives in its location and the rest of its body, if
+    /// any, coming from the client as "c".
+    fn passed_to(servers: [SocketAddr; 2], directives: &str, head: &str, rest: Option<Unread>) -> u16 {
+        let [first, second] = servers;
+        let text = format!("http {{ upstream u {{ server {first}; server {second}; }} proxy_read_timeout 1s; server {{ location / {{ proxy_pass http://u; {directives} }} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        block_on(async {
+            let (mut client, mut out) = pair().await;
+            if let Some(u) = &rest { out.write_all(if u.chunked.is_some() { b"1\r\nc\r\n0\r\n\r\n" } else { b"c" }).await.unwrap(); }
+            let (parsed, r) = request(head);
+            *r.shared.unread.lock().unwrap() = rest;
+            let found = located(&config.servers[0], &r, &r.uri);
+            answer(&config.servers[0], &r, parsed, found, Some(&mut client)).await.0.status
+        })
+    }
+
+    #[test]
+    fn requests_sent_are_not_sent_again() {
+        const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+        let (error, any) = ("proxy_next_upstream error;", "proxy_next_upstream error non_idempotent;");
+        let (status, status_any) = ("proxy_next_upstream http_503;", "proxy_next_upstream http_503 non_idempotent;");
+        // What the first server answers, and the status of the answer: 200 when the second server got the request.
+        for (first, directives, method, want) in [
+            ("", "", "GET", 200), ("", "", "PUT", 200),
+            ("", "", "POST", 502), ("", error, "LOCK", 502), ("", error, "PATCH", 502),
+            ("", any, "POST", 200),
+            // It is the client's method that matters.
+            ("", "proxy_method GET;", "POST", 502), ("", "proxy_method POST;", "GET", 200),
+            (UNAVAILABLE, status, "GET", 200), (UNAVAILABLE, status, "POST", 503), (UNAVAILABLE, status_any, "POST", 200),
+        ] {
+            let ((a, sent), (b, again)) = (closing(first), closing(OK));
+            assert_eq!(passed_to([a, b], directives, &format!("{method} / HTTP/1.0\n\n"), None), want, "{method} {directives}");
+            assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, (want == 200) as usize), "{method} {directives}");
+        }
+        // Nothing was sent to a server that refuses the connection: its port is bound, but nothing listens.
+        let refusing = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        refusing.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
+        let a = refusing.local_addr().unwrap().as_socket().unwrap();
+        let (b, again) = closing(OK);
+        assert_eq!((passed_to([a, b], "", "POST / HTTP/1.0\n\n", None), *again.lock().unwrap()), (200, 1));
+        // A body passed as it comes is passed once, whatever the method.
+        for (first, directives, want) in [("", any, 502), (UNAVAILABLE, status_any, 503)] {
+            for (framing, left, chunked) in [("Content-Length: 1", 1, None), ("Transfer-Encoding: chunked", 0, Some((Vec::new(), 0)))] {
+                let ((a, sent), (b, again)) = (closing(first), closing(OK));
+                let directives = format!("proxy_request_buffering off; {directives}");
+                assert_eq!(passed_to([a, b], &directives, &format!("PUT / HTTP/1.1\nHost: h\n{framing}\n\n"), Some(Unread { left, chunked, rest: Vec::new() })), want, "{framing}");
+                assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, 0), "{framing}");
+            }
+        }
+    }
+
+    /// A server whose connections answer so many requests each, those that are not
+    /// listed any number, read the next one and close without answering it; and how
+    /// many requests came.
+    fn dropping(answers: &'static [usize]) -> (SocketAddr, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
+        let all = came.clone();
+        thread::spawn(move || {
+            for (i, s) in listener.incoming().enumerate() {
+                let (mut s, came, mut left) = (s.unwrap(), all.clone(), answers.get(i).copied());
+                thread::spawn(move || {
+                    let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
+                    loop {
+                        while head_end(&buf).is_none() {
+                            let Ok(n @ 1..) = s.read(&mut chunk) else { return };
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                        buf.clear();
+                        *came.lock().unwrap() += 1;
+                        if left == Some(0) { return }
+                        left = left.map(|n| n - 1);
+                        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+                    }
+                });
+            }
+        });
+        (addr, came)
+    }
+
+    /// The answer of a server to a request without a body.
+    async fn answered(server: &Server, head: &str) -> Response {
+        let (parsed, r) = request(head);
+        answer(server, &r, parsed, located(server, &r, &r.uri), None).await.0
+    }
+
+    #[test]
+    fn kept_connections_that_are_closed_use_up_no_try() {
+        let (any, off, once) = ("proxy_next_upstream error non_idempotent;", "proxy_next_upstream off;", "proxy_next_upstream_tries 1;");
+        // How many requests the connections to each server answer, and how many
+        // connections there are to keep, as many to each server; the directives and the
+        // method; and the servers tried, each with its status.
+        let one: &[&[usize]] = &[&[1]];
+        let cases: [(&[&'static [usize]], usize, &str, &str, &[(usize, u16)]); 13] = [
+            (one, 1, "", "GET", &[(0, 502), (0, 200)]),
+            (one, 1, once, "GET", &[(0, 502), (0, 200)]),
+            (one, 1, "", "POST", &[(0, 502)]),
+            (one, 1, any, "POST", &[(0, 502), (0, 200)]),
+            (one, 1, off, "GET", &[(0, 502)]),
+            (&[&[1, 1]], 2, "", "GET", &[(0, 502), (0, 502), (0, 200)]),
+            // A new connection uses up the try, also after a kept one.
+            (&[&[0]], 0, "", "GET", &[(0, 502)]),
+            (&[&[1, 0]], 1, "", "GET", &[(0, 502), (0, 502)]),
+            (&[&[1], &[]], 2, "", "GET", &[(0, 502), (1, 200)]),
+            (&[&[1], &[]], 2, once, "GET", &[(0, 502), (1, 200)]),
+            (&[&[0], &[]], 0, "", "GET", &[(0, 502), (1, 200)]),
+            (&[&[0], &[]], 0, once, "GET", &[(0, 502)]),
+            // Neither of two servers is tried again.
+            (&[&[1], &[1]], 2, "", "GET", &[(0, 502), (1, 502)]),
+        ];
+        for (answers, kept, directives, method, want) in cases {
+            let servers: Vec<_> = answers.iter().map(|a| dropping(a)).collect();
+            let list: String = servers.iter().map(|s| format!("server {}; ", s.0)).collect();
+            let text = format!("http {{ upstream u {{ {list}keepalive 2; }} proxy_read_timeout 1s; server {{ location / {{ proxy_pass http://u; {directives} }} }} }}");
+            let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+            let server = &config.servers[0];
+            let resp = block_on(async {
+                let get = || answered(server, "GET / HTTP/1.0\n\n");
+                // Two at once have a connection each.
+                let statuses = match kept {
+                    0 => Vec::new(),
+                    1 => vec![get().await.status],
+                    _ => <[Response; 2]>::from(tokio::join!(get(), get())).map(|r| r.status).to_vec(),
+                };
+                assert_eq!(statuses, vec![200; kept]);
+                answered(server, &format!("{method} / HTTP/1.0\n\n")).await
+            });
+            let joined = |f: &dyn Fn(&(usize, u16)) -> String| Some(want.iter().map(f).collect::<Vec<_>>().join(", "));
+            let case = format!("{answers:?} {method} {directives}");
+            assert_eq!(Some(resp.status), want.last().map(|w| w.1), "{case}");
+            assert_eq!(resp.upstream_status, joined(&|w| w.1.to_string()), "{case}");
+            assert_eq!(resp.upstream_addr, joined(&|w| servers[w.0].0.to_string()), "{case}");
+            for (i, (_, came)) in servers.iter().enumerate() {
+                assert_eq!(*came.lock().unwrap(), kept / servers.len() + want.iter().filter(|w| w.0 == i).count(), "{case}");
+            }
+        }
+    }
+
+    /// An Ed25519 key and its certificate, made by openssl only for these tests (those of src/tls.rs).
+    const KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIABI8p3dtZAQNO9IIpddv0KdrpTZgBtF07GcXXMRAqlr\n-----END PRIVATE KEY-----\n";
+    const CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBMDCB46ADAgECAhQw6INwvSpRntD3tYuScAjkJthNEDAFBgMrZXAwDTELMAkG
+A1UEAwwCZWQwIBcNMjYxMTIyMTE0MTE3WhgPMjEyNjEwMjkxMTQxMTdaMA0xCzAJ
+BgNVBAMMAmVkMCowBQYDK2VwAyEAL8XKbEjgrlhEUcjM4UHN6toe66wfOnYQD/ra
+ShFX2D6jUzBRMB0GA1UdDgQWBBRx0M5Y4lwOex/ffMorAD1tsQoe8TAfBgNVHSME
+GDAWgBRx0M5Y4lwOex/ffMorAD1tsQoe8TAPBgNVHRMBAf8EBTADAQH/MAUGAytl
+cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
+4q04yOy8aX97GVjXKn4C5xldyA0=
+-----END CERTIFICATE-----
+";
+
+    /// What a server does with a request.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Act {
+        Answer,
+        /// Answers it, with close_notify after the answer.
+        Notify,
+        /// Answers it in so many bytes at least, with more plaintext after them.
+        More(usize),
+        /// Closes the connection, without an answer or a handshake.
+        Close,
+    }
+
+    /// Reads a request and gives its request line.
+    fn request_line(s: &mut impl Read) -> Option<String> {
+        let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
+        while head_end(&buf).is_none() {
+            let n = s.read(&mut chunk).ok().filter(|n| *n > 0)?;
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8(buf).unwrap().lines().next().map(str::to_string)
+    }
+
+    /// The answer to a request, with its request line as the body.
+    fn echo(line: &str, act: Act) -> String {
+        let answer = |pad: usize| format!("HTTP/1.1 200 OK\r\nX: {}\r\nContent-Length: {}\r\n\r\n{line}", "x".repeat(pad), line.len());
+        let Act::More(size) = act else { return answer(1) };
+        answer(size.saturating_sub(answer(0).len())) + "more"
+    }
+
+    /// A server that does what act says with each request of a connection (both
+    /// counted from 0), over TLS of the version once a handshake begins; and the
+    /// requests that came, each with the number of its connection.
+    fn securing(version: &'static rustls::SupportedProtocolVersion, act: fn(usize, usize) -> Act) -> (SocketAddr, Arc<Mutex<Vec<(usize, String)>>>) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+        let key = PrivateKeyDer::from_pem_slice(KEY.as_bytes()).unwrap();
+        let chain = vec![CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap()];
+        let config = Arc::new(rustls::ServerConfig::builder_with_protocol_versions(&[version]).with_no_client_auth().with_single_cert(chain, key).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())));
+        let all = came.clone();
+        thread::spawn(move || {
+            for (i, s) in listener.incoming().enumerate() {
+                let (mut s, came, config, mut tls) = (s.unwrap(), all.clone(), config.clone(), None);
+                thread::spawn(move || {
+                    let mut first = [0];
+                    for n in 0.. {
+                        if s.peek(&mut first).ok() != Some(1) { return }
+                        let act = act(i, n);
+                        if act == Act::Close {
+                            came.lock().unwrap().push((i, "closed".to_string()));
+                            let _ = s.read(&mut [0u8; 4096]);
+                            return;
+                        }
+                        // A handshake record begins with 22.
+                        if tls.is_none() && first[0] == 22 { tls = Some(rustls::ServerConnection::new(config.clone()).unwrap()); }
+                        let Some(tls) = &mut tls else {
+                            let Some(line) = request_line(&mut s) else { return };
+                            s.write_all(echo(&line, act).as_bytes()).unwrap();
+                            came.lock().unwrap().push((i, line));
+                            continue;
+                        };
+                        let Some(line) = request_line(&mut rustls::Stream::new(tls, &mut s)) else { return };
+                        // What is written at once comes at once: the answer is one record.
+                        tls.writer().write_all(echo(&line, act).as_bytes()).unwrap();
+                        if act == Act::Notify { tls.send_close_notify(); }
+                        came.lock().unwrap().push((i, line));
+                        while tls.wants_write() { tls.write_tls(&mut s).unwrap(); }
+                    }
+                });
+            }
+        });
+        (addr, came)
+    }
+
+    /// The answers to the requests, which are sent one after another, each its body
+    /// and $upstream_status, to the locations /s, which passes them over TLS, and
+    /// /p, which does not, to an upstream with the settings and the server.
+    fn secured(settings: &str, addr: SocketAddr, requests: &[&str]) -> Vec<(String, String)> {
+        let text = format!("http {{ upstream u {{ server {addr}; {settings} }} server {{ location /s {{ proxy_pass https://u; }} location /p {{ proxy_pass http://u; }} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        block_on(async {
+            let mut answers = Vec::new();
+            for target in requests {
+                let resp = answered(&config.servers[0], &format!("GET {target} HTTP/1.0\n\n")).await;
+                // $upstream_connect_time of the last try.
+                let times = resp.upstream_time.unwrap();
+                assert!(times.last().unwrap()[0].is_some(), "{times:?}");
+                answers.push((String::from_utf8(resp.body).unwrap(), resp.upstream_status.unwrap()));
+            }
+            answers
+        })
+    }
+
+    #[test]
+    fn connections_over_tls_are_kept() {
+        let all = |_, _| Act::Answer;
+        let second = |i, n| if (i, n) == (0, 1) { Act::Close } else { Act::Answer };
+        let (one, local) = ("keepalive 5;", "keepalive 5 local;");
+        // The requests, and the connection each was answered on; "closed" is one
+        // closed instead, after which the request is tried again.
+        let cases: [(&str, fn(usize, usize) -> Act, &[&str], &[usize]); 11] = [
+            (one, all, &["/s?1", "/s?2"], &[0, 0]),
+            ("keepalive 0;", all, &["/s?1", "/s?2"], &[0, 1]),
+            (one, |_, _| Act::Notify, &["/s?1", "/s?2"], &[0, 1]),
+            (one, |_, _| Act::More(0), &["/s?1", "/s?2"], &[0, 1]),
+            // What comes after the answer is not read with it.
+            (one, |_, _| Act::More(4096), &["/s?1", "/s?2"], &[0, 1]),
+            (one, second, &["/s?1", "/s?2", "/s?3"], &[0, 1, 1]),
+            // The handshake is made on a connection kept without TLS.
+            (one, all, &["/p?1", "/s?2", "/s?3"], &[0, 0, 0]),
+            (one, second, &["/p?1", "/s?2", "/s?3"], &[0, 1, 1]),
+            // One over TLS is used as it is.
+            (one, all, &["/s?1", "/p?2"], &[0, 0]),
+            (local, all, &["/p?1", "/s?2"], &[0, 1]),
+            (local, all, &["/s?1", "/p?2", "/s?3"], &[0, 1, 0]),
+        ];
+        for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+            for (case, (settings, act, requests, connections)) in cases.iter().enumerate() {
+                let (addr, came) = securing(version, *act);
+                let answers = secured(settings, addr, requests);
+                let mut want = Vec::new();
+                for (n, (target, i)) in requests.iter().zip(*connections).enumerate() {
+                    let again = (n, act(0, 1)) == (1, Act::Close);
+                    if again { want.push((0, "closed".to_string())); }
+                    want.push((*i, format!("GET {target} HTTP/1.1")));
+                    assert_eq!(answers[n], (format!("GET {target} HTTP/1.1"), if again { "502, 200" } else { "200" }.to_string()), "{version:?} {case}");
+                }
+                assert_eq!(*came.lock().unwrap(), want, "{version:?} {case}");
+            }
+        }
+    }
+
+    #[test]
     fn checks_the_length_of_answers() {
         let answers: [&[u8]; 4] = [
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nExpires: a\r\nExpires: b\r\n\r\nabcd",
@@ -2228,10 +2868,10 @@ mod tests {
             }
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = block_on(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false)).unwrap();
+        let resp = block_on(fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &|_| 0)).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(block_on(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false)).is_none());
+            assert!(block_on(fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &|_| 0)).is_none());
         }
     }
 

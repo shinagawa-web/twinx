@@ -30,6 +30,18 @@ impl Stream {
         match self { Stream::Tcp(s) => s, Stream::Server(s) => s.get_ref().0, Stream::Client(s) => s.get_ref().0 }
     }
 
+    /// Whether TLS, if any, holds nothing back: there is no plaintext left to
+    /// read, it did not fail, and the peer has not closed it. Reading less than a
+    /// whole record leaves the rest there, where a peek at the socket does not see it.
+    pub fn drained(&mut self) -> bool {
+        let state = match self {
+            Stream::Tcp(_) => return true,
+            Stream::Server(s) => s.get_mut().1.process_new_packets(),
+            Stream::Client(s) => s.get_mut().1.process_new_packets(),
+        };
+        state.is_ok_and(|s| s.plaintext_bytes_to_read() == 0 && !s.peer_has_closed())
+    }
+
     /// Shuts down both directions of the TCP connection, whatever is still to be read or written.
     pub fn close(&self) {
         let _ = socket2::SockRef::from(self.tcp()).shutdown(std::net::Shutdown::Both);
