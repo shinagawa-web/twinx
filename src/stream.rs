@@ -42,6 +42,15 @@ impl Stream {
         state.is_ok_and(|s| s.plaintext_bytes_to_read() == 0 && !s.peer_has_closed())
     }
 
+    /// Whether something the peer sent is waiting to be read: plaintext TLS holds
+    /// (or an end or error it has to give), or data on the socket. The socket is
+    /// peeked at only when the event loop says it is readable, which an end of
+    /// file makes it too, with nothing to read; a wrong readiness is cleared.
+    pub fn waiting(&mut self) -> bool {
+        let peek = |tcp: &TcpStream| socket2::SockRef::from(tcp).peek(&mut [std::mem::MaybeUninit::uninit()]);
+        !self.drained() || matches!(self.tcp().try_io(tokio::io::Interest::READABLE, || peek(self.tcp())), Ok(1..))
+    }
+
     /// Shuts down both directions of the TCP connection, whatever is still to be read or written.
     pub fn close(&self) {
         let _ = socket2::SockRef::from(self.tcp()).shutdown(std::net::Shutdown::Both);
@@ -235,6 +244,30 @@ mod tests {
             // A large buffer is not kept.
             recycle(Vec::with_capacity(1 << 20));
             assert_eq!(buffer().capacity(), 0);
+        });
+    }
+
+    #[test]
+    fn finds_what_is_waiting_to_be_read() {
+        block_on(async {
+            let (s, mut other) = pair().await;
+            let (mut s, mut buf) = (Stream::Tcp(s), Vec::new());
+            assert!(!s.waiting());
+            other.write_all(b"xy").await.unwrap();
+            s.tcp().readable().await.unwrap();
+            assert!(s.waiting());
+            // A read that fills its buffer leaves the connection readable, to
+            // the event loop, until a peek finds nothing.
+            assert_eq!(s.read(&mut [0; 2]).await.unwrap(), 2);
+            assert!(!s.waiting());
+            assert!(within(Some(Duration::from_millis(50)), s.tcp().readable()).await.is_none());
+            // What comes before the end is waiting; the end is not.
+            other.write_all(b"z").await.unwrap();
+            other.shutdown().await.unwrap();
+            s.tcp().readable().await.unwrap();
+            assert!(s.waiting());
+            assert_eq!(read_into(&mut s, &mut buf, None).await, 1);
+            assert!(!s.waiting());
         });
     }
 

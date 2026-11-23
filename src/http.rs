@@ -249,12 +249,23 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
         // What of an unbuffered body was not passed on is read and dropped.
         // What came after a chunked one is the next request.
         let unread = r.shared.unread.lock().unwrap().take();
+        let unbuffered = unread.is_some();
         if let Some(mut u) = unread {
             if pass_body(&mut u, &mut stream, level.max_body, &mut tokio::io::sink()).await.is_none() { return; }
             buf = u.rest;
         }
         if !level.body_in_file_only || level.body_clean { r.body_file.map(std::fs::remove_file); }
-        if idle.is_none() || SHUTTING.load(Ordering::SeqCst) { return linger(&mut stream).await; }
+        if idle.is_none() || SHUTTING.load(Ordering::SeqCst) {
+            // As ngx_http_finalize_connection() decides, but with the location
+            // first found, not the one an internal redirect ended in.
+            let lingers = match level.lingering_close {
+                // Closing with something unread resets the connection, which can
+                // destroy the answer before the client reads it.
+                Some(false) => parsed.is_err() || unbuffered || pipelined || !buf.is_empty() || stream.waiting(),
+                always => always.is_some(),
+            };
+            return close(&mut stream, lingers).await;
+        }
         // An idle connection keeps no buffer.
         if buf.is_empty() { recycle(std::mem::take(&mut buf)); }
     }
@@ -347,12 +358,13 @@ fn chunk_size(line: &str) -> Option<u64> {
     (digits > 0 && extension).then(|| i64::from_str_radix(hex, 16).ok()).flatten().map(|n| n as u64)
 }
 
-/// Closes the connection as nginx's lingering close does: stops sending, then
+/// Ends the connection, which is closed when it is dropped, after a close_notify
+/// with TLS. With lingers, as nginx's lingering close does: stops sending, then
 /// reads what the client still sends so that it gets the whole answer.
-/// With TLS, stopping sends a close_notify first.
-async fn linger(stream: &mut Stream) {
+async fn close(stream: &mut Stream, lingers: bool) {
     let wait = Some(Duration::from_secs(5));
-    let _ = within(wait, tokio::io::AsyncWriteExt::shutdown(stream)).await;
+    if lingers || !matches!(stream, Stream::Tcp(_)) { let _ = within(wait, tokio::io::AsyncWriteExt::shutdown(stream)).await; }
+    if !lingers { return }
     let mut buf = Vec::new();
     while read_into(stream, &mut buf, wait).await > 0 { buf.clear(); }
 }
@@ -1900,6 +1912,12 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use std::thread;
 
+    /// What the tests that count in BUSY, or wait for it, run one at a time under.
+    fn counted() -> std::sync::MutexGuard<'static, ()> {
+        static COUNTED: Mutex<()> = Mutex::new(());
+        COUNTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn listens_with_the_backlog() {
         let l = listen("127.0.0.1:0".parse().unwrap(), 511).unwrap();
@@ -1981,6 +1999,81 @@ mod tests {
         (Stream::Tcp(l.accept().await.unwrap().0), other)
     }
 
+    /// Serves a connection, which counts in BUSY, for a server with the
+    /// directives: the client's end, and the task.
+    async fn served(directives: &str) -> (tokio::net::TcpStream, JoinHandle<()>) {
+        let text = format!("http {{ server {{ {directives} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let (Stream::Tcp(stream), client) = pair().await else { unreachable!() };
+        let addr = "127.0.0.1:80".parse().unwrap();
+        (client, tokio::task::spawn_local(serving(Arc::new(config), stream, false, (addr, addr, addr), Busy::new())))
+    }
+
+    #[test]
+    fn lingers_only_when_told_to_with_nothing_unread() {
+        let _busy = counted();
+        for (directive, lingers) in [("", false), ("lingering_close on;", false), ("lingering_close off;", false), ("lingering_close always;", true)] {
+            block_on(async {
+                let (mut client, mut task) = served(&format!("{directive} location / {{ return 200 ok; }}")).await;
+                client.write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").await.unwrap();
+                let mut text = String::new();
+                client.read_to_string(&mut text).await.unwrap();
+                assert!(text.starts_with("HTTP/1.1 200 ") && text.ends_with("\r\n\r\nok"), "{text}");
+                // Lingering waits for the client to close, up to 5 seconds.
+                let ended = within(Some(Duration::from_secs(1)), &mut task).await;
+                assert_eq!(ended.is_none(), lingers, "{directive}");
+                drop(client);
+                if lingers { within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap(); }
+            });
+        }
+    }
+
+    /// Sends the start of a request, then more, slowly, whatever comes back:
+    /// the whole answer does, with the status and the end, and no reset.
+    fn answered_while_sending(directives: &str, start: &str, (status, end): (u16, &str)) {
+        let _busy = counted();
+        block_on(async {
+            let (mut client, task) = served(directives).await;
+            client.write_all(start.as_bytes()).await.unwrap();
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                client.write_all(&[b'x'; 16384]).await.unwrap();
+            }
+            let mut text = String::new();
+            client.read_to_string(&mut text).await.unwrap();
+            assert!(text.starts_with(&format!("HTTP/1.1 {status} ")) && text.ends_with(end), "{text}");
+            drop(client);
+            within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn refusing_a_body_resets_nothing() {
+        answered_while_sending("client_max_body_size 1k;", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 491520\r\n\r\n", (413, "</html>\r\n"));
+    }
+
+    #[test]
+    fn refusing_a_head_resets_nothing() {
+        answered_while_sending("", "GET / HTTP/1.1\r\nNo-Host: a\r\n\r\n", (400, "</html>\r\n"));
+    }
+
+    #[test]
+    fn refusing_a_long_line_resets_nothing() {
+        answered_while_sending("", &format!("GET /{}", "a".repeat(10000)), (414, "</html>\r\n"));
+    }
+
+    #[test]
+    fn closing_with_pipelined_data_resets_nothing() {
+        answered_while_sending("location / { return 200 ok; }", "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\nextra", (200, "\r\n\r\nok"));
+    }
+
+    #[test]
+    fn closing_with_data_on_the_socket_resets_nothing() {
+        // The answer takes longer than what comes meanwhile, which is not read.
+        let body = "b".repeat(1000);
+        answered_while_sending(&format!("location / {{ limit_rate 500; return 200 {body}; }}"), "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", (200, &body));
+    }
+
     #[test]
     fn tunnel_passes_data_both_ways() {
         block_on(async {
@@ -2033,6 +2126,7 @@ mod tests {
 
     #[test]
     fn shutting_down_answers_connections_already_accepted() {
+        let _busy = counted();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let text = format!("http {{ server {{ listen {addr}; location / {{ return 200 done; }} }} }}");
