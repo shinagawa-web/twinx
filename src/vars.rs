@@ -21,6 +21,8 @@ pub struct Shared {
     /// The variables set gives values to, and the captures of the last regular
     /// expression matched ("1", "2", ...).
     pub vars: std::sync::Mutex<Vec<(String, String)>>,
+    /// The trailers of a proxied server's answer that proxy_pass_trailers passes.
+    pub trailers: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 /// What a request carries, as the variables see it.

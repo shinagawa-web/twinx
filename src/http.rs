@@ -870,8 +870,10 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
     // The body is written from where it is, after the head, not copied after it.
     let mut tail = Vec::new();
-    // The trailers are made after the body, each seeing those before it ($sent_trailer_*).
-    let mut trailers = Vec::new();
+    // The trailers are made after the body, each seeing those before it ($sent_trailer_*);
+    // those of the proxied server come first.
+    let mut trailers = std::mem::take(&mut *r.shared.trailers.lock().unwrap());
+    trailers.retain(|_| chunked && !cut && resp.proxied);
     for (name, value, _) in level.add_trailer.iter().filter(|t| chunked && !cut && (t.2 || added)) {
         let value = value.render(r, &so_far(copy(&resp), trailers.clone()));
         if !value.is_empty() { trailers.push((name.clone(), value)); }
@@ -1379,11 +1381,13 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             (conn, _) => conn.ok_or(None),
         };
         // proxy_http_version 2: the request goes through a pipe, over HTTP/2 beyond it.
-        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c.stream, theirs, if p.ssl { "https" } else { "http" })); Conn::new(Stream::Pipe(ours), connecting) } else { c });
+        // Its trailers come in a slot of their own.
+        let slot = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c.stream, theirs, if p.ssl { "https" } else { "http" }, slot.clone())); Conn::new(Stream::Pipe(ours), connecting) } else { c });
         let begun = conn.is_ok();
         // A kept connection whose handshake fails counts as closed, as in nginx; one that times out does not.
         let mut closed = matches!(conn, Err(None));
-        let kept;
+        let mut kept;
         (answer, kept) = match conn {
             Ok(conn) => {
                 time[0] = Some(connecting.elapsed().as_millis());
@@ -1393,6 +1397,12 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             }
             Err(resp) => (resp, None),
         };
+        // proxy_pass_trailers: those of an answer over HTTP/2 are there once its stream has ended, and
+        // those proxy_hide_header names, or that nginx hides, are not passed.
+        if let (Some(_), Some(Some(c))) = (answer.as_ref().filter(|_| level.proxy_pass_trailers && level.proxy_h2), kept.as_mut()) {
+            while read_into(&mut c.stream, &mut Vec::new(), Some(level.proxy_read_timeout)).await > 0 {}
+            *r.shared.trailers.lock().unwrap() = std::mem::take(&mut *slot.lock().unwrap()).into_iter().filter(|(n, _)| !hidden(level, n)).collect();
+        }
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
@@ -2054,7 +2064,8 @@ fn valid_host(h: &str) -> Option<String> {
 fn keepalive(r: &Request) -> bool {
     let connection = header(r, "connection").map(|v| v.to_ascii_lowercase());
     let http11 = r.line.ends_with("HTTP/1.1");
-    connection.map_or(http11, |c| if http11 { c != "close" } else { c == "keep-alive" })
+    // As nginx reads it, "close" anywhere in the value closes; else "keep-alive" keeps alive.
+    connection.map_or(http11, |c| !c.contains("close") && (http11 || c.contains("keep-alive")))
 }
 
 /// A location found for a URI: its prefix, its settings, and whether the
@@ -2455,6 +2466,11 @@ mod tests {
         let (_, r) = request("GET http://[::1]:8/x HTTP/1.0\nHost: a\nConnection: keep-alive\n\n");
         assert_eq!((r.uri.as_str(), r.host.as_deref()), ("/x", Some("[::1]")));
         assert!(keepalive(&r));
+        // "close" anywhere in the value closes, as for nginx; else "keep-alive" anywhere keeps alive.
+        for (version, connection, kept) in [("1.1", "te, close", false), ("1.0", "Keep-Alive, te", true), ("1.0", "keep-alive, close", false), ("1.0", "te", false), ("1.1", "te", true)] {
+            let (_, r) = request(&format!("GET / HTTP/{version}\nHost: a\nConnection: {connection}\n\n"));
+            assert_eq!(keepalive(&r), kept, "{version} {connection}");
+        }
     }
 
     #[test]
