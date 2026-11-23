@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
+use crate::body::{Body, Came};
 use crate::conf::{Condition, Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, Step, TryFiles};
 use crate::vars::{Part, Template};
 use crate::expires;
@@ -589,11 +590,11 @@ impl Trailers {
 async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
     let (read, ended);
-    (resp.body, read, ended, resp.cut) = read_body(&mut rest.conn.stream, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await;
+    (resp.body, read, ended, resp.cut) = read_body(&mut rest.conn.stream, &rest.answer[rest.end..], rest.length, rest.chunked, rest.rate, rest.wait).await;
     if let Some(t) = rest.trailers.filter(|_| rest.keep && ended) { t.take(&mut rest.conn.stream, Some(rest.wait.unwrap_or_default())).await; }
     if let Some((up, addr, tag)) = rest.home.filter(|_| rest.keep && ended) { up.put(rest.conn, addr, tag); }
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
-    if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
+    if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = (read as u64, (rest.end + read) as u64); }
 }
 
 /// Whether a request is misdirected (421), as nginx finds it: its Host is not
@@ -1741,98 +1742,25 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// paces proxy_limit_rate: by the end of each second since the body started
 /// (counted in whole seconds of the clock) up to the rate for each second has
 /// been read, and when that much has, it waits for the time it is worth.
-/// Returns the body, with what came of the chunk it is cut off in, the bytes of
-/// the whole answer read, whether they end where the body does, and the cut, when
+/// Returns the body, with what came of the chunk it is cut off in, the bytes read
+/// after the head, whether they end where the body does, and the cut, when
 /// the server closed the connection before the body's end, or a read failed or
 /// waited longer than the time, or the chunks are malformed.
-async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> (Vec<u8>, usize, bool, Option<Box<Cut>>) {
+async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> (Vec<u8>, usize, bool, Option<Box<Cut>>) {
     let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let (start, rate, mut chunk, mut failed) = (secs(), rate as i64, vec![0u8; 4096], false);
-    while length.is_none_or(|n| answer.len() - end < n) && (!chunked || matches!(cut_off(&answer[end..]), Ok(Some(_)))) {
-        let limit = if rate == 0 { chunk.len() as i64 } else { rate * (secs() - start + 1) - (answer.len() - end) as i64 };
+    let (mut body, mut data, mut read) = (Body::new(length.map(|n| n as u64), chunked), Vec::new(), after.len());
+    let mut came = body.take(after, &mut data);
+    while came == Came::More {
+        let limit = if rate == 0 { chunk.len() as i64 } else { rate * (secs() - start + 1) - read as i64 };
         if limit <= 0 { tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await; continue; }
         let Some(Ok(n)) = within(wait, s.read(&mut chunk[..(limit as usize).min(4096)])).await else { failed = true; break };
         if n == 0 { break; }
-        answer.extend_from_slice(&chunk[..n]);
+        read += n;
+        came = body.take(&chunk[..n], &mut data);
     }
-    let body = &answer[end..];
-    let (mut data, part) = if chunked { (unchunk(body), cut_off(body)) } else {
-        let n = length.unwrap_or(body.len());
-        // Nor is a body whole that only the connection's end delimits, when a read of more fails.
-        (body[..n.min(body.len())].to_vec(), Ok((failed || body.len() < n).then_some(&body[..0])))
-    };
-    if let Ok(Some(part)) = part { data.extend_from_slice(part); }
-    let cut = (part != Ok(None)).then(|| Box::new(Cut { length, malformed: part.is_err() }));
-    (data, answer.len(), ended(body, length, chunked), cut)
-}
-
-/// What a chunked body is that cannot become a whole one, whatever follows.
-#[derive(Debug, PartialEq)]
-struct Malformed;
-
-/// When more must follow what came of a chunked body, which is well-formed so
-/// far, what came of the chunk it ends in, if it does in one that unchunk() does
-/// not take; None when the body is whole. The last chunk,
-/// the trailer lines and the empty line are part of it, as they are for
-/// ngx_http_parse_chunked(); unlike there, LF line ends are fine, as for unchunk().
-fn cut_off(after: &[u8]) -> Result<Option<&[u8]>, Malformed> {
-    // A line and, if it has ended, what follows it; a CR only ends a line.
-    let line = |from: &[u8]| {
-        let end = from.iter().position(|&c| c == b'\n');
-        let line = &from[..end.unwrap_or(from.len())];
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        (!line.contains(&b'\r')).then_some((line.len(), end.map(|n| n + 1))).ok_or(Malformed)
-    };
-    let mut rest = after;
-    while !rest.is_empty() {
-        let (n, next) = line(rest)?;
-        let size = answer_chunk_size(&rest[..n]).ok_or(Malformed)?;
-        let Some(next) = next else { break };
-        rest = &rest[next..];
-        if size == 0 {
-            loop {
-                let (n, next) = line(rest)?;
-                let Some(next) = next else { return Ok(Some(&[])) };
-                if n == 0 { return Ok(None); }
-                rest = &rest[next..];
-            }
-        }
-        let Some((data, end)) = rest.split_at_checked(usize::try_from(size).map_err(|_| Malformed)?) else { return Ok(Some(rest)) };
-        rest = match end {
-            [] | b"\r" | b"\n" => return Ok(Some(data)),
-            [b'\r', b'\n', next @ ..] | [b'\n', next @ ..] => next,
-            _ => return Err(Malformed),
-        };
-    }
-    Ok(Some(&[]))
-}
-
-/// Whether what came after the head of a proxied answer is its whole body and
-/// nothing else: as many bytes as its length, or well-formed chunks with the
-/// last one, the trailer lines and the empty line. A body that the closing of
-/// the connection ends has no such end.
-fn ended(after: &[u8], length: Option<usize>, chunked: bool) -> bool {
-    if !chunked { return length == Some(after.len()); }
-    // A line and where the next starts; a CR only ends a line.
-    let line = |at: usize| {
-        let n = after[at..].iter().position(|&c| c == b'\n')?;
-        let line = &after[at..at + n];
-        Some((line.strip_suffix(b"\r").unwrap_or(line), at + n + 1)).filter(|(l, _)| !l.contains(&b'\r'))
-    };
-    let mut at = 0;
-    loop {
-        let Some((size, start)) = line(at) else { return false };
-        let Some(end) = answer_chunk_size(size).and_then(|n| start.checked_add(n as usize)) else { return false };
-        at = start;
-        if end == start { break; }
-        let rest = after.get(end..).unwrap_or_default();
-        at = end + if rest.starts_with(b"\r\n") { 2 } else if rest.starts_with(b"\n") { 1 } else { return false };
-    }
-    loop {
-        let Some((trailer, next)) = line(at) else { return false };
-        at = next;
-        if trailer.is_empty() { return at == after.len(); }
-    }
+    let cut = body.cut(failed).then(|| Box::new(Cut { length, malformed: came == Came::Malformed }));
+    (data, read, came == Came::Whole { followed: false }, cut)
 }
 
 /// Whether a proxied server closes the connection after its answer, as nginx
@@ -1858,36 +1786,6 @@ fn bound(peer: &SocketAddr, (local, transparent): (SocketAddr, bool)) -> Option<
     let _ = if local.port() == 0 { set(libc::IPPROTO_IP, libc::IP_BIND_ADDRESS_NO_PORT) } else { set(libc::SOL_SOCKET, libc::SO_REUSEADDR) };
     s.bind(&local.into()).ok()?;
     Some(s)
-}
-
-/// The largest size of a chunk, NGX_MAX_OFF_T_VALUE / 16: nginx takes nothing
-/// after a larger one (ngx_http_parse_chunked()).
-const MAX_CHUNK: u64 = i64::MAX as u64 / 16;
-
-/// The size in a chunk's line of a proxied answer, as ngx_http_parse_chunked()
-/// reads it: hexadecimal digits from the start of the line, up to its end or a
-/// ";", space or tab, after which an extension is ignored.
-fn answer_chunk_size(line: &[u8]) -> Option<u64> {
-    let size = line.split(|c| b"; \t".contains(c)).next().filter(|s| s.iter().all(u8::is_ascii_hexdigit))?;
-    u64::from_str_radix(std::str::from_utf8(size).ok()?, 16).ok().filter(|n| *n <= MAX_CHUNK)
-}
-
-/// The data of the chunks of a proxied answer read so far, up to the last
-/// chunk or one that is invalid.
-fn unchunk(buf: &[u8]) -> Vec<u8> {
-    let (mut body, mut at) = (Vec::new(), 0);
-    while let Some(n) = buf[at..].iter().position(|&c| c == b'\n') {
-        let line = &buf[at..at + n];
-        let Some(size) = answer_chunk_size(line.strip_suffix(b"\r").unwrap_or(line)) else { break };
-        let size = size as usize;
-        let (start, end) = (at + n + 1, at + n + 1 + size);
-        if size == 0 { break; }
-        let Some(after) = buf.get(end..).filter(|a| a.len() >= 2) else { break };
-        if !after.starts_with(b"\r\n") && !after.starts_with(b"\n") { break; }
-        body.extend_from_slice(&buf[start..end]);
-        at = end + if after[0] == b'\r' { 2 } else { 1 };
-    }
-    body
 }
 
 /// A body read as it is passed on (proxy_request_buffering off): the
@@ -2714,117 +2612,6 @@ mod tests {
             assert_eq!((resp.body.len(), resp.rest.is_none()), (12000, true));
             assert!(resp.upstream_time.unwrap()[0][2].is_some());
         });
-    }
-
-    #[test]
-    fn unchunks_answers() {
-        assert_eq!(unchunk(b"3\r\nabc\r\n2;x=y\nde\n0\r\n\r\n3\r\nzzz\r\n"), b"abcde".to_vec());
-        assert_eq!(unchunk(b"3\r\nabc\r\n2\r\nd"), b"abc".to_vec());
-        assert_eq!(unchunk(b"3\r\nabc"), b"");
-        assert_eq!(unchunk(b"3\r\nabcd\r\n"), b"");
-        assert_eq!(unchunk(b"x\r\n"), b"");
-        // Sizes up to the largest that nginx takes.
-        assert_eq!(unchunk(b"2\r\nab\r\n7ffffffffffffff\r\ncd\r\n"), b"ab".to_vec());
-        for size in ["800000000000000", "7fffffffffffffff", "8000000000000000", "fffffffffffffff0", "ffffffffffffffef", "ffffffffffffffff", "10000000000000000"] {
-            for end in ["\n", "\r\n", ";x\r\n"] {
-                assert_eq!(unchunk(format!("{size}{end}ab\n0\n\n").as_bytes()), b"");
-                assert_eq!(unchunk(format!("2\r\nab\r\n{size}{end}cd\r\n0\r\n\r\n").as_bytes()), b"ab".to_vec());
-            }
-        }
-    }
-
-    #[test]
-    fn no_chunked_body_panics() {
-        // xorshift64, the same numbers each time.
-        let mut x = 0x2545_f491_4f6c_dd1d_u64;
-        let mut upto = move |n: usize| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            (x % n as u64) as usize
-        };
-        const PARTS: [&[u8]; 28] = [
-            b"0", b"1", b"2", b"A", b"f", b"10", b"ab", b"\r", b"\n", b"\r\n", b";", b";x=y", b" ", b"\t", b"+", b"-", b"zz", b"\0", b"\xff", "\u{e9}".as_bytes(),
-            b"0\r\n\r\n", b"2\r\nab\r\n", b"X: 1\r\n", b"ffffffffffffffff", b"fffffffffffffff0", b"7fffffffffffffff", b"7ffffffffffffff", b"10000000000000000",
-        ];
-        const WHOLE: [&[u8]; 4] = [b"2\r\nab\r\n0\r\n\r\n", b"A;x=y\r\n0123456789\r\n2\r\nab\r\n0\r\nX: 1\r\n\r\n", b"3\nabc\n0\n\n", b"2\r\nab\r\nffffffffffffffff\r\ncd\r\n0\r\n\r\n"];
-        for i in 0..400_000 {
-            let mut body = Vec::new();
-            if i % 2 == 0 {
-                for _ in 0..upto(12) { body.extend_from_slice(PARTS[upto(PARTS.len())]); }
-            } else {
-                // A part in the place of some bytes, a few times, and the end left out.
-                body.extend_from_slice(WHOLE[upto(WHOLE.len())]);
-                for _ in 0..upto(4) {
-                    let from = upto(body.len() + 1);
-                    let to = (from + upto(4)).min(body.len());
-                    body.splice(from..to, PARTS[upto(PARTS.len())].iter().copied());
-                }
-                if upto(3) == 0 { body.truncate(upto(body.len() + 1)); }
-            }
-            let (data, part, whole) = (unchunk(&body), cut_off(&body), ended(&body, None, true));
-            assert!(!whole || part == Ok(None), "{}", body.escape_ascii());
-            assert!(data.len() + part.ok().flatten().map_or(0, <[u8]>::len) <= body.len(), "{}", body.escape_ascii());
-        }
-    }
-
-    #[test]
-    fn ends_of_answers() {
-        let length: [(&[u8], usize, bool); 5] = [(b"ab", 2, true), (b"", 0, true), (b"a", 2, false), (b"abc", 2, false), (b"a", 0, false)];
-        for (after, n, is) in length { assert_eq!(ended(after, Some(n), false), is, "{after:?} {n}"); }
-        let chunked: [(&[u8], bool); 24] = [
-            (b"3\r\nabc\r\n0\r\n\r\n", true),
-            (b"0\r\n\r\n", true),
-            (b"A\r\n0123456789\r\n000\r\n\r\n", true),
-            // Trailer lines, chunk extensions and LF line ends.
-            (b"3\r\nabc\r\n0\r\nX: 1\r\nY: 2\r\n\r\n", true),
-            (b"3;x=y\r\nabc\r\n0;z\r\n\r\n", true),
-            (b"3\nabc\n0\nX: 1\n\n", true),
-            // Not all of it.
-            (b"", false),
-            (b"3\r\nab", false),
-            (b"3\r\nabc", false),
-            (b"3\r\nabc\r\n", false),
-            (b"3\r\nabc\r\n0\r\n", false),
-            (b"3\r\nabc\r\n0\r\n\r", false),
-            (b"3\r\nabc\r\n0\r\nX: 1\r\n", false),
-            // More than it.
-            (b"3\r\nabc\r\n0\r\n\r\nH", false),
-            (b"0\r\n\r\n\r\n", false),
-            // Malformed.
-            (b"x\r\n\r\n", false),
-            (b"\r\n\r\n", false),
-            (b"3\r\nabcd\r\n0\r\n\r\n", false),
-            (b"+1\r\na\r\n0\r\n\r\n", false),
-            (b"-0\r\n\r\n", false),
-            (b" 0\r\n\r\n", false),
-            (b"0;\rx\r\n\r\n", false),
-            (b"ffffffffffffffff\r\na\r\n0\r\n\r\n", false),
-            (b"10000000000000000\r\na\r\n0\r\n\r\n", false),
-        ];
-        for (after, is) in chunked { assert_eq!(ended(after, None, true), is, "{}", String::from_utf8_lossy(after)); }
-        for after in [&b""[..], b"ab", b"0\r\n\r\n"] { assert!(!ended(after, None, false)); }
-    }
-
-    #[test]
-    fn bodies_cut_off() {
-        let cases: [(&[u8], Result<Option<&[u8]>, Malformed>); 41] = [
-            // In or before a size, with what may follow it.
-            (b"", Ok(Some(b""))), (b"0", Ok(Some(b""))), (b"2", Ok(Some(b""))), (b"2\r", Ok(Some(b""))), (b"2;x=y", Ok(Some(b""))), (b"2 ", Ok(Some(b""))), (b"2 x\r\nab", Ok(Some(b"ab"))), (b"2\tx\r\nab\r\n0 x\r\n\r\n", Ok(None)),
-            // In a chunk, what came of it, and after it.
-            (b"2\r\n", Ok(Some(b""))), (b"2\r\na", Ok(Some(b"a"))), (b"2\na", Ok(Some(b"a"))), (b"2\r\nab", Ok(Some(b"ab"))), (b"2\r\nab\r", Ok(Some(b"ab"))), (b"2\nab\n", Ok(Some(b"ab"))),
-            (b"2\r\nab\r\n", Ok(Some(b""))), (b"2\r\nab\r\n3", Ok(Some(b""))), (b"2\r\nab\r\n3;x\r\ncd", Ok(Some(b"cd"))), (b"A \r\n0123456789\r\n0", Ok(Some(b""))),
-            // After the last chunk, before the empty line.
-            (b"0\r\n", Ok(Some(b""))), (b"0\r\n\r", Ok(Some(b""))), (b"2\r\nab\r\n0\r\n", Ok(Some(b""))), (b"0\r\nX: 1", Ok(Some(b""))), (b"0\r\nX: 1\r\n", Ok(Some(b""))),
-            // Whole, or more than it.
-            (b"0\r\n\r\n", Ok(None)), (b"0\n\n", Ok(None)), (b"2\r\nab\r\n0\r\nX: 1\r\n\r\n", Ok(None)), (b"0\r\n\r\nab", Ok(None)),
-            // Malformed.
-            (b"zz", Err(Malformed)), (b"\r", Err(Malformed)), (b"2\r\nab\r\nzz\r\n", Err(Malformed)), (b"2\r\nabc", Err(Malformed)), (b"2\r\nab\rc", Err(Malformed)), (b"2\rx", Err(Malformed)), (b"+2\r\nab", Err(Malformed)), (b" 2\r\nab", Err(Malformed)), (b"2x\r\nab", Err(Malformed)),
-            (b"0\r\nX\r: 1", Err(Malformed)), (b"7fffffffffffffff\r\nab", Err(Malformed)), (b"10000000000000002\r\nab", Err(Malformed)),
-            // The largest size and the next.
-            (b"7ffffffffffffff\r\nab", Ok(Some(b"ab"))), (b"800000000000000\r\nab", Err(Malformed)),
-        ];
-        for (after, part) in cases { assert_eq!(cut_off(after), part, "{}", String::from_utf8_lossy(after)); }
     }
 
     /// What comes back for the requests sent at once on a connection, until it is
