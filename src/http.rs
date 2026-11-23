@@ -1629,8 +1629,7 @@ fn cut_off(after: &[u8]) -> Result<Option<&[u8]>, Malformed> {
     let mut rest = after;
     while !rest.is_empty() {
         let (n, next) = line(rest)?;
-        let size = std::str::from_utf8(rest[..n].split(|&c| c == b';').next().unwrap_or_default()).map_err(|_| Malformed)?.trim_end_matches([' ', '\t']);
-        let size = u64::from_str_radix(size, 16).ok().filter(|s| !size.starts_with('+') && *s <= MAX_CHUNK).ok_or(Malformed)?;
+        let size = answer_chunk_size(&rest[..n]).ok_or(Malformed)?;
         let Some(next) = next else { break };
         rest = &rest[next..];
         if size == 0 {
@@ -1666,9 +1665,7 @@ fn ended(after: &[u8], length: Option<usize>, chunked: bool) -> bool {
     let mut at = 0;
     loop {
         let Some((size, start)) = line(at) else { return false };
-        let size = size.split(|&c| c == b';').next().unwrap_or_default();
-        let size = std::str::from_utf8(size).ok().filter(|s| s.bytes().all(|c| c.is_ascii_hexdigit())).and_then(|s| usize::from_str_radix(s, 16).ok());
-        let Some(end) = size.and_then(|n| start.checked_add(n)) else { return false };
+        let Some(end) = answer_chunk_size(size).and_then(|n| start.checked_add(n as usize)) else { return false };
         at = start;
         if end == start { break; }
         let rest = after.get(end..).unwrap_or_default();
@@ -1710,14 +1707,22 @@ fn bound(peer: &SocketAddr, (local, transparent): (SocketAddr, bool)) -> Option<
 /// after a larger one (ngx_http_parse_chunked()).
 const MAX_CHUNK: u64 = i64::MAX as u64 / 16;
 
+/// The size in a chunk's line of a proxied answer, as ngx_http_parse_chunked()
+/// reads it: hexadecimal digits from the start of the line, up to its end or a
+/// ";", space or tab, after which an extension is ignored.
+fn answer_chunk_size(line: &[u8]) -> Option<u64> {
+    let size = line.split(|c| b"; \t".contains(c)).next().filter(|s| s.iter().all(u8::is_ascii_hexdigit))?;
+    u64::from_str_radix(std::str::from_utf8(size).ok()?, 16).ok().filter(|n| *n <= MAX_CHUNK)
+}
+
 /// The data of the chunks of a proxied answer read so far, up to the last
 /// chunk or one that is invalid.
 fn unchunk(buf: &[u8]) -> Vec<u8> {
     let (mut body, mut at) = (Vec::new(), 0);
     while let Some(n) = buf[at..].iter().position(|&c| c == b'\n') {
-        let line = String::from_utf8_lossy(&buf[at..at + n]);
-        let size = usize::from_str_radix(line.split(';').next().unwrap_or_default().trim(), 16);
-        let Some(size) = size.ok().filter(|s| *s as u64 <= MAX_CHUNK) else { break };
+        let line = &buf[at..at + n];
+        let Some(size) = answer_chunk_size(line.strip_suffix(b"\r").unwrap_or(line)) else { break };
+        let size = size as usize;
         let (start, end) = (at + n + 1, at + n + 1 + size);
         if size == 0 { break; }
         let Some(after) = buf.get(end..).filter(|a| a.len() >= 2) else { break };
@@ -2610,9 +2615,9 @@ mod tests {
 
     #[test]
     fn bodies_cut_off() {
-        let cases: [(&[u8], Result<Option<&[u8]>, Malformed>); 38] = [
+        let cases: [(&[u8], Result<Option<&[u8]>, Malformed>); 41] = [
             // In or before a size, with what may follow it.
-            (b"", Ok(Some(b""))), (b"0", Ok(Some(b""))), (b"2", Ok(Some(b""))), (b"2\r", Ok(Some(b""))), (b"2;x=y", Ok(Some(b""))), (b"2 ", Ok(Some(b""))),
+            (b"", Ok(Some(b""))), (b"0", Ok(Some(b""))), (b"2", Ok(Some(b""))), (b"2\r", Ok(Some(b""))), (b"2;x=y", Ok(Some(b""))), (b"2 ", Ok(Some(b""))), (b"2 x\r\nab", Ok(Some(b"ab"))), (b"2\tx\r\nab\r\n0 x\r\n\r\n", Ok(None)),
             // In a chunk, what came of it, and after it.
             (b"2\r\n", Ok(Some(b""))), (b"2\r\na", Ok(Some(b"a"))), (b"2\na", Ok(Some(b"a"))), (b"2\r\nab", Ok(Some(b"ab"))), (b"2\r\nab\r", Ok(Some(b"ab"))), (b"2\nab\n", Ok(Some(b"ab"))),
             (b"2\r\nab\r\n", Ok(Some(b""))), (b"2\r\nab\r\n3", Ok(Some(b""))), (b"2\r\nab\r\n3;x\r\ncd", Ok(Some(b"cd"))), (b"A \r\n0123456789\r\n0", Ok(Some(b""))),
@@ -2621,7 +2626,7 @@ mod tests {
             // Whole, or more than it.
             (b"0\r\n\r\n", Ok(None)), (b"0\n\n", Ok(None)), (b"2\r\nab\r\n0\r\nX: 1\r\n\r\n", Ok(None)), (b"0\r\n\r\nab", Ok(None)),
             // Malformed.
-            (b"zz", Err(Malformed)), (b"\r", Err(Malformed)), (b"2\r\nab\r\nzz\r\n", Err(Malformed)), (b"2\r\nabc", Err(Malformed)), (b"2\r\nab\rc", Err(Malformed)), (b"2\rx", Err(Malformed)), (b"+2\r\nab", Err(Malformed)), (b"2 x\r\nab", Err(Malformed)),
+            (b"zz", Err(Malformed)), (b"\r", Err(Malformed)), (b"2\r\nab\r\nzz\r\n", Err(Malformed)), (b"2\r\nabc", Err(Malformed)), (b"2\r\nab\rc", Err(Malformed)), (b"2\rx", Err(Malformed)), (b"+2\r\nab", Err(Malformed)), (b" 2\r\nab", Err(Malformed)), (b"2x\r\nab", Err(Malformed)),
             (b"0\r\nX\r: 1", Err(Malformed)), (b"7fffffffffffffff\r\nab", Err(Malformed)), (b"10000000000000002\r\nab", Err(Malformed)),
             // The largest size and the next.
             (b"7ffffffffffffff\r\nab", Ok(Some(b"ab"))), (b"800000000000000\r\nab", Err(Malformed)),
