@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::config::Directive;
 use crate::log::{AccessLog, Cache, Format, Target};
 use crate::resolver::Resolver;
-use crate::upstream::{Peer, Upstream};
+use crate::upstream::{Keepalive, Peer, Upstream};
 use crate::vars::{Escape, Part, Template};
 
 const MAIN: u16 = 1;
@@ -48,6 +48,10 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("server", HTTP, 0, 0, true),
     ("upstream", HTTP, 1, 1, true),
     ("server", UPS, 1, usize::MAX, false),
+    ("keepalive", UPS, 1, 2, false),
+    ("keepalive_requests", UPS, 1, 1, false),
+    ("keepalive_time", UPS, 1, 1, false),
+    ("keepalive_timeout", UPS, 1, 1, false),
     ("listen", SRV, 1, usize::MAX, false),
     ("server_name", SRV, 1, usize::MAX, false),
     ("server_names_hash_bucket_size", HTTP, 1, 1, false),
@@ -700,10 +704,11 @@ impl Builder<'_> {
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true,
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
-            let servers = d.block.as_deref().unwrap_or_default();
-            servers.iter().try_for_each(|s| self.check(s, UPS))?;
-            let peers = servers.iter().map(|s| peer(&s.args).map_err(|e| format!("{e} in {}", s.at)));
-            let upstream = Upstream::new(peers.collect::<Result<_, _>>()?);
+            let block = d.block.as_deref().unwrap_or_default();
+            block.iter().try_for_each(|s| self.check(s, UPS))?;
+            let peers = block.iter().filter(|s| s.name == "server").map(|s| peer(&s.args).map_err(|e| format!("{e} in {}", s.at)));
+            let mut upstream = Upstream::new(peers.collect::<Result<_, _>>()?);
+            upstream.keepalive = upstream_keepalive(block)?;
             self.upstreams.insert(d.args[0].clone(), Arc::new(upstream));
         }
         // Named captures of server names are variables everywhere, so they are known first.
@@ -1236,6 +1241,29 @@ fn peer(args: &[String]) -> Result<Peer, String> {
     Ok(Peer { addr, weight: weight as i64, max_fails, fail_timeout, backup, down })
 }
 
+/// keepalive number [local], keepalive_requests, keepalive_time and
+/// keepalive_timeout in an upstream block; None when it keeps no connection.
+fn upstream_keepalive(block: &[Directive]) -> Result<Option<Keepalive>, String> {
+    let mut k = Keepalive::default();
+    for (i, d) in block.iter().enumerate().filter(|(_, d)| d.name.starts_with("keepalive")) {
+        let at = |e: String| format!("{e} in {}", d.at);
+        let directive = |e: &str| at(format!("\"{}\" directive {e}", d.name));
+        if block[..i].iter().any(|b| b.name == d.name) { return Err(directive("is duplicate")); }
+        let time = || millis(&d.args[0]).map_err(|e| directive(&e));
+        match d.name.as_str() {
+            "keepalive" => {
+                k.max = d.args[0].parse().map_err(|_| at(format!("invalid value \"{}\" in \"keepalive\" directive", d.args[0])))?;
+                if let Some(a) = d.args.get(1).filter(|a| *a != "local") { return Err(at(format!("invalid parameter \"{a}\""))); }
+                k.local = d.args.len() > 1;
+            }
+            "keepalive_requests" => k.requests = d.args[0].parse().map_err(|_| directive("invalid number"))?,
+            "keepalive_time" => k.time = time()?,
+            _ => k.timeout = time()?,
+        }
+    }
+    Ok((k.max > 0).then_some(k))
+}
+
 /// expires [modified] time | epoch | max | off; a value without variables must be valid.
 fn expires(args: &[String]) -> Result<Template, String> {
     let (value, t) = (args.join(" "), Template::parse(&args.join(" "))?);
@@ -1685,6 +1713,39 @@ mod tests {
         assert_eq!((p.max_fails, p.fail_timeout, p.weight, p.backup), (3, 5, 1, false));
         assert!(peer(&["127.0.0.1:1".into(), "down".into()]).unwrap().down);
         assert_eq!(peer(&["127.0.0.1:1".into(), "up".into()]).unwrap_err(), "invalid parameter \"up\"");
+    }
+
+    #[test]
+    fn upstream_keepalive_settings() {
+        let keepalive = |block: &str| {
+            let c = build_text(&format!("http {{ upstream u {{ server 127.0.0.1:8081; {block} }} server {{ location / {{ proxy_pass http://u; }} }} }}"))?;
+            let up = c.servers[0].locations[0].level.proxy.as_ref().unwrap().upstream.clone();
+            assert_eq!(up.peers.len(), 1);
+            Ok::<_, String>(up.keepalive.clone())
+        };
+        let (requests, time, timeout) = (1000, Duration::from_secs(3600), Duration::from_secs(60));
+        assert_eq!(keepalive(""), Ok(Some(Keepalive { max: 32, local: true, requests, time, timeout })));
+        assert_eq!(keepalive("keepalive 0;"), Ok(None));
+        assert_eq!(keepalive("keepalive 5;"), Ok(Some(Keepalive { max: 5, local: false, requests, time, timeout })));
+        assert_eq!(keepalive("keepalive 5 local;"), Ok(Some(Keepalive { max: 5, local: true, requests, time, timeout })));
+        let set = Keepalive { requests: 2, time: Duration::from_secs(60), timeout: Duration::from_millis(500), ..Keepalive::default() };
+        assert_eq!(keepalive("keepalive_requests 2; keepalive_time 1m; keepalive_timeout 500ms;"), Ok(Some(set)));
+        for (block, error) in [
+            ("keepalive x;", "invalid value \"x\" in \"keepalive\" directive"),
+            ("keepalive -1;", "invalid value \"-1\" in \"keepalive\" directive"),
+            ("keepalive 5 x;", "invalid parameter \"x\""),
+            ("keepalive 5; keepalive 5;", "\"keepalive\" directive is duplicate"),
+            ("keepalive_requests 2; keepalive_requests 2;", "\"keepalive_requests\" directive is duplicate"),
+            ("keepalive_time 1s; keepalive_time 1s;", "\"keepalive_time\" directive is duplicate"),
+            ("keepalive_timeout 1s; keepalive_timeout 1s;", "\"keepalive_timeout\" directive is duplicate"),
+            ("keepalive_requests x;", "\"keepalive_requests\" directive invalid number"),
+            ("keepalive_time x;", "\"keepalive_time\" directive invalid value"),
+            ("keepalive_timeout x;", "\"keepalive_timeout\" directive invalid value"),
+        ] {
+            assert_eq!(keepalive(block), Err(format!("{error} in t.conf:1")));
+        }
+        let c = build_text("http { server { location / { proxy_pass http://127.0.0.1:8081; } } }").unwrap();
+        assert_eq!(c.servers[0].locations[0].level.proxy.as_ref().unwrap().upstream.keepalive, None);
     }
 
     #[test]
