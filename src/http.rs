@@ -173,11 +173,13 @@ pub(crate) enum Reading { Buffered, Unbuffered, Discarded }
 /// What a stream of an HTTP/2 connection comes with: when that connection was
 /// made, the number of its request, how many of its header lines were made
 /// from its pseudo-header and cookie fields, which max_headers does not count,
-/// as nginx counts only the others; and what to tell how its body is read.
+/// as nginx counts only the others; the length of its header block, which is
+/// that of its head for $request_length; and what to tell how its body is read.
 pub(crate) struct Origin {
     pub connected: Instant,
     pub number: u64,
     pub made: usize,
+    pub length: usize,
     pub reading: Option<Box<dyn FnOnce(Reading)>>,
 }
 
@@ -231,7 +233,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             pipelined,
             connected,
             requests,
-            length: end,
+            length: origin.as_ref().map_or(end, |o| o.length),
             body: Vec::new(),
             body_file: None,
             upstream_addr: None,
