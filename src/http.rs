@@ -119,17 +119,26 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
 
 /// The end of the request head (after the empty line), if it has arrived.
 fn head_end(buf: &[u8]) -> Option<usize> {
-    let first = buf.iter().position(|&c| c == b'\n').map(|i| i + 1);
-    if let Some(end) = first.filter(|&end| http09(&buf[..end])) { return Some(end) }
-    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
-    let crlf = buf.windows(3).position(|w| w == b"\n\r\n").map(|i| i + 3);
-    lf.into_iter().chain(crlf).min()
+    let mut at = line_end(buf)?;
+    if http09(&buf[..at]) { return Some(at) }
+    loop {
+        match buf[at..] {
+            [b'\n', ..] => return Some(at + 1),
+            [b'\r', b'\n', ..] => return Some(at + 2),
+            _ => at += line_end(&buf[at..])?,
+        }
+    }
+}
+
+/// Where the first line of the buffer ends, after its LF, if that has come.
+fn line_end(buf: &[u8]) -> Option<usize> {
+    buf.iter().position(|&c| c == b'\n').map(|i| i + 1)
 }
 
 /// Whether a request line is of HTTP/0.9: a method and a URI, without a
 /// version. Such a request has no headers, and its answer is the body alone.
 fn http09(line: &[u8]) -> bool {
-    line.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty()).count() == 2
+    line.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty()).take(3).count() == 2
 }
 
 /// Serves the requests of a connection accepted on a listening address,
@@ -154,7 +163,6 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
             let wait = idle.filter(|_| buf.is_empty()).and_then(|t| started.checked_add(t));
             if read_until(&mut stream, &mut buf, || wait).await == 0 { return; }
         };
-        let head: Vec<u8> = buf.drain(..end).collect();
         let mut r = Request {
             method: String::new(),
             uri: String::new(),
@@ -169,7 +177,7 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
             pipelined,
             connected,
             requests,
-            length: head.len(),
+            length: end,
             body: Vec::new(),
             body_file: None,
             upstream_addr: None,
@@ -181,7 +189,8 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
             unread: Default::default(),
             ssl: ssl.clone(),
         };
-        let parsed = parse(&mut r, &head, &default.level);
+        let parsed = parse(&mut r, &buf[..end], &default.level);
+        buf.drain(..end);
         let parsed = overflowed.map_or(parsed, Err);
         let (server, captures) = server(config, listen, r.host.as_deref());
         r.captures = captures;
@@ -249,6 +258,8 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
 /// those of the server the Host header selects, once it has come. The status,
 /// 414 for the request line and 494 for a header line, and where that line starts.
 fn overflow(head: &[u8], first: usize, buffers: impl Fn(Option<&str>) -> (usize, usize)) -> Option<(u16, usize)> {
+    // Most heads fit in the first buffer, whatever lines they have.
+    if head.len() < first { return None }
     let (mut start, mut cap, mut used, mut host) = (0, first, 0, None);
     let mut line = 0;
     while line < head.len() {
@@ -1547,12 +1558,12 @@ async fn pass_body<C: AsyncRead + Unpin, W: AsyncWrite + Unpin>(u: &mut Unread, 
 
 /// Fills the request from its head, or gives the status nginx refuses it with.
 fn parse(r: &mut Request, head: &[u8], level: &Level) -> Result<(), u16> {
-    let text = crate::vars::text(head);
+    let text = std::str::from_utf8(head).map_or_else(|_| Cow::Owned(crate::vars::text(head)), Cow::Borrowed);
     let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     r.line = lines.next().unwrap_or_default().to_string();
-    let words: Vec<&str> = r.line.split(' ').filter(|w| !w.is_empty()).collect();
+    let mut words = r.line.split(' ').filter(|w| !w.is_empty());
     // HTTP/0.9, which has no version, has only GET.
-    let (method, target, version) = match words[..] { [m, t, v] => (m, t, v), [m @ "GET", t] => (m, t, ""), _ => return Err(400) };
+    let (method, target, version) = match [(); 4].map(|()| words.next()) { [Some(m), Some(t), Some(v), None] => (m, t, v), [Some(m @ "GET"), Some(t), None, _] => (m, t, ""), _ => return Err(400) };
     r.method = method.to_string();
     let valid_method = method.bytes().all(|c| c.is_ascii_uppercase() || c == b'_' || c == b'-');
     if !valid_method || !matches!(version, "HTTP/1.0" | "HTTP/1.1" | "") { return Err(400); }
@@ -1563,11 +1574,15 @@ fn parse(r: &mut Request, head: &[u8], level: &Level) -> Result<(), u16> {
     // Headers nginx takes only once: a second one is refused.
     const UNIQUE: &[&str] = &["if-modified-since", "if-unmodified-since", "if-match", "if-none-match", "content-length",
                               "content-range", "if-range", "transfer-encoding", "expect", "authorization"];
-    let count = |name: &str| r.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name)).count();
-    if UNIQUE.iter().any(|u| count(u) > 1) { return Err(400); }
-    let hosts: Vec<&String> = r.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("host")).map(|(_, v)| v).collect();
-    if hosts.len() > 1 || (hosts.is_empty() && version == "HTTP/1.1") { return Err(400); }
-    r.host = hosts.first().map(|h| valid_host(h).ok_or(400u16)).transpose()?;
+    let mut seen = 0u16;
+    for i in r.headers.iter().filter_map(|(n, _)| UNIQUE.iter().position(|u| n.eq_ignore_ascii_case(u))) {
+        if seen & 1 << i != 0 { return Err(400); }
+        seen |= 1 << i;
+    }
+    let mut hosts = r.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("host")).map(|(_, v)| v);
+    let host = hosts.next();
+    if hosts.next().is_some() || (host.is_none() && version == "HTTP/1.1") { return Err(400); }
+    r.host = host.map(|h| valid_host(h).ok_or(400u16)).transpose()?;
     if method == "CONNECT" { return Err(if target.starts_with('/') || !target.contains(':') { 400 } else { 405 }); }
     if target.bytes().any(|c| c < 0x20 || c == 0x7f) { return Err(400); }
     // A fragment is not part of the request.
@@ -1581,8 +1596,12 @@ fn parse(r: &mut Request, head: &[u8], level: &Level) -> Result<(), u16> {
         _ => target.to_string(),
     };
     if !path.starts_with('/') { return Err(400); }
-    let uri = decode(path.split('?').next().unwrap_or_default()).ok_or(400u16)?;
-    r.uri = dots(&if level.merge_slashes { merge_slashes(&uri) } else { uri }).ok_or(400u16)?;
+    // A path with nothing to decode, merge or resolve is the URI as it is.
+    let mut uri = Cow::Borrowed(path.split('?').next().unwrap_or_default());
+    if uri.contains('%') { uri = decode(&uri).ok_or(400u16)?.into(); }
+    if level.merge_slashes && uri.contains("//") { uri = merge_slashes(&uri).into(); }
+    if uri.contains("/.") { uri = dots(&uri).ok_or(400u16)?.into(); }
+    r.uri = uri.into_owned();
     r.target = path;
     if method == "TRACE" { return Err(405); }
     Ok(())
@@ -1959,6 +1978,9 @@ mod tests {
         assert_eq!(head_end(b"GET / HTTP/1.0\r\n\r\n"), Some(18));
         assert_eq!(head_end(b"GET / HTTP/1.0\r\n"), None);
         assert_eq!(head_end(b"GET /\r\nextra"), Some(7));
+        // The first empty line ends the head, whichever way its lines end.
+        assert_eq!(head_end(b"GET / HTTP/1.0\r\nA: b\n\r\n\n\n"), Some(23));
+        assert_eq!((head_end(b"\nGET / HTTP/1.0\n\nx"), head_end(b"\r\n\r\n"), head_end(b"GET / HTTP/1.0\n\r")), (Some(17), Some(4), None));
     }
 
     #[test]
@@ -1988,6 +2010,9 @@ mod tests {
         assert_eq!(request("CONNECT a HTTP/1.0\n\n").0, Err(400));
         assert_eq!(request("GET / HTTP/1.0\nHost: a\nHost: b\n\n").0, Err(400));
         assert_eq!(request("GET / HTTP/1.0\nbad\n\n").0, Err(400));
+        assert_eq!(request("GET / HTTP/1.0\nIf-Range: a\nAccept: b\nAccept: c\n\n").0, Ok(()));
+        assert_eq!(request("GET / HTTP/1.0\nIf-Range: a\nif-range: b\n\n").0, Err(400));
+        assert_eq!(request("GET / HTTP/1.0 x\n\n").0, Err(400));
         assert_eq!(request("GET x HTTP/1.0\n\n").0, Err(400));
     }
 
