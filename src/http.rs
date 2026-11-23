@@ -719,7 +719,8 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     }
     let body_len = if r.method == "HEAD" || silent { 0 } else { resp.body.len() };
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
-    out.extend_from_slice(&resp.body[..body_len]);
+    // The body is written from where it is, after the head, not copied after it.
+    let mut tail = Vec::new();
     // The trailers are made after the body, each seeing those before it ($sent_trailer_*).
     let mut trailers = Vec::new();
     for (name, value, _) in level.add_trailer.iter().filter(|t| chunked && (t.2 || added)) {
@@ -727,18 +728,18 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         if !value.is_empty() { trailers.push((name.clone(), value)); }
     }
     if chunked {
-        out.extend_from_slice(if body_len > 0 { b"\r\n0\r\n" } else { b"0\r\n" });
-        trailers.iter().for_each(|(n, v)| out.extend(crate::vars::bytes(&format!("{n}: {v}\r\n"))));
-        out.extend_from_slice(b"\r\n");
+        tail.extend_from_slice(if body_len > 0 { b"\r\n0\r\n" } else { b"0\r\n" });
+        trailers.iter().for_each(|(n, v)| tail.extend(crate::vars::bytes(&format!("{n}: {v}\r\n"))));
+        tail.extend_from_slice(b"\r\n");
     }
     // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
     let size = |t: &Template| crate::conf::size(&t.render(r, &Sent::default())).unwrap_or(0);
     let rate = r.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
     let _ = stream.set_write_timeout(Some(level.send_timeout).filter(|t| !t.is_zero()));
-    let written = send(stream, &out, rate, size(&level.limit_rate_after), r.started);
+    let written = send(stream, &[&out, &resp.body[..body_len], &tail], rate, size(&level.limit_rate_after), r.started);
     // What was passed from the proxied server through an upgraded connection counts as sent, as body.
     let tunneled = resp.tunnel.take().filter(|_| written).map_or(0, |up| tunnel(stream, up, ahead));
-    let sent = Sent { bytes: out.len() + tunneled, body: body_len + tunneled, ..so_far(&resp, &trailers) };
+    let sent = Sent { bytes: out.len() + body_len + tail.len() + tunneled, body: body_len + tunneled, ..so_far(&resp, &trailers) };
     if written { post_action(server, r, level); }
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     (written && keepalive && !silent).then_some(level.keepalive_timeout)
@@ -830,19 +831,43 @@ fn etag_match(list: &str, etag: Option<&str>, weak: bool) -> bool {
 /// by the end of each second since the request started (counted in whole
 /// seconds of the clock) up to limit_rate_after bytes and limit_rate bytes for
 /// each second have gone, and after each write the time it is worth at that
-/// rate is waited. Without a rate it is written at once.
-fn send(stream: &mut TcpStream, out: &[u8], rate: u64, after: u64, started: Instant) -> bool {
-    if rate == 0 { return stream.write_all(out).is_ok(); }
+/// rate is waited. Without a rate it is written at once. The answer is the
+/// parts one after another (the head, the body, the end of a chunked body),
+/// written together (writev) without copying them into one buffer.
+fn send(stream: &mut TcpStream, parts: &[&[u8]], rate: u64, after: u64, started: Instant) -> bool {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    if rate == 0 { return write_parts(stream, parts, 0, total); }
     let clock = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let start = (clock() - started.elapsed()).as_secs() as i64;
     let (rate, mut sent) = (rate as i64, 0);
-    while sent < out.len() {
+    while sent < total {
         let limit = rate * (clock().as_secs() as i64 - start + 1) - (sent as i64 - after as i64);
         if limit <= 0 { thread::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)); continue; }
-        let n = (limit as usize).min(out.len() - sent);
-        if stream.write_all(&out[sent..sent + n]).is_err() { return false; }
+        let n = (limit as usize).min(total - sent);
+        if !write_parts(stream, parts, sent, sent + n) { return false; }
         sent += n;
-        if sent < out.len() { thread::sleep(Duration::from_millis(n as u64 * 1000 / rate as u64)); }
+        if sent < total { thread::sleep(Duration::from_millis(n as u64 * 1000 / rate as u64)); }
+    }
+    true
+}
+
+/// Writes the bytes from..to of the parts taken one after another.
+fn write_parts(stream: &mut TcpStream, parts: &[&[u8]], from: usize, to: usize) -> bool {
+    let mut at = 0;
+    let mut bufs = Vec::new();
+    for p in parts {
+        let (start, end) = (from.max(at), to.min(at + p.len()));
+        if start < end { bufs.push(std::io::IoSlice::new(&p[start - at..end - at])); }
+        at += p.len();
+    }
+    let mut bufs = &mut bufs[..];
+    while !bufs.is_empty() {
+        match stream.write_vectored(bufs) {
+            Ok(0) => return false,
+            Ok(n) => std::io::IoSlice::advance_slices(&mut bufs, n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
     }
     true
 }
@@ -2197,15 +2222,17 @@ mod tests {
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut s, _) = listener.accept().unwrap();
         let started = Instant::now();
-        assert!(send(&mut s, &[b'x'; 3000], 0, 0, started));
+        assert!(send(&mut s, &[&[b'x'; 1000], &[b'y'; 2000], &[]], 0, 0, started));
         // 1000 bytes and 1000 a second: the rest goes after a second or two.
-        assert!(send(&mut s, &[b'x'; 2500], 1000, 1000, started));
+        assert!(send(&mut s, &[&[b'z'; 700], &[b'w'; 1800]], 1000, 1000, started));
         assert!(started.elapsed() >= Duration::from_millis(1400));
         let mut got = vec![0u8; 5500];
         client.read_exact(&mut got).unwrap();
+        let want = [vec![b'x'; 1000], vec![b'y'; 2000], vec![b'z'; 700], vec![b'w'; 1800]].concat();
+        assert!(got == want);
         drop(client);
         thread::sleep(Duration::from_millis(100));
-        assert!(!send(&mut s, &[b'x'; 1 << 22], 1 << 20, 0, Instant::now()));
+        assert!(!send(&mut s, &[&vec![b'x'; 1 << 22]], 1 << 20, 0, Instant::now()));
     }
 
     #[test]
