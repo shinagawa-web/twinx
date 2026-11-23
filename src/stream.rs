@@ -43,7 +43,13 @@ macro_rules! each {
 
 impl AsyncRead for Stream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut ReadBuf) -> Poll<std::io::Result<()>> {
-        each!(self, s => Pin::new(s).poll_read(cx, buf))
+        let this = self.get_mut();
+        let read = match this { Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf), Stream::Server(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Client(s) => Pin::new(&mut **s).poll_read(cx, buf) };
+        // What TLS answers to what it read, such as the alert refusing a
+        // renegotiation, is sent at once, not with the next write.
+        let wants = match this { Stream::Tcp(_) => false, Stream::Server(s) => s.get_ref().1.wants_write(), Stream::Client(s) => s.get_ref().1.wants_write() };
+        if wants { let _ = Pin::new(this).poll_flush(cx); }
+        read
     }
 }
 
