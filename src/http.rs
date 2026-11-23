@@ -293,6 +293,10 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
                     Ok(Some((body, used))) => {
                         r.length += used;
                         buf.drain(..used);
+                        // A body that would be passed as it comes but came whole with the
+                        // head stays in memory, client_body_in_file_only or not, as nginx's
+                        // request_body_no_buffering keeps it out of a file.
+                        if !body.is_empty() && unbuffered(level, length.is_none()) { r.body = body; break Ok(()); }
                         break keep_body(&mut r, level, body);
                     }
                     Err(status) => break Err(status),
@@ -448,6 +452,14 @@ fn keep_body(r: &mut Request, level: &Level, body: Vec<u8>) -> Result<(), u16> {
     if let Err(e) = written { error_log(level, r, &format!("open() \"{}\" failed ({e})", path.display())); return Err(500); }
     r.body_file = Some(path);
     Ok(())
+}
+
+/// Whether a location's proxy reads the request body as it passes it on, as
+/// ngx_http_proxy_handler() sets request_body_no_buffering: with
+/// proxy_request_buffering off, the client's body passed, no proxy_set_body,
+/// and a chunked body only to a server of HTTP/1.1 or later.
+fn unbuffered(level: &Level, chunked: bool) -> bool {
+    level.proxy.is_some() && !level.proxy_request_buffering && level.proxy_pass_request_body && level.proxy_set_body.is_none() && (!chunked || level.proxy_http_11)
 }
 
 /// Whether a location may read the request body: it proxies, or its rewrite
@@ -3709,6 +3721,20 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let level = Level { body_buffer: 4, body_temp_path: std::env::current_exe().unwrap(), ..Level::default() };
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
         assert_eq!(keep_body(&mut r, &level, b"abcde".to_vec()), Err(500));
+    }
+
+    #[test]
+    fn reads_unbuffered_as_the_proxy_handler_decides() {
+        let text = "http { server { proxy_request_buffering off; \
+                    location /a { proxy_pass http://127.0.0.1:1; } \
+                    location /b { proxy_pass http://127.0.0.1:1; proxy_http_version 1.0; } \
+                    location /c { proxy_pass http://127.0.0.1:1; proxy_set_body x; } \
+                    location /d { proxy_pass http://127.0.0.1:1; proxy_pass_request_body off; } \
+                    location /e { proxy_pass http://127.0.0.1:1; proxy_request_buffering on; } \
+                    location /f { } } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let got: Vec<_> = config.servers[0].locations.iter().map(|l| (unbuffered(&l.level, false), unbuffered(&l.level, true))).collect();
+        assert_eq!(got, [(true, true), (true, false), (false, false), (false, false), (false, false), (false, false)]);
     }
 
     #[test]
