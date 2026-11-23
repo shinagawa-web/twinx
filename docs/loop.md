@@ -1,6 +1,6 @@
 # One run of the loop
 
-The schedule runs stage 3 since v0.2.0 (2026-11-22, #132). A human may also start a run by hand; a run that has started goes ahead.
+The schedule is paused since 2026-11-23T00:01Z, after stage 3 was done at v0.3.0, until the human starts stage 4. A human may also start a run by hand; a run that has started goes ahead.
 
 A scheduled Claude Code session runs the loop as the Fixer, with model `claude-opus-5-5`, following `docs/fixer.md`.
 
