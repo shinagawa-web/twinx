@@ -181,7 +181,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         // With http2 on in the default server of the address, a connection
         // that starts with the preface of HTTP/2 speaks it, as nginx decides.
         if requests == 1 && ssl.is_none() && default.level.http2 && buf.starts_with(b"PRI * HTTP/2.0\r\n") && !matches!(stream, Stream::Pipe(_)) {
-            return Box::pin(crate::h2::serve(config.clone(), crate::h2::Rewound::new(buf, stream), (listen, local, peer), fresh.take())).await;
+            return Box::pin(crate::h2::serve(config.clone(), stream, buf, (listen, local, peer), fresh.take())).await;
         }
         let mut r = Request {
             method: String::new(),

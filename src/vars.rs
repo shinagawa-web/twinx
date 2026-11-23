@@ -370,7 +370,9 @@ pub fn plain(utf8: &[u8]) -> bool {
 
 /// The values of every header with the name, joined; None when there is none.
 fn joined(headers: &[(String, String)], name: &str, sep: &str) -> Option<String> {
-    let values: Vec<&str> = headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).collect();
+    // As nginx compares them, "_" in a header's name is "-" in the variable's.
+    let same = |n: &str| n.len() == name.len() && n.bytes().zip(name.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b) || a == b'_' && b == b'-');
+    let values: Vec<&str> = headers.iter().filter(|(n, _)| same(n)).map(|(_, v)| v.as_str()).collect();
     (!values.is_empty()).then(|| values.join(sep))
 }
 
