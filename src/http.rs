@@ -441,7 +441,7 @@ struct Rest { s: Stream, answer: Vec<u8>, end: usize, length: Option<usize>, chu
 /// Reads the rest of a proxied answer's body, noting how long the whole answer took.
 async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
-    let (body, read) = read_body(&mut rest.s, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await.unwrap_or_default();
+    let (body, read, _) = read_body(&mut rest.s, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await.unwrap_or_default();
     resp.body = body;
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
@@ -1399,6 +1399,10 @@ async fn connect(peer: &SocketAddr, socket: Option<socket2::Socket>, tls: Option
     }
 }
 
+/// Sends a request to a proxied server and reads its answer. The connection
+/// comes with it only when it may be used for another request: it has no
+/// TLS, the server does not close it, and the answer's body was read to its
+/// end with nothing after it. None when there is no valid answer.
 #[allow(clippy::too_many_arguments)]
 async fn fetch(mut s: Stream, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<(Response, Option<Stream>)> {
     // proxy_read_timeout: how long each read may wait.
@@ -1424,7 +1428,9 @@ async fn fetch(mut s: Stream, start: Instant, req: &[u8], level: &Level, mut cli
     time[1] = Some(start.elapsed().as_millis());
     let head = crate::vars::text(&answer[..end]);
     let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
-    let status = lines.next()?.strip_prefix("HTTP/1.")?.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()?;
+    let first = lines.next()?;
+    let version = first.split(' ').next()?;
+    let status = first.strip_prefix("HTTP/1.")?.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()?;
     let mut resp = Response { status, proxied: true, ..Response::default() };
     const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
     for line in lines {
@@ -1450,15 +1456,18 @@ async fn fetch(mut s: Stream, start: Instant, req: &[u8], level: &Level, mut cli
     };
     // The body of an answer that redirects with X-Accel-Redirect is not read.
     let accel = resp.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect"));
-    let no_body = req.starts_with(b"HEAD ") || [204, 304].contains(&status) || accel;
-    let (length, chunked) = if no_body { (Some(0), false) } else { (length, chunked) };
+    let no_body = req.starts_with(b"HEAD ") || [204, 304].contains(&status);
+    // An informational answer (1xx) has another after it; the body that is not
+    // read for X-Accel-Redirect would come before the next answer.
+    let skipped = accel && !no_body && length != Some(0);
+    let keep = status >= 200 && !closes(version, &values("connection")) && !skipped && matches!(s, Stream::Tcp(_));
+    let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
     if rate > 0 { return Some((Response { rest: Some(Rest { s, answer, end, length, chunked, rate, started: start, wait }), ..resp }, None)); }
-    let (body, read) = read_body(&mut s, answer, end, length, chunked, 0, wait).await?;
+    let (body, read, ended) = read_body(&mut s, answer, end, length, chunked, 0, wait).await?;
     (resp.body, bytes[0], bytes[1]) = (body, (read - end) as u64, read as u64);
-    Some((resp, Some(s)))
+    Some((resp, Some(s).filter(|_| keep && ended)))
 }
-
 
 /// A header line of a proxied server's answer as ngx_http_parse_header_line()
 /// reads it: a line without ":" is a name with an empty value, and the value
@@ -1477,9 +1486,9 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// proxy_limit_rate: by the end of each second since the body started
 /// (counted in whole seconds of the clock) up to the rate for each second has
 /// been read, and when that much has, it waits for the time it is worth.
-/// Returns the body and the bytes of the whole answer read; None when a read
-/// fails or waits longer than the time.
-async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> Option<(Vec<u8>, usize)> {
+/// Returns the body, the bytes of the whole answer read, and whether they end
+/// where the body does; None when a read fails or waits longer than the time.
+async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> Option<(Vec<u8>, usize, bool)> {
     let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let (start, rate, mut chunk) = (secs(), rate as i64, vec![0u8; 4096]);
     while length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1) {
@@ -1490,7 +1499,44 @@ async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Opti
         answer.extend_from_slice(&chunk[..n]);
     }
     let body = &answer[end..];
-    Some((if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() }, answer.len()))
+    Some((if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() }, answer.len(), ended(body, length, chunked)))
+}
+
+/// Whether what came after the head of a proxied answer is its whole body and
+/// nothing else: as many bytes as its length, or well-formed chunks with the
+/// last one, the trailer lines and the empty line. A body that the closing of
+/// the connection ends has no such end.
+fn ended(after: &[u8], length: Option<usize>, chunked: bool) -> bool {
+    if !chunked { return length == Some(after.len()); }
+    // A line and where the next starts; a CR only ends a line.
+    let line = |at: usize| {
+        let n = after[at..].iter().position(|&c| c == b'\n')?;
+        let line = &after[at..at + n];
+        Some((line.strip_suffix(b"\r").unwrap_or(line), at + n + 1)).filter(|(l, _)| !l.contains(&b'\r'))
+    };
+    let mut at = 0;
+    loop {
+        let Some((size, start)) = line(at) else { return false };
+        let size = size.split(|&c| c == b';').next().unwrap_or_default();
+        let size = std::str::from_utf8(size).ok().filter(|s| s.bytes().all(|c| c.is_ascii_hexdigit())).and_then(|s| usize::from_str_radix(s, 16).ok());
+        let Some(end) = size.and_then(|n| start.checked_add(n)) else { return false };
+        at = start;
+        if end == start { break; }
+        let rest = after.get(end..).unwrap_or_default();
+        at = end + if rest.starts_with(b"\r\n") { 2 } else if rest.starts_with(b"\n") { 1 } else { return false };
+    }
+    loop {
+        let Some((trailer, next)) = line(at) else { return false };
+        at = next;
+        if trailer.is_empty() { return at == after.len(); }
+    }
+}
+
+/// Whether a proxied server closes the connection after its answer, as nginx
+/// finds it: the version of the status line is not HTTP/1.1 or a later 1.x, or
+/// a Connection header has "close" anywhere in it.
+fn closes(version: &str, connection: &[String]) -> bool {
+    !matches!(version.strip_prefix("HTTP/1.").map(str::as_bytes), Some([b'1'..=b'9'])) || connection.iter().any(|v| v.to_ascii_lowercase().contains("close"))
 }
 
 /// A socket for connecting to a proxied server from a local address, set up
@@ -2224,6 +2270,105 @@ mod tests {
         assert_eq!(unchunk(b"3\r\nabc"), (Vec::new(), false));
         assert_eq!(unchunk(b"3\r\nabcd\r\n"), (Vec::new(), true));
         assert_eq!(unchunk(b"x\r\n"), (Vec::new(), true));
+    }
+
+    #[test]
+    fn ends_of_answers() {
+        let length: [(&[u8], usize, bool); 5] = [(b"ab", 2, true), (b"", 0, true), (b"a", 2, false), (b"abc", 2, false), (b"a", 0, false)];
+        for (after, n, is) in length { assert_eq!(ended(after, Some(n), false), is, "{after:?} {n}"); }
+        let chunked: [(&[u8], bool); 24] = [
+            (b"3\r\nabc\r\n0\r\n\r\n", true),
+            (b"0\r\n\r\n", true),
+            (b"A\r\n0123456789\r\n000\r\n\r\n", true),
+            // Trailer lines, chunk extensions and LF line ends.
+            (b"3\r\nabc\r\n0\r\nX: 1\r\nY: 2\r\n\r\n", true),
+            (b"3;x=y\r\nabc\r\n0;z\r\n\r\n", true),
+            (b"3\nabc\n0\nX: 1\n\n", true),
+            // Not all of it.
+            (b"", false),
+            (b"3\r\nab", false),
+            (b"3\r\nabc", false),
+            (b"3\r\nabc\r\n", false),
+            (b"3\r\nabc\r\n0\r\n", false),
+            (b"3\r\nabc\r\n0\r\n\r", false),
+            (b"3\r\nabc\r\n0\r\nX: 1\r\n", false),
+            // More than it.
+            (b"3\r\nabc\r\n0\r\n\r\nH", false),
+            (b"0\r\n\r\n\r\n", false),
+            // Malformed.
+            (b"x\r\n\r\n", false),
+            (b"\r\n\r\n", false),
+            (b"3\r\nabcd\r\n0\r\n\r\n", false),
+            (b"+1\r\na\r\n0\r\n\r\n", false),
+            (b"-0\r\n\r\n", false),
+            (b" 0\r\n\r\n", false),
+            (b"0;\rx\r\n\r\n", false),
+            (b"ffffffffffffffff\r\na\r\n0\r\n\r\n", false),
+            (b"10000000000000000\r\na\r\n0\r\n\r\n", false),
+        ];
+        for (after, is) in chunked { assert_eq!(ended(after, None, true), is, "{}", String::from_utf8_lossy(after)); }
+        for after in [&b""[..], b"ab", b"0\r\n\r\n"] { assert!(!ended(after, None, false)); }
+    }
+
+    #[test]
+    fn servers_that_close() {
+        for (version, connection, is) in [
+            ("HTTP/1.1", &[][..], false), ("HTTP/1.2", &[], false), ("HTTP/1.1", &["keep-alive"], false), ("HTTP/1.1", &["clos"], false),
+            ("HTTP/1.0", &[], true), ("HTTP/1.0", &["keep-alive"], true), ("HTTP/2.0", &[], true), ("HTTP/1.x", &[], true), ("HTTP/1.1\t200", &[], true),
+            ("HTTP/1.1", &["close"], true), ("HTTP/1.1", &["Close"], true), ("HTTP/1.1", &["keep-alive, CLOSE"], true), ("HTTP/1.1", &["disclosed"], true),
+            ("HTTP/1.1", &["keep-alive", "close"], true),
+        ] {
+            let values: Vec<String> = connection.iter().map(|v| v.to_string()).collect();
+            assert_eq!(closes(version, &values), is, "{version} {connection:?}");
+        }
+    }
+
+    #[test]
+    fn connections_that_may_be_used_again() {
+        // Whether the server closes the connection after its answer comes before
+        // whether fetch() returns the connection.
+        let answers: [(&str, &str, bool, bool); 18] = [
+            ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nab", false, true),
+            ("GET", "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nab", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: Close\r\n\r\nab", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nabc", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\na", true, false),
+            ("GET", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n", false, true),
+            ("GET", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\n\r\nab", true, false),
+            ("GET", "HTTP/1.1 204 No Content\r\n\r\n", false, true),
+            ("GET", "HTTP/1.1 204 No Content\r\n\r\nab", false, false),
+            ("HEAD", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", false, true),
+            ("GET", "HTTP/1.1 101 Switching Protocols\r\nContent-Length: 0\r\n\r\n", false, false),
+            ("HEAD", "HTTP/1.1 103 Early Hints\r\n\r\n", false, false),
+            // The body of an X-Accel-Redirect answer is not read, whether it came or not.
+            ("GET", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nContent-Length: 2\r\n\r\nab", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nContent-Length: 2\r\n\r\n", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nTransfer-Encoding: chunked\r\n\r\n", false, false),
+            ("GET", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nContent-Length: 0\r\n\r\n", false, true),
+            ("HEAD", "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /a\r\nContent-Length: 2\r\n\r\n", false, true),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut open = Vec::new();
+            for (_, answer, close, _) in answers {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = s.read(&mut [0u8; 1024]).unwrap();
+                s.write_all(answer.as_bytes()).unwrap();
+                if !close { open.push(s); }
+            }
+            thread::sleep(Duration::from_secs(5));
+        });
+        let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
+        for (method, answer, _, kept) in answers {
+            let req = format!("{method} / HTTP/1.1\r\n\r\n");
+            let (_, s) = block_on(async {
+                let s = connect(&addr, None, None, &level).await.ok()?;
+                fetch(s, Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).await
+            }).unwrap();
+            assert_eq!(s.is_some(), kept, "{method} {answer}");
+        }
     }
 
     #[test]
