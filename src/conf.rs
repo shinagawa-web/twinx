@@ -158,6 +158,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_http_version", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
     ("proxy_buffers", HSL, 2, 2, false),
+    ("proxy_busy_buffers_size", HSL, 1, 1, false),
     ("proxy_max_temp_file_size", HSL, 1, 1, false),
     ("proxy_cookie_domain", HSL, 1, 2, false),
     ("proxy_cookie_path", HSL, 1, 2, false),
@@ -952,6 +953,8 @@ impl Builder<'_> {
                 "chunked_transfer_encoding" => level.chunked = flag(d).map_err(at)?,
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
                 "proxy_buffer_size" => level.proxy_buffer_size = size(&d.args[0]).map_err(at)? as usize,
+                // Answers are not kept in buffers while they are sent: only the size is checked.
+                "proxy_busy_buffers_size" => { size(&d.args[0]).map_err(at)?; }
                 // How the proxied answer's body is read changes nothing that is sent: the value is only checked.
                 "proxy_buffering" => { flag(d).map_err(at)?; }
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
@@ -1727,6 +1730,12 @@ mod tests {
         assert_eq!((c.servers[0].level.max_headers, c.servers[1].level.max_headers), (5, 7));
         assert_eq!(build_text("http { server { } }").unwrap().servers[0].level.max_headers, 1000);
         assert_eq!(build_text("http { max_headers x; }").unwrap_err(), "invalid number in t.conf:1");
+    }
+
+    #[test]
+    fn proxy_busy_buffers_size() {
+        assert!(build_text("http { proxy_busy_buffers_size 65k; server { } }").is_ok());
+        assert!(build_text("http { proxy_busy_buffers_size x; server { } }").is_err());
     }
 
     #[test]
