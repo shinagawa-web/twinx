@@ -59,10 +59,10 @@ static SHUTTING: AtomicBool = AtomicBool::new(false);
 static BUSY: AtomicUsize = AtomicUsize::new(0);
 
 /// A request being answered, counted in BUSY while it lives.
-struct Busy;
+pub(crate) struct Busy;
 
 impl Busy {
-    fn new() -> Busy {
+    pub(crate) fn new() -> Busy {
         BUSY.fetch_add(1, Ordering::SeqCst);
         Busy
     }
@@ -155,7 +155,7 @@ fn http09(line: &[u8]) -> bool {
 
 /// Serves the requests of a connection accepted on a listening address,
 /// with its local and remote addresses.
-async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>), fresh: Busy) {
+pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>), fresh: Busy) {
     let mut fresh = Some(fresh);
     let mut buf = Vec::new();
     // After a kept-alive answer: how long the connection waits for the next request.
@@ -178,6 +178,11 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
             let wait = idle.filter(|_| buf.is_empty()).and_then(|t| started.checked_add(t));
             if read_until(&mut stream, &mut buf, || wait).await == 0 { return; }
         };
+        // With http2 on in the default server of the address, a connection
+        // that starts with the preface of HTTP/2 speaks it, as nginx decides.
+        if requests == 1 && ssl.is_none() && default.level.http2 && buf.starts_with(b"PRI * HTTP/2.0\r\n") && !matches!(stream, Stream::Pipe(_)) {
+            return Box::pin(crate::h2::serve(config.clone(), crate::h2::Rewound::new(buf, stream), (listen, local, peer), fresh.take())).await;
+        }
         let mut r = Request {
             method: String::new(),
             uri: String::new(),
@@ -202,7 +207,7 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
             shared: Default::default(),
             ssl: ssl.clone(),
         };
-        let parsed = parse(&mut r, &buf[..end], &default.level);
+        let parsed = parse(&mut r, &buf[..end], &default.level, matches!(stream, Stream::Pipe(_)));
         buf.drain(..end);
         let parsed = overflowed.map_or(parsed, Err);
         let (server, captures) = server(config, listen, r.host.as_deref());
@@ -1512,7 +1517,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let end = loop {
         if let Some(end) = head_end(&answer[..answer.len().min(level.proxy_buffer_size)]) { break end; }
         if answer.len() >= level.proxy_buffer_size { return Err(Other); }
-        let closed = async { match client.as_deref() { Some(c) => crate::stream::closed(c.tcp()).await, None => std::future::pending().await } };
+        let closed = async { match client.as_deref() { Some(c) => match c.tcp() { Some(tcp) => crate::stream::closed(tcp).await, None => std::future::pending().await }, None => std::future::pending().await } };
         let n = tokio::select! {
             biased;
             () = closed => return Ok((Response { status: 499, ..Response::default() }, None)),
@@ -1775,7 +1780,7 @@ async fn pass_body<C: AsyncRead + Unpin, W: AsyncWrite + Unpin>(u: &mut Unread, 
 }
 
 /// Fills the request from its head, or gives the status nginx refuses it with.
-fn parse(r: &mut Request, head: &[u8], level: &Level) -> Result<(), u16> {
+fn parse(r: &mut Request, head: &[u8], level: &Level, h2: bool) -> Result<(), u16> {
     let text = std::str::from_utf8(head).map_or_else(|_| Cow::Owned(crate::vars::text(head)), Cow::Borrowed);
     let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     r.line = lines.next().unwrap_or_default().to_string();
@@ -1784,7 +1789,8 @@ fn parse(r: &mut Request, head: &[u8], level: &Level) -> Result<(), u16> {
     let (method, target, version) = match [(); 4].map(|()| words.next()) { [Some(m), Some(t), Some(v), None] => (m, t, v), [Some(m @ "GET"), Some(t), None, _] => (m, t, ""), _ => return Err(400) };
     r.method = method.to_string();
     let valid_method = method.bytes().all(|c| c.is_ascii_uppercase() || c == b'_' || c == b'-');
-    if !valid_method || !matches!(version, "HTTP/1.0" | "HTTP/1.1" | "") { return Err(400); }
+    // HTTP/2.0 is the version of a request of an HTTP/2 stream (crate::h2).
+    if !valid_method || !(matches!(version, "HTTP/1.0" | "HTTP/1.1" | "") || h2 && version == "HTTP/2.0") { return Err(400); }
     for line in lines.filter(|l| !l.is_empty()) {
         let Some((name, value)) = header_line(line, level)? else { continue };
         r.headers.push((name.to_string(), value.trim_matches([' ', '\t']).to_string()));
@@ -2281,7 +2287,7 @@ mod tests {
             shared: Default::default(),
             ssl: None,
         };
-        (parse(&mut r, head.as_bytes(), &Level::default()), r)
+        (parse(&mut r, head.as_bytes(), &Level::default(), false), r)
     }
 
     #[test]
@@ -2289,7 +2295,7 @@ mod tests {
         let names = |head: &str, ignore: bool, underscores: bool| {
             let level = Level { ignore_invalid_headers: ignore, underscores_in_headers: underscores, ..Level::default() };
             let mut r = request("GET / HTTP/1.0\n\n").1;
-            parse(&mut r, head.as_bytes(), &level).map(|()| r.headers.iter().map(|h| h.0.clone()).collect::<Vec<_>>())
+            parse(&mut r, head.as_bytes(), &level, false).map(|()| r.headers.iter().map(|h| h.0.clone()).collect::<Vec<_>>())
         };
         let head = "GET / HTTP/1.0\nx_foo: a\n_y: b\nx.z: c\nA-1: d\n\n";
         assert_eq!(names(head, true, false), Ok(vec!["A-1".to_string()]));
@@ -3626,7 +3632,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(merge_slashes("//a///b/%2F/"), "/a/b/%2F/");
         let mut r = request("GET / HTTP/1.0\n\n").1;
         let level = Level { merge_slashes: true, ..Level::default() };
-        assert_eq!((parse(&mut r, b"GET /foo//../b%2F/c HTTP/1.0\r\n\r\n", &level), r.uri.as_str()), (Ok(()), "/b/c"));
+        assert_eq!((parse(&mut r, b"GET /foo//../b%2F/c HTTP/1.0\r\n\r\n", &level, false), r.uri.as_str()), (Ok(()), "/b/c"));
         let (_, r) = request("GET /foo///../bar HTTP/1.0\n\n");
         assert_eq!(r.uri, "/foo//bar");
         assert_eq!(request("GET /\x02 HTTP/1.0\n\n").0, Err(400));

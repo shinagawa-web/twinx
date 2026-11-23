@@ -84,7 +84,7 @@ impl Conn {
     }
 
     fn peek(&self) -> std::io::Result<usize> {
-        socket2::SockRef::from(self.stream.tcp()).peek(&mut [MaybeUninit::uninit()])
+        socket2::SockRef::from(self.stream.tcp().expect("a proxied server is connected over TCP")).peek(&mut [MaybeUninit::uninit()])
     }
 
     /// Has the task of the waker run on the next event of the connection; false
@@ -93,7 +93,7 @@ impl Conn {
     /// that has polled too much (tokio's budget) has nothing registered, but the
     /// waker's task is run soon, which registers it.
     fn register(&self, waker: &Waker) -> bool {
-        let tcp = self.stream.tcp();
+        let tcp = self.stream.tcp().expect("a proxied server is connected over TCP");
         loop {
             match tcp.poll_read_ready(&mut Context::from_waker(waker)) {
                 Poll::Pending => return true,
@@ -376,7 +376,7 @@ mod tests {
 
     /// The port of the connection taken.
     fn port(conn: &Option<Conn>) -> Option<u16> {
-        conn.as_ref().map(|c| c.stream.tcp().local_addr().unwrap().port())
+        conn.as_ref().map(|c| c.stream.tcp().unwrap().local_addr().unwrap().port())
     }
 
     /// Whether the connection was closed, as the server sees it: a connection closed

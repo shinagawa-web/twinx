@@ -11,23 +11,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 /// A connection: plain TCP, TLS taken from a client, or TLS to a proxied server.
+#[derive(Debug)]
 pub enum Stream {
     Tcp(TcpStream),
     Server(Box<tokio_rustls::server::TlsStream<TcpStream>>),
     Client(Box<tokio_rustls::client::TlsStream<TcpStream>>),
-}
-
-impl std::fmt::Debug for Stream {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let kind = match self { Stream::Tcp(_) => "Tcp", Stream::Server(_) => "Server", Stream::Client(_) => "Client" };
-        f.debug_tuple(kind).field(self.tcp()).finish()
-    }
+    /// One end of a pipe in memory: a stream of an HTTP/2 connection, which
+    /// the other end passes as an HTTP/1 request and its answer.
+    Pipe(tokio::io::DuplexStream),
 }
 
 impl Stream {
-    /// The TCP connection under it.
-    pub fn tcp(&self) -> &TcpStream {
-        match self { Stream::Tcp(s) => s, Stream::Server(s) => s.get_ref().0, Stream::Client(s) => s.get_ref().0 }
+    /// The TCP connection under it, which a pipe does not have.
+    pub fn tcp(&self) -> Option<&TcpStream> {
+        match self { Stream::Tcp(s) => Some(s), Stream::Server(s) => Some(s.get_ref().0), Stream::Client(s) => Some(s.get_ref().0), Stream::Pipe(_) => None }
     }
 
     /// Whether TLS, if any, holds nothing back: there is no plaintext left to
@@ -35,7 +32,7 @@ impl Stream {
     /// whole record leaves the rest there, where a peek at the socket does not see it.
     pub fn drained(&mut self) -> bool {
         let state = match self {
-            Stream::Tcp(_) => return true,
+            Stream::Tcp(_) | Stream::Pipe(_) => return true,
             Stream::Server(s) => s.get_mut().1.process_new_packets(),
             Stream::Client(s) => s.get_mut().1.process_new_packets(),
         };
@@ -48,28 +45,28 @@ impl Stream {
     /// file makes it too, with nothing to read; a wrong readiness is cleared.
     pub fn waiting(&mut self) -> bool {
         let peek = |tcp: &TcpStream| socket2::SockRef::from(tcp).peek(&mut [std::mem::MaybeUninit::uninit()]);
-        !self.drained() || matches!(self.tcp().try_io(tokio::io::Interest::READABLE, || peek(self.tcp())), Ok(1..))
+        !self.drained() || self.tcp().is_some_and(|tcp| matches!(tcp.try_io(tokio::io::Interest::READABLE, || peek(tcp)), Ok(1..)))
     }
 
     /// Shuts down both directions of the TCP connection, whatever is still to be read or written.
     pub fn close(&self) {
-        let _ = socket2::SockRef::from(self.tcp()).shutdown(std::net::Shutdown::Both);
+        if let Some(tcp) = self.tcp() { let _ = socket2::SockRef::from(tcp).shutdown(std::net::Shutdown::Both); }
     }
 }
 
 macro_rules! each {
     ($self:ident, $s:ident => $e:expr) => {
-        match $self.get_mut() { Stream::Tcp($s) => $e, Stream::Server($s) => $e, Stream::Client($s) => $e }
+        match $self.get_mut() { Stream::Tcp($s) => $e, Stream::Server($s) => $e, Stream::Client($s) => $e, Stream::Pipe($s) => $e }
     };
 }
 
 impl AsyncRead for Stream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut ReadBuf) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let read = match this { Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf), Stream::Server(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Client(s) => Pin::new(&mut **s).poll_read(cx, buf) };
+        let read = match this { Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf), Stream::Server(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Client(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Pipe(s) => Pin::new(s).poll_read(cx, buf) };
         // What TLS answers to what it read, such as the alert refusing a
         // renegotiation, is sent at once, not with the next write.
-        let wants = match this { Stream::Tcp(_) => false, Stream::Server(s) => s.get_ref().1.wants_write(), Stream::Client(s) => s.get_ref().1.wants_write() };
+        let wants = match this { Stream::Tcp(_) | Stream::Pipe(_) => false, Stream::Server(s) => s.get_ref().1.wants_write(), Stream::Client(s) => s.get_ref().1.wants_write() };
         if wants { let _ = Pin::new(this).poll_flush(cx); }
         read
     }
@@ -85,7 +82,7 @@ impl AsyncWrite for Stream {
     }
 
     fn is_write_vectored(&self) -> bool {
-        match self { Stream::Tcp(s) => s.is_write_vectored(), Stream::Server(s) => s.is_write_vectored(), Stream::Client(s) => s.is_write_vectored() }
+        match self { Stream::Tcp(s) => s.is_write_vectored(), Stream::Server(s) => s.is_write_vectored(), Stream::Client(s) => s.is_write_vectored(), Stream::Pipe(s) => s.is_write_vectored() }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
@@ -254,17 +251,17 @@ mod tests {
             let (mut s, mut buf) = (Stream::Tcp(s), Vec::new());
             assert!(!s.waiting());
             other.write_all(b"xy").await.unwrap();
-            s.tcp().readable().await.unwrap();
+            s.tcp().unwrap().readable().await.unwrap();
             assert!(s.waiting());
             // A read that fills its buffer leaves the connection readable, to
             // the event loop, until a peek finds nothing.
             assert_eq!(s.read(&mut [0; 2]).await.unwrap(), 2);
             assert!(!s.waiting());
-            assert!(within(Some(Duration::from_millis(50)), s.tcp().readable()).await.is_none());
+            assert!(within(Some(Duration::from_millis(50)), s.tcp().unwrap().readable()).await.is_none());
             // What comes before the end is waiting; the end is not.
             other.write_all(b"z").await.unwrap();
             other.shutdown().await.unwrap();
-            s.tcp().readable().await.unwrap();
+            s.tcp().unwrap().readable().await.unwrap();
             assert!(s.waiting());
             assert_eq!(read_into(&mut s, &mut buf, None).await, 1);
             assert!(!s.waiting());

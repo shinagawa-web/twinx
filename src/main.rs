@@ -4,6 +4,7 @@ mod clock;
 mod conf;
 mod expires;
 mod config;
+mod h2;
 mod http;
 mod log;
 mod ocsp;
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use libc::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, c_int, pid_t, sigset_t};
 
 /// What `-V` prints: Test::Nginx reads it to tell which modules twinx has.
-const CONFIGURE: &str = "--with-http_ssl_module --without-http_fastcgi_module --without-http_uwsgi_module \
+const CONFIGURE: &str = "--with-http_ssl_module --with-http_v2_module --without-http_fastcgi_module --without-http_uwsgi_module \
 --with-http_gunzip_module --with-http_gzip_static_module --without-http_scgi_module --without-http_grpc_module --without-http_memcached_module";
 
 /// The TLS library line of `-V`. twinx does TLS with rustls; nginx-tests reads

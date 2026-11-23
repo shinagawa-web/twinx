@@ -98,6 +98,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("ssl_ecdh_curve", HTTP | SRV, 1, 1, false),
     ("ssl_prefer_server_ciphers", HTTP | SRV, 1, 1, false),
     ("ssl_reject_handshake", HTTP | SRV, 1, 1, false),
+    ("http2", HTTP | SRV, 1, 1, false),
     ("ssl_conf_command", HTTP | SRV, 2, 2, false),
     ("ssl_session_cache", HTTP | SRV, 1, 2, false),
     ("ssl_session_tickets", HTTP | SRV, 1, 1, false),
@@ -478,6 +479,8 @@ pub struct Level {
     /// ssl_reject_handshake: handshakes for the server are refused with an
     /// unrecognized_name alert.
     pub ssl_reject_handshake: bool,
+    /// http2: connections that start with the HTTP/2 preface speak HTTP/2.
+    pub http2: bool,
     /// ssl_ecdh_curve: the groups keys are exchanged with; None takes the default ones.
     pub ssl_ecdh_curve: Option<String>,
     /// ssl_session_ticket_key: the files of the keys tickets are encrypted
@@ -863,6 +866,7 @@ impl Builder<'_> {
                 "ssl_ecdh_curve" => level.ssl_ecdh_curve = Some(d.args[0].clone()),
                 "ssl_prefer_server_ciphers" => level.ssl_prefer_server_ciphers = flag(d).map_err(at)?,
                 "ssl_reject_handshake" => level.ssl_reject_handshake = flag(d).map_err(at)?,
+                "http2" => level.http2 = flag(d).map_err(at)?,
                 // OpenSSL's commands that take a file are given its name in full, as nginx does.
                 "ssl_conf_command" => commands.get_or_insert_default().push((d.args[0].clone(), if ["Certificate", "PrivateKey"].contains(&d.args[0].as_str()) { self.path(&d.args[1]).to_string_lossy().into_owned() } else { d.args[1].clone() })),
                 // The sessions are kept in memory of each server, whatever the cache.
