@@ -435,14 +435,18 @@ struct Response {
 
 /// The connection to a proxied server whose body is still to be read, with
 /// what has been read of the answer, where its head ends, how the body's end
-/// is found, the rate, when the request to it started, and how long a read may wait.
+/// is found, the rate, when the request to it started, and how long a read may wait;
+/// whether the connection may be used again once the body has ended, and where it
+/// goes back to then: the upstream, the server's address and the location's tag.
 #[derive(Debug)]
-struct Rest { s: Stream, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration> }
+struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)> }
 
 /// Reads the rest of a proxied answer's body, noting how long the whole answer took.
 async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
-    let (body, read, _) = read_body(&mut rest.s, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await.unwrap_or_default();
+    let (body, read, ended) = read_body(&mut rest.conn.stream, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await.unwrap_or_default();
+    // A read that failed gave no body, and no end of it.
+    if let Some((up, addr, tag)) = rest.home.filter(|_| rest.keep && ended) { up.put(rest.conn, addr, tag); }
     resp.body = body;
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
@@ -1265,6 +1269,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout) && (resend || !begun);
         // The connection of an answer that is not used is closed.
         if let Some(conn) = kept.flatten().filter(|_| !again) { up.put(conn, addr, tag); }
+        // That of one whose body is still to be read goes back after it.
+        if let Some(rest) = answer.as_mut().and_then(|a| a.rest.as_mut()).filter(|_| !again) { rest.home = Some((up.clone(), addr, tag)); }
         up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404)));
         if !again || tries == 0 { break; }
         answer = None;
@@ -1434,7 +1440,7 @@ enum NoAnswer {
 /// Sends a request to a proxied server and reads its answer. The connection
 /// comes with it only when it may be used for another request: it has no
 /// TLS, the server does not close it, and the answer's body was read to its
-/// end with nothing after it.
+/// end with nothing after it. With a rate it is in the answer's rest.
 #[allow(clippy::too_many_arguments)]
 async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Result<(Response, Option<Conn>), NoAnswer> {
     use NoAnswer::{Closed, Other};
@@ -1497,7 +1503,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let keep = status >= 200 && !closes(version, &values("connection")) && !skipped && matches!(s, Stream::Tcp(_));
     let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
-    if rate > 0 { return Ok((Response { rest: Some(Rest { s: conn.stream, answer, end, length, chunked, rate, started: start, wait }), ..resp }, None)); }
+    if rate > 0 { return Ok((Response { rest: Some(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None }), ..resp }, None)); }
     let (body, read, ended) = read_body(s, answer, end, length, chunked, 0, wait).await.ok_or(Other)?;
     (resp.body, bytes[0], bytes[1]) = (body, (read - end) as u64, read as u64);
     Ok((resp, Some(conn).filter(|_| keep && ended)))
@@ -2442,11 +2448,11 @@ mod tests {
     }
 
     /// The bodies that answer the requests, which are sent one after another to the
-    /// locations /a and /b that pass them to an upstream with the settings and the
-    /// server, and the requests that came to it.
+    /// locations /a, /b and, with proxy_limit_rate, /c that pass them to an upstream
+    /// with the settings and the server, and the requests that came to it.
     fn proxied(settings: &str, lines: &'static str, requests: &[(&str, &str)]) -> (Vec<String>, Vec<(usize, String)>) {
         let (addr, came) = answering(lines);
-        let text = format!("http {{ upstream u {{ server {addr}; {settings} }} server {{ location /a {{ proxy_pass http://u; }} location /b {{ proxy_pass http://u; }} }} }}");
+        let text = format!("http {{ upstream u {{ server {addr}; {settings} }} server {{ location /a {{ proxy_pass http://u; }} location /b {{ proxy_pass http://u; }} location /c {{ proxy_pass http://u; proxy_limit_rate 1m; }} }} }}");
         let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let bodies = block_on(async {
             let mut bodies = Vec::new();
@@ -2454,8 +2460,9 @@ mod tests {
                 let (parsed, mut r) = request(head);
                 r.body = body.as_bytes().to_vec();
                 let found = located(&config.servers[0], &r, &r.uri);
-                let (resp, _, _) = answer(&config.servers[0], &r, parsed, found, None).await;
-                assert_eq!(resp.status, 200);
+                let (mut resp, _, _) = answer(&config.servers[0], &r, parsed, found, None).await;
+                assert_eq!((resp.status, resp.rest.is_some()), (200, r.uri == "/c"));
+                finish(&mut resp).await;
                 assert!(resp.upstream_time.unwrap()[0].iter().all(Option::is_some));
                 bodies.push(String::from_utf8(resp.body).unwrap());
             }
@@ -2480,6 +2487,31 @@ mod tests {
             let (_, came) = proxied(settings, lines, &requests);
             assert_eq!(came.iter().map(|c| c.0).collect::<Vec<_>>(), connections, "{settings} {lines}");
         }
+    }
+
+    #[test]
+    fn connections_of_answers_read_at_the_rate_are_kept() {
+        // The bodies are too long to come with the head.
+        let long = "x".repeat(6000);
+        let (one, two) = (format!("GET /c?1{long} HTTP/1.0\n\n"), format!("GET /c?2{long} HTTP/1.0\n\n"));
+        for (lines, connections) in [("", [0, 0]), ("Connection: close\r\n", [0, 1])] {
+            let (bodies, came) = proxied("keepalive 2;", lines, &[(&one, ""), (&two, "")]);
+            assert_eq!(bodies, [format!("GET /c?1{long} HTTP/1.1"), format!("GET /c?2{long} HTTP/1.1")]);
+            assert_eq!(came.iter().map(|c| c.0).collect::<Vec<_>>(), connections, "{lines}");
+        }
+        // A body that is shorter than its length.
+        let (addr, came) = closing("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab");
+        let text = format!("http {{ upstream u {{ server {addr}; keepalive 2; }} server {{ location / {{ proxy_pass http://u; proxy_limit_rate 1m; }} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        block_on(async {
+            for connections in 1..3 {
+                let mut resp = answered(&config.servers[0], "GET / HTTP/1.0\n\n").await;
+                assert!(resp.rest.is_some());
+                finish(&mut resp).await;
+                assert_eq!((resp.body.as_slice(), resp.upstream_status.as_deref()), (&b"ab"[..], Some("200")));
+                assert_eq!(*came.lock().unwrap(), connections);
+            }
+        });
     }
 
     #[test]
