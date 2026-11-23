@@ -547,8 +547,8 @@ struct Response {
     /// Whether a Location that starts with "/" is sent as it is: one a proxied
     /// server sent and proxy_redirect did not rewrite.
     relative: bool,
-    /// What is left to read of a proxied answer's body that proxy_limit_rate
-    /// paces: it is read once the head is made, as nginx sends the head first.
+    /// The body of a proxied answer, still to be read: it is read once the head
+    /// is made, as nginx sends the head first.
     rest: Option<Box<Rest>>,
     /// Set when the body is only what came of a proxied answer's, its server having
     /// closed the connection before the end of it, or a read of it having failed or
@@ -565,15 +565,32 @@ struct Cut { length: Option<usize>, malformed: bool }
 /// what has been read of the answer, where its head ends, how the body's end
 /// is found, the rate, when the request to it started, and how long a read may wait;
 /// whether the connection may be used again once the body has ended, and where it
-/// goes back to then: the upstream, the server's address and the location's tag.
+/// goes back to then: the upstream, the server's address and the location's tag;
+/// and where the trailers are then, if they are passed.
 #[derive(Debug)]
-struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)> }
+struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)>, trailers: Option<Trailers> }
 
-/// Reads the rest of a proxied answer's body, noting how long the whole answer took.
+/// The trailers of an answer over HTTP/2 (proxy_pass_trailers): the slot they come
+/// in, the headers proxy_hide_header names, and what they are passed through.
+#[derive(Debug)]
+struct Trailers { slot: Arc<std::sync::Mutex<Vec<(String, String)>>>, hide: Vec<String>, to: Arc<crate::vars::Shared> }
+
+impl Trailers {
+    /// Takes the trailers, which are there once the answer's stream has ended;
+    /// those proxy_hide_header names, or that nginx hides, are not passed.
+    async fn take(&self, s: &mut Stream, wait: Option<Duration>) {
+        while read_into(s, &mut Vec::new(), wait).await > 0 {}
+        *self.to.trailers.lock().unwrap() = std::mem::take(&mut *self.slot.lock().unwrap()).into_iter().filter(|(n, _)| !hidden(&self.hide, n)).collect();
+    }
+}
+
+/// Reads the body of a proxied answer, if it is still to be read, noting how long
+/// the whole answer took and how many bytes it has, and gives its connection back.
 async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
     let (read, ended);
     (resp.body, read, ended, resp.cut) = read_body(&mut rest.conn.stream, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await;
+    if let Some(t) = rest.trailers.filter(|_| rest.keep && ended) { t.take(&mut rest.conn.stream, Some(rest.wait.unwrap_or_default())).await; }
     if let Some((up, addr, tag)) = rest.home.filter(|_| rest.keep && ended) { up.put(rest.conn, addr, tag); }
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
@@ -1415,12 +1432,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             }
             Err(resp) => (resp, None),
         };
-        // proxy_pass_trailers: those of an answer over HTTP/2 are there once its stream has ended, and
-        // those proxy_hide_header names, or that nginx hides, are not passed.
-        if let (Some(_), Some(Some(c))) = (answer.as_ref().filter(|_| level.proxy_pass_trailers && level.proxy_h2), kept.as_mut()) {
-            while read_into(&mut c.stream, &mut Vec::new(), Some(level.proxy_read_timeout)).await > 0 {}
-            *r.shared.trailers.lock().unwrap() = std::mem::take(&mut *slot.lock().unwrap()).into_iter().filter(|(n, _)| !hidden(level, n)).collect();
-        }
+        // proxy_pass_trailers: those of an answer without a body are taken now.
+        let trailers = (level.proxy_pass_trailers && level.proxy_h2).then(|| Trailers { slot, hide: level.proxy_hide_header.clone(), to: r.shared.clone() });
+        if let (Some(t), Some(Some(c))) = (&trailers, kept.as_mut()) { t.take(&mut c.stream, Some(level.proxy_read_timeout)).await; }
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
@@ -1439,8 +1453,12 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // The connection of an answer that is not used is closed.
         // One over HTTP/2 is not kept.
         if let Some(conn) = kept.flatten().filter(|_| !again && !level.proxy_h2) { up.put(conn, addr, tag); }
-        // That of one whose body is still to be read goes back after it.
-        if let Some(rest) = answer.as_mut().and_then(|a| a.rest.as_mut()).filter(|_| !again && !level.proxy_h2) { rest.home = Some((up.clone(), addr, tag)); }
+        // That of one whose body is still to be read goes back after it, when the
+        // trailers are taken and the time is noted too.
+        if let Some(rest) = answer.as_mut().and_then(|a| a.rest.as_mut()).filter(|_| !again) {
+            (rest.started, rest.trailers) = (start, trailers);
+            if !level.proxy_h2 { rest.home = Some((up.clone(), addr, tag)); }
+        }
         up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404)));
         if !again || tries == 0 { break; }
         answer = None;
@@ -1611,10 +1629,10 @@ enum NoAnswer {
     Other,
 }
 
-/// Sends a request to a proxied server and reads its answer. The connection
-/// comes with it only when it may be used for another request: the server
-/// does not close it, and the answer's body was read to its end with nothing
-/// after it. With a rate it is in the answer's rest.
+/// Sends a request to a proxied server and reads the head of its answer; the
+/// body, if there is one to read, is in the answer's rest. Without one, the
+/// connection comes with it only when it may be used for another request: the
+/// server does not close it, and nothing came after the head.
 #[allow(clippy::too_many_arguments)]
 async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, (upgrade, hints): (bool, bool)) -> Result<(Response, Option<Conn>), NoAnswer> {
     use NoAnswer::{Closed, Other};
@@ -1649,7 +1667,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         if status != 103 { break (head, end, status) }
         // Early hints go to the client, with the headers of the answer that are
         // not hidden, when early_hints lets them and it has any; the answer comes after.
-        let shown = head.split('\n').skip(1).map(|l| l.trim_end_matches('\r')).filter_map(upstream_header).filter(|(n, _)| !hidden(level, n));
+        let shown = head.split('\n').skip(1).map(|l| l.trim_end_matches('\r')).filter_map(upstream_header).filter(|(n, _)| !hidden(&level.proxy_hide_header, n));
         let lines: String = shown.map(|(n, v)| format!("{n}: {v}\r\n")).collect();
         if let Some(c) = client.as_deref_mut().filter(|c| hints && !lines.is_empty() && !matches!(c, Stream::Pipe(_))) {
             write_all(c, format!("HTTP/1.1 103 Early Hints\r\n{lines}\r\n").as_bytes(), send_timeout(level)).await;
@@ -1690,19 +1708,19 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let skipped = accel && !no_body && length != Some(0);
     let keep = status >= 200 && !closes(version, &values("connection")) && !skipped;
     let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
+    if length == Some(0) {
+        (bytes[0], bytes[1]) = ((answer.len() - end) as u64, answer.len() as u64);
+        return Ok((resp, Some(conn).filter(|_| keep && answer.len() == end)));
+    }
     let rate = rate(&resp);
-    if rate > 0 { return Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None })), ..resp }, None)); }
-    let (read, ended);
-    (resp.body, read, ended, resp.cut) = read_body(s, answer, end, length, chunked, 0, wait).await;
-    (bytes[0], bytes[1]) = ((read - end) as u64, read as u64);
-    Ok((resp, Some(conn).filter(|_| keep && ended)))
+    Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None, trailers: None })), ..resp }, None))
 }
 
 /// Whether a header of a proxied server's early hints is hidden, as those of
 /// proxy_hide_header and those nginx hides by default are.
-fn hidden(level: &Level, name: &str) -> bool {
+fn hidden(hide: &[String], name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    ["date", "server", "x-pad"].contains(&lower.as_str()) || lower.starts_with("x-accel-") || level.proxy_hide_header.contains(&lower)
+    ["date", "server", "x-pad"].contains(&lower.as_str()) || lower.starts_with("x-accel-") || hide.contains(&lower)
 }
 
 /// A header line of a proxied server's answer as ngx_http_parse_header_line()
@@ -2462,7 +2480,7 @@ mod tests {
         assert_eq!(head_end(b"GET / HTTP/1.0\nHost: a\n\nrest"), Some(24));
         assert_eq!(head_end(b"GET / HTTP/1.0\r\n\r\n"), Some(18));
         let level = Level { proxy_hide_header: vec!["x-b".into()], ..Level::default() };
-        assert_eq!(["Date", "X-Accel-A", "x-pad", "X-B", "Link"].map(|n| hidden(&level, n)), [true, true, true, true, false]);
+        assert_eq!(["Date", "X-Accel-A", "x-pad", "X-B", "Link"].map(|n| hidden(&level.proxy_hide_header, n)), [true, true, true, true, false]);
         // A status line without a reason is no HTTP/0.9 request line.
         let answer = b"HTTP/1.1 103 \r\nLink: a\r\n\r\nHTTP/1.1 200 \r\n";
         assert_eq!((head_end(answer), line_end(answer).and_then(|at| lines_end(answer, at))), (Some(15), Some(26)));
@@ -2549,10 +2567,15 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (mut time, mut bytes) = ([None; 3], [0; 3]);
-        let resp = block_on(fetched(&addr, None, &level, (&mut time, &mut bytes), &|_| 0)).unwrap();
+        let resp = block_on(async {
+            let mut resp = fetched(&addr, None, &level, (&mut time, &mut bytes), &|_| 0).await.unwrap();
+            resp.upstream_bytes = Some(vec![bytes]);
+            finish(&mut resp).await;
+            resp
+        });
         assert!(time[0].is_some() && time[1].is_some());
         // The body, the whole answer and the request, in bytes.
-        assert_eq!(bytes, [4, 80, 18]);
+        assert_eq!(resp.upstream_bytes.unwrap(), [[4, 80, 18]]);
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
         assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
@@ -3116,7 +3139,7 @@ mod tests {
     #[test]
     fn connections_that_may_be_used_again() {
         // Whether the server closes the connection after its answer comes before
-        // whether fetch() returns the connection.
+        // whether fetch() returns the connection, or finish() gives it back.
         let answers: [(&str, &str, bool, bool); 19] = [
             ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nab", false, true),
             ("GET", "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nab", false, false),
@@ -3155,11 +3178,17 @@ mod tests {
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         for (method, answer, _, kept) in answers {
             let req = format!("{method} / HTTP/1.1\r\n\r\n");
-            let (_, conn) = block_on(async {
+            let back = block_on(async {
                 let s = connect(&addr, None, &level).await?;
-                fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, (false, false)).await.ok()
+                let (mut resp, conn) = fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, (false, false)).await.ok()?;
+                let mut up = Upstream::new(vec![crate::upstream::Peer::new(addr)]);
+                up.keepalive = Some(Default::default());
+                let up = Arc::new(up);
+                if let Some(rest) = &mut resp.rest { rest.home = Some((up.clone(), addr, 0)); }
+                finish(&mut resp).await;
+                Some(conn.is_some() || up.take(&addr, 0).is_some())
             }).unwrap();
-            assert_eq!(conn.is_some(), kept, "{method} {answer}");
+            assert_eq!(back, kept, "{method} {answer}");
         }
     }
 
@@ -3212,7 +3241,7 @@ mod tests {
                 r.body = body.as_bytes().to_vec();
                 let found = located(&config.servers[0], &r, &r.uri);
                 let (mut resp, _, _) = answer(&config.servers[0], &r, parsed, found, None).await;
-                assert_eq!((resp.status, resp.rest.is_some()), (200, r.uri == "/c"));
+                assert_eq!((resp.status, resp.rest.is_some()), (200, true));
                 finish(&mut resp).await;
                 assert!(resp.upstream_time.unwrap()[0].iter().all(Option::is_some));
                 bodies.push(String::from_utf8(resp.body).unwrap());
@@ -3538,7 +3567,8 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         block_on(async {
             let mut answers = Vec::new();
             for target in requests {
-                let resp = answered(&config.servers[0], &format!("GET {target} HTTP/1.0\n\n")).await;
+                let mut resp = answered(&config.servers[0], &format!("GET {target} HTTP/1.0\n\n")).await;
+                finish(&mut resp).await;
                 // $upstream_connect_time of the last try.
                 let times = resp.upstream_time.unwrap();
                 assert!(times.last().unwrap()[0].is_some(), "{times:?}");
@@ -3607,7 +3637,11 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             }
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = block_on(fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &|_| 0)).unwrap();
+        let resp = block_on(async {
+            let mut resp = fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &|_| 0).await.unwrap();
+            finish(&mut resp).await;
+            resp
+        });
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
             assert!(block_on(fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &|_| 0)).is_none());
