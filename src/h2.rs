@@ -53,7 +53,8 @@ const CONCURRENT: usize = 128;
 const TABLE_SIZE: usize = 4096;
 
 type Fields = Vec<(Vec<u8>, Vec<u8>)>;
-type Addrs = (SocketAddr, SocketAddr, SocketAddr);
+/// The listening, local and remote addresses of a connection, and its TLS session.
+pub type Addrs = (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>);
 /// What a stream is answered with: the status, the headers and the body; none resets it.
 type Answer = Option<(u16, Fields, Vec<u8>)>;
 
@@ -575,7 +576,7 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
                 // A line HTTP/1 refuses, for the answer nginx gives with 400.
                 None => b"-\r\n\r\n".to_vec(),
             };
-            let (tx, config) = (tx.clone(), config.clone());
+            let (tx, config, addrs) = (tx.clone(), config.clone(), addrs.clone());
             tokio::task::spawn_local(async move { let _ = tx.send((sid, exchange(config, request, addrs).await)); });
         }
         c.send_data();
@@ -594,9 +595,9 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
 }
 
 /// Answers the request of a stream, as a connection of its own answers it.
-async fn exchange(config: Arc<Config>, request: Vec<u8>, (listen, local, peer): Addrs) -> Answer {
+async fn exchange(config: Arc<Config>, request: Vec<u8>, (listen, local, peer, ssl): Addrs) -> Answer {
     let (mut ours, theirs) = tokio::io::duplex(65536);
-    tokio::task::spawn_local(async move { crate::http::connection(&config, Stream::Pipe(theirs), (listen, local, peer, None), Busy::new()).await });
+    tokio::task::spawn_local(async move { crate::http::connection(&config, Stream::Pipe(theirs), (listen, local, peer, ssl), Busy::new()).await });
     let mut answer = Vec::new();
     let _ = ours.write_all(&request).await;
     let _ = ours.shutdown().await;
