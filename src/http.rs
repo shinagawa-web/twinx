@@ -160,8 +160,11 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
     let mut buf = Vec::new();
     // After a kept-alive answer: how long the connection waits for the next request.
     let (connected, mut requests, mut idle) = (Instant::now(), 0, None);
+    // Whether any of its requests was pipelined, as nginx's c->pipeline stays set.
+    let mut piped = false;
     loop {
         let (pipelined, started) = (!buf.is_empty(), Instant::now());
+        piped |= pipelined;
         requests += 1;
         // Header lines are read with the settings of the default server of the address.
         let default = config.servers.iter().find(|s| s.listen.contains(&listen)).unwrap_or(&config.servers[0]);
@@ -261,7 +264,7 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
             let lingers = match level.lingering_close {
                 // Closing with something unread resets the connection, which can
                 // destroy the answer before the client reads it.
-                Some(false) => parsed.is_err() || unbuffered || pipelined || !buf.is_empty() || stream.waiting(),
+                Some(false) => parsed.is_err() || unbuffered || piped || !buf.is_empty() || stream.waiting(),
                 always => always.is_some(),
             };
             return close(&mut stream, lingers).await;
