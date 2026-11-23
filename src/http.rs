@@ -1217,6 +1217,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         addrs.push(addr.to_string());
         // A kept connection is used wherever it was bound, as in nginx. Those over TLS are not kept.
         let taken = if p.ssl { None } else { up.take(&addr, tag) };
+        let cached = taken.is_some();
         // A socket that cannot be bound fails the request without trying the next server.
         let socket = bind.filter(|_| taken.is_none()).map(|b| bound(&addr, b));
         if socket.as_ref().is_some_and(Option::is_none) { return special(500); }
@@ -1236,11 +1237,14 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             None => connect(&addr, socket.flatten(), tls.as_ref().map(|t| (t, name.as_deref())), level).await.map(|s| Conn::new(s, connecting)),
         };
         let begun = conn.is_ok();
+        let mut closed = false;
         let kept;
         (answer, kept) = match conn {
             Ok(conn) => {
                 time[0] = Some(connecting.elapsed().as_millis());
-                fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade).await.unzip()
+                let fetched = fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade).await;
+                closed = matches!(fetched, Err(NoAnswer::Closed));
+                fetched.ok().unzip()
             }
             Err(resp) => (resp, None),
         };
@@ -1249,7 +1253,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         bytes.push(counted);
         // An error, or a status proxy_next_upstream names while servers are
         // left to try, goes on to the next server; 403 and 404 are no failures.
-        tries -= 1;
+        // A kept connection that turns out to be closed, which is in the cache no
+        // more, does not use up a try.
+        if !(cached && closed) { tries -= 1; }
         let status = answer.as_ref().map(|a| a.status);
         statuses.push(status.unwrap_or(502).to_string());
         // proxy_next_upstream_tries and proxy_next_upstream_timeout end the tries too.
@@ -1416,29 +1422,39 @@ async fn connect(peer: &SocketAddr, socket: Option<socket2::Socket>, tls: Option
     }
 }
 
+/// Why there is no answer of a proxied server.
+enum NoAnswer {
+    /// The connection failed or was closed before the whole head came.
+    Closed,
+    /// The answer is invalid, or did not come in time or to its end; or the
+    /// request's body could not be passed.
+    Other,
+}
+
 /// Sends a request to a proxied server and reads its answer. The connection
 /// comes with it only when it may be used for another request: it has no
 /// TLS, the server does not close it, and the answer's body was read to its
-/// end with nothing after it. None when there is no valid answer.
+/// end with nothing after it.
 #[allow(clippy::too_many_arguments)]
-async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<(Response, Option<Conn>)> {
+async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Result<(Response, Option<Conn>), NoAnswer> {
+    use NoAnswer::{Closed, Other};
     let s = &mut conn.stream;
     // proxy_read_timeout: how long each read may wait.
     let wait = Some(level.proxy_read_timeout).filter(|t| !t.is_zero());
     let (mut answer, mut chunk) = (Vec::new(), vec![0u8; 4096]);
-    if !write_all(s, req, None).await { return None }
+    if !write_all(s, req, None).await { return Err(Closed) }
     bytes[2] = req.len() as u64;
     // The rest of a body that is not buffered goes on as the client sends it.
-    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut()?, max, s).await?; }
+    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other)?, max, s).await.ok_or(Other)?; }
     // A head that does not fit in proxy_buffer_size is too big: the answer is invalid.
     let end = loop {
         if let Some(end) = head_end(&answer[..answer.len().min(level.proxy_buffer_size)]) { break end; }
-        if answer.len() >= level.proxy_buffer_size { return None; }
+        if answer.len() >= level.proxy_buffer_size { return Err(Other); }
         let closed = async { match client.as_deref() { Some(c) => crate::stream::closed(c.tcp()).await, None => std::future::pending().await } };
         let n = tokio::select! {
             biased;
-            () = closed => return Some((Response { status: 499, ..Response::default() }, None)),
-            n = within(wait, s.read(&mut chunk)) => n?.ok().filter(|n| *n > 0)?,
+            () = closed => return Ok((Response { status: 499, ..Response::default() }, None)),
+            n = within(wait, s.read(&mut chunk)) => n.ok_or(Other)?.ok().filter(|n| *n > 0).ok_or(Closed)?,
         };
         answer.extend_from_slice(&chunk[..n]);
         bytes[1] = answer.len() as u64;
@@ -1446,13 +1462,13 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     time[1] = Some(start.elapsed().as_millis());
     let head = crate::vars::text(&answer[..end]);
     let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
-    let first = lines.next()?;
-    let version = first.split(' ').next()?;
-    let status = first.strip_prefix("HTTP/1.")?.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()?;
+    let first = lines.next().ok_or(Other)?;
+    let version = first.split(' ').next().ok_or(Other)?;
+    let status = first.strip_prefix("HTTP/1.").and_then(|f| f.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()).ok_or(Other)?;
     let mut resp = Response { status, proxied: true, ..Response::default() };
     const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
     for line in lines {
-        let (name, value) = upstream_header(line)?;
+        let (name, value) = upstream_header(line).ok_or(Other)?;
         let (lower, value) = (name.to_ascii_lowercase(), value.to_string());
         resp.upstream.push((name.to_string(), value.clone()));
         if lower == "content-type" { resp.ctype = Some(value.into()); continue; }
@@ -1461,16 +1477,16 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         if !again && !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
     }
     // 101 to a request with Upgrade: what came after the head goes to the client first.
-    if status == 101 && upgrade { return Some((Response { body: answer[end..].to_vec(), tunnel: Some(conn.stream), ..resp }, None)); }
+    if status == 101 && upgrade { return Ok((Response { body: answer[end..].to_vec(), tunnel: Some(conn.stream), ..resp }, None)); }
     // The body's length: one Content-Length of digits, or one "Transfer-Encoding:
     // chunked" without it; any other mix makes the answer invalid. A HEAD, 204
     // or 304 answer has no body.
     let values = |name: &str| resp.upstream.iter().filter(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone()).collect::<Vec<_>>();
     let (length, chunked) = match (&values("content-length")[..], &values("transfer-encoding")[..]) {
         ([], []) => (None, false),
-        ([l], []) => (Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten()?), false),
+        ([l], []) => (Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten().ok_or(Other)?), false),
         ([], [c]) if c.eq_ignore_ascii_case("chunked") => (None, true),
-        _ => return None,
+        _ => return Err(Other),
     };
     // The body of an answer that redirects with X-Accel-Redirect is not read.
     let accel = resp.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect"));
@@ -1481,10 +1497,10 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let keep = status >= 200 && !closes(version, &values("connection")) && !skipped && matches!(s, Stream::Tcp(_));
     let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
-    if rate > 0 { return Some((Response { rest: Some(Rest { s: conn.stream, answer, end, length, chunked, rate, started: start, wait }), ..resp }, None)); }
-    let (body, read, ended) = read_body(s, answer, end, length, chunked, 0, wait).await?;
+    if rate > 0 { return Ok((Response { rest: Some(Rest { s: conn.stream, answer, end, length, chunked, rate, started: start, wait }), ..resp }, None)); }
+    let (body, read, ended) = read_body(s, answer, end, length, chunked, 0, wait).await.ok_or(Other)?;
     (resp.body, bytes[0], bytes[1]) = (body, (read - end) as u64, read as u64);
-    Some((resp, Some(conn).filter(|_| keep && ended)))
+    Ok((resp, Some(conn).filter(|_| keep && ended)))
 }
 
 /// A header line of a proxied server's answer as ngx_http_parse_header_line()
@@ -2133,7 +2149,7 @@ mod tests {
         let start = Instant::now();
         let s = match connect(addr, socket, None, level).await { Ok(s) => s, Err(resp) => return resp };
         time[0] = Some(start.elapsed().as_millis());
-        fetch(Conn::new(s, start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, false).await.map(|(resp, _)| resp)
+        fetch(Conn::new(s, start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, false).await.ok().map(|(resp, _)| resp)
     }
 
     #[test]
@@ -2384,7 +2400,7 @@ mod tests {
             let req = format!("{method} / HTTP/1.1\r\n\r\n");
             let (_, conn) = block_on(async {
                 let s = connect(&addr, None, None, &level).await.ok()?;
-                fetch(Conn::new(s, Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).await
+                fetch(Conn::new(s, Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).await.ok()
             }).unwrap();
             assert_eq!(conn.is_some(), kept, "{method} {answer}");
         }
@@ -2552,6 +2568,93 @@ mod tests {
                 let directives = format!("proxy_request_buffering off; {directives}");
                 assert_eq!(passed_to([a, b], &directives, &format!("PUT / HTTP/1.1\nHost: h\n{framing}\n\n"), Some(Unread { left, chunked, rest: Vec::new() })), want, "{framing}");
                 assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, 0), "{framing}");
+            }
+        }
+    }
+
+    /// A server whose connections answer so many requests each, those that are not
+    /// listed any number, read the next one and close without answering it; and how
+    /// many requests came.
+    fn dropping(answers: &'static [usize]) -> (SocketAddr, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
+        let all = came.clone();
+        thread::spawn(move || {
+            for (i, s) in listener.incoming().enumerate() {
+                let (mut s, came, mut left) = (s.unwrap(), all.clone(), answers.get(i).copied());
+                thread::spawn(move || {
+                    let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
+                    loop {
+                        while head_end(&buf).is_none() {
+                            let Ok(n @ 1..) = s.read(&mut chunk) else { return };
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                        buf.clear();
+                        *came.lock().unwrap() += 1;
+                        if left == Some(0) { return }
+                        left = left.map(|n| n - 1);
+                        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+                    }
+                });
+            }
+        });
+        (addr, came)
+    }
+
+    /// The answer of a server to a request without a body.
+    async fn answered(server: &Server, head: &str) -> Response {
+        let (parsed, r) = request(head);
+        answer(server, &r, parsed, located(server, &r, &r.uri), None).await.0
+    }
+
+    #[test]
+    fn kept_connections_that_are_closed_use_up_no_try() {
+        let (any, off, once) = ("proxy_next_upstream error non_idempotent;", "proxy_next_upstream off;", "proxy_next_upstream_tries 1;");
+        // How many requests the connections to each server answer, and how many
+        // connections there are to keep, as many to each server; the directives and the
+        // method; and the servers tried, each with its status.
+        let one: &[&[usize]] = &[&[1]];
+        let cases: [(&[&'static [usize]], usize, &str, &str, &[(usize, u16)]); 13] = [
+            (one, 1, "", "GET", &[(0, 502), (0, 200)]),
+            (one, 1, once, "GET", &[(0, 502), (0, 200)]),
+            (one, 1, "", "POST", &[(0, 502)]),
+            (one, 1, any, "POST", &[(0, 502), (0, 200)]),
+            (one, 1, off, "GET", &[(0, 502)]),
+            (&[&[1, 1]], 2, "", "GET", &[(0, 502), (0, 502), (0, 200)]),
+            // A new connection uses up the try, also after a kept one.
+            (&[&[0]], 0, "", "GET", &[(0, 502)]),
+            (&[&[1, 0]], 1, "", "GET", &[(0, 502), (0, 502)]),
+            (&[&[1], &[]], 2, "", "GET", &[(0, 502), (1, 200)]),
+            (&[&[1], &[]], 2, once, "GET", &[(0, 502), (1, 200)]),
+            (&[&[0], &[]], 0, "", "GET", &[(0, 502), (1, 200)]),
+            (&[&[0], &[]], 0, once, "GET", &[(0, 502)]),
+            // Neither of two servers is tried again.
+            (&[&[1], &[1]], 2, "", "GET", &[(0, 502), (1, 502)]),
+        ];
+        for (answers, kept, directives, method, want) in cases {
+            let servers: Vec<_> = answers.iter().map(|a| dropping(a)).collect();
+            let list: String = servers.iter().map(|s| format!("server {}; ", s.0)).collect();
+            let text = format!("http {{ upstream u {{ {list}keepalive 2; }} proxy_read_timeout 1s; server {{ location / {{ proxy_pass http://u; {directives} }} }} }}");
+            let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+            let server = &config.servers[0];
+            let resp = block_on(async {
+                let get = || answered(server, "GET / HTTP/1.0\n\n");
+                // Two at once have a connection each.
+                let statuses = match kept {
+                    0 => Vec::new(),
+                    1 => vec![get().await.status],
+                    _ => <[Response; 2]>::from(tokio::join!(get(), get())).map(|r| r.status).to_vec(),
+                };
+                assert_eq!(statuses, vec![200; kept]);
+                answered(server, &format!("{method} / HTTP/1.0\n\n")).await
+            });
+            let joined = |f: &dyn Fn(&(usize, u16)) -> String| Some(want.iter().map(f).collect::<Vec<_>>().join(", "));
+            let case = format!("{answers:?} {method} {directives}");
+            assert_eq!(Some(resp.status), want.last().map(|w| w.1), "{case}");
+            assert_eq!(resp.upstream_status, joined(&|w| w.1.to_string()), "{case}");
+            assert_eq!(resp.upstream_addr, joined(&|w| servers[w.0].0.to_string()), "{case}");
+            for (i, (_, came)) in servers.iter().enumerate() {
+                assert_eq!(*came.lock().unwrap(), kept / servers.len() + want.iter().filter(|w| w.0 == i).count(), "{case}");
             }
         }
     }

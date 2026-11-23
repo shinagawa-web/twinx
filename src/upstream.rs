@@ -213,14 +213,14 @@ impl Upstream {
 
     /// The next server to try, given those already tried for this request:
     /// the primary servers first, then the backup ones, as
-    /// ngx_http_upstream_get_peer() chooses them.
+    /// ngx_http_upstream_get_peer() chooses them. A single server may be tried again.
     pub fn pick(&self, tried: &mut [bool]) -> Option<usize> {
         let mut state = self.state.lock().unwrap();
         let single = self.peers.len() == 1;
         let now = now();
         [false, true].into_iter().find_map(|backup| {
             let (mut best, mut total): (Option<(usize, i64)>, i64) = (None, 0);
-            for (i, p) in self.peers.iter().enumerate().filter(|(i, p)| p.backup == backup && !p.down && !tried[*i]) {
+            for (i, p) in self.peers.iter().enumerate().filter(|(i, p)| p.backup == backup && !p.down && (single || !tried[*i])) {
                 let s = &mut state[i];
                 if !single && p.max_fails > 0 && s.fails >= p.max_fails && now - s.checked <= p.fail_timeout { continue; }
                 s.current += s.effective;
@@ -341,6 +341,14 @@ mod tests {
         assert_eq!(u.tries(), 1);
         assert_eq!(u.pick(&mut [false, false]), Some(1));
         assert_eq!(u.pick(&mut [false, true]), None);
+    }
+
+    #[test]
+    fn a_single_server_is_picked_again() {
+        let (one, two) = (peers(1, 1), peers(2, 1));
+        let (mut tried, mut both) = ([false], [false, false]);
+        assert_eq!([(); 3].map(|_| one.pick(&mut tried)), [Some(0); 3]);
+        assert_eq!([(); 3].map(|_| two.pick(&mut both)), [Some(0), Some(1), None]);
     }
 
     /// An upstream that keeps connections.
