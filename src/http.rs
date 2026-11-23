@@ -106,7 +106,8 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
                 let Ok((stream, peer)) = listener.accept().await else { tokio::time::sleep(Duration::from_millis(10)).await; continue };
                 // Until its first request has arrived, a new connection is busy too.
                 let (config, fresh) = (config.clone(), Busy::new());
-                let local = stream.local_addr().unwrap_or(addr);
+                // As in nginx, only a socket that listens on every address is asked which one it is.
+                let local = if addr.ip().is_unspecified() { stream.local_addr().unwrap_or(addr) } else { addr };
                 tokio::task::spawn_local(serving(config, stream, tls, (addr, local, peer), fresh));
             }
         }));
