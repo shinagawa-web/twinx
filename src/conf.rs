@@ -130,6 +130,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_ssl_name", HSL, 1, 1, false),
     ("proxy_ssl_server_name", HSL, 1, 1, false),
     ("proxy_method", HSL, 1, 1, false),
+    ("early_hints", HSL, 1, usize::MAX, false),
     ("proxy_set_body", HSL, 1, 1, false),
     ("expires", HSL | LIF, 1, 2, false),
     ("post_action", HSL, 1, 1, false),
@@ -457,6 +458,9 @@ pub struct Level {
     /// proxy_method: the method, which may have variables, sent to proxied
     /// servers instead of the request's.
     pub proxy_method: Option<Template>,
+    /// early_hints: the values, which may have variables, of which one not
+    /// empty and not "0" lets the early hints of proxied servers (103) go to the client.
+    pub early_hints: Vec<Template>,
     /// proxy_set_body: the body, which may have variables, sent to proxied
     /// servers instead of the client's.
     pub proxy_set_body: Option<Template>,
@@ -1011,6 +1015,7 @@ impl Builder<'_> {
                 "limit_rate" => level.limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "limit_rate_after" => level.limit_rate_after = size_value(&d.args[0]).map_err(at)?,
                 "proxy_method" => level.proxy_method = Some(Template::parse(&d.args[0]).map_err(at)?),
+                "early_hints" => level.early_hints = d.args.iter().map(|a| Template::parse(a)).collect::<Result<_, _>>().map_err(at)?,
                 "proxy_set_body" => level.proxy_set_body = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_limit_rate" => level.proxy_limit_rate = size_value(&d.args[0]).map_err(at)?,
                 "if_modified_since" => level.if_modified_since = [("off", None), ("exact", Some(false)), ("before", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"if_modified_since\" directive, it must be \"off\", \"exact\" or \"before\"", d.args[0])))?.1,
@@ -1722,6 +1727,14 @@ mod tests {
         assert_eq!((c.servers[0].level.max_headers, c.servers[1].level.max_headers), (5, 7));
         assert_eq!(build_text("http { server { } }").unwrap().servers[0].level.max_headers, 1000);
         assert_eq!(build_text("http { max_headers x; }").unwrap_err(), "invalid number in t.conf:1");
+    }
+
+    #[test]
+    fn early_hints() {
+        let c = build_text("http { early_hints $uri 1; server { location / { } location /off { early_hints 0; } } }").unwrap();
+        let [on, off] = [0, 1].map(|i| c.servers[0].locations[i].level.early_hints.len());
+        assert_eq!((on, off), (2, 1));
+        assert!(build_text("http { server { early_hints; } }").is_err());
     }
 
     #[test]
