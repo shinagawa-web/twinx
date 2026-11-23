@@ -186,7 +186,9 @@ fn write_string(out: &mut Vec<u8>, s: &[u8], lower: bool) {
 
 /// The table of the fields the client added (RFC 7541, 2.3.2), newest first, as nginx keeps it.
 #[derive(Clone)]
-struct Table { entries: VecDeque<(Vec<u8>, Vec<u8>)>, size: usize, used: usize }
+/// The dynamic table of a decoder: its fields, newest first, its size, what they use of it,
+/// and the most a size update may make it, the size the decoder announced.
+struct Table { entries: VecDeque<(Vec<u8>, Vec<u8>)>, size: usize, used: usize, limit: usize }
 
 impl Table {
     fn field(&self, index: usize) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -228,7 +230,7 @@ impl Table {
             let (bits, add) = match block[at] { 0x80.. => (7, false), 0x40.. => (6, true), 0x20.. => (5, false), _ => (4, false) };
             let index = integer(block, &mut at, bits, length)?;
             if bits == 5 {
-                if index > TABLE_SIZE { return Err(COMPRESSION_ERROR) }
+                if index > self.limit { return Err(COMPRESSION_ERROR) }
                 (self.size, _) = (index, self.evict(index));
                 continue;
             }
@@ -677,7 +679,7 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
     let (limits, keepalive) = (level.large_header_buffers, (level.keepalive_requests, level.keepalive_timeout, level.keepalive_time));
     // lingering_close on or always: closing, it reads what the client still sends.
     let lingers = level.lingering_close.is_some();
-    let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 };
+    let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
     let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive };
     // nginx's settings: the streams at a time, the window of each, the largest frame it takes; and the largest window of the connection.
     frame(&mut c.out, SETTINGS, 0, 0, &[0, 3, 0, 0, 0, CONCURRENT as u8, 0, 4, 0, 1, 0, 0, 0, 5, 0, 0xff, 0xff, 0xff]);
@@ -752,8 +754,8 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
     }
     buf.drain(..end + 4);
     let mut out = PREFACE.to_vec();
-    // nginx's settings: no pushes, and the window of a stream as large as it goes.
-    frame(&mut out, SETTINGS, 0, 0, &[0, 2, 0, 0, 0, 0, 0, 4, 0x7f, 0xff, 0xff, 0xff]);
+    // nginx's settings: no dynamic table, no pushes, and the window of a stream as large as it goes.
+    frame(&mut out, SETTINGS, 0, 0, &[0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 4, 0x7f, 0xff, 0xff, 0xff]);
     frame(&mut out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
     let mut block = Vec::new();
     literals(&mut block, fields.iter());
@@ -761,7 +763,7 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
     header_frames(&mut out, 1, &block, 16384, ended);
     // The windows the server gives the connection and the stream, the largest frame it takes, and the body to send.
     let (mut window, mut stream_window, mut frame_size, mut pending, mut finished) = (65535i64, 65535i64, 16384, Vec::new(), ended);
-    let (mut table, mut answer) = (Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 }, None::<(u8, Vec<u8>)>);
+    let (mut table, mut answer) = (Table { entries: VecDeque::new(), size: 0, used: 0, limit: 0 }, None::<(u8, Vec<u8>)>);
     loop {
         finished |= body.take(&mut buf, &mut pending);
         loop {
@@ -912,7 +914,7 @@ mod tests {
 
     #[test]
     fn table() {
-        let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 };
+        let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
         let fields = t.decode(&[0x82, 0x86, 0x84, 0x41, 0x03, b'a', b'.', b'b', 0x40, 0x01, b'x', 0x01, b'y'], 13, (4, 8192)).unwrap();
         assert_eq!(fields[3], (b":authority".to_vec(), b"a.b".to_vec()));
         assert_eq!(t.field(62), Some((b"x".to_vec(), b"y".to_vec())));
@@ -956,7 +958,7 @@ mod tests {
         assert!(answer_head(b"HTTP/1.1 200 OK\r\nbroken").is_none());
         let block = header_block(status, &headers, true);
         assert_eq!(block[..6], [0x20, 0x48, 0x03, b'3', b'0', b'1']);
-        let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 };
+        let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
         let fields = t.decode(&block, block.len(), (4, 8192)).unwrap();
         let text: Vec<_> = fields.iter().map(|(n, v)| format!("{}: {}", String::from_utf8_lossy(n), String::from_utf8_lossy(v))).collect();
         assert_eq!(text, [":status: 301", "server: twinx", "location: /x", "x-a: b"]);
@@ -988,7 +990,7 @@ mod tests {
                 let kinds: Vec<_> = sent.iter().map(|f| (f.0, f.1)).collect();
                 assert_eq!(kinds, [(SETTINGS, 0), (WINDOW_UPDATE, 0), (HEADERS, END_HEADERS), (SETTINGS, ACK), (PING, ACK), (DATA, 0), (DATA, END_STREAM)]);
                 assert_eq!((&sent[5].2[..], &sent[6].2[..]), (&b"a"[..], &b"bc"[..]));
-                let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 };
+                let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
                 let fields = t.decode(&sent[2].2, sent[2].2.len(), (100, 100)).unwrap();
                 let text: Vec<_> = fields.iter().map(|(n, v)| format!("{}: {}", String::from_utf8_lossy(n), String::from_utf8_lossy(v))).collect();
                 assert_eq!(text, [":method: POST", ":scheme: http", ":authority: h", ":path: /x", "x-a: b"]);
@@ -1006,6 +1008,15 @@ mod tests {
             };
             tokio::join!(bridge, test);
         });
+    }
+
+    #[test]
+    fn tables_without_room() {
+        // A table of no size, as the bridge announces: updates to 0 only, and nothing is kept.
+        let mut t = Table { entries: VecDeque::new(), size: 0, used: 0, limit: 0 };
+        assert_eq!(t.decode(&[0x20, 0x48, 0x03, b'2', b'0', b'0'], 6, (10, 100)).unwrap(), [(b":status".to_vec(), b"200".to_vec())]);
+        assert!(t.entries.is_empty() && t.field(62).is_none());
+        assert_eq!(t.decode(&[0x21, 0x88], 2, (10, 100)), Err(COMPRESSION_ERROR));
     }
 
     #[test]
@@ -1074,7 +1085,7 @@ mod tests {
     }
 
     fn connection() -> Connection {
-        let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 };
+        let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
         Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits: (4, 8192), send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive: (2, Duration::from_secs(75), Duration::from_secs(3600)) }
     }
 
