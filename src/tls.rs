@@ -1,12 +1,8 @@
 //! TLS: connections accepted on "listen ... ssl" and connections to proxied
-//! servers with "proxy_pass https://". The rest of twinx reads and writes plain
-//! HTTP; a thread of each TLS connection passes the decrypted bytes through a
-//! Unix socket pair, whose other end twinx uses as it uses a TCP connection.
+//! servers with "proxy_pass https://", on the worker's event loop with
+//! tokio-rustls; the rest of twinx reads and writes them as any other stream.
 
-use std::io::{Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
-use std::os::unix::net::UnixStream;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,9 +15,13 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime};
 use x509_parser::prelude::{ASN1Time, CertificateRevocationList, FromDer, GeneralName, X509Certificate, X509Version};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::{ClientConfig, ClientConnection, Connection, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
+
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 use crate::conf::Config;
+use crate::stream::Stream;
 
 /// How long a client has to finish its handshake, as client_header_timeout's default.
 const HANDSHAKE: Duration = Duration::from_secs(60);
@@ -549,9 +549,9 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
 impl ServerTls {
     /// What a connection is taken with: with files named with variables, the
     /// certificate and key they name for it (None when they cannot be loaded).
-    fn for_connection(&self, tcp: &TcpStream, name: &str) -> Option<Arc<ServerConfig>> {
+    fn for_connection(&self, (peer, local): (SocketAddr, SocketAddr), name: &str) -> Option<Arc<ServerConfig>> {
         let Some(n) = &self.named else { return Some(self.config.clone()) };
-        let r = crate::vars::Request::connection(tcp.peer_addr().ok()?, tcp.local_addr().ok()?, Some(Session { server_name: name.to_string(), ..Session::default() }));
+        let r = crate::vars::Request::connection(peer, local, Some(Session { server_name: name.to_string(), ..Session::default() }));
         let sent = crate::vars::Sent::default();
         let mut keys = Vec::new();
         for (cert, key) in &n.files {
@@ -683,31 +683,62 @@ impl Session {
 }
 
 /// Takes a TLS connection from a client on a listening address: the server
-/// its SNI name selects (as the Host header selects one) does the handshake;
-/// then the plain end of the connection.
-pub fn accept(mut tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option<(TcpStream, Session)> {
-    let _ = tcp.set_read_timeout(Some(HANDSHAKE));
-    let mut acceptor = rustls::server::Acceptor::default();
-    let hello = loop {
-        if acceptor.read_tls(&mut tcp).ok().filter(|n| *n > 0).is_none() { return None }
-        if let Some(hello) = acceptor.accept().ok()? { break hello }
+/// its SNI name selects (as the Host header selects one) does the handshake,
+/// which has to end within HANDSHAKE; then the connection, and what the
+/// variables tell of it.
+pub async fn accept(tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option<(Stream, Session)> {
+    let addrs = (tcp.peer_addr().ok()?, tcp.local_addr().ok()?);
+    let (stream, tls, mut session) = tokio::time::timeout(HANDSHAKE, handshake(tcp, config, listen, addrs)).await.ok()??;
+    let chain = stream.get_ref().1.peer_certificates().map(<[_]>::to_vec).unwrap_or_default();
+    // An OCSP responder is asked over the network, which may take long, so not on the event loop.
+    session.verify = match tls.ocsp.clone().filter(|_| !chain.is_empty()) {
+        Some(ocsp) => {
+            let (chain, trusted, crls, depth) = (chain.clone(), tls.trusted.clone(), tls.crls.clone(), tls.depth);
+            tokio::task::spawn_blocking(move || verified(&chain, (&trusted, crls.as_deref(), depth), Some(&ocsp))).await.ok()?
+        }
+        None => verified(&chain, (&tls.trusted, tls.crls.as_deref(), tls.depth), None),
     };
-    let name = hello.client_hello().server_name().unwrap_or_default().to_string();
-    let server = crate::http::server(config, listen, hello.client_hello().server_name()).0;
+    (session.subject, session.cert) = (chain.first().and_then(|c| subject(c)), chain.first().cloned());
+    Some((Stream::Server(Box::new(stream)), session))
+}
+
+/// The handshake of a connection taken: the ClientHello is read first, as
+/// the server is chosen by its SNI name.
+async fn handshake<'a>(mut tcp: TcpStream, config: &'a Config, listen: SocketAddr, addrs: (SocketAddr, SocketAddr)) -> Option<(tokio_rustls::server::TlsStream<TcpStream>, &'a ServerTls, Session)> {
+    let (mut acceptor, mut buf) = (rustls::server::Acceptor::default(), Vec::new());
+    let accepted = loop {
+        buf.clear();
+        if crate::stream::read_into(&mut tcp, &mut buf, None).await == 0 { return None }
+        let mut data = &buf[..];
+        while !data.is_empty() { if acceptor.read_tls(&mut data).ok()? == 0 { break } }
+        if let Some(accepted) = acceptor.accept().ok()? { break accepted }
+    };
+    let hello = accepted.client_hello();
+    let name = hello.server_name().unwrap_or_default().to_string();
+    let server = crate::http::server(config, listen, hello.server_name()).0;
     // A rejected handshake gets a fatal unrecognized_name alert, as OpenSSL sends it.
-    if server.level.ssl_reject_handshake { let _ = tcp.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70]); return None }
+    if server.level.ssl_reject_handshake { let _ = tcp.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70]).await; return None }
     // A server without certificates of its own takes the default server's.
     let tls = server.tls.as_ref().or(crate::http::default_server(config, listen).tls.as_ref())?;
-    let ciphers = hello.client_hello().cipher_suites().iter().map(|c| cipher(u16::from(*c))).collect::<Vec<_>>().join(":");
-    let curves = hello.client_hello().named_groups().unwrap_or_default().iter().map(|g| curve(u16::from(*g))).collect::<Vec<_>>().join(":");
-    let mut conn = hello.into_connection(tls.for_connection(&tcp, &name)?).ok()?;
+    let ciphers = hello.cipher_suites().iter().map(|c| cipher(u16::from(*c))).collect::<Vec<_>>().join(":");
+    let curves = hello.named_groups().unwrap_or_default().iter().map(|g| curve(u16::from(*g))).collect::<Vec<_>>().join(":");
+    let for_connection = tls.for_connection(addrs, &name)?;
     // A session keeps its identifier when it is resumed, as OpenSSL's does.
-    let id = conn.received_resumption_data().map_or_else(|| { let mut id = [0u8; 32]; provider().secure_random.fill(&mut id).map(|_| id.to_vec()) }, |id| Ok(id.to_vec())).ok()?;
-    conn.set_resumption_data(&id);
-    let (stream, mut session, chain) = pipe(tcp, conn.into(), HANDSHAKE).ok()?;
-    (session.server_name, session.verify, session.subject) = (name, verified(&chain, (&tls.trusted, tls.crls.as_deref(), tls.depth), tls.ocsp.as_ref()), chain.first().and_then(|c| subject(c)));
-    (session.id, session.ciphers, session.cert, session.curves) = (id.iter().map(|b| format!("{b:02x}")).collect(), ciphers, chain.first().cloned(), curves);
-    Some((stream, session))
+    let mut id = None;
+    let start = tokio_rustls::StartHandshake::from_parts(accepted, tcp);
+    let stream = start.into_stream_with(for_connection, |conn| {
+        let mut new = [0u8; 32];
+        id = conn.received_resumption_data().map(<[u8]>::to_vec).or_else(|| provider().secure_random.fill(&mut new).ok().map(|()| new.to_vec()));
+        conn.set_resumption_data(id.as_deref().unwrap_or_default());
+    }).await.ok()?;
+    let id = id?;
+    let conn = stream.get_ref().1;
+    let protocol = conn.protocol_version().map(|v| format!("{v:?}").replace('_', ".")).unwrap_or_default();
+    let cipher = conn.negotiated_cipher_suite().map(|c| cipher(u16::from(c.suite()))).unwrap_or_default();
+    let curve = conn.negotiated_key_exchange_group().map(|g| curve(u16::from(g.name()))).unwrap_or_default();
+    let reused = conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed);
+    let id = id.iter().map(|b| format!("{b:02x}")).collect();
+    Some((stream, tls, Session { protocol, server_name: name, reused, id, cipher, ciphers, curve, curves, ..Session::default() }))
 }
 
 /// Clients may send a certificate, which the handshake takes whatever it is;
@@ -903,66 +934,19 @@ pub fn client_cert(base: &Arc<ClientConfig>, files: (&Path, &Path, Option<&Path>
 }
 
 /// Connects to a proxied server over TLS, to the name its certificate is
-/// verified for and SNI sends, if any (one that is no name fails; an address is not sent); the plain end of the
+/// verified for and SNI sends, if any (one that is no name fails; an address is not sent); the
 /// connection, or the error the handshake failed with (WouldBlock once the timeout passed).
-pub fn connect(tcp: TcpStream, (peer, name): (IpAddr, Option<&str>), timeout: Duration, config: &Arc<ClientConfig>) -> std::io::Result<TcpStream> {
+pub async fn connect(tcp: TcpStream, (peer, name): (IpAddr, Option<&str>), timeout: Duration, config: &Arc<ClientConfig>) -> std::io::Result<Stream> {
     let name = name.map_or(Ok(ServerName::from(peer)), |n| ServerName::try_from(n.to_string()).map_err(std::io::Error::other))?;
-    let conn = ClientConnection::new(config.clone(), name).map_err(std::io::Error::other)?;
-    pipe(tcp, conn.into(), timeout).map(|(s, ..)| s)
-}
-
-/// Completes the handshake, then passes data between the TLS connection and
-/// one end of a socket pair in a thread of its own, and gives the other end,
-/// on which twinx reads and writes as on a TCP connection.
-/// Also gives the certificates the peer sent.
-fn pipe(mut tcp: TcpStream, mut tls: Connection, timeout: Duration) -> std::io::Result<(TcpStream, Session, Vec<CertificateDer<'static>>)> {
-    let _ = tcp.set_read_timeout(Some(timeout));
-    while tls.is_handshaking() { tls.complete_io(&mut tcp)?; }
-    let _ = tcp.set_read_timeout(None);
-    let protocol = tls.protocol_version().map(|v| format!("{v:?}").replace('_', ".")).unwrap_or_default();
-    let cipher = tls.negotiated_cipher_suite().map(|c| cipher(u16::from(c.suite()))).unwrap_or_default();
-    let curve = tls.negotiated_key_exchange_group().map(|g| curve(u16::from(g.name()))).unwrap_or_default();
-    let session = Session { protocol, reused: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed), cipher, curve, ..Session::default() };
-    let chain = tls.peer_certificates().map(<[_]>::to_vec).unwrap_or_default();
-    let (ours, theirs) = UnixStream::pair()?;
-    std::thread::spawn(move || pump(tcp, tls, theirs));
-    // SAFETY: the descriptor is a connected stream socket that nothing else owns; the
-    // calls twinx makes on a TcpStream (read, write, shutdown, timeouts, poll) work on it.
-    Ok((unsafe { TcpStream::from_raw_fd(ours.into_raw_fd()) }, session, chain))
-}
-
-/// Decrypts what the peer sends into the socket pair, and encrypts what twinx
-/// writes there, until both have closed their sides. Once twinx has closed
-/// its side, the peer gets a close_notify and the end of the stream, and up to
-/// five seconds to close its own, as a lingering close waits.
-fn pump(mut tcp: TcpStream, mut tls: Connection, mut plain: UnixStream) {
-    let poll = |fd: i32| libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-    let (mut fds, mut buf) = ([poll(tcp.as_raw_fd()), poll(plain.as_raw_fd())], [0u8; 16384]);
-    loop {
-        while let Ok(n @ 1..) = tls.reader().read(&mut buf) { if plain.write_all(&buf[..n]).is_err() { return } }
-        while tls.wants_write() { if tls.write_tls(&mut tcp).is_err() { return } }
-        if fds[1].fd < 0 { let _ = tcp.shutdown(Shutdown::Write); }
-        let wait = if fds[1].fd < 0 { 5000 } else { -1 };
-        // SAFETY: fds is an array of two pollfd that lives through the call.
-        if fds[0].fd < 0 && fds[1].fd < 0 || unsafe { libc::poll(fds.as_mut_ptr(), 2, wait) } <= 0 { return }
-        // The peer closed its side, or sent what is not TLS (the alert goes back first).
-        if fds[0].revents != 0 && (!matches!(tls.read_tls(&mut tcp), Ok(1..)) || tls.process_new_packets().is_err()) {
-            let _ = plain.shutdown(Shutdown::Write);
-            fds[0].fd = -1;
-        }
-        if fds[1].revents != 0 {
-            match plain.read(&mut buf) {
-                Ok(n @ 1..) => { let _ = tls.writer().write_all(&buf[..n]); }
-                _ => { tls.send_close_notify(); fds[1].fd = -1; }
-            }
-        }
+    match tokio::time::timeout(timeout, tokio_rustls::TlsConnector::from(config.clone()).connect(name, tcp)).await {
+        Ok(stream) => stream.map(|s| Stream::Client(Box::new(s))),
+        Err(_) => Err(std::io::ErrorKind::WouldBlock.into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
 
     /// A self-signed P-256 certificate for localhost and its key, made by openssl only for these tests.
     const CERT: &str = "-----BEGIN CERTIFICATE-----
@@ -1208,10 +1192,9 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let files = (&names[..], None);
         let options = Options { verify: false, sessions: Sessions::default(), compress: false, ciphers: None, protocols: [true, true], prefer: false, curves: None, crl: None, depth: 1, ocsp: None, ticket_keys: Vec::new(), stapling: None, client_ca: None };
         let tls = server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), &[], options.clone()).unwrap();
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
-        assert!(tls.for_connection(&tcp, "c.pem").is_some());
-        assert!(tls.for_connection(&tcp, "none").is_none());
+        let addrs = ("127.0.0.1:1".parse().unwrap(), "127.0.0.1:2".parse().unwrap());
+        assert!(tls.for_connection(addrs, "c.pem").is_some());
+        assert!(tls.for_connection(addrs, "none").is_none());
         assert!(server(files, None, &[], options).is_err());
     }
 
@@ -1336,68 +1319,93 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(tickets.decrypt(&tickets.encrypt(b"t").unwrap()), Some(b"t".to_vec()));
     }
 
+    /// A listening socket on the event loop, and its address.
+    async fn listener() -> (tokio::net::TcpListener, SocketAddr) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        (l, addr)
+    }
+
     #[test]
     fn rejects_handshakes_and_lends_the_default_certificate() {
         let dir = dir();
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; }} server {{ listen {addr}; server_name virtual1; }} server {{ listen {addr}; server_name virtual2; ssl_reject_handshake on; }} }}");
-        let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
-        let accepted = std::thread::spawn(move || (0..2).map(|_| accept(l.accept().unwrap().0, &config, addr).map(|a| a.1.server_name)).collect::<Vec<_>>());
-        let tls = client((false, true), None, None).unwrap();
-        let ok = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), Some("virtual1")), Duration::from_secs(5), &tls).unwrap();
-        drop(ok);
-        let refused = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), Some("virtual2")), Duration::from_secs(5), &tls).err().unwrap();
-        assert!(format!("{refused:?}").contains("UnrecognisedName"), "{refused:?}");
-        assert_eq!(accepted.join().unwrap(), [Some("virtual1".to_string()), None]);
+        crate::stream::block_on(async {
+            let (l, addr) = listener().await;
+            let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; }} server {{ listen {addr}; server_name virtual1; }} server {{ listen {addr}; server_name virtual2; ssl_reject_handshake on; }} }}");
+            let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+            let accepted = tokio::task::spawn_local(async move {
+                let mut names = Vec::new();
+                for _ in 0..2 { names.push(accept(l.accept().await.unwrap().0, &config, addr).await.map(|a| a.1.server_name)); }
+                names
+            });
+            let tls = client((false, true), None, None).unwrap();
+            let ok = connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), Some("virtual1")), Duration::from_secs(5), &tls).await.unwrap();
+            drop(ok);
+            let refused = connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), Some("virtual2")), Duration::from_secs(5), &tls).await.err().unwrap();
+            assert!(format!("{refused:?}").contains("UnrecognisedName"), "{refused:?}");
+            assert_eq!(accepted.await.unwrap(), [Some("virtual1".to_string()), None]);
+        });
     }
 
     #[test]
     fn passes_data_both_ways_until_closed() {
+        use tokio::io::AsyncReadExt;
         let dir = dir();
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        let text = format!("http {{ server {{ listen {addr} ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; ssl_verify_client optional_no_ca; ssl_trusted_certificate c.pem; }} }}");
-        let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
-        assert_eq!(config.servers[0].ssl, [addr]);
-        let accepted = std::thread::spawn(move || accept(l.accept().unwrap().0, &config, addr).unwrap());
-        let c = dir.join("c.pem");
-        let mut client = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), Some("localhost")), Duration::from_secs(5), &client((false, true), Some((&c, &dir.join("k.pem"), None)), None).unwrap()).unwrap();
-        let (mut server, session) = accepted.join().unwrap();
-        assert_eq!((session.id.len(), session.cipher.as_str(), session.cert.as_ref()), (64, "TLS_AES_256_GCM_SHA384", Some(&der(CERT))));
-        assert!(session.ciphers.starts_with("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:"), "{}", session.ciphers);
-        let session = Session { id: String::new(), cipher: String::new(), ciphers: String::new(), cert: None, ..session };
-        assert_eq!(session, Session { protocol: "TLSv1.3".into(), server_name: "localhost".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()), curve: "X25519".into(), curves: "X25519:prime256v1:secp384r1".into(), ..Session::default() });
-        let mut buf = [0u8; 4];
-        client.write_all(b"ping").unwrap();
-        server.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"ping");
-        server.write_all(b"pong").unwrap();
-        client.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"pong");
-        // Closing one side ends the stream on the other, which then closes too.
-        server.shutdown(Shutdown::Write).unwrap();
-        assert_eq!(client.read(&mut buf).unwrap(), 0);
-        drop(client);
-        assert_eq!(server.read(&mut buf).unwrap(), 0);
+        crate::stream::block_on(async {
+            let (l, addr) = listener().await;
+            let text = format!("http {{ server {{ listen {addr} ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; ssl_verify_client optional_no_ca; ssl_trusted_certificate c.pem; }} }}");
+            let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+            assert_eq!(config.servers[0].ssl, [addr]);
+            let accepted = tokio::task::spawn_local(async move { accept(l.accept().await.unwrap().0, &config, addr).await.unwrap() });
+            let c = dir.join("c.pem");
+            let tls = client((false, true), Some((&c, &dir.join("k.pem"), None)), None).unwrap();
+            let mut client = connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), Some("localhost")), Duration::from_secs(5), &tls).await.unwrap();
+            let (mut server, session) = accepted.await.unwrap();
+            assert!(matches!(server, Stream::Server(_)) && matches!(client, Stream::Client(_)));
+            assert_eq!((session.id.len(), session.cipher.as_str(), session.cert.as_ref()), (64, "TLS_AES_256_GCM_SHA384", Some(&der(CERT))));
+            assert!(session.ciphers.starts_with("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:"), "{}", session.ciphers);
+            let session = Session { id: String::new(), cipher: String::new(), ciphers: String::new(), cert: None, ..session };
+            assert_eq!(session, Session { protocol: "TLSv1.3".into(), server_name: "localhost".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()), curve: "X25519".into(), curves: "X25519:prime256v1:secp384r1".into(), ..Session::default() });
+            let mut buf = [0u8; 4];
+            assert!(crate::stream::write_all(&mut client, b"ping", None).await);
+            server.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            assert!(crate::stream::write_all(&mut server, b"pong", None).await);
+            client.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"pong");
+            // Closing one side (close_notify) ends the stream on the other, which then closes too.
+            server.shutdown().await.unwrap();
+            assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+            drop(client);
+            assert_eq!(crate::stream::read_into(&mut server, &mut Vec::new(), None).await, 0);
+        });
     }
 
     #[test]
     fn a_handshake_that_does_not_end_in_time_times_out() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        let e = connect(TcpStream::connect(addr).unwrap(), (addr.ip(), None), Duration::from_millis(100), &client((true, false), None, None).unwrap()).unwrap_err();
-        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
-        drop(l);
+        crate::stream::block_on(async {
+            let (_l, addr) = listener().await;
+            let e = connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_millis(100), &client((true, false), None, None).unwrap()).await.unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+        });
     }
 
     #[test]
     fn a_failed_handshake_gives_no_connection() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        let peer = std::thread::spawn(move || { let mut s = l.accept().unwrap().0; s.write_all(b"HTTP/1.0 400\r\n\r\n").unwrap(); });
-        assert!(connect(TcpStream::connect(addr).unwrap(), (addr.ip(), None), Duration::from_secs(5), &client((true, false), None, None).unwrap()).is_err());
-        peer.join().unwrap();
+        crate::stream::block_on(async {
+            let (l, addr) = listener().await;
+            let peer = tokio::task::spawn_local(async move { let mut s = l.accept().await.unwrap().0; s.write_all(b"HTTP/1.0 400\r\n\r\n").await.unwrap(); });
+            assert!(connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_secs(5), &client((true, false), None, None).unwrap()).await.is_err());
+            peer.await.unwrap();
+            // A client that closes before its ClientHello, or sends what is not TLS, is no connection.
+            let config = crate::conf::build(&crate::config::parse("http { }", Path::new("t")).unwrap(), &dir()).unwrap();
+            let (l, addr) = listener().await;
+            let mut other = TcpStream::connect(addr).await.unwrap();
+            other.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+            assert!(accept(l.accept().await.unwrap().0, &config, addr).await.is_none());
+            drop(TcpStream::connect(addr).await.unwrap());
+            assert!(accept(l.accept().await.unwrap().0, &config, addr).await.is_none());
+        });
     }
 
     #[test]

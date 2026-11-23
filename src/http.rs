@@ -3,17 +3,21 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 
 use crate::conf::{Condition, Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, Step, TryFiles};
 use crate::vars::{Part, Template};
 use crate::expires;
 use crate::upstream::{Peer, Upstream};
 use crate::vars::{Request, Sent};
+use crate::stream::{Stream, read_into, within, write_all};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
 
@@ -29,17 +33,14 @@ const REASONS: &[(u16, &str)] = &[
     (503, "Service Temporarily Unavailable"), (504, "Gateway Time-out"), (505, "HTTP Version Not Supported"),
 ];
 
-/// Binds every address the servers listen on and accepts connections on each in a thread.
 /// Opens the listening sockets: the master does this, so that bind errors stop it and every worker shares them.
 pub fn bind(config: &Config, open: &[(TcpListener, SocketAddr)]) -> Result<Vec<(TcpListener, SocketAddr)>, String> {
     let mut addrs: Vec<SocketAddr> = Vec::new();
     for addr in config.servers.iter().flat_map(|s| &s.listen) { if !addrs.contains(addr) { addrs.push(*addr) } }
-    // On a reload, a socket already open on the address is kept. accept() on
-    // it gives up after a while, so that a worker shutting down stops accepting.
+    // On a reload, a socket already open on the address is kept.
     let backlog = |addr| config.servers.iter().flat_map(|s| &s.backlogs).find(|b| b.0 == addr).map_or(crate::conf::LISTEN_BACKLOG, |b| b.1);
     let get = |addr| open.iter().find(|o| o.1 == addr).map_or_else(|| listen(addr, backlog(addr)), |o| o.0.try_clone());
-    let timeout = |l: TcpListener| socket2::SockRef::from(&l).set_read_timeout(Some(ACCEPT_WAIT)).map(|()| l);
-    addrs.into_iter().map(|addr| get(addr).and_then(timeout).map(|l| (l, addr)).map_err(|e| format!("bind() to {addr} failed ({e})"))).collect()
+    addrs.into_iter().map(|addr| get(addr).map(|l| (l, addr)).map_err(|e| format!("bind() to {addr} failed ({e})"))).collect()
 }
 
 /// A listening socket as nginx opens it: SO_REUSEADDR, then listen() with the
@@ -52,14 +53,9 @@ fn listen(addr: SocketAddr, backlog: i32) -> std::io::Result<TcpListener> {
     Ok(socket.into())
 }
 
-/// How long accept() waits before it looks again whether the worker is shutting down.
-const ACCEPT_WAIT: Duration = Duration::from_millis(100);
-
 /// Whether the worker is shutting down gracefully, and how many requests it is answering.
 static SHUTTING: AtomicBool = AtomicBool::new(false);
 static BUSY: AtomicUsize = AtomicUsize::new(0);
-/// How many threads are still accepting connections.
-static ACCEPTING: AtomicUsize = AtomicUsize::new(0);
 
 /// A request being answered, counted in BUSY while it lives.
 struct Busy;
@@ -77,40 +73,47 @@ impl Drop for Busy {
     }
 }
 
-/// Shuts the worker down gracefully, as QUIT does: it stops accepting, closes
-/// each connection once its request is answered, and returns when no request
-/// is left, or once worker_shutdown_timeout has passed. Idle connections are
-/// closed when the worker exits. A connection accepted while it began to shut
-/// down is counted from its accept on, so its request is answered, not dropped.
-pub fn shut_down(timeout: Option<Duration>) {
+/// Shuts the worker down gracefully, as QUIT does: it stops the tasks that
+/// accept, closes each connection once its request is answered, and returns
+/// when no request is left, or once worker_shutdown_timeout has passed. Idle
+/// connections are closed when the worker exits. A connection accepted before
+/// the tasks stopped is counted from its accept on, so its request is
+/// answered, not dropped.
+pub async fn shut_down(accepting: Vec<JoinHandle<()>>, timeout: Option<Duration>) {
     let start = Instant::now();
     SHUTTING.store(true, Ordering::SeqCst);
-    while ACCEPTING.load(Ordering::SeqCst) > 0 { thread::sleep(Duration::from_millis(10)); }
-    while BUSY.load(Ordering::SeqCst) > 0 && timeout.is_none_or(|t| start.elapsed() < t) { thread::sleep(Duration::from_millis(10)); }
+    accepting.iter().for_each(JoinHandle::abort);
+    for task in accepting { let _ = task.await; }
+    while BUSY.load(Ordering::SeqCst) > 0 && timeout.is_none_or(|t| start.elapsed() < t) { tokio::time::sleep(Duration::from_millis(10)).await; }
 }
 
-/// Accepts connections on the listening sockets, in a worker process.
-pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> Result<(), String> {
+/// Accepts connections on the listening sockets, in a worker process: a task
+/// of the worker's event loop accepts on each socket, and each connection is
+/// served by a task of its own. Gives the tasks that accept, for shut_down.
+pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> Result<Vec<JoinHandle<()>>, String> {
+    let mut tasks = Vec::new();
     for (listener, addr) in listeners {
-        let (listener, addr, config) = (listener.try_clone().map_err(|e| e.to_string())?, *addr, config.clone());
+        // The socket keeps the options it was opened with; the event loop needs it non-blocking.
+        let listener = listener.try_clone().and_then(|l| l.set_nonblocking(true).and_then(|()| tokio::net::TcpListener::from_std(l))).map_err(|e| e.to_string())?;
+        let (addr, config) = (*addr, config.clone());
         // An address any server listens on with "ssl" takes TLS connections.
         let tls = config.servers.iter().any(|s| s.ssl.contains(&addr));
-        ACCEPTING.fetch_add(1, Ordering::SeqCst);
-        thread::spawn(move || {
-            while !SHUTTING.load(Ordering::SeqCst) {
-                let Ok((stream, peer)) = listener.accept() else { continue };
+        tasks.push(tokio::task::spawn_local(async move {
+            loop {
+                // Out of descriptors, say: accept() is tried again a little later.
+                let Ok((stream, peer)) = listener.accept().await else { tokio::time::sleep(Duration::from_millis(10)).await; continue };
                 // Until its first request has arrived, a new connection is busy too.
                 let (config, fresh) = (config.clone(), Busy::new());
                 let local = stream.local_addr().unwrap_or(addr);
-                thread::spawn(move || {
-                    let Some((stream, ssl)) = (if tls { crate::tls::accept(stream, &config, addr).map(|(s, ssl)| (s, Some(ssl))) } else { Some((stream, None)) }) else { return };
-                    connection(&config, stream, (addr, local, peer, ssl), fresh)
+                tokio::task::spawn_local(async move {
+                    let accepted = if tls { crate::tls::accept(stream, &config, addr).await.map(|(s, ssl)| (s, Some(ssl))) } else { Some((Stream::Tcp(stream), None)) };
+                    let Some((stream, ssl)) = accepted else { return };
+                    connection(&config, stream, (addr, local, peer, ssl), fresh).await
                 });
             }
-            ACCEPTING.fetch_sub(1, Ordering::SeqCst);
-        });
+        }));
     }
-    Ok(())
+    Ok(tasks)
 }
 
 /// The end of the request head (after the empty line), if it has arrived.
@@ -130,9 +133,9 @@ fn http09(line: &[u8]) -> bool {
 
 /// Serves the requests of a connection accepted on a listening address,
 /// with its local and remote addresses.
-fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<crate::tls::Session>), fresh: Busy) {
+async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<crate::tls::Session>), fresh: Busy) {
     let mut fresh = Some(fresh);
-    let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+    let mut buf = Vec::new();
     // After a kept-alive answer: how long the connection waits for the next request.
     let (connected, mut requests, mut idle) = (Instant::now(), 0, None);
     loop {
@@ -146,12 +149,9 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl)
             let end = head_end(&buf);
             if let Some((status, at)) = overflow(&buf[..end.unwrap_or(buf.len())], default.level.header_buffer, buffers) { break (at, Some(status)); }
             if let Some(end) = end { break (end, None); }
-            let _ = stream.set_read_timeout(idle.filter(|_| buf.is_empty()));
-            let n = stream.read(&mut chunk).unwrap_or(0);
-            if n == 0 { return; }
-            buf.extend_from_slice(&chunk[..n]);
+            let wait = idle.filter(|_| buf.is_empty());
+            if read_into(&mut stream, &mut buf, wait).await == 0 { return; }
         };
-        let _ = stream.set_read_timeout(None);
         let head: Vec<u8> = buf.drain(..end).collect();
         let mut r = Request {
             method: String::new(),
@@ -177,7 +177,6 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl)
             limit_rate: Default::default(),
             vars: Default::default(),
             unread: Default::default(),
-            client: std::os::fd::AsRawFd::as_raw_fd(&stream),
             ssl: ssl.clone(),
         };
         let parsed = parse(&mut r, &head, &default.level);
@@ -192,7 +191,7 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl)
         let level = found.1;
         let framing = parsed.and_then(|()| framing(&r)).and_then(|n| if n.unwrap_or(0) > level.max_body { Err(413) } else { Ok(n) });
         let expect = header(&r, "expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue"));
-        if framing.is_ok() && expect && r.line.ends_with("HTTP/1.1") { let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n"); }
+        if framing.is_ok() && expect && r.line.ends_with("HTTP/1.1") { write_all(&mut stream, b"HTTP/1.1 100 Continue\r\n\r\n", send_timeout(level)).await; }
         let parsed = match framing {
             Err(status) => Err(status),
             // With proxy_request_buffering off, what came with the head is passed
@@ -200,13 +199,13 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl)
             Ok(Some(n)) if level.proxy.is_some() && !level.proxy_request_buffering && (buf.len() as u64) < n => {
                 r.length += n as usize;
                 r.body = std::mem::take(&mut buf);
-                *r.unread.lock().unwrap() = stream.try_clone().ok().map(|client| Unread { client, left: n - r.body.len() as u64, chunked: None, rest: Vec::new() });
+                *r.unread.lock().unwrap() = Some(Unread { left: n - r.body.len() as u64, chunked: None, rest: Vec::new() });
                 Ok(())
             }
             // A chunked body only when passed as HTTP/1.1, its data passed in chunks of what has come.
             Ok(None) if level.proxy.is_some() && !level.proxy_request_buffering && level.proxy_http_11 && matches!(dechunk(&buf, level.max_body), Ok(None)) => {
                 r.body = decode_chunked(&buf, level.max_body).unwrap_or_default().0;
-                *r.unread.lock().unwrap() = stream.try_clone().ok().map(|client| Unread { client, left: 0, chunked: Some((std::mem::take(&mut buf), r.body.len())), rest: Vec::new() });
+                *r.unread.lock().unwrap() = Some(Unread { left: 0, chunked: Some((std::mem::take(&mut buf), r.body.len())), rest: Vec::new() });
                 Ok(())
             }
             Ok(length) => loop {
@@ -219,23 +218,24 @@ fn connection(config: &Config, mut stream: TcpStream, (listen, local, peer, ssl)
                     }
                     Err(status) => break Err(status),
                 }
-                let read = stream.read(&mut chunk).unwrap_or(0);
-                if read == 0 { return; }
-                buf.extend_from_slice(&chunk[..read]);
+                if read_into(&mut stream, &mut buf, None).await == 0 { return; }
             },
         };
         let busy = Busy::new();
         drop(fresh.take());
-        idle = exchange(&mut stream, server, &r, parsed, found, local, &buf);
+        idle = exchange(&mut stream, server, &r, parsed, found, local, &buf).await;
         drop(busy);
         // What of an unbuffered body was not passed on is read and dropped.
         // What came after a chunked one is the next request.
-        if let Some(mut u) = r.unread.lock().unwrap().take() {
-            if pass_body(&mut u, level.max_body, &mut std::io::sink()).is_none() { return; }
+        let unread = r.unread.lock().unwrap().take();
+        if let Some(mut u) = unread {
+            if pass_body(&mut u, &mut stream, level.max_body, &mut tokio::io::sink()).await.is_none() { return; }
             buf = u.rest;
         }
         if !level.body_in_file_only || level.body_clean { r.body_file.map(std::fs::remove_file); }
-        if idle.is_none() || SHUTTING.load(Ordering::SeqCst) { return linger(&mut stream); }
+        if idle.is_none() || SHUTTING.load(Ordering::SeqCst) { return linger(&mut stream).await; }
+        // An idle connection keeps no buffer.
+        if buf.is_empty() { buf = Vec::new(); }
     }
 }
 
@@ -326,11 +326,17 @@ fn chunk_size(line: &str) -> Option<u64> {
 
 /// Closes the connection as nginx's lingering close does: stops sending, then
 /// reads what the client still sends so that it gets the whole answer.
-fn linger(stream: &mut TcpStream) {
-    let _ = stream.shutdown(Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut chunk = [0u8; 4096];
-    while matches!(stream.read(&mut chunk), Ok(n) if n > 0) {}
+/// With TLS, stopping sends a close_notify first.
+async fn linger(stream: &mut Stream) {
+    let wait = Some(Duration::from_secs(5));
+    let _ = within(wait, tokio::io::AsyncWriteExt::shutdown(stream)).await;
+    let mut buf = Vec::new();
+    while read_into(stream, &mut buf, wait).await > 0 { buf.clear(); }
+}
+
+/// How long a write to the client may wait (send_timeout; zero: no limit).
+fn send_timeout(level: &Level) -> Option<Duration> {
+    Some(level.send_timeout).filter(|t| !t.is_zero())
 }
 
 /// Keeps the request body in memory, or in a file under client_body_temp_path
@@ -372,7 +378,7 @@ struct Response {
     vary: bool,
     /// The connection to a proxied server that switched protocols (101) for a
     /// request with Upgrade: once the head is sent, data is passed both ways.
-    tunnel: Option<TcpStream>,
+    tunnel: Option<Stream>,
     /// Whether this is a page nginx generates for an error or a redirect
     /// (ngx_http_special_response_handler()), which keeps its own status
     /// after an error_page redirect.
@@ -414,14 +420,14 @@ struct Response {
 
 /// The connection to a proxied server whose body is still to be read, with
 /// what has been read of the answer, where its head ends, how the body's end
-/// is found, the rate, and when the request to it started.
+/// is found, the rate, when the request to it started, and how long a read may wait.
 #[derive(Debug)]
-struct Rest { s: TcpStream, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant }
+struct Rest { s: Stream, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration> }
 
 /// Reads the rest of a proxied answer's body, noting how long the whole answer took.
-fn finish(resp: &mut Response) {
+async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
-    let (body, read) = read_body(&mut rest.s, rest.answer, rest.end, rest.length, rest.chunked, rest.rate).unwrap_or_default();
+    let (body, read) = read_body(&mut rest.s, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await.unwrap_or_default();
     resp.body = body;
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = ((read - rest.end) as u64, read as u64); }
@@ -471,7 +477,7 @@ fn redirect(status: u16, location: String) -> Response {
 }
 
 /// The answer the location gives, before error_page and the headers every answer gets.
-fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -> Response {
+async fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found<'_>, client: Option<&mut Stream>) -> Response {
     match parsed {
         Err(status) => return special(status),
         Ok(()) if auto => return redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
@@ -481,7 +487,7 @@ fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -
     let (mut to, mut changed, mut moved) = (r.clone(), false, false);
     for step in &level.rewrite {
         let rw = match step {
-            Step::Return(code, text) => return serve(&to, level, prefix, Some((*code, text))),
+            Step::Return(code, text) => return serve(&to, level, prefix, Some((*code, text)), client).await,
             Step::Break => { changed = false; break }
             Step::Rewrite(rw) => rw,
         };
@@ -508,8 +514,8 @@ fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found) -
     // Stopped by break, the location goes on with the new URI, and proxy_pass
     // passes it whole, without the URI it has (r->valid_location is 0).
     match level.proxy.as_deref().filter(|p| moved && p.uri.is_some() && level.try_files.is_none()) {
-        Some(p) => proxy(&Proxy { uri: None, ..p.clone() }, level, &to, prefix),
-        None => serve(&to, level, prefix, None),
+        Some(p) => proxy(&Proxy { uri: None, ..p.clone() }, level, &to, prefix, client).await,
+        None => serve(&to, level, prefix, None, client).await,
     }
 }
 
@@ -543,7 +549,7 @@ fn escape_args(s: &str) -> String {
 }
 
 /// The answer of return, else of proxy_pass, else of the static module.
-fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Template)>) -> Response {
+async fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Template)>, client: Option<&mut Stream>) -> Response {
     match (ret, &level.proxy, level.try_files.as_deref()) {
         (Some((code, text)), _, _) if REDIRECTS.contains(&code) => redirect(code, text.render(r, &Sent::default())),
         (Some((code, text)), _, _) if text.0.is_empty() && code >= 400 => special(code),
@@ -551,8 +557,8 @@ fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Template)>
             let ctype = Some("text/plain".to_string());
             Response { status: code, ctype, body: crate::vars::bytes(&text.render(r, &Sent::default())), ..Response::default() }
         }
-        (None, _, Some(tf)) => try_files(tf, level, r, prefix),
-        (None, Some(p), None) => proxy(p, level, r, prefix),
+        (None, _, Some(tf)) => try_files(tf, level, r, prefix, client).await,
+        (None, Some(p), None) => proxy(p, level, r, prefix, client).await,
         (None, None, None) => file(level, r, prefix),
     }
 }
@@ -560,7 +566,7 @@ fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Template)>
 /// try_files: the first parameter whose file exists (a directory when it ends
 /// with "/") is served, the URI changed to it; when none does, the last
 /// parameter gives a status or a URI to redirect to internally.
-fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str) -> Response {
+async fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str, client: Option<&mut Stream>) -> Response {
     let sent = Sent::default();
     for (name, dir) in &tf.files {
         let name = name.render(r, &sent);
@@ -570,7 +576,7 @@ fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str) -> Respons
         let path = PathBuf::from(format!("{}{rest}", base.display()));
         if std::fs::metadata(&path).is_ok_and(|m| m.is_dir() == *dir) {
             let to = Request { uri: name, ..r.clone() };
-            return match &level.proxy { Some(p) => proxy(p, level, &to, prefix), None => file_at(level, &to, path) };
+            return match &level.proxy { Some(p) => proxy(p, level, &to, prefix, client).await, None => file_at(level, &to, path) };
         }
     }
     match &tf.fallback {
@@ -605,8 +611,8 @@ fn args(r: &Request) -> &str {
 
 /// Answers one request; when the connection stays open for the next one, how
 /// long it waits for it (keepalive_timeout).
-fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found, local: SocketAddr, ahead: &[u8]) -> Option<Duration> {
-    let (mut resp, mut level, mut last) = answer(server, r, parsed, found);
+async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found<'_>, local: SocketAddr, ahead: &[u8]) -> Option<Duration> {
+    let (mut resp, mut level, mut last) = answer(server, r, parsed, found, Some(&mut *stream)).await;
     let intercepted = !resp.proxied || level.proxy_intercept_errors;
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)).filter(|_| intercepted) {
         // An intercepted 401 keeps the proxied server's WWW-Authenticate headers,
@@ -630,7 +636,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
             // answer's own), unless it is a page generated for its own error or redirect.
             let status = ep.status.unwrap_or(resp.status);
             let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
-            (resp, level, last) = answer(server, &to, Ok(()), found);
+            (resp, level, last) = answer(server, &to, Ok(()), found, Some(&mut *stream)).await;
             if !resp.generated && status != 0 { resp.status = status; }
             // A redirect the new answer makes replaces the Location kept.
             let own = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("location"));
@@ -652,7 +658,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     let gzipped = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && h.1.eq_ignore_ascii_case("gzip"));
     if level.gunzip && gzipped {
         resp.vary = true;
-        finish(&mut resp);
+        finish(&mut resp).await;
         if !gzip_ok(r, level) { gunzip(&mut resp); }
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
@@ -682,7 +688,7 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         if ["etag", "last-modified"].contains(&name.to_ascii_lowercase().as_str()) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case(name)); }
         if !value.is_empty() { resp.headers.push((name.clone(), value)); }
     }
-    finish(&mut resp);
+    finish(&mut resp).await;
     // server_tokens off: the pages twinx generates give its name without the version.
     if resp.generated && !level.server_tokens {
         resp.body = String::from_utf8_lossy(&resp.body).replace(&format!("<hr><center>{NAME}</center>"), "<hr><center>twinx</center>").into_bytes();
@@ -719,7 +725,8 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
     }
     let body_len = if r.method == "HEAD" || silent { 0 } else { resp.body.len() };
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
-    out.extend_from_slice(&resp.body[..body_len]);
+    // The body is written from where it is, after the head, not copied after it.
+    let mut tail = Vec::new();
     // The trailers are made after the body, each seeing those before it ($sent_trailer_*).
     let mut trailers = Vec::new();
     for (name, value, _) in level.add_trailer.iter().filter(|t| chunked && (t.2 || added)) {
@@ -727,50 +734,59 @@ fn exchange(stream: &mut TcpStream, server: &Server, r: &Request, parsed: Result
         if !value.is_empty() { trailers.push((name.clone(), value)); }
     }
     if chunked {
-        out.extend_from_slice(if body_len > 0 { b"\r\n0\r\n" } else { b"0\r\n" });
-        trailers.iter().for_each(|(n, v)| out.extend(crate::vars::bytes(&format!("{n}: {v}\r\n"))));
-        out.extend_from_slice(b"\r\n");
+        tail.extend_from_slice(if body_len > 0 { b"\r\n0\r\n" } else { b"0\r\n" });
+        trailers.iter().for_each(|(n, v)| tail.extend(crate::vars::bytes(&format!("{n}: {v}\r\n"))));
+        tail.extend_from_slice(b"\r\n");
     }
     // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
     let size = |t: &Template| crate::conf::size(&t.render(r, &Sent::default())).unwrap_or(0);
     let rate = r.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
-    let _ = stream.set_write_timeout(Some(level.send_timeout).filter(|t| !t.is_zero()));
-    let written = send(stream, &out, rate, size(&level.limit_rate_after), r.started);
+    let written = send(stream, &[&out, &resp.body[..body_len], &tail], rate, size(&level.limit_rate_after), r.started, send_timeout(level)).await;
     // What was passed from the proxied server through an upgraded connection counts as sent, as body.
-    let tunneled = resp.tunnel.take().filter(|_| written).map_or(0, |up| tunnel(stream, up, ahead));
-    let sent = Sent { bytes: out.len() + tunneled, body: body_len + tunneled, ..so_far(&resp, &trailers) };
-    if written { post_action(server, r, level); }
+    let tunneled = match resp.tunnel.take().filter(|_| written) { Some(up) => tunnel(stream, up, ahead, (Some(level.proxy_read_timeout).filter(|t| !t.is_zero()), send_timeout(level))).await, None => 0 };
+    let sent = Sent { bytes: out.len() + body_len + tail.len() + tunneled, body: body_len + tunneled, ..so_far(&resp, &trailers) };
+    if written { post_action(server, r, level, Some(stream)).await; }
     level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     (written && keepalive && !silent).then_some(level.keepalive_timeout)
 }
 
 /// Passes data both ways between a client and the proxied server its
 /// connection was upgraded to, until either closes it or sends nothing for
-/// proxy_read_timeout.
-fn tunnel(client: &TcpStream, up: TcpStream, ahead: &[u8]) -> usize {
-    let _ = client.set_read_timeout(up.read_timeout().ok().flatten());
-    let (Ok(mut from_client), Ok(mut to_up)) = (client.try_clone(), up.try_clone()) else { return 0 };
-    // What the client sent after the request's head goes first.
-    let ahead = ahead.to_vec();
-    let other = thread::spawn(move || { if to_up.write_all(&ahead).is_ok() { let _ = std::io::copy(&mut from_client, &mut to_up); } let _ = to_up.shutdown(Shutdown::Both); });
-    let (mut passed, mut chunk) = (0, [0u8; 16384]);
-    while let Ok(n @ 1..) = (&up).read(&mut chunk) { if (&*client).write_all(&chunk[..n]).is_err() { break } passed += n; }
-    let _ = client.shutdown(Shutdown::Both);
-    let _ = other.join();
+/// proxy_read_timeout (read), a write to the client waiting at most
+/// send_timeout; then both connections are closed. Gives the bytes passed
+/// from the proxied server.
+async fn tunnel(client: &mut Stream, mut up: Stream, ahead: &[u8], (read, send): (Option<Duration>, Option<Duration>)) -> usize {
+    let mut passed = 0;
+    {
+        let ((mut from_client, mut to_client), (mut from_up, mut to_up)) = (tokio::io::split(&mut *client), tokio::io::split(&mut up));
+        // What the client sent after the request's head goes first.
+        let upward = async {
+            let mut buf = vec![0u8; 16384];
+            if !write_all(&mut to_up, ahead, None).await { return }
+            while let Some(Ok(n @ 1..)) = within(read, from_client.read(&mut buf)).await { if !write_all(&mut to_up, &buf[..n], None).await { return } }
+        };
+        let downward = async {
+            let mut buf = vec![0u8; 16384];
+            while let Some(Ok(n @ 1..)) = within(read, from_up.read(&mut buf)).await { if !write_all(&mut to_client, &buf[..n], send).await { return } passed += n; }
+        };
+        tokio::select! { () = upward => {} () = downward => {} }
+    }
+    client.close();
+    up.close();
     passed
 }
 
 /// post_action: once the answer is sent, the request is redirected internally
 /// to the URI (or named location) post_action gives, and what that answers is
 /// discarded. The location it goes to does not run its own post_action.
-fn post_action(server: &Server, r: &Request, level: &Level) {
+async fn post_action(server: &Server, r: &Request, level: &Level, client: Option<&mut Stream>) {
     let Some(url) = &level.post_action else { return };
     let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && &l.path == url);
     // A named location answers the request as it is; a URI replaces the request's.
     let uri = || url.split('?').next().unwrap_or_default().to_string();
     let to = if named.is_some() { r.clone() } else { Request { uri: uri(), target: url.clone(), ..r.clone() } };
     let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
-    answer(server, &to, Ok(()), found);
+    answer(server, &to, Ok(()), found, client).await;
 }
 
 /// The not modified filter, as ngx_http_not_modified_filter() is: a 200
@@ -830,21 +846,37 @@ fn etag_match(list: &str, etag: Option<&str>, weak: bool) -> bool {
 /// by the end of each second since the request started (counted in whole
 /// seconds of the clock) up to limit_rate_after bytes and limit_rate bytes for
 /// each second have gone, and after each write the time it is worth at that
-/// rate is waited. Without a rate it is written at once.
-fn send(stream: &mut TcpStream, out: &[u8], rate: u64, after: u64, started: Instant) -> bool {
-    if rate == 0 { return stream.write_all(out).is_ok(); }
+/// rate is waited. Without a rate it is written at once. The answer is the
+/// parts one after another (the head, the body, the end of a chunked body),
+/// written together (writev) without copying them into one buffer. Each
+/// write waits at most the time (send_timeout).
+async fn send<S: AsyncWrite + Unpin>(stream: &mut S, parts: &[&[u8]], rate: u64, after: u64, started: Instant, time: Option<Duration>) -> bool {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    if rate == 0 { return write_parts(stream, parts, 0, total, time).await; }
     let clock = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let start = (clock() - started.elapsed()).as_secs() as i64;
     let (rate, mut sent) = (rate as i64, 0);
-    while sent < out.len() {
+    while sent < total {
         let limit = rate * (clock().as_secs() as i64 - start + 1) - (sent as i64 - after as i64);
-        if limit <= 0 { thread::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)); continue; }
-        let n = (limit as usize).min(out.len() - sent);
-        if stream.write_all(&out[sent..sent + n]).is_err() { return false; }
+        if limit <= 0 { tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await; continue; }
+        let n = (limit as usize).min(total - sent);
+        if !write_parts(stream, parts, sent, sent + n, time).await { return false; }
         sent += n;
-        if sent < out.len() { thread::sleep(Duration::from_millis(n as u64 * 1000 / rate as u64)); }
+        if sent < total { tokio::time::sleep(Duration::from_millis(n as u64 * 1000 / rate as u64)).await; }
     }
     true
+}
+
+/// Writes the bytes from..to of the parts taken one after another.
+async fn write_parts<S: AsyncWrite + Unpin>(stream: &mut S, parts: &[&[u8]], from: usize, to: usize, time: Option<Duration>) -> bool {
+    let mut at = 0;
+    let mut bufs = Vec::new();
+    for p in parts {
+        let (start, end) = (from.max(at), to.min(at + p.len()));
+        if start < end { bufs.push(std::io::IoSlice::new(&p[start - at..end - at])); }
+        at += p.len();
+    }
+    crate::stream::write_vectored(stream, &mut bufs, time).await
 }
 
 /// Whether the location lets the connection serve another request, as
@@ -871,13 +903,13 @@ fn browser(ua: &str) -> (bool, bool) {
 
 /// The answer of the location found, after the internal redirects of the
 /// index module, and the settings of the location that gave it.
-fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>) -> (Response, &'a Level, Request) {
+async fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Response, &'a Level, Request) {
     // Once the location or an if block that applied has proxy_pass, the request
     // is proxied: when the last if block that applied has no proxy_pass to
     // inherit, nginx has no upstream for it and answers 500.
     let mut proxied = level.proxy.is_some();
     if parsed.is_ok() { level = run(r, &level.script, run(r, &level.server_script, level, &mut proxied), &mut proxied); }
-    let mut resp = if proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration"); special(500) } else { respond(r, parsed, (prefix, level, auto)) };
+    let mut resp = if proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration"); special(500) } else { respond(r, parsed, (prefix, level, auto), client.as_deref_mut()).await };
     let (mut redirects, mut to) = (0, r.clone());
     while let Some(target) = resp.internal.take() {
         // nginx gives up after 10 internal redirects.
@@ -895,7 +927,7 @@ fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix,
         };
         let proxied = &mut false;
         level = run(&to, &found.script, if named.is_some() { found } else { run(&to, &found.server_script, found, proxied) }, proxied);
-        resp = if redirects > 10 || (target.starts_with('@') && named.is_none()) { special(500) } else { respond(&to, Ok(()), (prefix, level, auto)) };
+        resp = if redirects > 10 || (target.starts_with('@') && named.is_none()) { special(500) } else { respond(&to, Ok(()), (prefix, level, auto), client.as_deref_mut()).await };
         if let Some((headers, ctype)) = kept {
             resp.headers.splice(0..0, headers);
             if let Some(ctype) = ctype.filter(|_| resp.status < 300) { resp.ctype = Some(ctype); }
@@ -1084,11 +1116,11 @@ fn gunzip(resp: &mut Response) {
 /// Passes the request to the proxied servers in turn, as proxy_http_version
 /// says (1.1 by default) and, as nginx 1.30 does, with no Connection header of
 /// its own, until one answers with a response head.
-fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
+async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: Option<&mut Stream>) -> Response {
     let rest = escape_uri(r.uri.get(prefix.len()..).unwrap_or_default());
     let (host, uri, up) = match &p.url {
         None => (p.host.clone(), p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{rest}{}", args(r))), p.upstream.clone()),
-        Some(url) => match resolved(&url.render(r, &Sent::default()), p, level, r) {
+        Some(url) => match resolved(&url.render(r, &Sent::default()), p, level, r).await {
             Some(t) => t,
             None => return special(502),
         },
@@ -1151,7 +1183,7 @@ fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str) -> Response {
             },
             (_, tls) => tls.cloned(),
         };
-        answer = fetch((&up.peers[i].addr, tls.as_ref().map(|t| (t, name.as_deref()))), socket.flatten(), &req, level, r.client, (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade);
+        answer = fetch((&up.peers[i].addr, tls.as_ref().map(|t| (t, name.as_deref()))), socket.flatten(), &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, upgrade).await;
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
@@ -1276,7 +1308,7 @@ fn cookie_value(r: &Request, rw: &CookieRewrite, value: &str, domain: bool) -> O
 /// The Host, the URI and the servers of a proxy_pass URL with variables: its
 /// host is an upstream group, an address, or a name the location's resolver
 /// looks up. The URI, when the URL has one, is sent as it is.
-fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String, String, Arc<Upstream>)> {
+async fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String, String, Arc<Upstream>)> {
     let rest = url.strip_prefix("http://")?;
     let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
     if let Some(up) = p.groups.get(host) { return Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), up.clone())); }
@@ -1284,8 +1316,10 @@ fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String,
     // As in nginx, the implicit upstream of a proxy_pass with this host and port comes before the resolver.
     let implicit = p.implicit.lock().unwrap().get(&format!("{}:{port}", name.to_ascii_lowercase())).cloned();
     if let Some(up) = implicit { return Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), up)); }
-    let resolve = || level.resolver.as_ref()?.resolve(name, level.resolver_timeout);
-    let addrs = name.parse::<IpAddr>().map(|a| vec![a]).ok().or_else(resolve)?;
+    let addrs = match name.parse::<IpAddr>() {
+        Ok(a) => vec![a],
+        Err(_) => level.resolver.as_ref()?.resolve(name, level.resolver_timeout).await?,
+    };
     let peers = addrs.into_iter().map(|a| Peer::new(SocketAddr::new(a, port))).collect();
     Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), Arc::new(Upstream::new(peers))))
 }
@@ -1302,28 +1336,40 @@ fn ssl_name(name: &str) -> &str {
     host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
 }
 
-fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Option<&str>)>), socket: Option<socket2::Socket>, req: &[u8], level: &Level, client: i32, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
+#[allow(clippy::too_many_arguments)]
+async fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Option<&str>)>), socket: Option<socket2::Socket>, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, upgrade: bool) -> Option<Response> {
     let start = Instant::now();
-    let s = match socket {
-        Some(socket) => socket.connect_timeout(&(*peer).into(), level.proxy_connect_timeout).ok().map(|()| TcpStream::from(socket))?,
-        None => TcpStream::connect_timeout(peer, level.proxy_connect_timeout).ok()?,
+    let connect = async {
+        match socket {
+            Some(socket) => { socket.set_nonblocking(true)?; tokio::net::TcpSocket::from_std_stream(socket.into()).connect(*peer).await }
+            None => TcpStream::connect(peer).await,
+        }
     };
+    let s = tokio::time::timeout(level.proxy_connect_timeout, connect).await.ok()?.ok()?;
     // proxy_pass https://: the TLS handshake is part of connecting.
     // A handshake that does not end within proxy_connect_timeout is a timeout, answered with 504.
-    let mut s = if let Some((tls, name)) = tls { match crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls) { Ok(s) => s, Err(e) => return (e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504)) } } else { s };
+    let mut s = match tls {
+        Some((tls, name)) => match crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls).await { Ok(s) => s, Err(e) => return (e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504)) },
+        None => Stream::Tcp(s),
+    };
     time[0] = Some(start.elapsed().as_millis());
-    let _ = s.set_read_timeout(Some(level.proxy_read_timeout));
-    let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
-    s.write_all(req).ok()?;
+    // proxy_read_timeout: how long each read may wait.
+    let wait = Some(level.proxy_read_timeout).filter(|t| !t.is_zero());
+    let (mut answer, mut chunk) = (Vec::new(), vec![0u8; 4096]);
+    if !write_all(&mut s, req, None).await { return None }
     bytes[2] = req.len() as u64;
     // The rest of a body that is not buffered goes on as the client sends it.
-    if let Some(u) = unread { bytes[2] += pass_body(u, max, &mut s)?; }
+    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut()?, max, &mut s).await?; }
     // A head that does not fit in proxy_buffer_size is too big: the answer is invalid.
     let end = loop {
         if let Some(end) = head_end(&answer[..answer.len().min(level.proxy_buffer_size)]) { break end; }
         if answer.len() >= level.proxy_buffer_size { return None; }
-        if client_closed(&s, client, level.proxy_read_timeout)? { return Some(Response { status: 499, ..Response::default() }); }
-        let n = s.read(&mut chunk).ok().filter(|n| *n > 0)?;
+        let closed = async { match client.as_deref() { Some(c) => crate::stream::closed(c.tcp()).await, None => std::future::pending().await } };
+        let n = tokio::select! {
+            biased;
+            () = closed => return Some(Response { status: 499, ..Response::default() }),
+            n = within(wait, s.read(&mut chunk)) => n?.ok().filter(|n| *n > 0)?,
+        };
         answer.extend_from_slice(&chunk[..n]);
         bytes[1] = answer.len() as u64;
     };
@@ -1359,8 +1405,8 @@ fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Option<&
     let no_body = req.starts_with(b"HEAD ") || [204, 304].contains(&status) || accel;
     let (length, chunked) = if no_body { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
-    if rate > 0 { return Some(Response { rest: Some(Rest { s, answer, end, length, chunked, rate, started: start }), ..resp }); }
-    let (body, read) = read_body(&mut s, answer, end, length, chunked, 0)?;
+    if rate > 0 { return Some(Response { rest: Some(Rest { s, answer, end, length, chunked, rate, started: start, wait }), ..resp }); }
+    let (body, read) = read_body(&mut s, answer, end, length, chunked, 0, wait).await?;
     (resp.body, bytes[0], bytes[1]) = (body, (read - end) as u64, read as u64);
     Some(resp)
 }
@@ -1383,14 +1429,15 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// proxy_limit_rate: by the end of each second since the body started
 /// (counted in whole seconds of the clock) up to the rate for each second has
 /// been read, and when that much has, it waits for the time it is worth.
-/// Returns the body and the bytes of the whole answer read.
-fn read_body(s: &mut TcpStream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64) -> Option<(Vec<u8>, usize)> {
+/// Returns the body and the bytes of the whole answer read; None when a read
+/// fails or waits longer than the time.
+async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> Option<(Vec<u8>, usize)> {
     let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    let (start, rate, mut chunk) = (secs(), rate as i64, [0u8; 4096]);
+    let (start, rate, mut chunk) = (secs(), rate as i64, vec![0u8; 4096]);
     while length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1) {
         let limit = if rate == 0 { chunk.len() as i64 } else { rate * (secs() - start + 1) - (answer.len() - end) as i64 };
-        if limit <= 0 { thread::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)); continue; }
-        let n = s.read(&mut chunk[..(limit as usize).min(4096)]).ok()?;
+        if limit <= 0 { tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await; continue; }
+        let n = within(wait, s.read(&mut chunk[..(limit as usize).min(4096)])).await?.ok()?;
         if n == 0 { break; }
         answer.extend_from_slice(&chunk[..n]);
     }
@@ -1434,11 +1481,11 @@ fn unchunk(buf: &[u8]) -> (Vec<u8>, bool) {
 }
 
 /// A body read as it is passed on (proxy_request_buffering off): the
-/// client's socket, the bytes left of a body with a Content-Length, or what
+/// bytes left of a body with a Content-Length, or what
 /// has come of a chunked one and how much of its data was passed; and, once
 /// a chunked body ended, what came after it.
 #[derive(Debug)]
-pub struct Unread { client: TcpStream, left: u64, chunked: Option<(Vec<u8>, usize)>, rest: Vec<u8> }
+pub struct Unread { left: u64, chunked: Option<(Vec<u8>, usize)>, rest: Vec<u8> }
 
 /// Data as one chunk.
 fn chunk(data: &[u8]) -> Vec<u8> {
@@ -1450,13 +1497,13 @@ fn chunk(data: &[u8]) -> Vec<u8> {
 /// one in a chunk for each read, with the last chunk once it ends, and returns
 /// how many bytes it wrote ($upstream_bytes_sent). None when
 /// the client closes, the body is invalid or the writing fails.
-fn pass_body(u: &mut Unread, max: u64, to: &mut dyn Write) -> Option<u64> {
-    let (mut buf, mut written) = ([0u8; 4096], 0);
+async fn pass_body<C: AsyncRead + Unpin, W: AsyncWrite + Unpin>(u: &mut Unread, client: &mut C, max: u64, to: &mut W) -> Option<u64> {
+    let (mut buf, mut written) = (vec![0u8; 4096], 0);
     let Some((raw, sent)) = &mut u.chunked else {
         while u.left > 0 {
-            let got = u.client.read(&mut buf[..u.left.min(4096) as usize]).ok().filter(|g| *g > 0)?;
+            let got = client.read(&mut buf[..u.left.min(4096) as usize]).await.ok().filter(|g| *g > 0)?;
             u.left -= got as u64;
-            to.write_all(&buf[..got]).ok()?;
+            if !write_all(to, &buf[..got], None).await { return None }
             written += got as u64;
         }
         return Some(written);
@@ -1466,22 +1513,12 @@ fn pass_body(u: &mut Unread, max: u64, to: &mut dyn Write) -> Option<u64> {
         let mut out = if data.len() > *sent { chunk(&data[*sent..]) } else { Vec::new() };
         *sent = data.len();
         if used.is_some() { out.extend_from_slice(b"0\r\n\r\n"); }
-        to.write_all(&out).ok()?;
+        if !write_all(to, &out, None).await { return None }
         written += out.len() as u64;
         if let Some(used) = used { u.rest = raw.split_off(used); u.chunked = None; return Some(written); }
-        let got = u.client.read(&mut buf).ok().filter(|g| *g > 0)?;
+        let got = client.read(&mut buf).await.ok().filter(|g| *g > 0)?;
         raw.extend_from_slice(&buf[..got]);
     }
-}
-
-/// Waits until the proxied server sends something or the client closes the
-/// connection (true); None when proxy_read_timeout passes first.
-fn client_closed(s: &TcpStream, client: i32, timeout: Duration) -> Option<bool> {
-    use std::os::fd::AsRawFd;
-    let mut fds = [libc::pollfd { fd: s.as_raw_fd(), events: libc::POLLIN, revents: 0 }, libc::pollfd { fd: client, events: libc::POLLRDHUP, revents: 0 }];
-    // SAFETY: fds is an array of two pollfd that lives through the call.
-    let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout.as_millis().try_into().unwrap_or(i32::MAX)) };
-    (n > 0).then_some(fds[1].revents != 0)
 }
 
 /// Fills the request from its head, or gives the status nginx refuses it with.
@@ -1696,6 +1733,10 @@ fn page_with(status: u16, title: &str, more: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::block_on;
+    use std::net::TcpStream;
+    use tokio::io::AsyncWriteExt;
+    use std::thread;
 
     #[test]
     fn listens_with_the_backlog() {
@@ -1727,27 +1768,50 @@ mod tests {
             <center><h1>400 Bad Request</h1></center>\r\n<center>Request Header Or Cookie Too Large</center>\r\n<hr>"));
     }
 
+    /// What exchange() writes to a client for a GET of a server.
+    fn exchanged(s: &Server, target: &str) -> String {
+        block_on(async {
+            let (mut stream, mut out) = pair().await;
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]).await;
+            drop(stream);
+            let mut text = String::new();
+            out.read_to_string(&mut text).await.unwrap();
+            text
+        })
+    }
+
+    /// A connection accepted on the event loop, and the other end.
+    async fn pair() -> (Stream, tokio::net::TcpStream) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = tokio::net::TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        (Stream::Tcp(l.accept().await.unwrap().0), other)
+    }
+
     #[test]
     fn tunnel_passes_data_both_ways() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        let (mut client, accepted) = (TcpStream::connect(addr).unwrap(), l.accept().unwrap().0);
-        let (mut server, up) = (TcpStream::connect(addr).unwrap(), l.accept().unwrap().0);
-        let t = thread::spawn(move || tunnel(&accepted, up, b"early"));
-        let mut buf = [0u8; 4];
-        let mut early = [0u8; 5];
-        server.read_exact(&mut early).unwrap();
-        assert_eq!(&early, b"early");
-        client.write_all(b"ping").unwrap();
-        server.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"ping");
-        server.write_all(b"pong").unwrap();
-        client.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"pong");
-        // The proxied server closing ends the client's connection too.
-        drop(server);
-        assert_eq!(client.read(&mut buf).unwrap(), 0);
-        assert_eq!(t.join().unwrap(), 4);
+        block_on(async {
+            let ((mut accepted, mut client), (up, mut server)) = (pair().await, pair().await);
+            let t = tokio::task::spawn_local(async move { tunnel(&mut accepted, up, b"early", (Some(Duration::from_secs(5)), None)).await });
+            let mut buf = [0u8; 4];
+            let mut early = [0u8; 5];
+            server.read_exact(&mut early).await.unwrap();
+            assert_eq!(&early, b"early");
+            client.write_all(b"ping").await.unwrap();
+            server.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            server.write_all(b"pong").await.unwrap();
+            client.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"pong");
+            // The proxied server closing ends the client's connection too.
+            drop(server);
+            assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+            assert_eq!(t.await.unwrap(), 4);
+            // So does a client that sends nothing for proxy_read_timeout.
+            let ((mut accepted, _client), (up, mut server)) = (pair().await, pair().await);
+            assert_eq!(tunnel(&mut accepted, up, b"", (Some(Duration::from_millis(50)), None)).await, 0);
+            assert_eq!(server.read(&mut buf).await.unwrap(), 0);
+        });
     }
 
     #[test]
@@ -1777,22 +1841,39 @@ mod tests {
     #[test]
     fn shutting_down_answers_connections_already_accepted() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        socket2::SockRef::from(&l).set_read_timeout(Some(ACCEPT_WAIT)).unwrap();
         let addr = l.local_addr().unwrap();
         let text = format!("http {{ server {{ listen {addr}; location / {{ return 200 done; }} }} }}");
         let config = Arc::new(crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
         let mut client = TcpStream::connect(addr).unwrap();
-        accept(config, &[(l, addr)]).unwrap();
-        while BUSY.load(Ordering::SeqCst) == 0 { thread::sleep(Duration::from_millis(1)); }
-        // The connection was accepted before its request came: shutting down waits for it.
-        let shut = thread::spawn(|| shut_down(None));
-        thread::sleep(Duration::from_millis(300));
-        assert!(!shut.is_finished());
-        client.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
-        shut.join().unwrap();
-        let mut text = String::new();
-        client.read_to_string(&mut text).unwrap();
+        let writer = thread::spawn(move || {
+            // The connection was accepted before its request came: shutting down waits for it.
+            thread::sleep(Duration::from_millis(300));
+            client.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+            let mut text = String::new();
+            client.read_to_string(&mut text).unwrap();
+            text
+        });
+        block_on(async {
+            let accepting = accept(config, &[(l, addr)]).unwrap();
+            while BUSY.load(Ordering::SeqCst) == 0 { tokio::time::sleep(Duration::from_millis(1)).await; }
+            let started = Instant::now();
+            shut_down(accepting, None).await;
+            assert!(started.elapsed() >= Duration::from_millis(200));
+        });
+        let text = writer.join().unwrap();
         assert!(text.starts_with("HTTP/1.1 200 ") && text.ends_with("done"), "{text}");
+        // worker_shutdown_timeout: a request that does not come is not waited for longer.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("http {{ server {{ listen {addr}; }} }}"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        let _idle = TcpStream::connect(addr).unwrap();
+        block_on(async {
+            let accepting = accept(config, &[(l, addr)]).unwrap();
+            while BUSY.load(Ordering::SeqCst) == 0 { tokio::time::sleep(Duration::from_millis(1)).await; }
+            let started = Instant::now();
+            shut_down(accepting, Some(Duration::from_millis(100))).await;
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
     }
 
     fn request(head: &str) -> (Result<(), u16>, Request) {
@@ -1820,7 +1901,6 @@ mod tests {
             limit_rate: Default::default(),
             vars: Default::default(),
             unread: Default::default(),
-            client: -1,
             ssl: None,
         };
         (parse(&mut r, head.as_bytes(), &Level::default()), r)
@@ -1917,7 +1997,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (mut time, mut bytes) = ([None; 3], [0; 3]);
-        let resp = fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut time, &mut bytes), &|_| 0, None, 0, false).unwrap();
+        let resp = block_on(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut time, &mut bytes), &|_| 0, None, 0, false)).unwrap();
         assert!(time[0].is_some() && time[1].is_some());
         // The body, the whole answer and the request, in bytes.
         assert_eq!(bytes, [4, 80, 18]);
@@ -1941,17 +2021,7 @@ mod tests {
                             location /off {{ proxy_pass http://{addr}; }} location /e {{ return 200 e; }} }} }}");
         let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
-        let answer = |target: &str| {
-            let client = TcpListener::bind("127.0.0.1:0").unwrap();
-            let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
-            let (mut stream, _) = client.accept().unwrap();
-            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]);
-            drop(stream);
-            let mut text = String::new();
-            out.read_to_string(&mut text).unwrap();
-            text
-        };
+        let answer = |target: &str| exchanged(s, target);
         let on = answer("/on");
         assert!(on.starts_with("HTTP/1.1 401 ") && on.ends_with("\r\n\r\ne"), "{on}");
         assert!(on.contains("WWW-Authenticate: a\r\nWWW-Authenticate: b\r\n") && !on.contains("X-A"), "{on}");
@@ -1990,17 +2060,7 @@ mod tests {
         let text = "http { server { location /a { return 404; } location /b { server_tokens off; return 404; } } }";
         let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
-        let get = |target: &str| {
-            let client = TcpListener::bind("127.0.0.1:0").unwrap();
-            let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
-            let (mut stream, _) = client.accept().unwrap();
-            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]);
-            drop(stream);
-            let mut text = String::new();
-            out.read_to_string(&mut text).unwrap();
-            text
-        };
+        let get = |target: &str| exchanged(s, target);
         let a = get("/a");
         assert!(a.contains(&format!("Server: {NAME}\r\n")) && a.contains(&format!("<center>{NAME}</center>")), "{a}");
         let b = get("/b");
@@ -2016,17 +2076,7 @@ mod tests {
                     location /n { return 204; } location /t { return 200 t; } location /r { return 302 y; } } }";
         let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
-        let get = |target: &str| {
-            let client = TcpListener::bind("127.0.0.1:0").unwrap();
-            let mut out = TcpStream::connect(client.local_addr().unwrap()).unwrap();
-            let (mut stream, _) = client.accept().unwrap();
-            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            exchange(&mut stream, s, &r, Ok(()), location(s, &r.uri), "127.0.0.1:8080".parse().unwrap(), &[]);
-            drop(stream);
-            let mut text = String::new();
-            out.read_to_string(&mut text).unwrap();
-            text
-        };
+        let get = |target: &str| exchanged(s, target);
         // The answer takes the error's status, unless it is a page of its own, or "=" is given.
         assert!(get("/a").starts_with("HTTP/1.1 405 "));
         assert!(get("/d").starts_with("HTTP/1.1 204 "));
@@ -2048,7 +2098,7 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let socket = bound(&addr, ("127.0.0.2:0".parse().unwrap(), false));
-        assert_eq!(fetch((&addr, None), socket, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap().status, 200);
+        assert_eq!(block_on(fetch((&addr, None), socket, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false)).unwrap().status, 200);
         assert_eq!(from.join().unwrap().ip().to_string(), "127.0.0.2");
         let taken = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(bound(&addr, (taken, false)).is_some());
@@ -2067,16 +2117,18 @@ mod tests {
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
-        let mut resp = fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).unwrap();
-        // The body is read after the head, 4000 bytes (what came with the head too)
-        // in each second of the clock: it ends in the third second.
-        assert!(resp.body.is_empty() && resp.rest.is_some());
-        resp.upstream_time = Some(vec![[None; 3]]);
-        let started = Instant::now();
-        finish(&mut resp);
-        assert!(started.elapsed() >= Duration::from_millis(900));
-        assert_eq!((resp.body.len(), resp.rest.is_none()), (12000, true));
-        assert!(resp.upstream_time.unwrap()[0][2].is_some());
+        block_on(async {
+            let mut resp = fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &rate, None, 0, false).await.unwrap();
+            // The body is read after the head, 4000 bytes (what came with the head too)
+            // in each second of the clock: it ends in the third second.
+            assert!(resp.body.is_empty() && resp.rest.is_some());
+            resp.upstream_time = Some(vec![[None; 3]]);
+            let started = Instant::now();
+            finish(&mut resp).await;
+            assert!(started.elapsed() >= Duration::from_millis(900));
+            assert_eq!((resp.body.len(), resp.rest.is_none()), (12000, true));
+            assert!(resp.upstream_time.unwrap()[0][2].is_some());
+        });
     }
 
     #[test]
@@ -2108,10 +2160,10 @@ mod tests {
             }
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
-        let resp = fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).unwrap();
+        let resp = block_on(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false)).unwrap();
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
         for _ in 1..answers.len() {
-            assert!(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, -1, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false).is_none());
+            assert!(block_on(fetch((&addr, None), None, b"GET / HTTP/1.0\r\n\r\n", &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, false)).is_none());
         }
     }
 
@@ -2138,7 +2190,7 @@ mod tests {
         let p = Proxy { host: "h".into(), ssl: false, upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("POST /a HTTP/1.0\n\n");
-        let resp = proxy(&p, &level, &r, "");
+        let resp = block_on(proxy(&p, &level, &r, "", None));
         assert_eq!((resp.internal.as_deref(), resp.as_get, r.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
         assert!(resp.upstream_time.unwrap()[0][2].unwrap() < 1000);
     }
@@ -2193,19 +2245,24 @@ mod tests {
 
     #[test]
     fn sends_at_the_rate() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut s, _) = listener.accept().unwrap();
-        let started = Instant::now();
-        assert!(send(&mut s, &[b'x'; 3000], 0, 0, started));
-        // 1000 bytes and 1000 a second: the rest goes after a second or two.
-        assert!(send(&mut s, &[b'x'; 2500], 1000, 1000, started));
-        assert!(started.elapsed() >= Duration::from_millis(1400));
-        let mut got = vec![0u8; 5500];
-        client.read_exact(&mut got).unwrap();
-        drop(client);
-        thread::sleep(Duration::from_millis(100));
-        assert!(!send(&mut s, &[b'x'; 1 << 22], 1 << 20, 0, Instant::now()));
+        block_on(async {
+            let (mut s, mut client) = pair().await;
+            let started = Instant::now();
+            assert!(send(&mut s, &[&[b'x'; 1000], &[b'y'; 2000], &[]], 0, 0, started, None).await);
+            // 1000 bytes and 1000 a second: the rest goes after a second or two.
+            assert!(send(&mut s, &[&[b'z'; 700], &[b'w'; 1800]], 1000, 1000, started, None).await);
+            assert!(started.elapsed() >= Duration::from_millis(1400));
+            let mut got = vec![0u8; 5500];
+            client.read_exact(&mut got).await.unwrap();
+            let want = [vec![b'x'; 1000], vec![b'y'; 2000], vec![b'z'; 700], vec![b'w'; 1800]].concat();
+            assert!(got == want);
+            drop(client);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!send(&mut s, &[&vec![b'x'; 1 << 22]], 1 << 20, 0, Instant::now(), None).await);
+            // A client that does not read for send_timeout fails the write.
+            let (mut s, _client) = pair().await;
+            assert!(!send(&mut s, &[&vec![b'x'; 1 << 24]], 0, 0, Instant::now(), Some(Duration::from_millis(200))).await);
+        });
     }
 
     #[test]
@@ -2222,7 +2279,7 @@ mod tests {
         let p = Proxy { host: "h".into(), ssl: false, upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
         let level = Level { proxy_hide_header: vec!["x-location".into(), "content-type".into()], proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("GET / HTTP/1.0\n\n");
-        let resp = proxy(&p, &level, &r, "/");
+        let resp = block_on(proxy(&p, &level, &r, "/", None));
         assert_eq!(resp.upstream_addr, Some(addr.to_string()));
         assert_eq!((resp.ctype, resp.headers), (None, vec![("X-B".to_string(), "2".to_string())]));
     }
@@ -2232,12 +2289,12 @@ mod tests {
         let (_, r) = request("GET /a?b HTTP/1.0\n\n");
         let group = Arc::new(Upstream::new(Vec::new()));
         let p = Proxy { host: String::new(), ssl: false, upstream: group.clone(), uri: None, url: None, groups: [("u".to_string(), group)].into(), implicit: Default::default() };
-        assert_eq!(resolved("http://u/y", &p, &Level::default(), &r).map(|t| (t.0, t.1)), Some(("u".into(), "/y".into())));
-        let (host, uri, up) = resolved("http://127.0.0.2:81/x", &p, &Level::default(), &r).unwrap();
+        assert_eq!(block_on(resolved("http://u/y", &p, &Level::default(), &r)).map(|t| (t.0, t.1)), Some(("u".into(), "/y".into())));
+        let (host, uri, up) = block_on(resolved("http://127.0.0.2:81/x", &p, &Level::default(), &r)).unwrap();
         assert_eq!((host.as_str(), uri.as_str(), up.peers[0].addr.to_string()), ("127.0.0.2:81", "/x", "127.0.0.2:81".to_string()));
-        assert_eq!(resolved("http://127.0.0.2", &p, &Level::default(), &r).map(|t| (t.0, t.1)), Some(("127.0.0.2".into(), "/a?b".into())));
-        assert!(resolved("http://example.net/x", &p, &Level::default(), &r).is_none());
-        let (_, _, up) = resolved("http://[::1]:82/x", &p, &Level::default(), &r).unwrap();
+        assert_eq!(block_on(resolved("http://127.0.0.2", &p, &Level::default(), &r)).map(|t| (t.0, t.1)), Some(("127.0.0.2".into(), "/a?b".into())));
+        assert!(block_on(resolved("http://example.net/x", &p, &Level::default(), &r)).is_none());
+        let (_, _, up) = block_on(resolved("http://[::1]:82/x", &p, &Level::default(), &r)).unwrap();
         assert_eq!(up.peers[0].addr.to_string(), "[::1]:82");
     }
 
@@ -2346,7 +2403,7 @@ mod tests {
         let s = &config.servers[0];
         let body = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            String::from_utf8(answer(s, &r, Ok(()), located(s, &r, &r.uri)).0.body).unwrap()
+            String::from_utf8(block_on(answer(s, &r, Ok(()), located(s, &r, &r.uri), None)).0.body).unwrap()
         };
         assert_eq!(body("/c/xyz"), "xyz");
         assert_eq!(body("/a/f.txt"), "F");
@@ -2361,7 +2418,7 @@ mod tests {
         let status = |line: &str| {
             let (_, r) = request(&format!("{line} HTTP/1.0\n\n"));
             let found = located(s, &r, &r.uri);
-            (answer(s, &r, Ok(()), found).0.status, found.1.proxy.is_some())
+            (block_on(answer(s, &r, Ok(()), found, None)).0.status, found.1.proxy.is_some())
         };
         // GET allows HEAD too.
         assert_eq!(status("HEAD /lg"), (404, false));
@@ -2378,7 +2435,7 @@ mod tests {
         let s = &config.servers[0];
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            let resp = respond(&r, Ok(()), location(s, &r.uri));
+            let resp = block_on(respond(&r, Ok(()), location(s, &r.uri), None));
             (resp.status, resp.headers[0].1.clone())
         };
         assert_eq!(answer("/a?x=1"), (302, "http://e/1?x=1".to_string()));
@@ -2400,7 +2457,7 @@ mod tests {
         let s = &config.servers[0];
         let get = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            let resp = answer(s, &r, Ok(()), location(s, &r.uri)).0;
+            let resp = block_on(answer(s, &r, Ok(()), location(s, &r.uri), None)).0;
             (resp.status, String::from_utf8(resp.body).unwrap(), resp.headers.first().map(|h| h.1.clone()))
         };
         // Without a flag the next rewrite and return see the new URI; a capture in the
@@ -2423,9 +2480,9 @@ mod tests {
         assert!(location(s, "@n").0.is_empty());
         let (_, r) = request("GET /a?x=1 HTTP/1.0\n\n");
         // break skips return; the new URI keeps the arguments and is looked for under root.
-        assert_eq!(respond(&r, Ok(()), location(s, &r.uri)).status, 404);
+        assert_eq!(block_on(respond(&r, Ok(()), location(s, &r.uri), None)).status, 404);
         let named = (s.locations[1].path.as_str(), &s.locations[1].level, false);
-        assert_eq!(respond(&r, Ok(()), named).body, b"n/a");
+        assert_eq!(block_on(respond(&r, Ok(()), named, None)).body, b"n/a");
     }
 
     #[test]
@@ -2435,7 +2492,7 @@ mod tests {
         let s = &config.servers[0];
         let rate = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            String::from_utf8(super::answer(s, &r, Ok(()), location(s, &r.uri)).0.body).unwrap()
+            String::from_utf8(block_on(super::answer(s, &r, Ok(()), location(s, &r.uri), None)).0.body).unwrap()
         };
         assert_eq!(rate("/a?l=40k"), "40960");
         assert_eq!(rate("/a?l=2M"), "2097152");
@@ -2451,7 +2508,7 @@ mod tests {
         let s = &config.servers[0];
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            let (resp, level, _) = answer(s, &r, Ok(()), location(s, &r.uri));
+            let (resp, level, _) = block_on(answer(s, &r, Ok(()), location(s, &r.uri), None));
             (String::from_utf8(resp.body).unwrap(), level.add_header.len())
         };
         assert_eq!(answer("/?a=1"), ("[1][1]x".to_string(), 1));
@@ -2464,7 +2521,7 @@ mod tests {
         let s = &config.servers[0];
         let body = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            String::from_utf8(super::answer(s, &r, Ok(()), location(s, &r.uri)).0.body).unwrap()
+            String::from_utf8(block_on(super::answer(s, &r, Ok(()), location(s, &r.uri), None)).0.body).unwrap()
         };
         assert_eq!((body("/?r=1"), body("/")), ("r".to_string(), "l".to_string()));
         let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
@@ -2488,7 +2545,7 @@ mod tests {
         let s = &config.servers[0];
         let get = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            let resp = answer(s, &r, Ok(()), location(s, &r.uri)).0;
+            let resp = block_on(answer(s, &r, Ok(()), location(s, &r.uri), None)).0;
             (resp.status, String::from_utf8(resp.body).unwrap())
         };
         assert_eq!((get("/eq?c=2").0, get("/eq?c=1").0), (204, 404));
@@ -2538,33 +2595,33 @@ mod tests {
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), proxy_set_body: set, ..Level::default() };
         let (_, mut r) = request("POST /a?a=1 HTTP/1.0\nContent-Length: 3\n\n");
         r.body = b"xyz".to_vec();
-        assert_eq!(proxy(&p, &level, &r, "").status, 204);
+        assert_eq!(block_on(proxy(&p, &level, &r, "", None)).status, 204);
         let sent = got.join().unwrap();
         assert!(sent.contains("Content-Length: 3\r\n") && sent.ends_with("\r\n\r\nb=1"), "{sent}");
     }
 
     #[test]
     fn passes_bodies_as_they_come() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut out = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut client, _) = listener.accept().unwrap();
-        let unread = |client: &TcpStream, left: u64, chunked: Option<&[u8]>| Unread { client: client.try_clone().unwrap(), left, chunked: chunked.map(|c| (c.to_vec(), 1)), rest: Vec::new() };
-        out.write_all(b"abcdef").unwrap();
-        let (mut to, mut u) = (Vec::new(), unread(&client, 4, None));
-        assert_eq!(pass_body(&mut u, 100, &mut to), Some(4));
-        assert_eq!((to.as_slice(), u.left), (&b"abcd"[..], 0));
-        // A chunked body: the data that came after the one passed, in one chunk
-        // for each read, then the last chunk; what follows it is kept.
-        let (mut to, mut u) = (Vec::new(), unread(&client, 0, Some(b"3\r\nx")));
-        out.write_all(b"\r\n4\r\nmany\r\n0\r\n\r\nGET").unwrap();
-        assert_eq!(pass_body(&mut u, 100, &mut to), Some(16));
-        assert_eq!((String::from_utf8_lossy(&to), u.rest.as_slice()), ("6\r\nefmany\r\n0\r\n\r\n".into(), &b"GET"[..]));
-        // An invalid chunk, or the client closing before the end, fails it.
-        assert_eq!(pass_body(&mut unread(&client, 0, Some(b"z\r\n")), 100, &mut to), None);
-        drop(out);
-        let mut u = unread(&client, 5, None);
-        assert_eq!(pass_body(&mut u, 100, &mut to), None);
-        assert_eq!(u.left, 5);
+        block_on(async {
+            let (mut client, mut out) = pair().await;
+            let unread = |left: u64, chunked: Option<&[u8]>| Unread { left, chunked: chunked.map(|c| (c.to_vec(), 1)), rest: Vec::new() };
+            out.write_all(b"abcdef").await.unwrap();
+            let (mut to, mut u) = (Vec::new(), unread(4, None));
+            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to).await, Some(4));
+            assert_eq!((to.as_slice(), u.left), (&b"abcd"[..], 0));
+            // A chunked body: the data that came after the one passed, in one chunk
+            // for each read, then the last chunk; what follows it is kept.
+            let (mut to, mut u) = (Vec::new(), unread(0, Some(b"3\r\nx")));
+            out.write_all(b"\r\n4\r\nmany\r\n0\r\n\r\nGET").await.unwrap();
+            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to).await, Some(16));
+            assert_eq!((String::from_utf8_lossy(&to), u.rest.as_slice()), ("6\r\nefmany\r\n0\r\n\r\n".into(), &b"GET"[..]));
+            // An invalid chunk, or the client closing before the end, fails it.
+            assert_eq!(pass_body(&mut unread(0, Some(b"z\r\n")), &mut client, 100, &mut to).await, None);
+            drop(out);
+            let mut u = unread(5, None);
+            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to).await, None);
+            assert_eq!(u.left, 5);
+        });
     }
 
     #[test]
@@ -2688,7 +2745,7 @@ mod tests {
         let s = &config.servers[0];
         let status = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            let (resp, _, _) = answer(s, &r, Ok(()), location(s, &r.uri));
+            let (resp, _, _) = block_on(answer(s, &r, Ok(()), location(s, &r.uri), None));
             (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
         };
         assert_eq!(status("/a/?x"), (200, "i/a/index.html".to_string()));
@@ -2709,7 +2766,7 @@ mod tests {
         let s = &config.servers[0];
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            let (resp, _, last) = answer(s, &r, Ok(()), location(s, &r.uri));
+            let (resp, _, last) = block_on(answer(s, &r, Ok(()), location(s, &r.uri), None));
             (resp.status, last.target)
         };
         assert_eq!(answer("/m/?a"), (200, "/m/two.html?a".to_string()));
@@ -2741,7 +2798,7 @@ mod tests {
         let s = &config.servers[0];
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            let (resp, _, _) = answer(s, &r, Ok(()), location(s, &r.uri));
+            let (resp, _, _) = block_on(answer(s, &r, Ok(()), location(s, &r.uri), None));
             (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
         };
         assert_eq!(answer("/f.html"), (200, "f".to_string()));
@@ -2786,7 +2843,7 @@ mod tests {
         let s = &config.servers[0];
         for target in ["/", "/u"] {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            post_action(s, &r, location(s, &r.uri).1);
+            block_on(post_action(s, &r, location(s, &r.uri).1, None));
         }
         assert_eq!(location(s, "/").1.post_action.as_deref(), Some("@n"));
     }
