@@ -454,7 +454,15 @@ struct Response {
     /// What is left to read of a proxied answer's body that proxy_limit_rate
     /// paces: it is read once the head is made, as nginx sends the head first.
     rest: Option<Box<Rest>>,
+    /// Set when the body is only what came of a proxied answer's, its server
+    /// having closed the connection before the end of it.
+    cut: Option<Box<Cut>>,
 }
+
+/// A proxied answer cut off: the length its server gave it, if any, until a
+/// filter changes the body.
+#[derive(Debug)]
+struct Cut { length: Option<usize> }
 
 /// The connection to a proxied server whose body is still to be read, with
 /// what has been read of the answer, where its head ends, how the body's end
@@ -467,7 +475,7 @@ struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, ch
 /// Reads the rest of a proxied answer's body, noting how long the whole answer took.
 async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
-    let (body, read, ended) = read_body(&mut rest.conn.stream, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await.unwrap_or_default();
+    let (body, read, ended, _) = read_body(&mut rest.conn.stream, rest.answer, rest.end, rest.length, rest.chunked, rest.rate, rest.wait).await.unwrap_or_default();
     // A read that failed gave no body, and no end of it.
     if let Some((up, addr, tag)) = rest.home.filter(|_| rest.keep && ended) { up.put(rest.conn, addr, tag); }
     resp.body = body;
@@ -739,19 +747,23 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     gzip(r, level, &mut resp);
     range(r, &mut resp);
     let status = resp.status;
+    // 444 closes the connection without an answer; 499 is the status of a client that closed it.
+    let silent = [444, 499].contains(&status);
+    // An answer cut off has the length it would have whole, and the connection
+    // closes after it, so that the client can tell. Without a body to send, it is not one.
+    let cut = resp.cut.is_some() && r.method != "HEAD" && !silent && ![204, 304].contains(&status);
     // A body of unknown length is chunked for HTTP/1.1; otherwise the connection
     // closes after it. A HEAD answer has neither.
     // add_trailer makes it chunked too, except for a status that has no body.
     // chunked_transfer_encoding off leaves both unchunked.
-    let unknown = resp.unknown_length && r.method != "HEAD";
+    let length = resp.cut.as_ref().filter(|_| cut).map_or(Some(resp.body.len()), |c| c.length).filter(|_| !resp.unknown_length);
+    let unknown = length.is_none() && r.method != "HEAD";
     let trailing = level.add_trailer.iter().any(|t| t.2 || added) && r.method != "HEAD" && ![204, 304].contains(&status);
     // An upgraded connection is neither chunked nor kept alive, and has no length.
     let upgraded = resp.tunnel.is_some();
     let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1") && level.chunked && !upgraded;
     let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown) && !upgraded;
     let mut out = buffer();
-    // 444 closes the connection without an answer; 499 is the status of a client that closed it.
-    let silent = [444, 499].contains(&status);
     if !silent && !http09(r.line.as_bytes()) {
         let mut add = |parts: &[&str]| parts.iter().for_each(|p| out.extend_from_slice(p.as_bytes()));
         let server = if level.server_tokens { NAME } else { "twinx" };
@@ -759,7 +771,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         crate::clock::date(|date| add(&[date, "\r\n"]));
         if let Some(ctype) = &resp.ctype { add(&["Content-Type: ", ctype, "\r\n"]); }
         if chunked { add(&["Transfer-Encoding: chunked\r\n"]); }
-        else if !resp.unknown_length && status != 304 && !upgraded { add(&["Content-Length: ", decimal(&mut [0; 20], resp.body.len() as u64), "\r\n"]); }
+        else if let Some(n) = length.filter(|_| status != 304 && !upgraded) { add(&["Content-Length: ", decimal(&mut [0; 20], n as u64), "\r\n"]); }
         add(&["Connection: ", if upgraded { "upgrade" } else if keepalive { "keep-alive" } else { "close" }, "\r\n"]);
         if let Some(t) = level.keepalive_header.filter(|_| keepalive) { add(&["Keep-Alive: timeout=", decimal(&mut [0; 20], t), "\r\n"]); }
         if resp.vary && level.gzip_vary { add(&["Vary: Accept-Encoding\r\n"]); }
@@ -767,17 +779,21 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         add(&["\r\n"]);
         if !crate::vars::plain(&out) { out = crate::vars::bytes(&String::from_utf8_lossy(&out)); }
     }
+    let head_len = out.len();
     let body_len = if r.method == "HEAD" || silent { 0 } else { resp.body.len() };
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
     // The body is written from where it is, after the head, not copied after it.
     let mut tail = Vec::new();
     // The trailers are made after the body, each seeing those before it ($sent_trailer_*).
     let mut trailers = Vec::new();
-    for (name, value, _) in level.add_trailer.iter().filter(|t| chunked && (t.2 || added)) {
+    for (name, value, _) in level.add_trailer.iter().filter(|t| chunked && !cut && (t.2 || added)) {
         let value = value.render(r, &so_far(copy(&resp), trailers.clone()));
         if !value.is_empty() { trailers.push((name.clone(), value)); }
     }
-    if chunked {
+    if chunked && cut {
+        // What came is a whole chunk, but there is no last one.
+        if body_len > 0 { tail.extend_from_slice(b"\r\n"); }
+    } else if chunked {
         tail.extend_from_slice(if body_len > 0 { b"\r\n0\r\n" } else { b"0\r\n" });
         trailers.iter().for_each(|(n, v)| tail.extend(crate::vars::bytes(&format!("{n}: {v}\r\n"))));
         tail.extend_from_slice(b"\r\n");
@@ -790,11 +806,13 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let tunneled = match resp.tunnel.take().filter(|_| written) { Some(up) => tunnel(stream, up, ahead, (Some(level.proxy_read_timeout).filter(|t| !t.is_zero()), send_timeout(level))).await, None => 0 };
     if written && level.post_action.is_some() { Box::pin(post_action(server, r, level, Some(stream))).await; }
     if !level.access_log.is_empty() {
-        let sent = Sent { bytes: out.len() + body_len + tail.len() + tunneled, body: body_len + tunneled, ..so_far(resp, trailers) };
+        // The body sent of an answer cut off has what makes it a chunk.
+        let chunking = if cut { out.len() - head_len + tail.len() } else { 0 };
+        let sent = Sent { bytes: out.len() + body_len + tail.len() + tunneled, body: body_len + chunking + tunneled, ..so_far(resp, trailers) };
         level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     }
     recycle(out);
-    (written && keepalive && !silent).then_some(level.keepalive_timeout)
+    (written && keepalive && !silent && !cut).then_some(level.keepalive_timeout)
 }
 
 /// A number in decimal digits, written at the end of the space given.
@@ -862,18 +880,18 @@ fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
     let (ims, inm) = (header(r, "if-modified-since"), header(r, "if-none-match"));
     let same = |t: &str| level.if_modified_since.zip(modified).is_some_and(|(before, m)| expires::http_time(t).is_some_and(|t| t == m || before && t > m));
     if (ims.is_none() && inm.is_none()) || ims.is_some_and(|t| !same(t)) || inm.is_some_and(|v| !etag_match(v, etag.as_deref(), true)) { return; }
-    (resp.status, resp.ctype, resp.body, resp.rest) = (304, None, Vec::new(), None);
+    (resp.status, resp.ctype, resp.body, resp.rest, resp.cut) = (304, None, Vec::new(), None, None);
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges") && !h.0.eq_ignore_ascii_case("content-encoding"));
 }
 
 /// The range filter, as ngx_http_range_header_filter() is: a 200 answer of a
-/// known length that allows ranges, to a request with a "bytes=" Range, is
-/// 206 with the part the range asks for ("start-end", "start-" or "-suffix"),
+/// known length that allows ranges and is whole, to a request with a "bytes="
+/// Range, is 206 with the part the range asks for ("start-end", "start-" or "-suffix"),
 /// unless an If-Range differs from its ETag (a quoted value, compared exactly)
 /// or its Last-Modified time. A range that starts past the end is 416.
 /// Several ranges (multipart), which no test needs, are not done yet.
 fn range(r: &Request, resp: &mut Response) {
-    let ok = resp.status == 200 && resp.ranges && !resp.unknown_length && !http09(r.line.as_bytes());
+    let ok = resp.status == 200 && resp.ranges && resp.cut.is_none() && !resp.unknown_length && !http09(r.line.as_bytes());
     let Some(spec) = header(r, "range").filter(|v| ok && v.len() > 6 && v[..6].eq_ignore_ascii_case("bytes=")).map(|v| v[6..].trim()) else { return };
     let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     let same = |v: &str| if v.len() >= 2 && v.ends_with('"') { sent("etag").as_deref() == Some(v) } else { sent("last-modified").and_then(|t| expires::http_time(&t)).is_some_and(|t| expires::http_time(v) == Some(t)) };
@@ -1176,6 +1194,7 @@ fn gunzip(resp: &mut Response) {
     let mut body = Vec::new();
     let _ = flate2::read::MultiGzDecoder::new(resp.body.as_slice()).read_to_end(&mut body);
     resp.body = body;
+    if let Some(cut) = &mut resp.cut { cut.length = None; }
 }
 
 /// Passes the request to the proxied servers in turn, as proxy_http_version
@@ -1538,8 +1557,12 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
     if rate > 0 { return Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None })), ..resp }, None)); }
-    let (body, read, ended) = read_body(s, answer, end, length, chunked, 0, wait).await.ok_or(Other)?;
+    let (body, read, ended, cut) = read_body(s, answer, end, length, chunked, 0, wait).await.ok_or(Other)?;
     (resp.body, bytes[0], bytes[1]) = (body, (read - end) as u64, read as u64);
+    if let Some(part) = cut {
+        resp.body.extend(part);
+        resp.cut = Some(Box::new(Cut { length }));
+    }
     Ok((resp, Some(conn).filter(|_| keep && ended)))
 }
 
@@ -1556,24 +1579,72 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 
 /// Reads a proxied answer's body up to its length, up to its last chunk, or
 /// until the server closes the connection; what follows the last chunk is
-/// dropped. With a rate it is read as ngx_event_pipe_read_upstream() paces
-/// proxy_limit_rate: by the end of each second since the body started
-/// (counted in whole seconds of the clock) up to the rate for each second has
-/// been read, and when that much has, it waits for the time it is worth.
-/// Returns the body, the bytes of the whole answer read, and whether they end
-/// where the body does; None when a read fails or waits longer than the time.
-async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> Option<(Vec<u8>, usize, bool)> {
+/// dropped, but without a rate it is read up to the empty line after the trailer
+/// lines, where the body ends for nginx. With a rate it is read
+/// as ngx_event_pipe_read_upstream() paces proxy_limit_rate: by the end of each
+/// second since the body started (counted in whole seconds of the clock) up to
+/// the rate for each second has been read, and when that much has, it waits for
+/// the time it is worth.
+/// Returns the body, the bytes of the whole answer read, whether they end
+/// where the body does, and, when the server closed the connection before the
+/// body's end, what came of the chunk it did so in (nothing without chunks); None
+/// when a read fails or waits longer than the time, but after the last chunk.
+async fn read_body(s: &mut Stream, mut answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> Option<(Vec<u8>, usize, bool, Option<Vec<u8>>)> {
     let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    let (start, rate, mut chunk) = (secs(), rate as i64, vec![0u8; 4096]);
-    while length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1) {
+    let (start, rate, mut chunk, mut closed) = (secs(), rate as i64, vec![0u8; 4096], false);
+    while length.is_none_or(|n| answer.len() - end < n) && !(chunked && unchunk(&answer[end..]).1 && (rate > 0 || cut_off(&answer[end..]).is_none())) {
         let limit = if rate == 0 { chunk.len() as i64 } else { rate * (secs() - start + 1) - (answer.len() - end) as i64 };
         if limit <= 0 { tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await; continue; }
-        let n = within(wait, s.read(&mut chunk[..(limit as usize).min(4096)])).await?.ok()?;
-        if n == 0 { break; }
+        let n = match within(wait, s.read(&mut chunk[..(limit as usize).min(4096)])).await {
+            Some(Ok(n)) => n,
+            _ if chunked && unchunk(&answer[end..]).1 => break,
+            _ => return None,
+        };
+        if n == 0 { closed = true; break; }
         answer.extend_from_slice(&chunk[..n]);
     }
     let body = &answer[end..];
-    Some((if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() }, answer.len(), ended(body, length, chunked)))
+    let cut = if chunked { cut_off(body).filter(|_| closed) } else { length.filter(|n| body.len() < *n).map(|_| &body[..0]) }.map(<[u8]>::to_vec);
+    Some((if chunked { unchunk(body).0 } else { body[..length.unwrap_or(body.len()).min(body.len())].to_vec() }, answer.len(), ended(body, length, chunked), cut))
+}
+
+/// When more must follow what came of a chunked body, which is well-formed so
+/// far, what came of the chunk it ends in, if it does in one that unchunk() does
+/// not take; None when the body is whole or malformed. The last chunk,
+/// the trailer lines and the empty line are part of it, as they are for
+/// ngx_http_parse_chunked(); unlike there, LF line ends are fine, as for unchunk().
+fn cut_off(after: &[u8]) -> Option<&[u8]> {
+    // A line and, if it has ended, what follows it; a CR only ends a line.
+    let line = |from: &[u8]| {
+        let end = from.iter().position(|&c| c == b'\n');
+        let line = &from[..end.unwrap_or(from.len())];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        (!line.contains(&b'\r')).then_some((line.len(), end.map(|n| n + 1)))
+    };
+    let mut rest = after;
+    while !rest.is_empty() {
+        let (n, next) = line(rest)?;
+        let size = std::str::from_utf8(rest[..n].split(|&c| c == b';').next()?).ok()?.trim_end_matches([' ', '\t']);
+        // As in nginx, a size that leaves no room for what follows the chunk is invalid.
+        let size = u64::from_str_radix(size, 16).ok().filter(|s| !size.starts_with('+') && *s <= i64::MAX as u64 - 9)?;
+        let Some(next) = next else { break };
+        rest = &rest[next..];
+        if size == 0 {
+            loop {
+                let (n, next) = line(rest)?;
+                let Some(next) = next else { return Some(&[]) };
+                if n == 0 { return None; }
+                rest = &rest[next..];
+            }
+        }
+        let Some((data, end)) = rest.split_at_checked(usize::try_from(size).ok()?) else { return Some(rest) };
+        rest = match end {
+            [] | b"\r" | b"\n" => return Some(data),
+            [b'\r', b'\n', next @ ..] | [b'\n', next @ ..] => next,
+            _ => return None,
+        };
+    }
+    Some(&[])
 }
 
 /// Whether what came after the head of a proxied answer is its whole body and
@@ -2478,6 +2549,155 @@ mod tests {
         ];
         for (after, is) in chunked { assert_eq!(ended(after, None, true), is, "{}", String::from_utf8_lossy(after)); }
         for after in [&b""[..], b"ab", b"0\r\n\r\n"] { assert!(!ended(after, None, false)); }
+    }
+
+    #[test]
+    fn bodies_cut_off() {
+        let cases: [(&[u8], Option<&[u8]>); 36] = [
+            // In or before a size, with what may follow it.
+            (b"", Some(b"")), (b"0", Some(b"")), (b"2", Some(b"")), (b"2\r", Some(b"")), (b"2;x=y", Some(b"")), (b"2 ", Some(b"")),
+            // In a chunk, what came of it, and after it.
+            (b"2\r\n", Some(b"")), (b"2\r\na", Some(b"a")), (b"2\na", Some(b"a")), (b"2\r\nab", Some(b"ab")), (b"2\r\nab\r", Some(b"ab")), (b"2\nab\n", Some(b"ab")),
+            (b"2\r\nab\r\n", Some(b"")), (b"2\r\nab\r\n3", Some(b"")), (b"2\r\nab\r\n3;x\r\ncd", Some(b"cd")), (b"A \r\n0123456789\r\n0", Some(b"")),
+            // After the last chunk, before the empty line.
+            (b"0\r\n", Some(b"")), (b"0\r\n\r", Some(b"")), (b"2\r\nab\r\n0\r\n", Some(b"")), (b"0\r\nX: 1", Some(b"")), (b"0\r\nX: 1\r\n", Some(b"")),
+            // Whole, or more than it.
+            (b"0\r\n\r\n", None), (b"0\n\n", None), (b"2\r\nab\r\n0\r\nX: 1\r\n\r\n", None), (b"0\r\n\r\nab", None),
+            // Malformed.
+            (b"zz", None), (b"\r", None), (b"2\r\nab\r\nzz\r\n", None), (b"2\r\nabc", None), (b"2\r\nab\rc", None), (b"2\rx", None), (b"+2\r\nab", None), (b"2 x\r\nab", None),
+            (b"0\r\nX\r: 1", None), (b"7fffffffffffffff\r\nab", None), (b"10000000000000002\r\nab", None),
+        ];
+        for (after, part) in cases { assert_eq!(cut_off(after), part, "{}", String::from_utf8_lossy(after)); }
+    }
+
+    /// What comes back for the requests sent at once on a connection, until it is
+    /// closed, without the Date lines, when a server's location has the
+    /// directives and passes them to a server that sends the answer to each and closes
+    /// the connection; and how many requests came to that one.
+    fn passed_on(answer: &str, directives: &str, requests: &str) -> (Vec<u8>, usize) {
+        let _busy = counted();
+        // A test of shutting down leaves it set, which closes connections.
+        SHUTTING.store(false, Ordering::SeqCst);
+        let (addr, came) = closing(answer.to_string().leak());
+        let got = block_on(async {
+            let (mut client, task) = served(&format!("location /e {{ return 200 e; }} location / {{ proxy_pass http://{addr}; {directives} }}")).await;
+            client.write_all(requests.as_bytes()).await.unwrap();
+            let mut got = Vec::new();
+            within(Some(Duration::from_secs(4)), client.read_to_end(&mut got)).await.unwrap().unwrap();
+            drop(client);
+            within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
+            got
+        });
+        let mut text = Vec::new();
+        for line in got.split_inclusive(|&c| c == b'\n').filter(|l| !l.starts_with(b"Date: ")) { text.extend_from_slice(line); }
+        let came = *came.lock().unwrap();
+        (text, came)
+    }
+
+    const LENGTH: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 30000\r\n\r\n";
+    const CHUNKED: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    /// The head of an answer with the Content-Length or Transfer-Encoding line, if
+    /// any, and the Connection header.
+    fn head(line: &str, connection: &str) -> String {
+        format!("HTTP/1.1 200 OK\r\nServer: {NAME}\r\nContent-Type: text/html\r\n{line}Connection: {connection}\r\n\r\n")
+    }
+
+    #[test]
+    fn answers_cut_off_are_sent_so() {
+        let big = "x".repeat(20000);
+        let (http11, http10, keep) = ("GET / HTTP/1.1\r\nHost: a\r\n\r\n", "GET / HTTP/1.0\r\n\r\n", "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+        let (length, chunked) = (head("Content-Length: 30000\r\n", "keep-alive"), head("Transfer-Encoding: chunked\r\n", "keep-alive"));
+        for (answer, directives, request, want) in [
+            (format!("{CHUNKED}2\r\nab\r\n"), "", http11, format!("{chunked}2\r\nab\r\n")),
+            (format!("{CHUNKED}4e20\r\n{big}\r\n"), "", http11, format!("{chunked}4e20\r\n{big}\r\n")),
+            (format!("{LENGTH}ab"), "", http11, format!("{length}ab")),
+            (format!("{LENGTH}{big}"), "", http11, format!("{length}{big}")),
+            // In a chunk, before any, and after the last one.
+            (format!("{CHUNKED}2\r\nab\r\n5\r\ncd"), "", http11, format!("{chunked}4\r\nabcd\r\n")),
+            (CHUNKED.to_string(), "", http11, chunked.clone()),
+            (format!("{CHUNKED}2\r\nab\r\n0\r\n"), "", http11, format!("{chunked}2\r\nab\r\n")),
+            // Without chunks.
+            (format!("{CHUNKED}2\r\nab\r\n"), "", http10, format!("{}ab", head("", "close"))),
+            (format!("{CHUNKED}2\r\nab\r\n"), "", keep, format!("{}ab", head("", "close"))),
+            (format!("{CHUNKED}2\r\nab\r\n"), "chunked_transfer_encoding off;", http11, format!("{}ab", head("", "close"))),
+            (format!("{LENGTH}ab"), "", keep, format!("{length}ab")),
+            // No trailers.
+            (format!("{LENGTH}ab"), "add_trailer X 1;", http11, format!("{chunked}2\r\nab\r\n")),
+            // What gunzip changes has no length any more.
+            (format!("{LENGTH}ab").replace("Content-Length", "Content-Encoding: gzip\r\nContent-Length"), "gunzip on;", http11, chunked.clone()),
+        ] {
+            // Nothing more comes, not even the answer to a second request.
+            for requests in [request.to_string(), request.repeat(2)] {
+                let (got, came) = passed_on(&answer, directives, &requests);
+                assert_eq!((String::from_utf8(got).unwrap(), came), (want.clone(), 1), "{answer} {directives} {requests}");
+            }
+        }
+    }
+
+    #[test]
+    fn whole_answers_stay_so() {
+        let (http11, two) = ("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", "GET / HTTP/1.1\r\nHost: a\r\n\r\n".repeat(2));
+        let whole = head("Content-Length: 2\r\n", "close");
+        let length = LENGTH.replace("30000", "2");
+        for answer in [
+            format!("{length}ab"), format!("{length}abc"), LENGTH.replace("Content-Length: 30000\r\n", "") + "ab",
+            format!("{CHUNKED}2\r\nab\r\n0\r\n\r\n"), format!("{CHUNKED}2\r\nab\r\n0\r\nX: 1\r\n\r\n"),
+            // Malformed.
+            format!("{CHUNKED}2\r\nab\r\nzz\r\n"),
+        ] {
+            let (got, _) = passed_on(&answer, "", http11);
+            assert_eq!(String::from_utf8(got).unwrap(), format!("{whole}ab"), "{answer}");
+        }
+        // Requests on one connection are all answered. A page or a head instead of the
+        // answer cut off is whole too.
+        let error = format!("{LENGTH}ab").replace("200 OK", "404 Not Found");
+        let etag = format!("{LENGTH}ab").replace("\r\n\r\n", "\r\nETag: \"e\"\r\n\r\n");
+        let fresh = "GET / HTTP/1.1\r\nHost: a\r\nIf-None-Match: \"e\"\r\n\r\n".repeat(2);
+        for (answer, directives, requests, status, ends) in [
+            (format!("{length}ab"), "", two.as_str(), 200, "\r\n\r\nab"),
+            (error, "proxy_intercept_errors on; error_page 404 /e;", &two, 404, "\r\n\r\ne"),
+            (etag, "", &fresh, 304, "\r\n\r\n"),
+            (format!("{CHUNKED}2\r\nab\r\n"), "proxy_method GET;", &two.replace("GET", "HEAD"), 200, "\r\n\r\n"),
+            (LENGTH.replace("\r\n\r\n", "\r\nX-Accel-Redirect: /e\r\n\r\n"), "", &two, 200, "\r\n\r\ne"),
+        ] {
+            let (got, came) = passed_on(&answer, directives, &(requests.to_string() + "GET /e HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"));
+            let got = String::from_utf8(got).unwrap();
+            let answers: Vec<_> = got.split("HTTP/1.1 ").collect();
+            assert_eq!((answers.len(), came), (4, 2), "{got}");
+            for a in &answers[1..3] { assert!(a.starts_with(&status.to_string()) && a.contains("Connection: keep-alive") && !a.contains("chunked") && a.ends_with(ends), "{got}"); }
+        }
+    }
+
+    #[test]
+    fn answers_cut_off_are_compressed_as_far_as_they_came() {
+        let body = "x".repeat(64);
+        for answer in [format!("{CHUNKED}40\r\n{body}\r\n"), format!("{LENGTH}{body}")] {
+            let (got, _) = passed_on(&answer, "gzip on;", "GET / HTTP/1.1\r\nHost: a\r\nAccept-Encoding: gzip\r\n\r\n");
+            let start = head_end(&got).unwrap();
+            let text = String::from_utf8_lossy(&got[..start]);
+            assert!(text.contains("Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n") && text.contains("Content-Encoding: gzip\r\n") && !text.contains("Content-Length"), "{text}");
+            let n = got[start..].iter().position(|&c| c == b'\n').unwrap() + start + 1;
+            let size = usize::from_str_radix(std::str::from_utf8(&got[start..n - 2]).unwrap(), 16).unwrap();
+            // One chunk, and no last one.
+            assert_eq!(&got[n + size..], b"\r\n");
+            let mut plain = String::new();
+            flate2::read::GzDecoder::new(&got[n..n + size]).read_to_string(&mut plain).unwrap();
+            assert_eq!(plain, body);
+        }
+    }
+
+    #[test]
+    fn answers_cut_off_are_logged_as_sent() {
+        let log = std::env::temp_dir().join(format!("twinx-cut-{}", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let directives = format!("access_log {};", log.display());
+        for answer in [format!("{CHUNKED}2\r\nab\r\n"), format!("{LENGTH}ab"), format!("{CHUNKED}2\r\nab\r\n0\r\n\r\n")] {
+            passed_on(&answer, &directives, "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        }
+        // The status and $body_bytes_sent, with what makes it a chunk.
+        let lines = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(lines.lines().map(|l| l.split(' ').skip(8).take(2).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>(), ["200 7", "200 2", "200 2"], "{lines}");
     }
 
     #[test]
