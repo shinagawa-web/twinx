@@ -725,6 +725,121 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
     }
 }
 
+/// proxy_http_version 2: passes the HTTP/1 request that comes on a pipe to the
+/// proxied server on a connection of its own, as the one stream of an HTTP/2
+/// connection, and its answer back on the pipe, as HTTP/1 that ends when the
+/// pipe closes. Whatever goes wrong closes both.
+pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme: &str) {
+    let (mut buf, mut got) = (Vec::new(), Vec::new());
+    let end = loop {
+        if let Some(n) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break n }
+        if pipe.read_buf(&mut buf).await.unwrap_or(0) == 0 { return }
+    };
+    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let mut line = lines.next().unwrap_or_default().split(' ');
+    let (method, path) = (line.next().unwrap_or_default(), line.next().unwrap_or_default());
+    let mut fields = vec![(b":method".to_vec(), method.as_bytes().to_vec()), (b":scheme".to_vec(), scheme.as_bytes().to_vec()), (b":path".to_vec(), path.as_bytes().to_vec())];
+    let mut body = Body::Length(0);
+    for (name, value) in lines.filter_map(|l| l.split_once(':')).map(|(n, v)| (n.to_ascii_lowercase(), v.trim())) {
+        match name.as_str() {
+            "host" => fields.insert(2, (b":authority".to_vec(), value.as_bytes().to_vec())),
+            "transfer-encoding" => body = Body::Chunked(0, false),
+            "connection" | "keep-alive" | "proxy-connection" | "upgrade" | "te" => {}
+            _ => { if name == "content-length" { body = Body::Length(value.parse().unwrap_or(0)) } fields.push((name.into_bytes(), value.as_bytes().to_vec())) }
+        }
+    }
+    buf.drain(..end + 4);
+    let mut out = PREFACE.to_vec();
+    // nginx's settings: no pushes, and the window of a stream as large as it goes.
+    frame(&mut out, SETTINGS, 0, 0, &[0, 2, 0, 0, 0, 0, 0, 4, 0x7f, 0xff, 0xff, 0xff]);
+    frame(&mut out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
+    let mut block = Vec::new();
+    literals(&mut block, fields.iter());
+    let mut ended = body == Body::Length(0);
+    header_frames(&mut out, 1, &block, 16384, ended);
+    // The windows the server gives the connection and the stream, the largest frame it takes, and the body to send.
+    let (mut window, mut stream_window, mut frame_size, mut pending, mut finished) = (65535i64, 65535i64, 16384, Vec::new(), ended);
+    let (mut table, mut answer) = (Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 }, None::<(u8, Vec<u8>)>);
+    loop {
+        finished |= body.take(&mut buf, &mut pending);
+        loop {
+            let n = pending.len().min(frame_size).min(window.min(stream_window).max(0) as usize);
+            let last = finished && n == pending.len();
+            if ended || n == 0 && !last { break }
+            ended = last;
+            frame(&mut out, DATA, if ended { END_STREAM } else { 0 }, 1, &pending.drain(..n).collect::<Vec<_>>());
+            (window, stream_window) = (window - n as i64, stream_window - n as i64);
+        }
+        if !out.is_empty() && up.write_all(&std::mem::take(&mut out)).await.is_err() { return }
+        tokio::select! {
+            n = pipe.read_buf(&mut buf), if !finished => if n.unwrap_or(0) == 0 { return },
+            n = up.read_buf(&mut got) => if n.unwrap_or(0) == 0 { return },
+        }
+        while got.len() >= 9 && got.len() >= 9 + (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize) {
+            let (len, kind, flags, sid) = (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize, got[3], got[4], u32::from_be_bytes([got[5], got[6], got[7], got[8]]) & 0x7fff_ffff);
+            let p: Vec<u8> = got.drain(..9 + len).skip(9).collect();
+            match kind {
+                SETTINGS if flags & ACK == 0 => {
+                    for s in p.chunks(6).filter(|s| s.len() == 6) {
+                        let value = u32::from_be_bytes([s[2], s[3], s[4], s[5]]);
+                        match u16::from_be_bytes([s[0], s[1]]) { 4 => stream_window += i64::from(value) - 65535, 5 => frame_size = value as usize, _ => {} }
+                    }
+                    frame(&mut out, SETTINGS, ACK, 0, &[]);
+                }
+                PING if flags & ACK == 0 => frame(&mut out, PING, ACK, 0, &p),
+                WINDOW_UPDATE => { let n = i64::from(u32::from_be_bytes([p[0], p[1], p[2], p[3]]) & 0x7fff_ffff); if sid == 0 { window += n } else { stream_window += n } }
+                HEADERS | CONTINUATION if sid == 1 => {
+                    let (pad, priority) = if kind == HEADERS { (usize::from(flags & PADDED != 0), if flags & PRIORITY_FLAG != 0 { 5 } else { 0 }) } else { (0, 0) };
+                    let padding = if pad == 1 { usize::from(p[0]) } else { 0 };
+                    let (first, mut so_far) = answer.take().unwrap_or((flags, Vec::new()));
+                    so_far.extend_from_slice(p.get(pad + priority..p.len() - padding).unwrap_or_default());
+                    if flags & END_HEADERS == 0 { answer = Some((first, so_far)); continue }
+                    let Ok(fields) = table.decode(&so_far, so_far.len(), (1000, 1 << 20)) else { return };
+                    let status = fields.iter().find(|f| f.0 == b":status").map(|f| String::from_utf8_lossy(&f.1).into_owned()).unwrap_or_default();
+                    let mut head = format!("HTTP/1.1 {status} \r\n").into_bytes();
+                    fields.iter().filter(|f| !f.0.starts_with(b":")).for_each(|(n, v)| head.extend([&n[..], b": ", v, b"\r\n"].concat()));
+                    head.extend_from_slice(b"\r\n");
+                    if pipe.write_all(&head).await.is_err() || first & END_STREAM != 0 { return }
+                }
+                DATA if sid == 1 => {
+                    let padding = if flags & PADDED != 0 { usize::from(p[0]) + 1 } else { 0 };
+                    if pipe.write_all(p.get(padding.min(1)..p.len() - padding.saturating_sub(1)).unwrap_or_default()).await.is_err() || flags & END_STREAM != 0 { return }
+                    // What was taken is given back to the windows.
+                    if len > 0 { [0, 1].iter().for_each(|&sid| frame(&mut out, WINDOW_UPDATE, 0, sid, &(len as u32).to_be_bytes())); }
+                }
+                RST_STREAM | GOAWAY => return,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// How the body of a request passed on a pipe comes: so many bytes, or in
+/// chunks (what is left of the one it is in, and whether its line ends are to come).
+#[derive(PartialEq)]
+enum Body { Length(u64), Chunked(u64, bool) }
+
+impl Body {
+    /// Moves the data of what came of the body into what is to be sent, and tells whether it has all come.
+    fn take(&mut self, buf: &mut Vec<u8>, to: &mut Vec<u8>) -> bool {
+        loop {
+            match self {
+                Body::Length(left) => { let n = (*left).min(buf.len() as u64); to.extend(buf.drain(..n as usize)); *left -= n; return *left == 0 }
+                Body::Chunked(left, _) if *left > 0 => { let n = (*left).min(buf.len() as u64); to.extend(buf.drain(..n as usize)); *left -= n; if *left > 0 { return false } *self = Body::Chunked(0, true) }
+                Body::Chunked(_, crlf) => {
+                    let Some(at) = buf.windows(2).position(|w| w == b"\r\n") else { return false };
+                    let line: Vec<u8> = buf.drain(..at + 2).collect();
+                    if *crlf { *crlf = false; continue }
+                    let size = std::str::from_utf8(&line[..at]).ok().and_then(|l| u64::from_str_radix(l.split(';').next()?.trim(), 16).ok()).unwrap_or(0);
+                    if size == 0 { return true }
+                    *self = Body::Chunked(size, false);
+                }
+            }
+        }
+    }
+}
+
 /// Answers the request of a stream, as a connection of its own answers it,
 /// one made when the HTTP/2 connection was, of which it is the request so
 /// numbered; the request has so many header lines made, not sent by the client.
@@ -834,6 +949,66 @@ mod tests {
         let text: Vec<_> = fields.iter().map(|(n, v)| format!("{}: {}", String::from_utf8_lossy(n), String::from_utf8_lossy(v))).collect();
         assert_eq!(text, [":status: 301", "server: twinx", "location: /x", "x-a: b"]);
         assert_eq!(header_block(200, &[(b"Content-Length".to_vec(), b"12".to_vec())], false), [0x88, 0x5c, 0x02, b'1', b'2']);
+    }
+
+    #[test]
+    fn requests_are_passed_over_http2() {
+        crate::stream::block_on(async {
+            let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
+            let bridge = upstream(Stream::Pipe(up), theirs, "http");
+            let test = async {
+                ours.write_all(b"POST /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-A: b\r\n\r\n").await.unwrap();
+                // The server lets only a byte of the body go at first.
+                let mut out = Vec::new();
+                frame(&mut out, SETTINGS, 0, 0, &[0, 4, 0, 0, 0, 1, 0, 9, 0, 0, 0, 0]);
+                frame(&mut out, PING, 0, 0, b"12345678");
+                server.write_all(&out).await.unwrap();
+                let mut got = Vec::new();
+                let frames = |got: &[u8]| { let mut at = PREFACE.len(); std::iter::from_fn(|| { let len = u32::from_be_bytes([0, *got.get(at)?, *got.get(at + 1)?, *got.get(at + 2)?]) as usize; let f = (got.get(at + 3).copied()?, got.get(at + 4).copied()?, got.get(at + 9..at + 9 + len)?.to_vec()); at += 9 + len; Some(f) }).collect::<Vec<_>>() };
+                while !frames(&got).iter().any(|f| f.0 == PING) { server.read_buf(&mut got).await.unwrap(); }
+                ours.write_all(b"2\r\nab\r\n1;e\r\nc\r\n0\r\n\r\n").await.unwrap();
+                while !frames(&got).iter().any(|f| f.0 == DATA) { server.read_buf(&mut got).await.unwrap(); }
+                out.clear();
+                frame(&mut out, WINDOW_UPDATE, 0, 1, &[0, 0, 0, 10]);
+                server.write_all(&out).await.unwrap();
+                while !frames(&got).iter().any(|f| f.0 == DATA && f.1 == END_STREAM) { server.read_buf(&mut got).await.unwrap(); }
+                let sent = frames(&got);
+                let kinds: Vec<_> = sent.iter().map(|f| (f.0, f.1)).collect();
+                assert_eq!(kinds, [(SETTINGS, 0), (WINDOW_UPDATE, 0), (HEADERS, END_HEADERS), (SETTINGS, ACK), (PING, ACK), (DATA, 0), (DATA, END_STREAM)]);
+                assert_eq!((&sent[5].2[..], &sent[6].2[..]), (&b"a"[..], &b"bc"[..]));
+                let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 };
+                let fields = t.decode(&sent[2].2, sent[2].2.len(), (100, 100)).unwrap();
+                let text: Vec<_> = fields.iter().map(|(n, v)| format!("{}: {}", String::from_utf8_lossy(n), String::from_utf8_lossy(v))).collect();
+                assert_eq!(text, [":method: POST", ":scheme: http", ":authority: h", ":path: /x", "x-a: b"]);
+                // The answer, padded, in parts.
+                out.clear();
+                let block = header_block(200, &[(b"x-b".to_vec(), b"c".to_vec())], false);
+                frame(&mut out, HEADERS, PADDED, 1, &[[1].as_slice(), &block[..1], &[0]].concat());
+                frame(&mut out, CONTINUATION, END_HEADERS, 1, &block[1..]);
+                frame(&mut out, DATA, PADDED, 1, b"\x01ok\x00");
+                frame(&mut out, DATA, END_STREAM, 1, b"!");
+                server.write_all(&out).await.unwrap();
+                let mut answer = Vec::new();
+                ours.read_to_end(&mut answer).await.unwrap();
+                assert_eq!(String::from_utf8_lossy(&answer), "HTTP/1.1 200 \r\nx-b: c\r\n\r\nok!");
+            };
+            tokio::join!(bridge, test);
+        });
+    }
+
+    #[test]
+    fn bodies_come_so() {
+        let (mut buf, mut to) = (b"abc".to_vec(), Vec::new());
+        assert!(!Body::Length(5).take(&mut buf, &mut to));
+        assert!(Body::Length(1).take(&mut b"xy".to_vec(), &mut to));
+        let mut body = Body::Chunked(0, false);
+        let mut buf = b"3\r\nab".to_vec();
+        assert!(!body.take(&mut buf, &mut to));
+        buf.extend_from_slice(b"c\r");
+        assert!(!body.take(&mut buf, &mut to));
+        buf.extend_from_slice(b"\n0\r\n\r\n");
+        assert!(body.take(&mut buf, &mut to));
+        assert_eq!(to, b"abcxabc");
     }
 
     #[test]

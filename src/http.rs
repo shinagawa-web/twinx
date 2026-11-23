@@ -1356,6 +1356,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             (Some(conn), Some(tls)) => secure(conn, &addr, (tls, name.as_deref()), level).await,
             (conn, _) => conn.ok_or(None),
         };
+        // proxy_http_version 2: the request goes through a pipe, over HTTP/2 beyond it.
+        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c.stream, theirs, if p.ssl { "https" } else { "http" })); Conn::new(Stream::Pipe(ours), connecting) } else { c });
         let begun = conn.is_ok();
         // A kept connection whose handshake fails counts as closed, as in nginx; one that times out does not.
         let mut closed = matches!(conn, Err(None));
@@ -1385,9 +1387,10 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let timed_out = answer.as_ref().is_some_and(|a| a.generated);
         let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout) && (resend || !begun);
         // The connection of an answer that is not used is closed.
-        if let Some(conn) = kept.flatten().filter(|_| !again) { up.put(conn, addr, tag); }
+        // One over HTTP/2 is not kept.
+        if let Some(conn) = kept.flatten().filter(|_| !again && !level.proxy_h2) { up.put(conn, addr, tag); }
         // That of one whose body is still to be read goes back after it.
-        if let Some(rest) = answer.as_mut().and_then(|a| a.rest.as_mut()).filter(|_| !again) { rest.home = Some((up.clone(), addr, tag)); }
+        if let Some(rest) = answer.as_mut().and_then(|a| a.rest.as_mut()).filter(|_| !again && !level.proxy_h2) { rest.home = Some((up.clone(), addr, tag)); }
         up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404)));
         if !again || tries == 0 { break; }
         answer = None;
