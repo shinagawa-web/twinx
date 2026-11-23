@@ -132,7 +132,10 @@ fn head_end(buf: &[u8]) -> Option<usize> {
 
 /// Where the first line of the buffer ends, after its LF, if that has come.
 fn line_end(buf: &[u8]) -> Option<usize> {
-    buf.iter().position(|&c| c == b'\n').map(|i| i + 1)
+    // SAFETY: memchr() reads the buffer's length from its start, and gives a
+    // place in it or null.
+    let lf = unsafe { libc::memchr(buf.as_ptr().cast(), b'\n'.into(), buf.len()) };
+    (!lf.is_null()).then(|| lf as usize - buf.as_ptr() as usize + 1)
 }
 
 /// Whether a request line is of HTTP/0.9: a method and a URI, without a
@@ -917,9 +920,10 @@ async fn write_parts<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, part
 /// keepalive_requests and keepalive_time are not reached, and keepalive_disable
 /// does not name the browser.
 fn keeps_alive(r: &Request, level: &Level) -> bool {
-    let (msie6, safari) = browser(header(r, "user-agent").unwrap_or_default());
+    let (post, safari) = (r.method == "POST" && level.keepalive_disable_msie6, level.keepalive_disable_safari);
     let limits = !level.keepalive_timeout.is_zero() && r.requests < level.keepalive_requests && crate::clock::coarse().saturating_duration_since(r.connected) <= level.keepalive_time;
-    limits && !(msie6 && r.method == "POST" && level.keepalive_disable_msie6) && !(safari && level.keepalive_disable_safari)
+    // The browser matters only to a POST, or with "keepalive_disable safari".
+    limits && (!post && !safari || { let is = browser(header(r, "user-agent").unwrap_or_default()); !(post && is.0) && !(safari && is.1) })
 }
 
 /// Whether a User-Agent is MSIE 6 or older, and whether it is Safari on Mac OS X,
