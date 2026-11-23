@@ -162,6 +162,10 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
     let (connected, mut requests, mut idle) = (Instant::now(), 0, None);
     // Whether any of its requests was pipelined, as nginx's c->pipeline stays set.
     let mut piped = false;
+    // A TLS connection whose client and server agreed on h2 (ALPN) speaks HTTP/2.
+    if ssl.as_ref().is_some_and(|s| s.alpn == "h2") && !matches!(stream, Stream::Pipe(_)) {
+        return Box::pin(crate::h2::serve(config.clone(), crate::h2::Rewound::new(buf, stream), (listen, local, peer, ssl), fresh.take())).await;
+    }
     loop {
         let (pipelined, started) = (!buf.is_empty(), Instant::now());
         piped |= pipelined;
@@ -180,8 +184,8 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         };
         // With http2 on in the default server of the address, a connection
         // that starts with the preface of HTTP/2 speaks it, as nginx decides.
-        if requests == 1 && ssl.is_none() && default.level.http2 && buf.starts_with(b"PRI * HTTP/2.0\r\n") && !matches!(stream, Stream::Pipe(_)) {
-            return Box::pin(crate::h2::serve(config.clone(), crate::h2::Rewound::new(buf, stream), (listen, local, peer), fresh.take())).await;
+        if requests == 1 && ssl.is_none() && http2(config, listen, default) && buf.starts_with(b"PRI * HTTP/2.0\r\n") && !matches!(stream, Stream::Pipe(_)) {
+            return Box::pin(crate::h2::serve(config.clone(), crate::h2::Rewound::new(buf, stream), (listen, local, peer, None), fresh.take())).await;
         }
         let mut r = Request {
             method: String::new(),
@@ -214,6 +218,8 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         r.captures = captures;
         let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
         let parsed = parsed.and_then(|()| if misdirected(r.ssl.as_deref(), r.host.as_deref(), server.level.ssl_verify_client) { Err(421) } else { Ok(()) });
+        // A stream of HTTP/2 asking for a server that does not speak it is misdirected too.
+        let parsed = parsed.and_then(|()| if matches!(stream, Stream::Pipe(_)) && !http2(config, listen, server) { Err(421) } else { Ok(()) });
         let parsed = parsed.and_then(|()| cert_error(server.level.ssl_verify_client, r.ssl.as_deref()));
         r.server_name = server.name.clone();
         let found = located(server, &r, &r.uri);
@@ -1922,6 +1928,12 @@ pub fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) ->
 
 /// The default server of a listening address: the one listening there with
 /// default_server, else the first server listening there.
+/// Whether a server speaks HTTP/2 on a listening address: http2 is on in
+/// it, or any server listens on the address with "http2".
+pub fn http2(config: &Config, listen: SocketAddr, server: &Server) -> bool {
+    server.level.http2 || config.servers.iter().any(|s| s.http2.contains(&listen))
+}
+
 pub fn default_server(config: &Config, listen: SocketAddr) -> &Server {
     let on = || config.servers.iter().filter(|s| s.listen.contains(&listen));
     on().find(|s| s.defaults.contains(&listen)).or_else(|| on().next()).unwrap_or(&config.servers[0])
@@ -2439,6 +2451,16 @@ mod tests {
         assert_eq!(cert_error(1, None), Ok(()));
         assert_eq!(special(495).status, 400);
         assert!(String::from_utf8(special(496).body).unwrap().contains("<center>No required SSL certificate was sent</center>"));
+    }
+
+    #[test]
+    fn speaks_http2_where_the_address_or_the_server_says_so() {
+        let text = "events {} http { server { listen 127.0.0.1:8080; server_name one; } server { listen 127.0.0.1:8080 http2; server_name two; } server { listen 127.0.0.1:8081; server_name three; } server { listen 127.0.0.1:8081; server_name four; http2 on; } }";
+        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let on = |addr: &str, name: &str| http2(&config, addr.parse().unwrap(), server(&config, addr.parse().unwrap(), Some(name)).0);
+        // "listen ... http2" makes every server of the address speak it, http2 only its own.
+        assert!(on("127.0.0.1:8080", "one") && on("127.0.0.1:8080", "two"));
+        assert!(!on("127.0.0.1:8081", "three") && on("127.0.0.1:8081", "four"));
     }
 
     #[test]

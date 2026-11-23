@@ -40,8 +40,11 @@ impl AsyncWrite for Rewound {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> { Pin::new(&mut self.get_mut().stream).poll_shutdown(cx) }
 }
 
-/// Serves the streams of an HTTP/2 connection, with its listening, local and remote addresses.
-pub async fn serve(config: Arc<Config>, io: Rewound, addrs: (SocketAddr, SocketAddr, SocketAddr), fresh: Option<Busy>) {
+/// The listening, local and remote addresses of a connection, and its TLS session.
+pub type Addrs = (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>);
+
+/// Serves the streams of an HTTP/2 connection, with its addresses and TLS session.
+pub async fn serve(config: Arc<Config>, io: Rewound, addrs: Addrs, fresh: Option<Busy>) {
     // nginx's settings: 128 streams at a time (http2_max_concurrent_streams),
     // a window of 64k for each (its preread buffer), the largest for the connection.
     let mut builder = h2::server::Builder::new();
@@ -49,7 +52,7 @@ pub async fn serve(config: Arc<Config>, io: Rewound, addrs: (SocketAddr, SocketA
     let Ok(mut conn) = builder.handshake::<_, Bytes>(io).await else { return };
     drop(fresh);
     while let Some(Ok((request, respond))) = conn.accept().await {
-        tokio::task::spawn_local(exchange(config.clone(), request, respond, addrs));
+        tokio::task::spawn_local(exchange(config.clone(), request, respond, addrs.clone()));
     }
 }
 
@@ -80,12 +83,12 @@ fn answer_head(head: &[u8]) -> Option<http::response::Builder> {
 }
 
 /// Answers the request of one stream.
-async fn exchange(config: Arc<Config>, request: http::Request<h2::RecvStream>, mut respond: h2::server::SendResponse<Bytes>, (listen, local, peer): (SocketAddr, SocketAddr, SocketAddr)) {
+async fn exchange(config: Arc<Config>, request: http::Request<h2::RecvStream>, mut respond: h2::server::SendResponse<Bytes>, (listen, local, peer, ssl): Addrs) {
     let (parts, mut body) = request.into_parts();
     let mut sent = head(&parts);
     while let Some(Ok(data)) = body.data().await { let _ = body.flow_control().release_capacity(data.len()); sent.extend_from_slice(&data); }
     let (mut ours, theirs) = tokio::io::duplex(65536);
-    tokio::task::spawn_local(async move { crate::http::connection(&config, Stream::Pipe(theirs), (listen, local, peer, None), Busy::new()).await });
+    tokio::task::spawn_local(async move { crate::http::connection(&config, Stream::Pipe(theirs), (listen, local, peer, ssl), Busy::new()).await });
     let mut answer = Vec::new();
     let _ = ours.write_all(&sent).await;
     let _ = ours.shutdown().await;

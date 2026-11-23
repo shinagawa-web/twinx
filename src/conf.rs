@@ -614,6 +614,8 @@ pub struct Server {
     pub defaults: Vec<SocketAddr>,
     /// The listen backlogs it sets ("listen ... backlog=number").
     pub backlogs: Vec<(SocketAddr, i32)>,
+    /// The addresses it listens on with "http2", which speak HTTP/2 whatever http2 says.
+    pub http2: Vec<SocketAddr>,
 }
 
 /// The backlog nginx listens with on Linux when "listen" does not set one
@@ -735,13 +737,14 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new() };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), http2: Vec::new() };
         self.level(block, SRV, &mut s.level)?;
         for d in block {
             match d.name.as_str() {
                 "listen" => {
                     let addrs = listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
                     if d.args[1..].iter().any(|a| a == "ssl") { s.ssl.extend(&addrs); }
+                    if d.args[1..].iter().any(|a| a == "http2") { s.http2.extend(&addrs); }
                     if d.args[1..].iter().any(|a| a == "default_server" || a == "default") { s.defaults.extend(&addrs); }
                     for a in d.args[1..].iter().filter_map(|a| a.strip_prefix("backlog=")) {
                         let n = a.parse::<i32>().ok().filter(|n| *n != 0).ok_or_else(|| format!("invalid backlog \"{a}\" in {}", d.at))?;
@@ -1528,6 +1531,16 @@ mod tests {
             let e = build_text(&format!("events {{}} http {{ server {{ listen 127.0.0.1:8080 backlog={bad}; }} }}")).unwrap_err();
             assert!(e.starts_with(&format!("invalid backlog \"{bad}\" in ")), "{e}");
         }
+    }
+
+    #[test]
+    fn listen_http2() {
+        let c = build_text("events {} http { server { listen 127.0.0.1:8080 http2; } server { listen 127.0.0.1:8081; http2 on; } server { listen 127.0.0.1:8082; } }").unwrap();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(c.servers[0].http2, [addr]);
+        assert!(!c.servers[0].level.http2);
+        assert!(c.servers[1].http2.is_empty() && c.servers[1].level.http2);
+        assert!(c.servers[2].http2.is_empty() && !c.servers[2].level.http2);
     }
 
     #[test]
