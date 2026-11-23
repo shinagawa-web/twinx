@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -33,6 +34,7 @@ const ACK: u8 = 1;
 const END_HEADERS: u8 = 4;
 const PADDED: u8 = 8;
 const PRIORITY_FLAG: u8 = 0x20;
+const NO_ERROR: u32 = 0;
 const PROTOCOL_ERROR: u32 = 1;
 const INTERNAL_ERROR: u32 = 2;
 const FLOW_CONTROL_ERROR: u32 = 3;
@@ -323,7 +325,7 @@ fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, sid: u32, payload: &[u8]) {
 /// answered (none for one refused with 400) and its body, then the body of
 /// the answer and how much of it has been sent.
 #[derive(Default)]
-struct Open { send: i64, recv: i64, head: Option<(Vec<u8>, bool)>, body: Vec<u8>, ended: bool, answer: Option<Vec<u8>>, sent: usize }
+struct Open { send: i64, recv: i64, head: Option<(Vec<u8>, bool)>, body: Vec<u8>, ended: bool, answer: Option<Vec<u8>>, sent: usize, number: u64 }
 
 /// The state of an HTTP/2 connection.
 struct Connection {
@@ -348,6 +350,13 @@ struct Connection {
     recv: i64,
     /// Whether the client changed its table size: the next header block starts with an update to 0.
     table_update: bool,
+    /// When the connection was made, the requests it has had, and whether it
+    /// sent GOAWAY: it then takes no new stream and closes once those it has are answered.
+    started: Instant,
+    requests: u64,
+    goaway: bool,
+    /// keepalive_requests, keepalive_timeout and keepalive_time of the default server of the address.
+    keepalive: (u64, Duration, Duration),
 }
 
 impl Connection {
@@ -377,6 +386,12 @@ impl Connection {
         let path = [&[sid][..], &self.ancestors(sid)].concat();
         let share = path.iter().filter_map(|s| self.nodes.get(s)).map(|n| f64::from(n.1) / 256.0).product::<f64>();
         (path.len() - 1, -share)
+    }
+
+    /// Sends GOAWAY without an error, with the last stream it has taken.
+    fn goaway(&mut self) {
+        frame(&mut self.out, GOAWAY, 0, 0, &[self.last_sid.to_be_bytes(), NO_ERROR.to_be_bytes()].concat());
+        self.goaway = true;
     }
 
     fn rst(&mut self, sid: u32, code: u32) {
@@ -446,6 +461,8 @@ impl Connection {
         let (pad, priority) = (usize::from(flags & PADDED != 0), if flags & PRIORITY_FLAG != 0 { 5 } else { 0 });
         // A header block cannot be empty.
         if p.len() <= pad + priority { return Err(FRAME_SIZE_ERROR) }
+        // After GOAWAY, a new stream is not taken.
+        if self.goaway { return Ok(()) }
         let padding = if pad == 1 { usize::from(p[0]) } else { 0 };
         if padding > p.len() - pad - priority { return Err(PROTOCOL_ERROR) }
         let depends = (priority > 0).then(|| (u32::from_be_bytes([p[pad], p[pad + 1], p[pad + 2], p[pad + 3]]), u16::from(p[pad + 4]) + 1));
@@ -453,6 +470,11 @@ impl Connection {
         self.last_sid = sid;
         if depends.is_some() || !self.nodes.contains_key(&sid) { let (on, weight) = depends.unwrap_or((0, 16)); self.depend(sid, on, weight); }
         let refused = self.streams.len() >= CONCURRENT;
+        // As in nginx, a stream that reaches keepalive_requests or keepalive_time,
+        // or any with keepalive_timeout 0, is the last the connection takes.
+        self.requests += u64::from(!refused);
+        let (requests, timeout, time) = self.keepalive;
+        if !refused && (timeout.is_zero() || self.requests >= requests || self.started.elapsed() > time) { self.goaway(); }
         self.block = Some((sid, flags, Vec::new(), refused));
         self.header_block(flags, &p[pad + priority..p.len() - padding])
     }
@@ -463,7 +485,7 @@ impl Connection {
         let fields = self.table.decode(&block, block.len(), self.limits)?;
         if refused { self.rst(sid, REFUSED_STREAM); return Ok(()) }
         let ended = flags & END_STREAM != 0;
-        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head: request(&fields, ended), ended, ..Open::default() });
+        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head: request(&fields, ended), ended, number: self.requests, ..Open::default() });
         if ended { self.ready.push(sid); }
         Ok(())
     }
@@ -554,17 +576,22 @@ impl Connection {
 
 /// Serves an HTTP/2 connection, with what was read of it already, its
 /// listening, local and remote addresses.
-pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, addrs: Addrs, fresh: Option<Busy>) {
-    let limits = crate::http::default_server(&config, addrs.0).level.large_header_buffers;
+/// The connection counts as busy while it lives: a worker shutting down
+/// gracefully sends GOAWAY on it, and waits until it has answered its streams.
+pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, addrs: Addrs, _busy: Option<Busy>) {
+    let level = &crate::http::default_server(&config, addrs.0).level;
+    let (limits, keepalive) = (level.large_header_buffers, (level.keepalive_requests, level.keepalive_timeout, level.keepalive_time));
+    // lingering_close on or always: closing, it reads what the client still sends.
+    let lingers = level.lingering_close.is_some();
     let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 };
-    let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false };
+    let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive };
     // nginx's settings: the streams at a time, the window of each, the largest frame it takes; and the largest window of the connection.
     frame(&mut c.out, SETTINGS, 0, 0, &[0, 3, 0, 0, 0, CONCURRENT as u8, 0, 4, 0, 1, 0, 0, 0, 5, 0, 0xff, 0xff, 0xff]);
     frame(&mut c.out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut preface = false;
-    drop(fresh);
     loop {
+        if crate::http::shutting() && !c.goaway { c.goaway(); }
         let read = if preface { c.read(&mut buf) } else if buf.len() < PREFACE.len() { Ok(()) } else if buf.starts_with(PREFACE) { preface = true; buf.drain(..PREFACE.len()); c.read(&mut buf) } else { Err(PROTOCOL_ERROR) };
         for sid in std::mem::take(&mut c.ready) {
             let Some(s) = c.streams.get_mut(&sid) else { continue };
@@ -576,8 +603,8 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
                 // A line HTTP/1 refuses, for the answer nginx gives with 400.
                 None => b"-\r\n\r\n".to_vec(),
             };
-            let (tx, config, addrs) = (tx.clone(), config.clone(), addrs.clone());
-            tokio::task::spawn_local(async move { let _ = tx.send((sid, exchange(config, request, addrs).await)); });
+            let (tx, config, addrs, origin) = (tx.clone(), config.clone(), addrs.clone(), (c.started, s.number));
+            tokio::task::spawn_local(async move { let _ = tx.send((sid, exchange(config, request, addrs, origin).await)); });
         }
         c.send_data();
         if let Err(code) = read {
@@ -587,17 +614,21 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
             return;
         }
         if !c.out.is_empty() && stream.write_all(&std::mem::take(&mut c.out)).await.is_err() { return }
+        // After GOAWAY, the connection closes once its streams are answered.
+        if c.goaway && c.streams.is_empty() { return crate::http::close(&mut stream, lingers).await }
         tokio::select! {
             n = stream.read_buf(&mut buf) => if n.unwrap_or(0) == 0 { return },
             Some((sid, answer)) = rx.recv() => c.answer(sid, answer),
+            () = crate::http::SHUTDOWN.notified() => {}
         }
     }
 }
 
-/// Answers the request of a stream, as a connection of its own answers it.
-async fn exchange(config: Arc<Config>, request: Vec<u8>, (listen, local, peer, ssl): Addrs) -> Answer {
+/// Answers the request of a stream, as a connection of its own answers it,
+/// one made when the HTTP/2 connection was, of which it is the request so numbered.
+async fn exchange(config: Arc<Config>, request: Vec<u8>, (listen, local, peer, ssl): Addrs, origin: (Instant, u64)) -> Answer {
     let (mut ours, theirs) = tokio::io::duplex(65536);
-    tokio::task::spawn_local(async move { crate::http::connection(&config, Stream::Pipe(theirs), (listen, local, peer, ssl), Busy::new()).await });
+    tokio::task::spawn_local(async move { crate::http::connection(&config, Stream::Pipe(theirs), (listen, local, peer, ssl), Busy::new(), Some(Box::new(origin))).await });
     let mut answer = Vec::new();
     let _ = ours.write_all(&request).await;
     let _ = ours.shutdown().await;
@@ -691,7 +722,7 @@ mod tests {
 
     fn connection() -> Connection {
         let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0 };
-        Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits: (4, 8192), send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false }
+        Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits: (4, 8192), send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive: (2, Duration::from_secs(75), Duration::from_secs(3600)) }
     }
 
     #[test]
@@ -719,6 +750,27 @@ mod tests {
         assert_eq!(c.read(&mut buf), Ok(()));
         buf = vec![0, 0, 6, HEADERS, END_HEADERS, 0, 0, 0, 3, 0x42, 0xff, 0xff, 0xff, 0xff];
         assert_eq!((c.read(&mut buf), c.last_sid), (Err(COMPRESSION_ERROR), 3));
+    }
+
+    #[test]
+    fn keepalive() {
+        let goaway = |last: u32| { let mut f = Vec::new(); frame(&mut f, GOAWAY, 0, 0, &[last.to_be_bytes(), [0; 4]].concat()); f };
+        // keepalive_requests 2: the second stream is the last, and one after it is not taken.
+        let mut c = connection();
+        let mut buf = Vec::new();
+        frame(&mut buf, HEADERS, END_HEADERS | END_STREAM, 1, &[0x82, 0x86, 0x84, 0x41, 0x01, b'h']);
+        assert_eq!((c.read(&mut buf), c.goaway), (Ok(()), false));
+        frame(&mut buf, HEADERS, END_HEADERS | END_STREAM, 3, &[0x82, 0x86, 0x84, 0x41, 0x01, b'h']);
+        frame(&mut buf, HEADERS, END_HEADERS | END_STREAM, 5, &[0x82, 0x86, 0x84, 0x41, 0x01, b'h']);
+        assert_eq!(c.read(&mut buf), Ok(()));
+        assert_eq!((c.goaway, c.last_sid, c.ready.clone(), c.streams[&3].number), (true, 3, vec![1, 3], 2));
+        assert!(c.out.ends_with(&goaway(3)));
+        // keepalive_timeout 0 and keepalive_time: the first stream already is the last.
+        for keepalive in [(9, Duration::ZERO, Duration::from_secs(9)), (9, Duration::from_secs(9), Duration::ZERO)] {
+            let mut c = Connection { keepalive, started: Instant::now() - Duration::from_millis(1), ..connection() };
+            assert_eq!(c.frame(HEADERS, END_HEADERS, 1, &[0x82]), Ok(()));
+            assert_eq!(c.out, goaway(1));
+        }
     }
 
     #[test]

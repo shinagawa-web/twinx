@@ -57,6 +57,13 @@ fn listen(addr: SocketAddr, backlog: i32) -> std::io::Result<TcpListener> {
 /// Whether the worker is shutting down gracefully, and how many requests it is answering.
 static SHUTTING: AtomicBool = AtomicBool::new(false);
 static BUSY: AtomicUsize = AtomicUsize::new(0);
+/// Wakes the connections that wait when the worker starts shutting down.
+pub(crate) static SHUTDOWN: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Whether the worker is shutting down gracefully.
+pub(crate) fn shutting() -> bool {
+    SHUTTING.load(Ordering::SeqCst)
+}
 
 /// A request being answered, counted in BUSY while it lives.
 pub(crate) struct Busy;
@@ -83,6 +90,7 @@ impl Drop for Busy {
 pub async fn shut_down(accepting: Vec<JoinHandle<()>>, timeout: Option<Duration>) {
     let start = Instant::now();
     SHUTTING.store(true, Ordering::SeqCst);
+    SHUTDOWN.notify_waiters();
     crate::upstream::close_idle();
     accepting.iter().for_each(JoinHandle::abort);
     for task in accepting { let _ = task.await; }
@@ -122,7 +130,7 @@ fn serving(config: Arc<Config>, stream: TcpStream, tls: bool, (addr, local, peer
     async move {
         let accepted = if tls { Box::pin(crate::tls::accept(stream, &config, addr)).await.map(|(s, ssl)| (s, Some(Arc::new(ssl)))) } else { Some((Stream::Tcp(stream), None)) };
         let Some((stream, ssl)) = accepted else { return };
-        connection(&config, stream, (addr, local, peer, ssl), fresh).await
+        connection(&config, stream, (addr, local, peer, ssl), fresh, None).await
     }
 }
 
@@ -154,12 +162,13 @@ fn http09(line: &[u8]) -> bool {
 }
 
 /// Serves the requests of a connection accepted on a listening address,
-/// with its local and remote addresses.
-pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>), fresh: Busy) {
+/// with its local and remote addresses. A stream of an HTTP/2 connection
+/// comes with when that connection was made and the number of its request.
+pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>), fresh: Busy, origin: Option<Box<(Instant, u64)>>) {
     let mut fresh = Some(fresh);
     let mut buf = Vec::new();
     // After a kept-alive answer: how long the connection waits for the next request.
-    let (connected, mut requests, mut idle) = (Instant::now(), 0, None);
+    let ((connected, mut requests), mut idle) = (origin.map_or((Instant::now(), 0), |o| (o.0, o.1 - 1)), None);
     // Whether any of its requests was pipelined, as nginx's c->pipeline stays set.
     let mut piped = false;
     // A TLS connection whose client and server agreed on h2 (ALPN) speaks HTTP/2.
@@ -375,7 +384,7 @@ fn chunk_size(line: &str) -> Option<u64> {
 /// Ends the connection, which is closed when it is dropped, after a close_notify
 /// with TLS. With lingers, as nginx's lingering close does: stops sending, then
 /// reads what the client still sends so that it gets the whole answer.
-async fn close(stream: &mut Stream, lingers: bool) {
+pub(crate) async fn close(stream: &mut Stream, lingers: bool) {
     let wait = Some(Duration::from_secs(5));
     if lingers || !matches!(stream, Stream::Tcp(_)) { let _ = within(wait, tokio::io::AsyncWriteExt::shutdown(stream)).await; }
     if !lingers { return }
