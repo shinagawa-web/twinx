@@ -949,6 +949,14 @@ pub fn client_cert(base: &Arc<ClientConfig>, files: (&Path, &Path, Option<&Path>
     Ok(Arc::new(c))
 }
 
+/// What a connection to a proxied server spoken to over HTTP/2 (proxy_http_version 2)
+/// is made with: config's settings, offering h2 alone with ALPN, as nginx does.
+pub fn h2(config: &Arc<ClientConfig>) -> Arc<ClientConfig> {
+    let mut c = (**config).clone();
+    c.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(c)
+}
+
 /// Connects to a proxied server over TLS, to the name its certificate is
 /// verified for and SNI sends, if any (one that is no name fails; an address is not sent); the
 /// connection, or the error the handshake failed with (WouldBlock once the timeout passed).
@@ -1421,6 +1429,22 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                 drop(connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), Some(name)), Duration::from_secs(5), &tls).await.unwrap());
             }
             assert_eq!(accepted.await.unwrap(), ["h2", "http/1.1"]);
+        });
+    }
+
+    #[test]
+    fn a_client_for_http2_offers_h2_alone() {
+        let base = client((true, false), None, None).unwrap();
+        assert!(base.alpn_protocols.is_empty());
+        assert_eq!(h2(&base).alpn_protocols, [b"h2".to_vec()]);
+        let dir = dir();
+        crate::stream::block_on(async {
+            let (l, addr) = listener().await;
+            let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; http2 on; }} }}");
+            let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+            let accepted = tokio::task::spawn_local(async move { accept(l.accept().await.unwrap().0, &config, addr).await.unwrap().1.alpn });
+            drop(connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_secs(5), &h2(&base)).await.unwrap());
+            assert_eq!(accepted.await.unwrap(), "h2");
         });
     }
 

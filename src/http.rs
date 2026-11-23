@@ -1373,6 +1373,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             None => connect(&addr, socket.flatten(), level).await.map(|s| Conn::new(Stream::Tcp(s), connecting)),
         };
         let conn = match (conn, &tls) {
+            // Over HTTP/2, ALPN offers h2.
+            (Some(conn), Some(tls)) if level.proxy_h2 => secure(conn, &addr, (&crate::tls::h2(tls), name.as_deref()), level).await,
             (Some(conn), Some(tls)) => secure(conn, &addr, (tls, name.as_deref()), level).await,
             (conn, _) => conn.ok_or(None),
         };
