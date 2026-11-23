@@ -1,6 +1,7 @@
 //! HTTP/1.x connections: reading requests, choosing the server and location,
 //! answering, and writing the access log.
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::net::{IpAddr, SocketAddr, TcpListener};
@@ -372,7 +373,7 @@ fn header<'a>(r: &'a Request, name: &str) -> Option<&'a str> {
 #[derive(Debug, Default)]
 struct Response {
     status: u16,
-    ctype: Option<String>,
+    ctype: Option<Cow<'static, str>>,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     /// Whether "Vary: Accept-Encoding" is sent when gzip_vary is on.
@@ -457,7 +458,7 @@ fn cert_error(mode: u8, ssl: Option<&crate::tls::Session>) -> Result<(), u16> {
 
 /// The page nginx generates for an error status.
 fn special(status: u16) -> Response {
-    let ctype = Some("text/html".to_string());
+    let ctype = Some("text/html".into());
     // 494, a header line too long, is answered as 400 with a page of its own.
     let (status, body) = match status {
         494 => (400, page_with(400, "Request Header Or Cookie Too Large", "<center>Request Header Or Cookie Too Large</center>\r\n")),
@@ -485,7 +486,7 @@ async fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Fo
         Ok(()) => {}
     }
     // The rewrite module's directives, in order, as ngx_http_rewrite_handler() runs them.
-    let (mut to, mut changed, mut moved) = (r.clone(), false, false);
+    let (mut to, mut changed, mut moved) = (Cow::Borrowed(r), false, false);
     for step in &level.rewrite {
         let rw = match step {
             Step::Return(code, text) => return serve(&to, level, prefix, Some((*code, text)), client).await,
@@ -505,13 +506,13 @@ async fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Fo
             None => String::new(),
         };
         if rw.redirect { return redirect(rw.status, format!("{uri}{args}")); }
-        to.target = format!("{uri}{args}");
-        to.uri = uri;
+        let target = format!("{uri}{args}");
+        (to.to_mut().target, to.to_mut().uri) = (target, uri);
         (changed, moved) = (rw.flag != Flag::Break, true);
         if rw.flag != Flag::Next { break; }
     }
     // A URI changed without "break" is looked for again among the locations.
-    if changed { return Response { internal: Some(to.target), ..Response::default() }; }
+    if changed { return Response { internal: Some(to.into_owned().target), ..Response::default() }; }
     // Stopped by break, the location goes on with the new URI, and proxy_pass
     // passes it whole, without the URI it has (r->valid_location is 0).
     match level.proxy.as_deref().filter(|p| moved && p.uri.is_some() && level.try_files.is_none()) {
@@ -555,7 +556,7 @@ async fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Temp
         (Some((code, text)), _, _) if REDIRECTS.contains(&code) => redirect(code, text.render(r, &Sent::default())),
         (Some((code, text)), _, _) if text.0.is_empty() && code >= 400 => special(code),
         (Some((code, text)), _, _) => {
-            let ctype = Some("text/plain".to_string());
+            let ctype = Some("text/plain".into());
             Response { status: code, ctype, body: crate::vars::bytes(&text.render(r, &Sent::default())), ..Response::default() }
         }
         (None, _, Some(tf)) => try_files(tf, level, r, prefix, client).await,
@@ -613,6 +614,7 @@ fn args(r: &Request) -> &str {
 /// Answers one request; when the connection stays open for the next one, how
 /// long it waits for it (keepalive_timeout).
 async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found<'_>, local: SocketAddr, ahead: &[u8]) -> Option<Duration> {
+    let redirected;
     let (mut resp, mut level, mut last) = answer(server, r, parsed, found, Some(&mut *stream)).await;
     let intercepted = !resp.proxied || level.proxy_intercept_errors;
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)).filter(|_| intercepted) {
@@ -637,7 +639,8 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             // answer's own), unless it is a page generated for its own error or redirect.
             let status = ep.status.unwrap_or(resp.status);
             let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
-            (resp, level, last) = answer(server, &to, Ok(()), found, Some(&mut *stream)).await;
+            redirected = to;
+            (resp, level, last) = answer(server, &redirected, Ok(()), found, Some(&mut *stream)).await;
             if !resp.generated && status != 0 { resp.status = status; }
             // A redirect the new answer makes replaces the Location kept.
             let own = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("location"));
@@ -648,7 +651,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         }
     }
     // The headers and the log see the request as the last internal redirect left it ($uri).
-    let r = &last;
+    let r = &*last;
     not_modified(r, level, &mut resp);
     let absolute = level.absolute_redirect && !resp.relative;
     if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| absolute) {
@@ -665,21 +668,21 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
     let added = ADDED.contains(&resp.status);
     let expires = level.expires.as_ref().filter(|_| added).and_then(|e| expires::parse(&e.render(r, &Sent::default())));
-    let modified = resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case("last-modified"));
-    let modified = modified.and_then(|h| chrono::DateTime::parse_from_rfc2822(&h.1).ok()).map(|t| t.timestamp());
-    if let Some((e, cc)) = expires.and_then(|e| expires::headers(e, modified)) {
+    let modified = |resp: &Response| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case("last-modified")).and_then(|h| chrono::DateTime::parse_from_rfc2822(&h.1).ok()).map(|t| t.timestamp());
+    if let Some((e, cc)) = expires.and_then(|e| expires::headers(e, modified(&resp))) {
         resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("expires") && !h.0.eq_ignore_ascii_case("cache-control"));
         resp.headers.extend([("Expires".to_string(), e), ("Cache-Control".to_string(), cc)]);
     }
     // What has been sent so far, for $sent_http_* and $upstream_http_*.
-    let so_far = |resp: &Response, trailers: &[(String, String)]| {
-        let ctype = resp.ctype.iter().map(|t| ("Content-Type".to_string(), t.clone()));
-        let headers = ctype.chain(resp.headers.iter().cloned()).collect();
-        Sent { status: resp.status, headers, upstream: resp.upstream.clone(), trailers: trailers.to_vec(), upstream_addr: resp.upstream_addr.clone(), upstream_status: resp.upstream_status.clone(), upstream_time: resp.upstream_time.clone(), upstream_bytes: resp.upstream_bytes.clone(), proxy_host: resp.proxy_host.clone(), ..Sent::default() }
+    let so_far = |resp: Response, trailers: Vec<(String, String)>| {
+        let mut headers = resp.headers;
+        if let Some(ctype) = resp.ctype { headers.insert(0, ("Content-Type".to_string(), ctype.into_owned())); }
+        Sent { status: resp.status, headers, upstream: resp.upstream, trailers, upstream_addr: resp.upstream_addr, upstream_status: resp.upstream_status, upstream_time: resp.upstream_time, upstream_bytes: resp.upstream_bytes, proxy_host: resp.proxy_host, ..Sent::default() }
     };
+    let copy = |resp: &Response| Response { status: resp.status, ctype: resp.ctype.clone(), headers: resp.headers.clone(), upstream: resp.upstream.clone(), upstream_addr: resp.upstream_addr.clone(), upstream_status: resp.upstream_status.clone(), upstream_time: resp.upstream_time.clone(), upstream_bytes: resp.upstream_bytes.clone(), proxy_host: resp.proxy_host.clone(), ..Response::default() };
     // While the head is made, the last proxied server is still sending ($upstream_response_time).
     let at_head = |resp: &Response| {
-        let mut sent = so_far(resp, &[]);
+        let mut sent = so_far(copy(resp), Vec::new());
         sent.upstream_time.iter_mut().filter_map(|t| t.last_mut()).for_each(|t| t[2] = None);
         sent
     };
@@ -733,7 +736,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     // The trailers are made after the body, each seeing those before it ($sent_trailer_*).
     let mut trailers = Vec::new();
     for (name, value, _) in level.add_trailer.iter().filter(|t| chunked && (t.2 || added)) {
-        let value = value.render(r, &so_far(&resp, &trailers));
+        let value = value.render(r, &so_far(copy(&resp), trailers.clone()));
         if !value.is_empty() { trailers.push((name.clone(), value)); }
     }
     if chunked {
@@ -747,9 +750,11 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let written = send(stream, &[&out, &resp.body[..body_len], &tail], rate, size(&level.limit_rate_after), r.started, send_timeout(level)).await;
     // What was passed from the proxied server through an upgraded connection counts as sent, as body.
     let tunneled = match resp.tunnel.take().filter(|_| written) { Some(up) => tunnel(stream, up, ahead, (Some(level.proxy_read_timeout).filter(|t| !t.is_zero()), send_timeout(level))).await, None => 0 };
-    let sent = Sent { bytes: out.len() + body_len + tail.len() + tunneled, body: body_len + tunneled, ..so_far(&resp, &trailers) };
     if written { post_action(server, r, level, Some(stream)).await; }
-    level.access_log.iter().for_each(|log| log.write(level, r, &sent));
+    if !level.access_log.is_empty() {
+        let sent = Sent { bytes: out.len() + body_len + tail.len() + tunneled, body: body_len + tunneled, ..so_far(resp, trailers) };
+        level.access_log.iter().for_each(|log| log.write(level, r, &sent));
+    }
     (written && keepalive && !silent).then_some(level.keepalive_timeout)
 }
 
@@ -797,7 +802,8 @@ async fn post_action(server: &Server, r: &Request, level: &Level, client: Option
 /// body, Content-Type, Accept-Ranges or Content-Encoding, when the
 /// If-Modified-Since (as if_modified_since says) and If-None-Match it has hold.
 fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
-    if resp.status != 200 { return; }
+    const CONDITIONS: &[&str] = &["if-match", "if-modified-since", "if-none-match"];
+    if resp.status != 200 || !r.headers.iter().any(|h| CONDITIONS.iter().any(|c| h.0.eq_ignore_ascii_case(c))) { return; }
     let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     let (modified, etag) = (sent("last-modified").and_then(|t| expires::http_time(&t)), sent("etag"));
     // If-Unmodified-Since, which no test needs, is not done yet.
@@ -906,26 +912,27 @@ fn browser(ua: &str) -> (bool, bool) {
 
 /// The answer of the location found, after the internal redirects of the
 /// index module, and the settings of the location that gave it.
-async fn answer<'a>(server: &'a Server, r: &Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Response, &'a Level, Request) {
+async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Response, &'a Level, Cow<'r, Request>) {
     // Once the location or an if block that applied has proxy_pass, the request
     // is proxied: when the last if block that applied has no proxy_pass to
     // inherit, nginx has no upstream for it and answers 500.
     let mut proxied = level.proxy.is_some();
     if parsed.is_ok() { level = run(r, &level.script, run(r, &level.server_script, level, &mut proxied), &mut proxied); }
     let mut resp = if proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration"); special(500) } else { respond(r, parsed, (prefix, level, auto), client.as_deref_mut()).await };
-    let (mut redirects, mut to) = (0, r.clone());
+    let (mut redirects, mut to) = (0, Cow::Borrowed(r));
     while let Some(target) = resp.internal.take() {
         // nginx gives up after 10 internal redirects.
         redirects += 1;
         // After X-Accel-Redirect the proxied answer's headers stay ($upstream_http_*),
         // and the new answer has those of them nginx keeps.
-        let kept = resp.proxied.then(|| { to.upstream = std::mem::take(&mut resp.upstream); (std::mem::take(&mut resp.headers), resp.ctype.take()) });
+        let kept = resp.proxied.then(|| { to.to_mut().upstream = std::mem::take(&mut resp.upstream); (std::mem::take(&mut resp.headers), resp.ctype.take()) });
         // A named location answers the request as it is, without the server's rewrites.
         let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == target);
         let (prefix, found, auto) = if let Some(l) = named { (l.path.as_str(), &l.level, false) } else {
-            if resp.as_get && to.method != "HEAD" { to.method = "GET".to_string(); }
-            to.uri = target.split('?').next().unwrap_or_default().to_string();
-            to.target = target.clone();
+            let next = to.to_mut();
+            if resp.as_get && next.method != "HEAD" { next.method = "GET".to_string(); }
+            next.uri = target.split('?').next().unwrap_or_default().to_string();
+            next.target = target.clone();
             located(server, &to, &to.uri)
         };
         let proxied = &mut false;
@@ -1056,12 +1063,12 @@ fn file_at(level: &Level, r: &Request, path: PathBuf) -> Response {
     let modified = expires::http_date(mtime as i64);
     const TYPES: &[(&str, &str)] = &[("html", "text/html"), ("gif", "image/gif"), ("jpg", "image/jpeg")];
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
-    let ctype = TYPES.iter().find(|t| t.0 == ext).map_or(level.default_type.as_str(), |t| t.1);
+    let ctype = TYPES.iter().find(|t| t.0 == ext).map_or_else(|| level.default_type.clone().into(), |t| t.1.into());
     let mut headers = vec![("Last-Modified".to_string(), modified)];
     headers.extend(gz.map(|_| ("Content-Encoding".to_string(), "gzip".to_string())));
     headers.push(("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", body.len())));
     headers.push(("Accept-Ranges".to_string(), "bytes".to_string()));
-    Response { status: 200, ctype: Some(ctype.to_string()), headers, body, vary, ranges: true, ..Response::default() }
+    Response { status: 200, ctype: Some(ctype), headers, body, vary, ranges: true, ..Response::default() }
 }
 
 /// Whether the client takes gzip, as ngx_http_gzip_ok() decides: it accepts the
@@ -1089,10 +1096,11 @@ fn recoded(resp: &mut Response) {
 /// gzip_types (text/html always) is compressed for a client that takes gzip,
 /// at gzip_comp_level 1, and sent without a length.
 fn gzip(r: &Request, level: &Level, resp: &mut Response) {
+    if !level.gzip || resp.body.len() < 20 { return; }
     let ctype = resp.ctype.as_deref().unwrap_or_default().split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
     let typed = ctype == "text/html" || level.gzip_types.iter().any(|t| t == "*" || *t == ctype);
     let encoded = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && !h.1.is_empty());
-    if !level.gzip || ![200, 403, 404].contains(&resp.status) || encoded || resp.body.len() < 20 || !typed { return; }
+    if ![200, 403, 404].contains(&resp.status) || encoded || !typed { return; }
     resp.vary = true;
     if !gzip_ok(r, level) { return; }
     recoded(resp);
@@ -1386,7 +1394,7 @@ async fn fetch((peer, tls): (&SocketAddr, Option<(&Arc<rustls::ClientConfig>, Op
         let (name, value) = upstream_header(line)?;
         let (lower, value) = (name.to_ascii_lowercase(), value.to_string());
         resp.upstream.push((name.to_string(), value.clone()));
-        if lower == "content-type" { resp.ctype = Some(value); continue; }
+        if lower == "content-type" { resp.ctype = Some(value.into()); continue; }
         // A second Expires is ignored.
         let again = lower == "expires" && resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("expires"));
         if !again && !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
@@ -2714,7 +2722,7 @@ mod tests {
         let (_, r) = request("GET / HTTP/1.1\nHost: a\nAccept-Encoding: gzip\n\n");
         let make = |status, ctype: &str, len| {
             let headers = vec![("ETag".to_string(), "\"1-2\"".to_string()), ("Accept-Ranges".to_string(), "bytes".to_string())];
-            Response { status, ctype: Some(ctype.to_string()), headers, body: vec![b'X'; len], ..Response::default() }
+            Response { status, ctype: Some(ctype.to_string().into()), headers, body: vec![b'X'; len], ..Response::default() }
         };
         let mut resp = make(404, "text/plain; charset=utf-8", 64);
         gzip(&r, &level, &mut resp);
@@ -2770,7 +2778,7 @@ mod tests {
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
             let (resp, _, last) = block_on(answer(s, &r, Ok(()), location(s, &r.uri), None));
-            (resp.status, last.target)
+            (resp.status, last.into_owned().target)
         };
         assert_eq!(answer("/m/?a"), (200, "/m/two.html?a".to_string()));
         assert_eq!(answer("/abs/").1, "/m/localhost");
