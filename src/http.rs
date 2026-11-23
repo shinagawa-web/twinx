@@ -59,6 +59,18 @@ static SHUTTING: AtomicBool = AtomicBool::new(false);
 static BUSY: AtomicUsize = AtomicUsize::new(0);
 /// Wakes the connections that wait when the worker starts shutting down.
 pub(crate) static SHUTDOWN: tokio::sync::Notify = tokio::sync::Notify::const_new();
+/// Whether worker_shutdown_timeout has passed, and what wakes the requests then waiting.
+static HALTED: AtomicBool = AtomicBool::new(false);
+static HALT: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Ends once worker_shutdown_timeout has passed while the worker shuts down.
+async fn halted() {
+    loop {
+        let halt = HALT.notified();
+        if HALTED.load(Ordering::SeqCst) { return }
+        halt.await;
+    }
+}
 
 /// Whether the worker is shutting down gracefully.
 pub(crate) fn shutting() -> bool {
@@ -95,6 +107,12 @@ pub async fn shut_down(accepting: Vec<JoinHandle<()>>, timeout: Option<Duration>
     accepting.iter().for_each(JoinHandle::abort);
     for task in accepting { let _ = task.await; }
     while BUSY.load(Ordering::SeqCst) > 0 && timeout.is_none_or(|t| start.elapsed() < t) { tokio::time::sleep(Duration::from_millis(10)).await; }
+    // Once the timeout has passed, as nginx closes their connections, the requests waiting
+    // for proxied servers end as their clients had closed them (499), and are logged so.
+    if BUSY.load(Ordering::SeqCst) == 0 { return }
+    HALTED.store(true, Ordering::SeqCst);
+    HALT.notify_waiters();
+    for _ in 0..100 { if BUSY.load(Ordering::SeqCst) == 0 { break } tokio::task::yield_now().await; }
 }
 
 /// Accepts connections on the listening sockets, in a worker process: a task
@@ -1615,6 +1633,8 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
             if let Some(end) = line_end(buf).and_then(|at| lines_end(buf, at)) { break end; }
             if answer.len() >= level.proxy_buffer_size { return Err(Other); }
             let closed = async { match client.as_deref() { Some(c) => match c.tcp() { Some(tcp) => crate::stream::closed(tcp).await, None => std::future::pending().await }, None => std::future::pending().await } };
+            // So does the worker_shutdown_timeout of a worker shutting down.
+            let closed = async { tokio::select! { () = closed => {} () = halted() => {} } };
             let n = tokio::select! {
                 biased;
                 () = closed => return Ok((Response { status: 499, ..Response::default() }, None)),
@@ -2380,7 +2400,10 @@ mod tests {
             let started = Instant::now();
             shut_down(accepting, Some(Duration::from_millis(100))).await;
             assert!(started.elapsed() < Duration::from_secs(2));
+            // The timeout passed with a request left: what waits for proxied servers ends.
+            assert!(tokio::time::timeout(Duration::from_secs(1), halted()).await.is_ok());
         });
+        HALTED.store(false, Ordering::SeqCst);
     }
 
     fn request(head: &str) -> (Result<(), u16>, Request) {
@@ -2789,6 +2812,7 @@ mod tests {
         let _busy = counted();
         // A test of shutting down leaves it set, which closes connections.
         SHUTTING.store(false, Ordering::SeqCst);
+        HALTED.store(false, Ordering::SeqCst);
         let (addr, came) = closing(answer.to_string().leak());
         let text = block_on(received(&format!("server {{ location /e {{ return 200 e; }} location / {{ proxy_pass http://{addr}; {directives} }} }}"), requests));
         let came = *came.lock().unwrap();
@@ -3033,6 +3057,7 @@ mod tests {
         let _busy = counted();
         // A test of shutting down leaves it set, which closes connections.
         SHUTTING.store(false, Ordering::SeqCst);
+        HALTED.store(false, Ordering::SeqCst);
         let (big, delimited) = ("x".repeat(20000), LENGTH.replace("Content-Length: 30000\r\n", ""));
         let cases = [
             (format!("{LENGTH}ab"), http11, format!("{length}ab")),
