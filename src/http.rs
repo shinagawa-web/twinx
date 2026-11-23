@@ -161,16 +161,31 @@ fn http09(line: &[u8]) -> bool {
     line.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty()).take(3).count() == 2
 }
 
+/// How the body of a stream of HTTP/2 is read, as nginx decides once the
+/// stream's location is found: into buffers, with its window then opened as
+/// wide as it goes; passed on as it comes (proxy_request_buffering off); or
+/// discarded, by a location whose content handler does not read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reading { Buffered, Unbuffered, Discarded }
+
+/// What a stream of an HTTP/2 connection comes with: when that connection was
+/// made, the number of its request, how many of its header lines were made
+/// from its pseudo-header and cookie fields, which max_headers does not count,
+/// as nginx counts only the others; and what to tell how its body is read.
+pub(crate) struct Origin {
+    pub connected: Instant,
+    pub number: u64,
+    pub made: usize,
+    pub reading: Option<Box<dyn FnOnce(Reading)>>,
+}
+
 /// Serves the requests of a connection accepted on a listening address,
-/// with its local and remote addresses. A stream of an HTTP/2 connection
-/// comes with when that connection was made, the number of its request, and
-/// how many of its header lines were made from its pseudo-header and cookie
-/// fields, which max_headers does not count, as nginx counts only the others.
-pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>), fresh: Busy, origin: Option<Box<(Instant, u64, usize)>>) {
+/// with its local and remote addresses, or a stream of an HTTP/2 connection.
+pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>), fresh: Busy, mut origin: Option<Box<Origin>>) {
     let mut fresh = Some(fresh);
     let mut buf = Vec::new();
     // After a kept-alive answer: how long the connection waits for the next request.
-    let ((connected, mut requests), mut idle) = (origin.as_ref().map_or((Instant::now(), 0), |o| (o.0, o.1 - 1)), None);
+    let ((connected, mut requests), mut idle) = (origin.as_ref().map_or((Instant::now(), 0), |o| (o.connected, o.number - 1)), None);
     // Whether any of its requests was pipelined, as nginx's c->pipeline stays set.
     let mut piped = false;
     // A TLS connection whose client and server agreed on h2 (ALPN) speaks HTTP/2.
@@ -227,7 +242,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         let parsed = overflowed.map_or(parsed, Err);
         let (server, captures) = server(config, listen, r.host.as_deref());
         r.captures = captures;
-        let parsed = parsed.and_then(|()| if r.headers.len().saturating_sub(origin.as_ref().map_or(0, |o| o.2)) > server.level.max_headers { Err(400) } else { Ok(()) });
+        let parsed = parsed.and_then(|()| if r.headers.len().saturating_sub(origin.as_ref().map_or(0, |o| o.made)) > server.level.max_headers { Err(400) } else { Ok(()) });
         let parsed = parsed.and_then(|()| if misdirected(r.ssl.as_deref(), r.host.as_deref(), server.level.ssl_verify_client) { Err(421) } else { Ok(()) });
         // A stream of HTTP/2 asking for a server that does not speak it is misdirected too.
         let parsed = parsed.and_then(|()| if matches!(stream, Stream::Pipe(_)) && !http2(config, listen, server) { Err(421) } else { Ok(()) });
@@ -238,7 +253,12 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         let framing = parsed.and_then(|()| framing(&r)).and_then(|n| if n.unwrap_or(0) > level.max_body { Err(413) } else { Ok(n) });
         let expect = header(&r, "expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue"));
         if framing.is_ok() && expect && r.line.ends_with("HTTP/1.1") { write_all(&mut stream, b"HTTP/1.1 100 Continue\r\n\r\n", send_timeout(level)).await; }
+        let reading = if !reads_body(level) { Reading::Discarded } else if level.proxy.is_some() && !level.proxy_request_buffering { Reading::Unbuffered } else { Reading::Buffered };
+        if framing.is_ok() { if let Some(tell) = origin.as_mut().and_then(|o| o.reading.take()) { tell(reading); } }
+        // A stream of HTTP/2 whose body is discarded is answered without waiting for it.
+        let discarded = origin.is_some() && reading == Reading::Discarded;
         let parsed = match framing {
+            Ok(_) if discarded => Ok(()),
             Err(status) => Err(status),
             // With proxy_request_buffering off, what came with the head is passed
             // with the request, and the rest of the body as it comes.
@@ -287,7 +307,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             let lingers = match level.lingering_close {
                 // Closing with something unread resets the connection, which can
                 // destroy the answer before the client reads it.
-                Some(false) => parsed.is_err() || unbuffered || piped || !buf.is_empty() || stream.waiting(),
+                Some(false) => !discarded && (parsed.is_err() || unbuffered || piped || !buf.is_empty() || stream.waiting()),
                 always => always.is_some(),
             };
             return close(&mut stream, lingers).await;
@@ -406,13 +426,22 @@ fn send_timeout(level: &Level) -> Option<Duration> {
 /// 500 when the file cannot be written.
 fn keep_body(r: &mut Request, level: &Level, body: Vec<u8>) -> Result<(), u16> {
     static NEXT: AtomicU32 = AtomicU32::new(1);
-    let to_file = !body.is_empty() && (level.body_in_file_only || body.len() as u64 > level.body_buffer);
+    // A body that was framed, even empty, goes in a file with client_body_in_file_only.
+    let framed = header(r, "content-length").is_some() || header(r, "transfer-encoding").is_some();
+    let to_file = (!body.is_empty() || framed) && (level.body_in_file_only || body.len() as u64 > level.body_buffer);
     if !to_file { r.body = body; return Ok(()); }
     let path = temp_file(&level.body_temp_path, &level.body_temp_levels, NEXT.fetch_add(1, Ordering::Relaxed));
     let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, &body));
     if let Err(e) = written { error_log(level, r, &format!("open() \"{}\" failed ({e})", path.display())); return Err(500); }
     r.body_file = Some(path);
     Ok(())
+}
+
+/// Whether a location may read the request body: it proxies, or its rewrite
+/// module directives or try_files may lead elsewhere. Otherwise its content
+/// handler (static files) discards the body, as nginx's does.
+fn reads_body(level: &Level) -> bool {
+    level.proxy.is_some() || !level.rewrite.is_empty() || !level.script.is_empty() || !level.server_script.is_empty() || level.try_files.is_some() || level.post_action.is_some()
 }
 
 /// A temporary file's path: the number in ten digits, in the subdirectories
@@ -3631,6 +3660,26 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let level = Level { body_buffer: 4, body_temp_path: std::env::current_exe().unwrap(), ..Level::default() };
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
         assert_eq!(keep_body(&mut r, &level, b"abcde".to_vec()), Err(500));
+    }
+
+    #[test]
+    fn keeps_empty_framed_bodies_in_files() {
+        // With client_body_in_file_only, an empty body goes in a file when the request framed it, not when it has none.
+        let dir = std::env::temp_dir().join(format!("twinx-empty-body-{}", std::process::id()));
+        let level = Level { body_in_file_only: true, body_buffer: 4, body_temp_path: dir, ..Level::default() };
+        let (_, mut r) = request("POST / HTTP/1.0\nContent-Length: 0\n\n");
+        keep_body(&mut r, &level, Vec::new()).unwrap();
+        assert_eq!(std::fs::read(r.body_file.unwrap()).unwrap(), b"");
+        let (_, mut r) = request("GET / HTTP/1.0\n\n");
+        keep_body(&mut r, &level, Vec::new()).unwrap();
+        assert!(r.body_file.is_none());
+    }
+
+    #[test]
+    fn locations_that_read_bodies() {
+        assert!(!reads_body(&Level::default()));
+        assert!(reads_body(&Level { try_files: Some(Arc::new(TryFiles { files: Vec::new(), fallback: Fallback::Status(404) })), ..Level::default() }));
+        assert!(reads_body(&Level { post_action: Some("/a".into()), ..Level::default() }));
     }
 
     #[test]
