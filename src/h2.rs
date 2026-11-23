@@ -370,15 +370,17 @@ fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, sid: u32, payload: &[u8]) {
 /// until it ends, and what is to take it; the length the client declared of
 /// it, how much came, whether it goes in chunks (it has no length), and
 /// whether it turned out longer or shorter; then the body of the answer, how
-/// much of it has been sent, and the header block of its trailers, sent after it. Of the answers it may get, only that of the
-/// exchange so numbered is taken. Until how its body is read is known, what
-/// comes of it is preread, and its window is not updated.
+/// much of it has been sent, and the header block of its trailers, sent after
+/// it. Of the answers it may get, only that of the exchange so numbered is
+/// taken. Until how its body is read is known, what comes of it is preread,
+/// and its window is not updated. The length of its header block is that of
+/// its request's head ($request_length), as in nginx.
 #[derive(Default)]
 struct Open {
     send: i64, recv: i64, head: Option<(Vec<u8>, bool, usize)>, ended: bool, reading: Option<Reading>,
     body: Option<UnboundedSender<Vec<u8>>>, taker: Option<UnboundedReceiver<Vec<u8>>>,
     declared: Option<u64>, got: u64, chunked: bool, bad: bool,
-    answer: Option<Vec<u8>>, sent: usize, number: u64, exchange: u32, trailers: Option<Vec<u8>>,
+    answer: Option<Vec<u8>>, sent: usize, number: u64, exchange: u32, trailers: Option<Vec<u8>>, block: usize,
 }
 
 /// The state of an HTTP/2 connection.
@@ -546,7 +548,7 @@ impl Connection {
         let declared = fields.iter().find(|f| f.0 == b"content-length").and_then(|f| std::str::from_utf8(&f.1).ok()?.parse().ok());
         let chunked = head.as_ref().is_some_and(|h| !h.1) && !ended;
         let (body, taker) = tokio::sync::mpsc::unbounded_channel();
-        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head, ended, body: (!ended).then_some(body), taker: Some(taker), declared, chunked, number: self.requests, ..Open::default() });
+        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head, ended, body: (!ended).then_some(body), taker: Some(taker), declared, chunked, number: self.requests, block: block.len(), ..Open::default() });
         self.ready.push(sid);
         Ok(())
     }
@@ -700,7 +702,7 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
             };
             let (tx, config, addrs, number) = (tx.clone(), config.clone(), addrs.clone(), s.exchange);
             let told = tx.clone();
-            let origin = Origin { connected: c.started, number: s.number, made, reading: Some(Box::new(move |r| { let _ = told.send((sid, number, Told::Reading(r))); })) };
+            let origin = Origin { connected: c.started, number: s.number, made, length: s.block, reading: Some(Box::new(move |r| { let _ = told.send((sid, number, Told::Reading(r))); })) };
             tokio::task::spawn_local(async move { let _ = tx.send((sid, number, Told::Answer(exchange(config, request, taker, addrs, origin).await))); });
         }
         c.send_data();
@@ -977,6 +979,8 @@ mod tests {
         buf.extend_from_slice(&[0, 0]);
         assert_eq!(c.read(&mut buf), Ok(()));
         assert_eq!((buf.len(), c.ready.clone(), c.frame_size, c.table_update), (2, vec![1], 16384, true));
+        // The header block, of both frames, is the request's head.
+        assert_eq!(c.streams[&1].block, 6);
         let s = c.streams.get_mut(&1).unwrap();
         // Without a length, the body goes on in chunks, one of each frame's data, then the last.
         let mut taker = s.taker.take().unwrap();
