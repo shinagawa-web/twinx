@@ -684,6 +684,15 @@ impl Session {
     }
 }
 
+/// Whether a connection to an address that takes TLS speaks plain HTTP
+/// instead, as nginx tells by its first byte: neither that of a TLS record of
+/// a handshake nor that of SSLv2. None when nothing came within HANDSHAKE.
+pub async fn plain(tcp: &TcpStream) -> Option<bool> {
+    let mut first = [0];
+    let n = tokio::time::timeout(HANDSHAKE, tcp.peek(&mut first)).await.ok()?.ok()?;
+    Some(n == 1 && first[0] != 0x16 && first[0] & 0x80 == 0)
+}
+
 /// Takes a TLS connection from a client on a listening address: the server
 /// its SNI name selects (as the Host header selects one) does the handshake,
 /// which has to end within HANDSHAKE; then the connection, and what the
@@ -1439,6 +1448,20 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             assert!(accept(l.accept().await.unwrap().0, &config, addr).await.is_none());
             drop(TcpStream::connect(addr).await.unwrap());
             assert!(accept(l.accept().await.unwrap().0, &config, addr).await.is_none());
+        });
+    }
+
+    #[test]
+    fn tells_plain_connections_by_their_first_byte() {
+        crate::stream::block_on(async {
+            let (l, addr) = listener().await;
+            let mut open = Vec::new();
+            for (first, expected) in [(&b"GET"[..], Some(true)), (&[0x16, 3, 1][..], Some(false)), (&[0x80][..], Some(false)), (&[][..], Some(false))] {
+                let mut other = TcpStream::connect(addr).await.unwrap();
+                other.write_all(first).await.unwrap();
+                if first.is_empty() { drop(other) } else { open.push(other) }
+                assert_eq!(plain(&l.accept().await.unwrap().0).await, expected);
+            }
         });
     }
 
