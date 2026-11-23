@@ -163,12 +163,14 @@ fn http09(line: &[u8]) -> bool {
 
 /// Serves the requests of a connection accepted on a listening address,
 /// with its local and remote addresses. A stream of an HTTP/2 connection
-/// comes with when that connection was made and the number of its request.
-pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>), fresh: Busy, origin: Option<Box<(Instant, u64)>>) {
+/// comes with when that connection was made, the number of its request, and
+/// how many of its header lines were made from its pseudo-header and cookie
+/// fields, which max_headers does not count, as nginx counts only the others.
+pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>), fresh: Busy, origin: Option<Box<(Instant, u64, usize)>>) {
     let mut fresh = Some(fresh);
     let mut buf = Vec::new();
     // After a kept-alive answer: how long the connection waits for the next request.
-    let ((connected, mut requests), mut idle) = (origin.map_or((Instant::now(), 0), |o| (o.0, o.1 - 1)), None);
+    let ((connected, mut requests), mut idle) = (origin.as_ref().map_or((Instant::now(), 0), |o| (o.0, o.1 - 1)), None);
     // Whether any of its requests was pipelined, as nginx's c->pipeline stays set.
     let mut piped = false;
     // A TLS connection whose client and server agreed on h2 (ALPN) speaks HTTP/2.
@@ -225,7 +227,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         let parsed = overflowed.map_or(parsed, Err);
         let (server, captures) = server(config, listen, r.host.as_deref());
         r.captures = captures;
-        let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
+        let parsed = parsed.and_then(|()| if r.headers.len().saturating_sub(origin.as_ref().map_or(0, |o| o.2)) > server.level.max_headers { Err(400) } else { Ok(()) });
         let parsed = parsed.and_then(|()| if misdirected(r.ssl.as_deref(), r.host.as_deref(), server.level.ssl_verify_client) { Err(421) } else { Ok(()) });
         // A stream of HTTP/2 asking for a server that does not speak it is misdirected too.
         let parsed = parsed.and_then(|()| if matches!(stream, Stream::Pipe(_)) && !http2(config, listen, server) { Err(421) } else { Ok(()) });

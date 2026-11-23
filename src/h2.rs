@@ -242,10 +242,11 @@ impl Table {
 }
 
 /// The request of a stream as HTTP/1 writes it, without the empty line, with
-/// the version HTTP/2.0, and whether it has Content-Length; none for one nginx
-/// refuses with 400. The pseudo-header fields give the request line and the
-/// host, and cookie fields are joined into one, as nginx does.
-fn request(fields: &[(Vec<u8>, Vec<u8>)], end: bool) -> Option<(Vec<u8>, bool)> {
+/// the version HTTP/2.0, whether it has Content-Length, and how many of its
+/// lines it makes; none for one nginx refuses with 400. The pseudo-header
+/// fields give the request line and the host, and cookie fields are joined
+/// into one, as nginx does.
+fn request(fields: &[(Vec<u8>, Vec<u8>)], end: bool) -> Option<(Vec<u8>, bool, usize)> {
     let mut pseudo: [Option<&[u8]>; 4] = [None; 4];
     let (mut lines, mut cookies, mut host, mut length) = (Vec::new(), Vec::new(), None, None);
     for (name, value) in fields {
@@ -270,7 +271,7 @@ fn request(fields: &[(Vec<u8>, Vec<u8>)], end: bool) -> Option<(Vec<u8>, bool)> 
     lines.iter().for_each(|(n, v)| head.extend([n, &b": "[..], v, b"\r\n"].concat()));
     if !cookies.is_empty() { head.extend([&b"cookie: "[..], &cookies.join(&b"; "[..]), b"\r\n"].concat()); }
     if let (Some(a), None) = (authority, host) { head.extend([&b"host: "[..], a, b"\r\n"].concat()); }
-    Some((head, length.is_some()))
+    Some((head, length.is_some(), usize::from(!cookies.is_empty()) + usize::from(host.is_none())))
 }
 
 /// The status and headers of an HTTP/1 answer's head, without those only
@@ -325,7 +326,7 @@ fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, sid: u32, payload: &[u8]) {
 /// answered (none for one refused with 400) and its body, then the body of
 /// the answer and how much of it has been sent.
 #[derive(Default)]
-struct Open { send: i64, recv: i64, head: Option<(Vec<u8>, bool)>, body: Vec<u8>, ended: bool, answer: Option<Vec<u8>>, sent: usize, number: u64 }
+struct Open { send: i64, recv: i64, head: Option<(Vec<u8>, bool, usize)>, body: Vec<u8>, ended: bool, answer: Option<Vec<u8>>, sent: usize, number: u64 }
 
 /// The state of an HTTP/2 connection.
 struct Connection {
@@ -595,15 +596,16 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
         let read = if preface { c.read(&mut buf) } else if buf.len() < PREFACE.len() { Ok(()) } else if buf.starts_with(PREFACE) { preface = true; buf.drain(..PREFACE.len()); c.read(&mut buf) } else { Err(PROTOCOL_ERROR) };
         for sid in std::mem::take(&mut c.ready) {
             let Some(s) = c.streams.get_mut(&sid) else { continue };
-            let request = match s.head.take() {
-                Some((mut head, length)) => {
-                    if !length && !s.body.is_empty() { head.extend(format!("content-length: {}\r\n", s.body.len()).bytes()); }
-                    [head, b"\r\n".to_vec(), std::mem::take(&mut s.body)].concat()
+            let (request, made) = match s.head.take() {
+                Some((mut head, length, made)) => {
+                    let unsized_body = !length && !s.body.is_empty();
+                    if unsized_body { head.extend(format!("content-length: {}\r\n", s.body.len()).bytes()); }
+                    ([head, b"\r\n".to_vec(), std::mem::take(&mut s.body)].concat(), made + usize::from(unsized_body))
                 }
                 // A line HTTP/1 refuses, for the answer nginx gives with 400.
-                None => b"-\r\n\r\n".to_vec(),
+                None => (b"-\r\n\r\n".to_vec(), 0),
             };
-            let (tx, config, addrs, origin) = (tx.clone(), config.clone(), addrs.clone(), (c.started, s.number));
+            let (tx, config, addrs, origin) = (tx.clone(), config.clone(), addrs.clone(), (c.started, s.number, made));
             tokio::task::spawn_local(async move { let _ = tx.send((sid, exchange(config, request, addrs, origin).await)); });
         }
         c.send_data();
@@ -625,8 +627,9 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
 }
 
 /// Answers the request of a stream, as a connection of its own answers it,
-/// one made when the HTTP/2 connection was, of which it is the request so numbered.
-async fn exchange(config: Arc<Config>, request: Vec<u8>, (listen, local, peer, ssl): Addrs, origin: (Instant, u64)) -> Answer {
+/// one made when the HTTP/2 connection was, of which it is the request so
+/// numbered; the request has so many header lines made, not sent by the client.
+async fn exchange(config: Arc<Config>, request: Vec<u8>, (listen, local, peer, ssl): Addrs, origin: (Instant, u64, usize)) -> Answer {
     let (mut ours, theirs) = tokio::io::duplex(65536);
     tokio::task::spawn_local(async move { crate::http::connection(&config, Stream::Pipe(theirs), (listen, local, peer, ssl), Busy::new(), Some(Box::new(origin))).await });
     let mut answer = Vec::new();
@@ -692,8 +695,9 @@ mod tests {
     fn requests() {
         let f = |list: &[(&str, &str)]| list.iter().map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec())).collect::<Vec<_>>();
         let base = [(":method", "GET"), (":scheme", "http"), (":path", "/a?b"), (":authority", "h")];
-        let (head, length) = request(&f(&[&base[..], &[("cookie", "a=b"), ("x-a", "1"), ("cookie", "c=d")]].concat()), true).unwrap();
-        assert_eq!((String::from_utf8(head).unwrap().as_str(), length), ("GET /a?b HTTP/2.0\r\nx-a: 1\r\ncookie: a=b; c=d\r\nhost: h\r\n", false));
+        let (head, length, made) = request(&f(&[&base[..], &[("cookie", "a=b"), ("x-a", "1"), ("cookie", "c=d")]].concat()), true).unwrap();
+        assert_eq!((String::from_utf8(head).unwrap().as_str(), length, made), ("GET /a?b HTTP/2.0\r\nx-a: 1\r\ncookie: a=b; c=d\r\nhost: h\r\n", false, 2));
+        assert_eq!(request(&f(&[&base[..], &[("host", "h")]].concat()), true).unwrap().2, 0);
         assert!(request(&f(&[&base[..], &[("host", "h"), ("content-length", "1")]].concat()), false).unwrap().1);
         assert!(request(&f(&[&base[..], &[("content-length", "1")]].concat()), true).is_none());
         assert!(request(&f(&[&base[..], &[("host", "other")]].concat()), true).is_none());
