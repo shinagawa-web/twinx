@@ -68,7 +68,6 @@ pub struct Conn {
 
 impl Conn {
     /// A new connection; the request it is opened for counts, as in nginx's c->requests.
-    #[allow(dead_code)] // The next commit uses it.
     pub fn new(stream: Stream, opened: Instant) -> Conn {
         Conn { stream, opened, requests: 1 }
     }
@@ -117,7 +116,6 @@ thread_local! {
 
 /// Closes the idle connections of every upstream of the worker, which is
 /// shutting down; no more are kept.
-#[allow(dead_code)] // The next commit uses it.
 pub fn close_idle() {
     CLOSING.set(true);
     let caches: Vec<Arc<Upstream>> = CACHES.with_borrow(|c| c.iter().filter_map(Weak::upgrade).collect());
@@ -202,7 +200,6 @@ impl Upstream {
     /// The idle connection to the server that was kept last, counted as used for
     /// one more request; opened by the location if they are local to one. Those
     /// found on the way that are not usable any more are closed.
-    #[allow(dead_code)] // The next commit uses it.
     pub fn take(&self, addr: &SocketAddr, tag: usize) -> Option<Conn> {
         let keepalive = self.keepalive.as_ref()?;
         let (mut cache, now) = (self.cache.lock().unwrap(), Instant::now());
@@ -219,7 +216,6 @@ impl Upstream {
     /// Keeps a connection whose answer was read to its end, or closes it, as
     /// ngx_http_upstream_free_keepalive_peer() does; the one kept for the longest
     /// makes room for it.
-    #[allow(dead_code)] // The next commit uses it.
     pub fn put(self: &Arc<Self>, conn: Conn, addr: SocketAddr, tag: usize) {
         let Some(keepalive) = &self.keepalive else { return };
         let now = Instant::now();
