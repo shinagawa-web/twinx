@@ -17,7 +17,7 @@ use crate::vars::{Part, Template};
 use crate::expires;
 use crate::upstream::{Peer, Upstream};
 use crate::vars::{Request, Sent};
-use crate::stream::{Stream, read_into, within, write_all};
+use crate::stream::{Stream, read_into, read_until, within, write_all};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
 
@@ -149,8 +149,9 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
             let end = head_end(&buf);
             if let Some((status, at)) = overflow(&buf[..end.unwrap_or(buf.len())], default.level.header_buffer, buffers) { break (at, Some(status)); }
             if let Some(end) = end { break (end, None); }
-            let wait = idle.filter(|_| buf.is_empty());
-            if read_into(&mut stream, &mut buf, wait).await == 0 { return; }
+            // Waiting for a next request, the time left counts from the end of the last one.
+            let wait = idle.filter(|_| buf.is_empty()).and_then(|t| started.checked_add(t));
+            if read_until(&mut stream, &mut buf, || wait).await == 0 { return; }
         };
         let head: Vec<u8> = buf.drain(..end).collect();
         let mut r = Request {
@@ -711,7 +712,9 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let silent = [444, 499].contains(&status);
     if !silent && !http09(r.line.as_bytes()) {
         let reason = REASONS.iter().find(|(c, _)| *c == status).map_or("", |(_, r)| r);
-        let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
+        let mut date = Vec::new();
+        crate::clock::date(&mut date);
+        let date = String::from_utf8_lossy(&date);
         let ctype = resp.ctype.as_ref().map(|t| format!("Content-Type: {t}\r\n")).unwrap_or_default();
         let connection = if upgraded { "upgrade" } else if keepalive { "keep-alive" } else { "close" };
         let len = resp.body.len();
@@ -885,7 +888,7 @@ async fn write_parts<S: AsyncWrite + Unpin>(stream: &mut S, parts: &[&[u8]], fro
 /// does not name the browser.
 fn keeps_alive(r: &Request, level: &Level) -> bool {
     let (msie6, safari) = browser(header(r, "user-agent").unwrap_or_default());
-    let limits = !level.keepalive_timeout.is_zero() && r.requests < level.keepalive_requests && r.connected.elapsed() <= level.keepalive_time;
+    let limits = !level.keepalive_timeout.is_zero() && r.requests < level.keepalive_requests && crate::clock::coarse().saturating_duration_since(r.connected) <= level.keepalive_time;
     limits && !(msie6 && r.method == "POST" && level.keepalive_disable_msie6) && !(safari && level.keepalive_disable_safari)
 }
 

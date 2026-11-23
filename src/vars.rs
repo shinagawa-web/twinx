@@ -1,6 +1,7 @@
 //! Variables ($uri, $status, ...) and the strings built from them: the
 //! complex values of directives such as return, and access log formats.
 
+use std::cell::OnceCell;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -144,6 +145,14 @@ pub struct Sent {
     pub proxy_host: Option<String>,
 }
 
+/// The time a string's variables show: read once, when the first of them asks for it.
+#[derive(Debug, Default)]
+pub struct Now(OnceCell<DateTime<Local>>);
+
+impl Now {
+    fn get(&self) -> &DateTime<Local> { self.0.get_or_init(Local::now) }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Var {
     Uri,
@@ -249,7 +258,7 @@ impl Var {
     }
 
     /// The value, or None when the variable is "not found" (no such header, no user).
-    pub fn value(&self, r: &Request, s: &Sent, now: &DateTime<Local>) -> Option<Vec<u8>> {
+    pub fn value(&self, r: &Request, s: &Sent, now: &Now) -> Option<Vec<u8>> {
         Some(bytes(match self {
             Var::Uri => r.uri.clone(),
             Var::RequestMethod => r.method.clone(),
@@ -259,9 +268,9 @@ impl Var {
             Var::BytesSent => s.bytes.to_string(),
             Var::BodyBytesSent => s.body.to_string(),
             Var::Pipe => (if r.pipelined { "p" } else { "." }).to_string(),
-            Var::Msec => format!("{}.{:03}", now.timestamp(), now.timestamp_subsec_millis()),
-            Var::TimeIso8601 => now.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
-            Var::TimeLocal => now.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
+            Var::Msec => { let now = now.get(); format!("{}.{:03}", now.timestamp(), now.timestamp_subsec_millis()) }
+            Var::TimeIso8601 => now.get().format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+            Var::TimeLocal => now.get().format("%d/%b/%Y:%H:%M:%S %z").to_string(),
             Var::RemoteAddr => r.peer.ip().to_string(),
             Var::RemotePort => r.peer.port().to_string(),
             Var::BinaryRemoteAddr => return Some(match r.peer.ip() { IpAddr::V4(a) => a.octets().to_vec(), IpAddr::V6(a) => a.octets().to_vec() }),
@@ -453,7 +462,7 @@ impl Template {
 
     /// The value for a directive: variables that are not found give "".
     pub fn render(&self, r: &Request, s: &Sent) -> String {
-        let now = Local::now();
+        let now = Now::default();
         let value = |v: &Var| v.value(r, s, &now).map(|v| text(&v)).unwrap_or_default();
         self.0.iter().map(|p| match p { Part::Text(t) => t.clone(), Part::Var(v) => value(v) }).collect()
     }
@@ -461,7 +470,7 @@ impl Template {
     /// The value for an access log line, its variables escaped as log_format
     /// says: "-" for variables that are not found by default, nothing otherwise.
     pub fn log_line(&self, r: &Request, s: &Sent, escape: Escape) -> Vec<u8> {
-        let (now, mut out) = (Local::now(), Vec::new());
+        let (now, mut out) = (Now::default(), Vec::new());
         for part in &self.0 {
             let value = match part { Part::Text(t) => { out.extend_from_slice(t.as_bytes()); continue } Part::Var(v) => v.value(r, s, &now) };
             match (value, escape) {

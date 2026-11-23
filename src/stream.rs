@@ -4,7 +4,7 @@
 use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -77,17 +77,30 @@ impl AsyncWrite for Stream {
 
 /// What a future gives, None when it does not end within the time (none: no limit).
 pub async fn within<F: Future>(time: Option<Duration>, f: F) -> Option<F::Output> {
-    match time {
-        Some(t) => tokio::time::timeout(t, f).await.ok(),
-        None => Some(f.await),
-    }
+    until(|| time.and_then(|t| Instant::now().checked_add(t)), f).await
+}
+
+/// What a future gives, None when it does not end before the deadline, which
+/// is asked for only once the future has to wait (none: no limit).
+pub async fn until<F: Future>(deadline: impl Fn() -> Option<Instant>, f: F) -> Option<F::Output> {
+    let (mut f, mut sleep) = (std::pin::pin!(f), std::pin::pin!(None));
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(out) = f.as_mut().poll(cx) { return Poll::Ready(Some(out)) }
+        if sleep.is_none() { sleep.set(deadline().map(|d| tokio::time::sleep_until(d.into()))); }
+        sleep.as_mut().as_pin_mut().map_or(Poll::Pending, |s| s.poll(cx).map(|()| None))
+    }).await
 }
 
 /// Reads what comes into the end of buf, waiting at most the time for it;
 /// 0 when the connection closed, failed or the time passed.
 pub async fn read_into<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, time: Option<Duration>) -> usize {
+    read_until(s, buf, || time.and_then(|t| Instant::now().checked_add(t))).await
+}
+
+/// Reads what comes into the end of buf before the deadline, as read_into does.
+pub async fn read_until<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, deadline: impl Fn() -> Option<Instant>) -> usize {
     buf.reserve(4096);
-    within(time, s.read_buf(buf)).await.and_then(Result::ok).unwrap_or(0)
+    until(deadline, s.read_buf(buf)).await.and_then(Result::ok).unwrap_or(0)
 }
 
 /// Writes data and flushes it (a TLS record may wait in the connection otherwise),

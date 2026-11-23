@@ -1,6 +1,6 @@
 //! The expires directive: the Expires and Cache-Control headers it sets.
 
-use chrono::{DateTime, Local, Timelike, Utc};
+use chrono::{DateTime, Local, Timelike};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expires {
@@ -51,7 +51,7 @@ pub fn http_time(s: &str) -> Option<i64> {
 
 /// The Expires and Cache-Control values, given the response's Last-Modified time.
 pub fn headers(e: Expires, last_modified: Option<i64>) -> Option<(String, String)> {
-    let now = Utc::now().timestamp();
+    let now = crate::clock::seconds();
     let (expires, cc) = match e {
         Expires::Off => return None,
         Expires::Fixed(t, cc) => (t, cc.to_string()),
