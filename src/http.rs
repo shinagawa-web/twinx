@@ -107,15 +107,22 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
                 // Until its first request has arrived, a new connection is busy too.
                 let (config, fresh) = (config.clone(), Busy::new());
                 let local = stream.local_addr().unwrap_or(addr);
-                tokio::task::spawn_local(async move {
-                    let accepted = if tls { crate::tls::accept(stream, &config, addr).await.map(|(s, ssl)| (s, Some(ssl))) } else { Some((Stream::Tcp(stream), None)) };
-                    let Some((stream, ssl)) = accepted else { return };
-                    connection(&config, stream, (addr, local, peer, ssl), fresh).await
-                });
+                tokio::task::spawn_local(serving(config, stream, tls, (addr, local, peer), fresh));
             }
         }));
     }
     Ok(tasks)
+}
+
+/// What the task of a connection runs. It is copied when it is made, spawned
+/// and done, so it is kept small: what few connections use is boxed where it
+/// is awaited.
+fn serving(config: Arc<Config>, stream: TcpStream, tls: bool, (addr, local, peer): (SocketAddr, SocketAddr, SocketAddr), fresh: Busy) -> impl Future<Output = ()> {
+    async move {
+        let accepted = if tls { Box::pin(crate::tls::accept(stream, &config, addr)).await.map(|(s, ssl)| (s, Some(Arc::new(ssl)))) } else { Some((Stream::Tcp(stream), None)) };
+        let Some((stream, ssl)) = accepted else { return };
+        connection(&config, stream, (addr, local, peer, ssl), fresh).await
+    }
 }
 
 /// The end of the request head (after the empty line), if it has arrived.
@@ -147,7 +154,7 @@ fn http09(line: &[u8]) -> bool {
 
 /// Serves the requests of a connection accepted on a listening address,
 /// with its local and remote addresses.
-async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<crate::tls::Session>), fresh: Busy) {
+async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>), fresh: Busy) {
     let mut fresh = Some(fresh);
     let mut buf = Vec::new();
     // After a kept-alive answer: how long the connection waits for the next request.
@@ -197,8 +204,8 @@ async fn connection(config: &Config, mut stream: Stream, (listen, local, peer, s
         let (server, captures) = server(config, listen, r.host.as_deref());
         r.captures = captures;
         let parsed = parsed.and_then(|()| if r.headers.len() > server.level.max_headers { Err(400) } else { Ok(()) });
-        let parsed = parsed.and_then(|()| if misdirected(r.ssl.as_ref(), r.host.as_deref(), server.level.ssl_verify_client) { Err(421) } else { Ok(()) });
-        let parsed = parsed.and_then(|()| cert_error(server.level.ssl_verify_client, r.ssl.as_ref()));
+        let parsed = parsed.and_then(|()| if misdirected(r.ssl.as_deref(), r.host.as_deref(), server.level.ssl_verify_client) { Err(421) } else { Ok(()) });
+        let parsed = parsed.and_then(|()| cert_error(server.level.ssl_verify_client, r.ssl.as_deref()));
         r.server_name = server.name.clone();
         let found = located(server, &r, &r.uri);
         let level = found.1;
@@ -430,7 +437,7 @@ struct Response {
     relative: bool,
     /// What is left to read of a proxied answer's body that proxy_limit_rate
     /// paces: it is read once the head is made, as nginx sends the head first.
-    rest: Option<Rest>,
+    rest: Option<Box<Rest>>,
 }
 
 /// The connection to a proxied server whose body is still to be read, with
@@ -533,7 +540,7 @@ async fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Fo
     // Stopped by break, the location goes on with the new URI, and proxy_pass
     // passes it whole, without the URI it has (r->valid_location is 0).
     match level.proxy.as_deref().filter(|p| moved && p.uri.is_some() && level.try_files.is_none()) {
-        Some(p) => proxy(&Proxy { uri: None, ..p.clone() }, level, &to, prefix, client).await,
+        Some(p) => Box::pin(async { proxy(&Proxy { uri: None, ..p.clone() }, level, &to, prefix, client).await }).await,
         None => serve(&to, level, prefix, None, client).await,
     }
 }
@@ -577,7 +584,7 @@ async fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Temp
             Response { status: code, ctype, body: crate::vars::bytes(&text.value(r, &Sent::default())), ..Response::default() }
         }
         (None, _, Some(tf)) => try_files(tf, level, r, prefix, client).await,
-        (None, Some(p), None) => proxy(p, level, r, prefix, client).await,
+        (None, Some(p), None) => Box::pin(proxy(p, level, r, prefix, client)).await,
         (None, None, None) => file(level, r, prefix),
     }
 }
@@ -586,21 +593,20 @@ async fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Temp
 /// with "/") is served, the URI changed to it; when none does, the last
 /// parameter gives a status or a URI to redirect to internally.
 async fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str, client: Option<&mut Stream>) -> Response {
-    let sent = Sent::default();
     for (name, dir) in &tf.files {
-        let name = name.render(r, &sent);
+        let name = name.render(r, &Sent::default());
         let base = level.alias.as_ref().unwrap_or(&level.root);
         // With alias, the location's prefix at the start of the name is replaced, as in the URI.
         let rest = level.alias.as_ref().and(level.alias_len).and_then(|n| name.strip_prefix(r.uri.get(..n)?)).unwrap_or(&name);
         let path = PathBuf::from(format!("{}{rest}", base.display()));
         if std::fs::metadata(&path).is_ok_and(|m| m.is_dir() == *dir) {
             let to = Request { uri: name, ..r.clone() };
-            return match &level.proxy { Some(p) => proxy(p, level, &to, prefix, client).await, None => file_at(level, &to, path) };
+            return match &level.proxy { Some(p) => Box::pin(async move { proxy(p, level, &to, prefix, client).await }).await, None => file_at(level, &to, path) };
         }
     }
     match &tf.fallback {
         Fallback::Status(code) => special(*code),
-        Fallback::Uri(uri) => Response { internal: Some(uri.render(r, &sent)), ..Response::default() },
+        Fallback::Uri(uri) => Response { internal: Some(uri.render(r, &Sent::default())), ..Response::default() },
     }
 }
 
@@ -645,7 +651,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             // An internal redirect: the URI is answered as a GET (or HEAD) request
             // by its location, with the error's status unless that answer has its own.
             // A named location answers the request as it is.
-            let mut to = r.clone();
+            let mut to = Box::new(r.clone());
             (to.upstream_addr, to.upstream_status) = (resp.upstream_addr.take(), resp.upstream_status.take());
             if named.is_none() {
                 to.uri = url.split('?').next().unwrap_or_default().to_string();
@@ -766,7 +772,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let written = send(stream, &[&out, &resp.body[..body_len], &tail], rate, size(&level.limit_rate_after), r.started, send_timeout(level)).await;
     // What was passed from the proxied server through an upgraded connection counts as sent, as body.
     let tunneled = match resp.tunnel.take().filter(|_| written) { Some(up) => tunnel(stream, up, ahead, (Some(level.proxy_read_timeout).filter(|t| !t.is_zero()), send_timeout(level))).await, None => 0 };
-    if written { post_action(server, r, level, Some(stream)).await; }
+    if written && level.post_action.is_some() { Box::pin(post_action(server, r, level, Some(stream))).await; }
     if !level.access_log.is_empty() {
         let sent = Sent { bytes: out.len() + body_len + tail.len() + tunneled, body: body_len + tunneled, ..so_far(resp, trailers) };
         level.access_log.iter().for_each(|log| log.write(level, r, &sent));
@@ -1515,7 +1521,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let keep = status >= 200 && !closes(version, &values("connection")) && !skipped;
     let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
     let rate = rate(&resp);
-    if rate > 0 { return Ok((Response { rest: Some(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None }), ..resp }, None)); }
+    if rate > 0 { return Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None })), ..resp }, None)); }
     let (body, read, ended) = read_body(s, answer, end, length, chunked, 0, wait).await.ok_or(Other)?;
     (resp.body, bytes[0], bytes[1]) = (body, (read - end) as u64, read as u64);
     Ok((resp, Some(conn).filter(|_| keep && ended)))
@@ -1900,6 +1906,19 @@ mod tests {
         let _client = TcpStream::connect(addr).unwrap();
         assert_eq!(l.accept().unwrap().1.ip(), addr.ip());
         assert!(listen(addr, 511).is_err());
+    }
+
+    #[test]
+    fn the_future_of_a_connection_is_small() {
+        let config = crate::conf::build(&crate::config::parse("http { server { } }", std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        block_on(async {
+            let Stream::Tcp(stream) = pair().await.0 else { unreachable!() };
+            let addr = "127.0.0.1:80".parse().unwrap();
+            // Not counted in BUSY, which another test waits for, so not dropped either.
+            let future = std::mem::ManuallyDrop::new(serving(Arc::new(config), stream, false, (addr, addr, addr), Busy));
+            let size = size_of_val(&future);
+            assert!(size < 4096, "{size} bytes");
+        });
     }
 
     #[test]
