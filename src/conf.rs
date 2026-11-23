@@ -129,6 +129,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_ssl_verify_depth", HSL, 1, 1, false),
     ("proxy_ssl_name", HSL, 1, 1, false),
     ("proxy_ssl_server_name", HSL, 1, 1, false),
+    ("proxy_pass_trailers", HSL, 1, 1, false),
     ("proxy_method", HSL, 1, 1, false),
     ("early_hints", HSL, 1, usize::MAX, false),
     ("proxy_set_body", HSL, 1, 1, false),
@@ -422,6 +423,8 @@ pub struct Level {
     pub proxy_http_11: bool,
     /// proxy_http_version 2: requests are passed over HTTP/2 (crate::h2::upstream).
     pub proxy_h2: bool,
+    /// proxy_pass_trailers: the trailers of a proxied server's answer are passed to the client.
+    pub proxy_pass_trailers: bool,
     /// proxy_buffer_size: the buffer the proxied server's response head must fit in.
     pub proxy_buffer_size: usize,
     /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
@@ -913,6 +916,7 @@ impl Builder<'_> {
                 "proxy_ssl_trusted_certificate" => (level.proxy_ssl_trusted_certificate, own_tls) = (Some(self.path(&d.args[0])), true),
                 "proxy_ssl_crl" => (level.proxy_ssl_crl, own_tls) = (Some(self.path(&d.args[0])), true),
                 "proxy_ssl_verify_depth" => (level.proxy_ssl_verify_depth, own_tls) = (d.args[0].parse().map_err(|_| at(format!("invalid value \"{}\" in \"proxy_ssl_verify_depth\" directive", d.args[0])))?, true),
+                "proxy_pass_trailers" => level.proxy_pass_trailers = flag(d).map_err(at)?,
                 "proxy_ssl_server_name" => (level.proxy_ssl_server_name, own_tls) = (flag(d).map_err(at)?, true),
                 "proxy_ssl_name" => level.proxy_ssl_name = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_redirect" => {
@@ -1612,6 +1616,9 @@ mod tests {
         let c = build_text("http { proxy_http_version 2; server { location /a { proxy_http_version 1.1; } location /b { } } }").unwrap();
         let v: Vec<_> = c.servers[0].locations.iter().map(|l| (l.level.proxy_http_11, l.level.proxy_h2)).collect();
         assert_eq!(v, [(true, false), (true, true)]);
+        let c = build_text("http { proxy_pass_trailers on; server { location /a { proxy_pass_trailers off; } location /b { } } }").unwrap();
+        let v: Vec<_> = c.servers[0].locations.iter().map(|l| l.level.proxy_pass_trailers).collect();
+        assert_eq!(v, [false, true]);
         assert!(build_text("http { proxy_http_version 3; }").unwrap_err().starts_with("invalid value \"3\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\""));
     }
 

@@ -730,8 +730,8 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
 /// proxy_http_version 2: passes the HTTP/1 request that comes on a pipe to the
 /// proxied server on a connection of its own, as the one stream of an HTTP/2
 /// connection, and its answer back on the pipe, as HTTP/1 that ends when the
-/// pipe closes. Whatever goes wrong closes both.
-pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme: &str) {
+/// pipe closes; the trailers that follow it go in trailers. Whatever goes wrong closes both.
+pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme: &str, trailers: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
     let (mut buf, mut got) = (Vec::new(), Vec::new());
     let end = loop {
         if let Some(n) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break n }
@@ -764,6 +764,8 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
     // The windows the server gives the connection and the stream, the largest frame it takes, and the body to send.
     let (mut window, mut stream_window, mut frame_size, mut pending, mut finished) = (65535i64, 65535i64, 16384, Vec::new(), ended);
     let (mut table, mut answer) = (Table { entries: VecDeque::new(), size: 0, used: 0, limit: 0 }, None::<(u8, Vec<u8>)>);
+    // Whether the head of the answer, not one of 1xx, has come: a header block after it has the trailers.
+    let mut headed = false;
     loop {
         finished |= body.take(&mut buf, &mut pending);
         loop {
@@ -805,12 +807,18 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
                     so_far.extend_from_slice(p.get(pad + priority..p.len() - padding).unwrap_or_default());
                     if flags & END_HEADERS == 0 { answer = Some((first, so_far)); continue }
                     let Ok(fields) = table.decode(&so_far, so_far.len(), (1000, 1 << 20)) else { return };
+                    done |= first & END_STREAM != 0;
+                    if headed {
+                        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+                        trailers.lock().unwrap().extend(fields.iter().filter(|f| !f.0.starts_with(b":")).map(|(n, v)| (text(n), text(v))));
+                        continue
+                    }
                     let status = fields.iter().find(|f| f.0 == b":status").map(|f| String::from_utf8_lossy(&f.1).into_owned()).unwrap_or_default();
+                    headed = !status.starts_with('1');
                     let mut head = format!("HTTP/1.1 {status} \r\n").into_bytes();
                     fields.iter().filter(|f| !f.0.starts_with(b":")).for_each(|(n, v)| head.extend([&n[..], b": ", v, b"\r\n"].concat()));
                     head.extend_from_slice(b"\r\n");
                     to_pipe.extend_from_slice(&head);
-                    done |= first & END_STREAM != 0;
                 }
                 DATA if sid == 1 => {
                     let padding = if flags & PADDED != 0 { usize::from(p[0]) + 1 } else { 0 };
@@ -969,7 +977,7 @@ mod tests {
     fn requests_are_passed_over_http2() {
         crate::stream::block_on(async {
             let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
-            let bridge = upstream(Stream::Pipe(up), theirs, "http");
+            let bridge = upstream(Stream::Pipe(up), theirs, "http", Default::default());
             let test = async {
                 ours.write_all(b"POST /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-A: b\r\n\r\n").await.unwrap();
                 // The server lets only a byte of the body go at first.
@@ -1011,6 +1019,32 @@ mod tests {
     }
 
     #[test]
+    fn trailers_go_apart() {
+        crate::stream::block_on(async {
+            let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
+            let trailers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let bridge = upstream(Stream::Pipe(up), theirs, "http", trailers.clone());
+            let test = async {
+                ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
+                // An informational answer, the answer, and the trailers.
+                let mut out = Vec::new();
+                frame(&mut out, HEADERS, END_HEADERS, 1, &header_block(103, &[(b"link".to_vec(), b"<a>".to_vec())], false));
+                frame(&mut out, HEADERS, END_HEADERS, 1, &header_block(200, &[], false));
+                frame(&mut out, DATA, 0, 1, b"ok");
+                let mut block = Vec::new();
+                literals(&mut block, [(b"x-t".to_vec(), b"1".to_vec())].iter());
+                frame(&mut out, HEADERS, END_HEADERS | END_STREAM, 1, &block);
+                server.write_all(&out).await.unwrap();
+                let mut answer = Vec::new();
+                ours.read_to_end(&mut answer).await.unwrap();
+                String::from_utf8_lossy(&answer).into_owned()
+            };
+            assert_eq!(tokio::join!(bridge, test).1, "HTTP/1.1 103 \r\nlink: <a>\r\n\r\nHTTP/1.1 200 \r\n\r\nok");
+            assert_eq!(*trailers.lock().unwrap(), [("x-t".to_string(), "1".to_string())]);
+        });
+    }
+
+    #[test]
     fn tables_without_room() {
         // A table of no size, as the bridge announces: updates to 0 only, and nothing is kept.
         let mut t = Table { entries: VecDeque::new(), size: 0, used: 0, limit: 0 };
@@ -1024,7 +1058,7 @@ mod tests {
         // What the server sends at once, and what the bridge passes of it.
         let answered = |rst: &[u32]| crate::stream::block_on(async {
             let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
-            let bridge = upstream(Stream::Pipe(up), theirs, "http");
+            let bridge = upstream(Stream::Pipe(up), theirs, "http", Default::default());
             let test = async {
                 ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
                 let mut out = Vec::new();
