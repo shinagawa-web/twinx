@@ -567,21 +567,28 @@ struct Cut { length: Option<usize>, malformed: bool }
 /// is found, the rate, when the request to it started, and how long a read may wait;
 /// whether the connection may be used again once the body has ended, and where it
 /// goes back to then: the upstream, the server's address and the location's tag;
-/// and where the trailers are then, if they are passed.
+/// and where the trailers are then, if they are passed, and, over HTTP/2, how the
+/// answer ended.
 #[derive(Debug)]
-struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)>, trailers: Option<Trailers> }
+struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)>, trailers: Option<Trailers>, slot: Option<crate::h2::Slot> }
 
 /// The trailers of an answer over HTTP/2 (proxy_pass_trailers): the slot they come
 /// in, the headers proxy_hide_header names, and what they are passed through.
 #[derive(Debug)]
-struct Trailers { slot: Arc<std::sync::Mutex<Vec<(String, String)>>>, hide: Vec<String>, to: Arc<crate::vars::Shared> }
+struct Trailers { slot: crate::h2::Slot, hide: Vec<String>, to: Arc<crate::vars::Shared> }
 
 impl Trailers {
-    /// Takes the trailers, which are there once the answer's stream has ended;
-    /// those proxy_hide_header names, or that nginx hides, are not passed.
-    async fn take(&self, s: &mut Stream, wait: Option<Duration>) {
+    /// Takes the trailers, which are there once the answer's stream has ended as it
+    /// should; those proxy_hide_header names, or that nginx hides, are not passed.
+    /// Tells whether there are any.
+    async fn take(&self, s: &mut Stream, wait: Option<Duration>) -> bool {
         while read_into(s, &mut Vec::new(), wait).await > 0 {}
-        *self.to.trailers.lock().unwrap() = std::mem::take(&mut *self.slot.lock().unwrap()).into_iter().filter(|(n, _)| !hidden(&self.hide, n)).collect();
+        let mut ending = self.slot.lock().unwrap();
+        let whole = ending.end == crate::h2::End::Whole;
+        let passed: Vec<_> = std::mem::take(&mut ending.trailers).into_iter().filter(|(n, _)| whole && !hidden(&self.hide, n)).collect();
+        let any = !passed.is_empty();
+        *self.to.trailers.lock().unwrap() = passed;
+        any
     }
 }
 
@@ -590,8 +597,12 @@ impl Trailers {
 async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
     let (read, ended);
-    (resp.body, read, ended, resp.cut) = read_body(&mut rest.conn.stream, &rest.answer[rest.end..], rest.length, rest.chunked, rest.rate, rest.wait).await;
-    if let Some(t) = rest.trailers.filter(|_| rest.keep && ended) { t.take(&mut rest.conn.stream, Some(rest.wait.unwrap_or_default())).await; }
+    (resp.body, read, ended, resp.cut) = read_body(&mut rest.conn.stream, &rest.answer[rest.end..], rest.length, rest.chunked, rest.rate, rest.wait, rest.slot.as_ref()).await;
+    if let Some(t) = rest.trailers.filter(|_| resp.cut.is_none()) {
+        let any = t.take(&mut rest.conn.stream, Some(rest.wait.unwrap_or_default())).await;
+        // They come after a body in chunks, if it has no length of the server's.
+        resp.unknown_length |= any && rest.length.is_none();
+    }
     if let Some((up, addr, tag)) = rest.home.filter(|_| rest.keep && ended) { up.put(rest.conn, addr, tag); }
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = (read as u64, (rest.end + read) as u64); }
@@ -881,8 +892,9 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let trailing = level.add_trailer.iter().any(|t| t.2 || added) && r.method != "HEAD" && ![204, 304].contains(&status);
     // An upgraded connection is neither chunked nor kept alive, and has no length.
     let upgraded = resp.tunnel.is_some();
-    // An HTTP/2 stream's answer with trailers comes to crate::h2 chunked, with its length, to carry them.
-    let h2 = trailing && !cut && r.line.ends_with("HTTP/2.0");
+    // An HTTP/2 stream's answer with trailers, the proxied server's too, comes to crate::h2 chunked, with its length, to carry them.
+    let passed = resp.proxied && !r.shared.trailers.lock().unwrap().is_empty() && r.method != "HEAD" && ![204, 304].contains(&status);
+    let h2 = (trailing || passed) && !cut && r.line.ends_with("HTTP/2.0");
     let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1") && level.chunked && !upgraded || h2;
     let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown) && !upgraded;
     let mut out = buffer();
@@ -1418,8 +1430,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         };
         // proxy_http_version 2: the request goes through a pipe, over HTTP/2 beyond it.
         // Its trailers come in a slot of their own.
-        let slot = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c.stream, theirs, if p.ssl { "https" } else { "http" }, slot.clone())); Conn::new(Stream::Pipe(ours), connecting) } else { c });
+        let slot = crate::h2::Slot::default();
+        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c.stream, theirs, if p.ssl { "https" } else { "http" }, level.proxy_buffer_size, slot.clone())); Conn::new(Stream::Pipe(ours), connecting) } else { c });
         let begun = conn.is_ok();
         // A kept connection whose handshake fails counts as closed, as in nginx; one that times out does not.
         let mut closed = matches!(conn, Err(None));
@@ -1433,8 +1445,10 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             }
             Err(resp) => (resp, None),
         };
+        // Over HTTP/2, what fails the stream before the head makes the answer invalid.
+        let failure = if slot.lock().unwrap().end == crate::h2::End::Failed { "invalid_header" } else { "error" };
         // proxy_pass_trailers: those of an answer without a body are taken now.
-        let trailers = (level.proxy_pass_trailers && level.proxy_h2).then(|| Trailers { slot, hide: level.proxy_hide_header.clone(), to: r.shared.clone() });
+        let trailers = (level.proxy_pass_trailers && level.proxy_h2).then(|| Trailers { slot: slot.clone(), hide: level.proxy_hide_header.clone(), to: r.shared.clone() });
         if let (Some(t), Some(Some(c))) = (&trailers, kept.as_mut()) { t.take(&mut c.stream, Some(level.proxy_read_timeout)).await; }
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
@@ -1450,7 +1464,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let timeout = level.proxy_next_upstream_timeout;
         // The page secure() generates for a timeout, rather than an answer of the server.
         let timed_out = answer.as_ref().is_some_and(|a| a.generated);
-        let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout) && (resend || !begun);
+        let again = if timed_out { next("timeout") } else { status.map_or(next(failure), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout) && (resend || !begun);
         // The connection of an answer that is not used is closed.
         // One over HTTP/2 is not kept.
         if let Some(conn) = kept.flatten().filter(|_| !again && !level.proxy_h2) { up.put(conn, addr, tag); }
@@ -1458,7 +1472,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // trailers are taken and the time is noted too.
         if let Some(rest) = answer.as_mut().and_then(|a| a.rest.as_mut()).filter(|_| !again) {
             (rest.started, rest.trailers) = (start, trailers);
-            if !level.proxy_h2 { rest.home = Some((up.clone(), addr, tag)); }
+            if level.proxy_h2 { rest.slot = Some(slot); } else { rest.home = Some((up.clone(), addr, tag)); }
         }
         up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404)));
         if !again || tries == 0 { break; }
@@ -1714,7 +1728,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         return Ok((resp, Some(conn).filter(|_| keep && answer.len() == end)));
     }
     let rate = rate(&resp);
-    Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None, trailers: None })), ..resp }, None))
+    Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None, trailers: None, slot: None })), ..resp }, None))
 }
 
 /// Whether a header of a proxied server's early hints is hidden, as those of
@@ -1745,21 +1759,27 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// Returns the body, with what came of the chunk it is cut off in, the bytes read
 /// after the head, whether they end where the body does, and the cut, when
 /// the server closed the connection before the body's end, or a read failed or
-/// waited longer than the time, or the chunks are malformed.
-async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>) -> (Vec<u8>, usize, bool, Option<Box<Cut>>) {
+/// waited longer than the time, or the chunks are malformed. Over HTTP/2, the slot
+/// says whether the connection's end is the body's; the frames that fail an answer
+/// before any of the body are as malformed chunks.
+async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>, slot: Option<&crate::h2::Slot>) -> (Vec<u8>, usize, bool, Option<Box<Cut>>) {
     let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    let (start, rate, mut chunk, mut failed) = (secs(), rate as i64, vec![0u8; 4096], false);
+    let (start, rate, mut chunk, mut failed, mut malformed) = (secs(), rate as i64, vec![0u8; 4096], false, false);
     let (mut body, mut data, mut read) = (Body::new(length.map(|n| n as u64), chunked), Vec::new(), after.len());
     let mut came = body.take(after, &mut data);
     while came == Came::More {
         let limit = if rate == 0 { chunk.len() as i64 } else { rate * (secs() - start + 1) - read as i64 };
         if limit <= 0 { tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await; continue; }
         let Some(Ok(n)) = within(wait, s.read(&mut chunk[..(limit as usize).min(4096)])).await else { failed = true; break };
-        if n == 0 { break; }
+        if n == 0 {
+            let end = slot.map(|s| s.lock().unwrap().end);
+            (failed, malformed) = (end.is_some_and(|e| e != crate::h2::End::Whole), end == Some(crate::h2::End::Failed) && data.is_empty());
+            break;
+        }
         read += n;
         came = body.take(&chunk[..n], &mut data);
     }
-    let cut = body.cut(failed).then(|| Box::new(Cut { length, malformed: came == Came::Malformed }));
+    let cut = body.cut(failed).then(|| Box::new(Cut { length, malformed: malformed || came == Came::Malformed }));
     (data, read, came == Came::Whole { followed: false }, cut)
 }
 
@@ -2846,6 +2866,119 @@ mod tests {
             }
         });
         (addr, came)
+    }
+
+    /// A frame of HTTP/2.
+    fn h2_frame(kind: u8, flags: u8, sid: u8, payload: &[u8]) -> Vec<u8> {
+        [&(payload.len() as u32).to_be_bytes()[1..], &[kind, flags, 0, 0, 0, sid], payload].concat()
+    }
+
+    /// A server of HTTP/2 that sends the pieces, one after another, when a request has
+    /// come, and then nothing until the connection is closed, or closes it; and how many connections came.
+    fn sends(pieces: &[Vec<u8>], closes: bool) -> (SocketAddr, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
+        let (all, pieces) = (came.clone(), pieces.to_vec());
+        thread::spawn(move || {
+            for s in listener.incoming() {
+                *all.lock().unwrap() += 1;
+                let mut s = s.unwrap();
+                // The preface, two frames, and the HEADERS.
+                let mut got = Vec::new();
+                while got.len() < 24 + 27 + 13 + 9 { let mut part = [0; 1024]; let n = s.read(&mut part).unwrap(); assert!(n > 0); got.extend_from_slice(&part[..n]); }
+                for (i, piece) in pieces.iter().enumerate() {
+                    if i > 0 { thread::sleep(Duration::from_millis(50)); }
+                    if s.write_all(piece).is_err() { break }
+                }
+                if !closes { while s.read(&mut [0; 1024]).is_ok_and(|n| n > 0) {} }
+            }
+        });
+        (addr, came)
+    }
+
+    /// What received() gives for a request to a location with the directives, passed over
+    /// HTTP/2 to an upstream of two servers that send the pieces so, without its first
+    /// lines, the body's framing aside, and how many connections came to both.
+    fn over_h2(pieces: &[Vec<u8>], closes: bool, directives: &str, request: &str) -> (String, usize) {
+        let _busy = counted();
+        SHUTTING.store(false, Ordering::SeqCst);
+        HALTED.store(false, Ordering::SeqCst);
+        let ((a, came_a), (b, came_b)) = (sends(pieces, closes), sends(pieces, closes));
+        let http = format!("access_log off; upstream u {{ server {a}; server {b}; }} server {{ proxy_read_timeout 1s; location / {{ proxy_http_version 2; proxy_pass http://u; {directives} }} }}");
+        let got = String::from_utf8(block_on(received(&http, request))).unwrap();
+        let came = *came_a.lock().unwrap() + *came_b.lock().unwrap();
+        (got, came)
+    }
+
+    #[test]
+    fn answers_over_http2_end_as_their_streams_do() {
+        let request = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+        let head = h2_frame(1, 4, 1, &[0x88]);
+        let length = h2_frame(1, 4, 1, b"\x88\x0f\x0d\x0210");
+        let data = h2_frame(0, 0, 1, b"abcde");
+        let text = |framing: &str, body: &str| format!("HTTP/1.1 200 OK\r\nServer: {NAME}\r\n{framing}\r\nConnection: close\r\n\r\n{body}");
+        let cut = |head: &Vec<u8>, body: &str| if *head == length { text("Content-Length: 10", body) } else if body.is_empty() { text("Transfer-Encoding: chunked", "") } else { text("Transfer-Encoding: chunked", &format!("5\r\n{body}\r\n")) };
+        // Reset, with an error or without one; going away before the stream; a frame too short.
+        let fails = [h2_frame(3, 0, 1, &[0, 0, 0, 2]), h2_frame(3, 0, 1, &[0; 4]), h2_frame(7, 0, 0, &[0; 8]), h2_frame(8, 0, 0, &[0; 3])];
+        let going = h2_frame(7, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]);
+        for head in [&head, &length] {
+            for fail in &fails {
+                assert_eq!(over_h2(&[head.clone(), data.clone(), fail.clone()], false, "", request), (cut(head, "abcde"), 1), "{fail:?}");
+                // Nothing is sent of the answer when no part of its body came before.
+                assert_eq!(over_h2(&[head.clone(), fail.clone()], false, "", request), (String::new(), 1), "{fail:?}");
+                assert_eq!(over_h2(&[[&head[..], &data, fail].concat()], false, "", request), (String::new(), 1), "{fail:?}");
+            }
+            for closing in [Vec::new(), going.clone()] {
+                assert_eq!(over_h2(&[head.clone(), data.clone(), closing.clone()], true, "", request), (cut(head, "abcde"), 1));
+                assert_eq!(over_h2(&[head.clone(), closing], true, "", request), (cut(head, ""), 1));
+            }
+            // One going away after the stream goes on with it.
+            let (whole, came) = over_h2(&[head.clone(), data.clone(), going.clone(), h2_frame(0, 1, 1, b"fghij")], false, "", request);
+            assert!(came == 1 && whole.ends_with("\r\n\r\nabcdefghij"), "{whole}");
+        }
+        // What has no body is not cut.
+        let head_only = "HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+        let (got, came) = over_h2(&[[&length[..], &fails[0]].concat()], false, "", head_only);
+        assert!(got.starts_with("HTTP/1.1 200 ") && came == 1, "{got}");
+        // Before the head, what fails is an invalid header, and the connection closing an error.
+        for fail in &fails {
+            for (next, want) in [("", 1), ("proxy_next_upstream error;", 1), ("proxy_next_upstream invalid_header;", 2)] {
+                let (got, came) = over_h2(&[Vec::new(), fail.clone()], false, next, request);
+                assert!(got.starts_with("HTTP/1.1 502 ") && came == want, "{fail:?} {next} {came} {got}");
+            }
+        }
+        for closing in [Vec::new(), going] {
+            for (next, want) in [("", 2), ("proxy_next_upstream error;", 2), ("proxy_next_upstream invalid_header;", 1)] {
+                let (got, came) = over_h2(&[Vec::new(), closing.clone()], true, next, request);
+                assert!(got.starts_with("HTTP/1.1 502 ") && came == want, "{closing:?} {next} {came} {got}");
+            }
+        }
+    }
+
+    #[test]
+    fn trailers_over_http2_are_passed_once_the_stream_ends() {
+        let (request, old) = ("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", "GET / HTTP/1.0\r\nHost: a\r\n\r\n");
+        let head = h2_frame(1, 4, 1, &[0x88]);
+        let length = h2_frame(1, 4, 1, b"\x88\x0f\x0d\x015");
+        let data = h2_frame(0, 0, 1, b"abcde");
+        let trailer = |flags: u8| h2_frame(1, flags, 1, b"\x00\x03x-t\x011");
+        let (on, added) = ("proxy_pass_trailers on;", "proxy_pass_trailers on; add_trailer X-A b;");
+        let body = |got: &(String, usize)| got.0.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+        for apart in [false, true] {
+            let pieces = |parts: [&[u8]; 3]| if apart { parts.iter().map(|p| p.to_vec()).collect() } else { vec![parts.concat()] };
+            let get = |head: &[u8], trailer: &[u8], directives: &str, request: &str| body(&over_h2(&pieces([head, &data, trailer]), false, directives, request));
+            assert_eq!(get(&head, &trailer(5), on, request), "5\r\nabcde\r\n0\r\nx-t: 1\r\n\r\n");
+            assert_eq!(get(&head, &trailer(5), added, request), "5\r\nabcde\r\n0\r\nx-t: 1\r\nX-A: b\r\n\r\n");
+            assert_eq!(get(&length, &trailer(5), added, request), "5\r\nabcde\r\n0\r\nx-t: 1\r\nX-A: b\r\n\r\n");
+            // Not in a body of a length, nor to one of HTTP/1.0, nor of a stream that fails.
+            assert_eq!(get(&length, &trailer(5), on, request), "abcde");
+            assert_eq!(get(&head, &trailer(5), on, old), "abcde");
+            assert!(!get(&head, &[trailer(5), h2_frame(3, 0, 1, &[0, 0, 0, 2])].concat(), on, request).contains("x-t"));
+            assert!(!get(&head, &trailer(4), on, request).contains("x-t"));
+        }
+        // A "connection" header does not matter.
+        let close = h2_frame(1, 4, 1, b"\x88\x00\x0aconnection\x05close");
+        assert_eq!(body(&over_h2(&[[&close[..], &data, &trailer(5)].concat()], false, on, request)), "5\r\nabcde\r\n0\r\nx-t: 1\r\n\r\n");
     }
 
     /// What received() gives for a request when a server has the directives and passes

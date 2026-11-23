@@ -727,11 +727,26 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
     }
 }
 
+/// How the stream of a proxied server's answer ended: as END_STREAM ends it; before
+/// that, as the connection closed; or with a frame, or the end of the stream, that fails it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum End { Whole, #[default] Closed, Failed }
+
+/// What is known of a proxied server's answer once the pipe that passes it has
+/// closed, besides what came on it: how its stream ended, and its trailers.
+#[derive(Debug, Default)]
+pub struct Ending { pub end: End, pub trailers: Vec<(String, String)> }
+
+/// Where what passes the answer tells it what reads the answer.
+pub type Slot = Arc<std::sync::Mutex<Ending>>;
+
 /// proxy_http_version 2: passes the HTTP/1 request that comes on a pipe to the
 /// proxied server on a connection of its own, as the one stream of an HTTP/2
 /// connection, and its answer back on the pipe, as HTTP/1 that ends when the
-/// pipe closes; the trailers that follow it go in trailers. Whatever goes wrong closes both.
-pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme: &str, trailers: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+/// pipe closes; the trailers that follow it, and how it ended, go in the slot. The
+/// frames of the head have the size of proxy_buffer_size at most. Whatever goes wrong
+/// closes both, and so does the answer not being wanted any more.
+pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot) {
     let (mut buf, mut got) = (Vec::new(), Vec::new());
     let end = loop {
         if let Some(n) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break n }
@@ -761,80 +776,151 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
     literals(&mut block, fields.iter());
     let mut ended = body == Body::Length(0);
     header_frames(&mut out, 1, &block, 16384, ended);
-    // The windows the server gives the connection and the stream, the largest frame it takes, and the body to send.
-    let (mut window, mut stream_window, mut frame_size, mut pending, mut finished) = (65535i64, 65535i64, 16384, Vec::new(), ended);
+    // The windows the server gives the connection, a stream at first and the stream, and the body to send.
+    let (mut window, mut initial, mut stream_window, mut pending, mut finished) = (65535i64, 65535i64, 65535i64, Vec::new(), ended);
     let (mut table, mut answer) = (Table { entries: VecDeque::new(), size: 0, used: 0, limit: 0 }, None::<(u8, Vec<u8>)>);
-    // Whether the head of the answer, not one of 1xx, has come: a header block after it has the trailers.
-    let mut headed = false;
+    // Whether the head of the answer, not one of 1xx, has come: a header block after it has the trailers;
+    // the bytes of the frames of the head so far; and whether the server takes no more.
+    let (mut headed, mut size, mut deaf) = (false, 0, false);
     loop {
+        if finished { buf.clear(); }
         finished |= body.take(&mut buf, &mut pending);
         loop {
-            let n = pending.len().min(frame_size).min(window.min(stream_window).max(0) as usize);
+            // Frames are of 16384 bytes at most, whatever larger ones the server takes, as nginx's.
+            let n = pending.len().min(16384).min(window.min(stream_window).max(0) as usize);
             let last = finished && n == pending.len();
             if ended || n == 0 && !last { break }
             ended = last;
             frame(&mut out, DATA, if ended { END_STREAM } else { 0 }, 1, &pending.drain(..n).collect::<Vec<_>>());
             (window, stream_window) = (window - n as i64, stream_window - n as i64);
         }
-        if !out.is_empty() && up.write_all(&std::mem::take(&mut out)).await.is_err() { return }
+        let (frames, had) = (std::mem::take(&mut out), buf.len());
+        if !frames.is_empty() && !deaf {
+            tokio::select! {
+                // What the server sent before it took no more is still to be read.
+                sent = up.write_all(&frames) => deaf = sent.is_err(),
+                () = unwanted(&mut pipe, &mut buf) => return,
+            }
+            if buf.len() > had { continue }
+        }
         // A read takes as much as a buffer of nginx's proxy_buffer_size would.
         got.reserve(4096);
         tokio::select! {
-            n = pipe.read_buf(&mut buf), if !finished => if n.unwrap_or(0) == 0 { return },
-            n = up.read_buf(&mut got) => if n.unwrap_or(0) == 0 { return },
+            // The pipe ends when the answer is not wanted any more.
+            n = pipe.read_buf(&mut buf) => if n.unwrap_or(0) == 0 { return },
+            n = up.read_buf(&mut got) => if n.unwrap_or(0) == 0 {
+                // What came of the data of a frame cut off goes on too.
+                if let Some(&[a, b, c, DATA, flags, 0, 0, 0, 1]) = got.get(..9).filter(|_| headed) {
+                    let (p, padded) = (&got[9..], usize::from(flags & PADDED != 0));
+                    let padding = if padded == 1 { p.first().copied().unwrap_or(0) } else { 0 };
+                    let end = (u32::from_be_bytes([0, a, b, c]) as usize).saturating_sub(padding.into());
+                    let _ = pipe.write_all(p.get(padded..end.min(p.len())).unwrap_or_default()).await;
+                }
+                return
+            },
         }
         // What the frames of a read give is passed only once they all have been taken,
-        // those after the end of the stream too, so that a stream reset with an error
-        // drops what came with it, as nginx does.
-        let (mut to_pipe, mut done, mut reset) = (Vec::new(), false, false);
-        while got.len() >= 9 && got.len() >= 9 + (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize) {
+        // those after the end of the stream too, so that what fails the stream drops
+        // the data that came with it, as nginx does, but not the head.
+        let (mut to_pipe, mut head_end, mut done, mut reset, mut failed) = (Vec::new(), 0, false, false, false);
+        while got.len() >= 9 {
             let (len, kind, flags, sid) = (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize, got[3], got[4], u32::from_be_bytes([got[5], got[6], got[7], got[8]]) & 0x7fff_ffff);
+            // A head too long; data before it; and frames of the stream after its end.
+            let block = sid == 1 && matches!(kind, HEADERS | CONTINUATION) && !headed;
+            failed = wrong_length(kind, flags, len) || block && size + 9 + len > head_size || sid == 1 && (kind == DATA && !headed || done && !matches!(kind, RST_STREAM | WINDOW_UPDATE));
+            if failed || got.len() < 9 + len { break }
+            if block { size += 9 + len; }
             let p: Vec<u8> = got.drain(..9 + len).skip(9).collect();
+            let word = |at: usize| u32::from_be_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]);
             match kind {
                 SETTINGS if flags & ACK == 0 => {
-                    for s in p.chunks(6).filter(|s| s.len() == 6) {
-                        let value = u32::from_be_bytes([s[2], s[3], s[4], s[5]]);
-                        match u16::from_be_bytes([s[0], s[1]]) { 4 => stream_window += i64::from(value) - 65535, 5 => frame_size = value as usize, _ => {} }
+                    for s in p.chunks_exact(6).filter(|s| s[..2] == [0, 4]) {
+                        let value = i64::from(u32::from_be_bytes([s[2], s[3], s[4], s[5]]));
+                        (stream_window, initial) = (stream_window + value - initial, value);
+                        failed |= value > MAX_WINDOW || stream_window > MAX_WINDOW;
                     }
                     frame(&mut out, SETTINGS, ACK, 0, &[]);
                 }
                 PING if flags & ACK == 0 => frame(&mut out, PING, ACK, 0, &p),
-                WINDOW_UPDATE => { let n = i64::from(u32::from_be_bytes([p[0], p[1], p[2], p[3]]) & 0x7fff_ffff); if sid == 0 { window += n } else { stream_window += n } }
+                WINDOW_UPDATE => {
+                    let of = if sid == 0 { &mut window } else { &mut stream_window };
+                    *of += i64::from(word(0) & 0x7fff_ffff);
+                    failed = *of > MAX_WINDOW;
+                }
                 HEADERS | CONTINUATION if sid == 1 => {
-                    let (pad, priority) = if kind == HEADERS { (usize::from(flags & PADDED != 0), if flags & PRIORITY_FLAG != 0 { 5 } else { 0 }) } else { (0, 0) };
-                    let padding = if pad == 1 { usize::from(p[0]) } else { 0 };
                     let (first, mut so_far) = answer.take().unwrap_or((flags, Vec::new()));
-                    so_far.extend_from_slice(p.get(pad + priority..p.len() - padding).unwrap_or_default());
+                    let Some(part) = unpadded(kind, flags, &p) else { failed = true; break };
+                    so_far.extend_from_slice(part);
                     if flags & END_HEADERS == 0 { answer = Some((first, so_far)); continue }
-                    let Ok(fields) = table.decode(&so_far, so_far.len(), (1000, 1 << 20)) else { return };
+                    let Ok(fields) = table.decode(&so_far, so_far.len(), (1000, 1 << 20)) else { failed = true; break };
                     done |= first & END_STREAM != 0;
                     if headed {
+                        // Trailers end the stream.
+                        failed = !done;
                         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-                        trailers.lock().unwrap().extend(fields.iter().filter(|f| !f.0.starts_with(b":")).map(|(n, v)| (text(n), text(v))));
-                        continue
+                        slot.lock().unwrap().trailers.extend(fields.iter().filter(|f| !f.0.starts_with(b":")).map(|(n, v)| (text(n), text(v))));
+                    } else {
+                        let status = fields.iter().find(|f| f.0 == b":status").map(|f| String::from_utf8_lossy(&f.1).into_owned()).unwrap_or_default();
+                        (headed, size) = (!status.starts_with('1'), 0);
+                        let mut head = format!("HTTP/1.1 {status} \r\n").into_bytes();
+                        fields.iter().filter(|f| !f.0.starts_with(b":")).for_each(|(n, v)| head.extend([&n[..], b": ", v, b"\r\n"].concat()));
+                        head.extend_from_slice(b"\r\n");
+                        to_pipe.extend_from_slice(&head);
+                        head_end = to_pipe.len();
                     }
-                    let status = fields.iter().find(|f| f.0 == b":status").map(|f| String::from_utf8_lossy(&f.1).into_owned()).unwrap_or_default();
-                    headed = !status.starts_with('1');
-                    let mut head = format!("HTTP/1.1 {status} \r\n").into_bytes();
-                    fields.iter().filter(|f| !f.0.starts_with(b":")).for_each(|(n, v)| head.extend([&n[..], b": ", v, b"\r\n"].concat()));
-                    head.extend_from_slice(b"\r\n");
-                    to_pipe.extend_from_slice(&head);
                 }
                 DATA if sid == 1 => {
-                    let padding = if flags & PADDED != 0 { usize::from(p[0]) + 1 } else { 0 };
-                    to_pipe.extend_from_slice(p.get(padding.min(1)..p.len() - padding.saturating_sub(1)).unwrap_or_default());
+                    let Some(data) = unpadded(kind, flags, &p) else { failed = true; break };
+                    to_pipe.extend_from_slice(data);
                     done |= flags & END_STREAM != 0;
                     // What was taken is given back to the windows.
                     if len > 0 { [0, 1].iter().for_each(|&sid| frame(&mut out, WINDOW_UPDATE, 0, sid, &(len as u32).to_be_bytes())); }
                 }
                 // A reset with NO_ERROR after the end of the stream is taken once; any other fails the answer.
-                RST_STREAM if sid == 1 => { if p != [0; 4] || reset || !done { return } reset = true }
-                // The connection going away ends the answer.
-                _ => done |= kind == GOAWAY,
+                RST_STREAM if sid == 1 => (failed, reset) = (word(0) != NO_ERROR || reset || !done, true),
+                // The connection goes away after the answer, unless the request is not among those taken.
+                GOAWAY => failed = word(0) & 0x7fff_ffff == 0,
+                _ => {}
             }
+            if failed { break }
         }
-        if pipe.write_all(&to_pipe).await.is_err() || done { return }
+        if failed { to_pipe.truncate(head_end); }
+        // The slot says how the stream ended before the pipe closes.
+        if failed || done { slot.lock().unwrap().end = if failed { End::Failed } else { End::Whole }; }
+        if pipe.write_all(&to_pipe).await.is_err() || failed || done { return }
     }
+}
+
+/// Whether the length of a frame of a proxied server is one nginx takes no frame of that kind with.
+fn wrong_length(kind: u8, flags: u8, len: usize) -> bool {
+    let padded = usize::from(flags & PADDED != 0);
+    len > 16384 || match kind {
+        DATA => len < padded,
+        HEADERS => len < padded + if flags & PRIORITY_FLAG != 0 { 5 } else { 0 },
+        RST_STREAM | WINDOW_UPDATE => len != 4,
+        SETTINGS => len % 6 != 0 || flags & ACK != 0 && len != 0,
+        PING => len != 8,
+        GOAWAY => len < 8,
+        _ => false,
+    }
+}
+
+/// What a DATA, HEADERS or CONTINUATION frame has without its padding and priority;
+/// none when the padding is longer than the rest.
+fn unpadded(kind: u8, flags: u8, p: &[u8]) -> Option<&[u8]> {
+    let padded = kind != CONTINUATION && flags & PADDED != 0;
+    let skip = usize::from(padded) + if kind == HEADERS && flags & PRIORITY_FLAG != 0 { 5 } else { 0 };
+    let padding = if padded { usize::from(*p.first()?) } else { 0 };
+    p.get(skip..p.len().checked_sub(padding)?)
+}
+
+/// Waits until what reads the answer has gone, taking meanwhile what comes of the
+/// request, unless much of it is there already.
+async fn unwanted(pipe: &mut tokio::io::DuplexStream, buf: &mut Vec<u8>) {
+    while buf.len() < 65536 {
+        if pipe.read_buf(buf).await.unwrap_or(0) == 0 { return }
+    }
+    std::future::pending().await
 }
 
 /// How the body of a request passed on a pipe comes: so many bytes, or in
@@ -977,7 +1063,7 @@ mod tests {
     fn requests_are_passed_over_http2() {
         crate::stream::block_on(async {
             let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
-            let bridge = upstream(Stream::Pipe(up), theirs, "http", Default::default());
+            let bridge = upstream(Stream::Pipe(up), theirs, "http", 4096, Default::default());
             let test = async {
                 ours.write_all(b"POST /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-A: b\r\n\r\n").await.unwrap();
                 // The server lets only a byte of the body go at first.
@@ -1022,8 +1108,8 @@ mod tests {
     fn trailers_go_apart() {
         crate::stream::block_on(async {
             let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
-            let trailers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let bridge = upstream(Stream::Pipe(up), theirs, "http", trailers.clone());
+            let slot = Slot::default();
+            let bridge = upstream(Stream::Pipe(up), theirs, "http", 4096, slot.clone());
             let test = async {
                 ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
                 // An informational answer, the answer, and the trailers.
@@ -1040,7 +1126,7 @@ mod tests {
                 String::from_utf8_lossy(&answer).into_owned()
             };
             assert_eq!(tokio::join!(bridge, test).1, "HTTP/1.1 103 \r\nlink: <a>\r\n\r\nHTTP/1.1 200 \r\n\r\nok");
-            assert_eq!(*trailers.lock().unwrap(), [("x-t".to_string(), "1".to_string())]);
+            assert_eq!(slot.lock().unwrap().trailers, [("x-t".to_string(), "1".to_string())]);
         });
     }
 
@@ -1053,29 +1139,234 @@ mod tests {
         assert_eq!(t.decode(&[0x21, 0x88], 2, (10, 100)), Err(COMPRESSION_ERROR));
     }
 
-    #[test]
-    fn resets_after_the_answer() {
-        // What the server sends at once, and what the bridge passes of it.
-        let answered = |rst: &[u32]| crate::stream::block_on(async {
-            let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
-            let bridge = upstream(Stream::Pipe(up), theirs, "http", Default::default());
-            let test = async {
-                ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
-                let mut out = Vec::new();
-                frame(&mut out, HEADERS, END_HEADERS, 1, &header_block(200, &[], false));
-                frame(&mut out, DATA, END_STREAM, 1, b"ok");
-                rst.iter().for_each(|code| frame(&mut out, RST_STREAM, 0, 1, &code.to_be_bytes()));
-                server.write_all(&out).await.unwrap();
-                let mut answer = Vec::new();
-                ours.read_to_end(&mut answer).await.unwrap();
-                String::from_utf8_lossy(&answer).into_owned()
-            };
-            tokio::join!(bridge, test).1
+    /// A frame.
+    fn framed(kind: u8, flags: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        frame(&mut out, kind, flags, sid, payload);
+        out
+    }
+
+    /// What the bridge passes of the pieces a server sends, each once the one before
+    /// has been taken, and how it says the answer ended; the server keeps the
+    /// connection, or closes it, after them. The bridge ends by itself, or within a
+    /// second once what reads the answer has gone.
+    fn passed(pieces: &[&[u8]], closes: bool) -> (String, End, Vec<(String, String)>) {
+        let ((mut ours, theirs), (up, server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 20));
+        let slot = Slot::default();
+        let told = slot.clone();
+        let answer = crate::stream::block_on(async {
+            let bridge = tokio::task::spawn_local(upstream(Stream::Pipe(up), theirs, "http", 4096, slot));
+            ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
+            let mut server = Some(server);
+            for piece in pieces {
+                if server.as_mut().unwrap().write_all(piece).await.is_err() { break }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            if closes { server.take(); }
+            let mut answer = Vec::new();
+            let _ = crate::stream::within(Some(Duration::from_millis(50)), ours.read_to_end(&mut answer)).await;
+            drop(ours);
+            crate::stream::within(Some(Duration::from_secs(1)), bridge).await.expect("the bridge stays").unwrap();
+            String::from_utf8_lossy(&answer).into_owned()
         });
-        assert_eq!(answered(&[]), "HTTP/1.1 200 \r\n\r\nok");
-        assert_eq!(answered(&[NO_ERROR]), "HTTP/1.1 200 \r\n\r\nok");
-        assert_eq!(answered(&[NO_ERROR, NO_ERROR]), "");
-        assert_eq!(answered(&[INTERNAL_ERROR]), "");
+        let told = std::mem::take(&mut *told.lock().unwrap());
+        (answer, told.end, told.trailers)
+    }
+
+    #[test]
+    fn answers_end_as_their_streams_do() {
+        let head = framed(HEADERS, END_HEADERS, 1, &header_block(200, &[], false));
+        let data = framed(DATA, 0, 1, b"ok");
+        let last = framed(DATA, END_STREAM, 1, b"!");
+        let rst = |code: u32| framed(RST_STREAM, 0, 1, &code.to_be_bytes());
+        let goaway = |last: u32| framed(GOAWAY, 0, 0, &[last.to_be_bytes(), [0; 4]].concat());
+        let trailers = |flags: u8| { let mut block = Vec::new(); literals(&mut block, [(b"x-t".to_vec(), b"1".to_vec())].iter()); framed(HEADERS, END_HEADERS | flags, 1, &block) };
+        // The frames that follow the head and the data, apart or at once with them, and
+        // what is passed of the answer then, besides the head.
+        let cases = [
+            (vec![last.clone()], "ok!", "ok!", End::Whole),
+            (vec![last.clone(), rst(NO_ERROR)], "ok!", "ok!", End::Whole),
+            (vec![goaway(1), last.clone()], "ok!", "ok!", End::Whole),
+            (vec![trailers(END_STREAM)], "ok", "ok", End::Whole),
+            // What comes with what fails the stream is dropped, but for the head.
+            (vec![rst(INTERNAL_ERROR)], "ok", "", End::Failed),
+            (vec![rst(NO_ERROR)], "ok", "", End::Failed),
+            (vec![last.clone(), rst(INTERNAL_ERROR)], "ok", "", End::Failed),
+            (vec![last.clone(), rst(NO_ERROR), rst(NO_ERROR)], "ok", "", End::Failed),
+            (vec![last.clone(), data.clone()], "ok", "", End::Failed),
+            (vec![goaway(0)], "ok", "", End::Failed),
+            (vec![trailers(0)], "ok", "", End::Failed),
+            (vec![framed(WINDOW_UPDATE, 0, 0, &[0; 3])], "ok", "", End::Failed),
+            // The connection closing, whatever was said before, is not the end of the stream.
+            (vec![], "ok", "ok", End::Closed),
+            (vec![goaway(1)], "ok", "ok", End::Closed),
+            // Part of a frame.
+            (vec![data[..10].to_vec()], "oko", "oko", End::Closed),
+            (vec![framed(DATA, PADDED, 1, b"\x02okay..")[..15].to_vec()], "okokay", "okokay", End::Closed),
+        ];
+        for (frames, apart, at_once, end) in cases {
+            let (frames, text) = (frames.concat(), |body: &str| format!("HTTP/1.1 200 \r\n\r\n{body}"));
+            let got = passed(&[&head, &data, &frames], end == End::Closed);
+            assert_eq!((got.0, got.1), (text(apart), end), "{frames:?}");
+            let got = passed(&[&[&head[..], &data, &frames].concat()], end == End::Closed);
+            assert_eq!((got.0, got.1), (text(at_once), end), "{frames:?}");
+        }
+        // Before the head.
+        for (frames, end) in [(rst(INTERNAL_ERROR), End::Failed), (rst(NO_ERROR), End::Failed), (goaway(0), End::Failed), (data.clone(), End::Failed), (goaway(1), End::Closed), (Vec::new(), End::Closed)] {
+            assert_eq!(passed(&[&frames], end == End::Closed), (String::new(), end, Vec::new()), "{frames:?}");
+        }
+        // In the head, which has no body, the end of the stream is that of the answer.
+        assert_eq!(passed(&[&framed(HEADERS, END_HEADERS | END_STREAM, 1, &header_block(200, &[], false))], false).1, End::Whole);
+        assert_eq!(passed(&[&head, &data, &trailers(END_STREAM)], false).2, [("x-t".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn answers_are_read_after_a_write_fails() {
+        // The server has closed the connection once it has sent the answer, before any of it is taken.
+        let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 20));
+        let slot = Slot::default();
+        let body = crate::stream::block_on(async {
+            let mut out = framed(SETTINGS, 0, 0, &[]);
+            frame(&mut out, HEADERS, END_HEADERS, 1, &header_block(200, &[], false));
+            (0..20).for_each(|i| frame(&mut out, DATA, u8::from(i == 19), 1, &[b'x'; 16384]));
+            server.write_all(&out).await.unwrap();
+            drop(server);
+            ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
+            let mut answer = Vec::new();
+            tokio::join!(upstream(Stream::Pipe(up), theirs, "http", 4096, slot.clone()), ours.read_to_end(&mut answer)).1.unwrap();
+            answer.len() - "HTTP/1.1 200 \r\n\r\n".len()
+        });
+        assert_eq!((body, slot.lock().unwrap().end), (20 * 16384, End::Whole));
+    }
+
+    #[test]
+    fn unwanted_answers_end_the_connection() {
+        // While the server sends nothing, before the head and in the body, and while it
+        // takes nothing of what is to be written.
+        let head = framed(HEADERS, END_HEADERS, 1, &header_block(200, &[], false));
+        let pings = framed(PING, 0, 0, &[0; 8]).repeat(200);
+        for (sent, room) in [(Vec::new(), 1 << 16), (head.clone(), 1 << 16), ([head, pings].concat(), 256)] {
+            crate::stream::block_on(async {
+                let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(room));
+                let bridge = tokio::task::spawn_local(upstream(Stream::Pipe(up), theirs, "http", 4096, Slot::default()));
+                ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
+                let _ = crate::stream::within(Some(Duration::from_millis(50)), server.write_all(&sent)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                drop(ours);
+                crate::stream::within(Some(Duration::from_millis(500)), bridge).await.expect("the bridge stays").unwrap();
+                assert!(server.read_to_end(&mut Vec::new()).await.is_ok());
+            });
+        }
+    }
+
+    #[test]
+    fn a_full_pipe_holds_the_server_back() {
+        crate::stream::block_on(async {
+            let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
+            let bridge = tokio::task::spawn_local(upstream(Stream::Pipe(up), theirs, "http", 4096, Slot::default()));
+            ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
+            server.write_all(&framed(HEADERS, END_HEADERS, 1, &header_block(200, &[], false))).await.unwrap();
+            let mut sent = 0;
+            while crate::stream::within(Some(Duration::from_millis(20)), server.write_all(&framed(DATA, 0, 1, &[b'x'; 1000]))).await.is_some() { sent += 1; }
+            assert!((64..300).contains(&sent), "{sent}");
+            drop(ours);
+            crate::stream::within(Some(Duration::from_millis(500)), bridge).await.expect("the bridge stays").unwrap();
+        });
+    }
+
+    #[test]
+    fn frames_that_are_wrong_fail_the_answer() {
+        let head = framed(HEADERS, END_HEADERS, 1, &header_block(200, &[], false));
+        let word = |n: u32| n.to_be_bytes();
+        let setting = |id: u8, n: u32| [&[0, id][..], &word(n)].concat();
+        let max = (1u32 << 31) - 1;
+        let wrong = [
+            framed(DATA, 0, 1, &[0; 16385]), framed(77, 0, 0, &[0; 16385]), framed(77, 0, 0, &[0; 16385])[..9].to_vec(),
+            framed(DATA, PADDED, 1, &[]), framed(DATA, PADDED, 1, &[4, 0, 0, 0]), framed(HEADERS, END_HEADERS | PADDED, 1, &[]), framed(HEADERS, END_HEADERS | PADDED, 1, &[3, 0, 0]),
+            framed(HEADERS, END_HEADERS | PRIORITY_FLAG, 1, &[0; 4]), framed(HEADERS, END_HEADERS | PADDED | PRIORITY_FLAG, 1, &[0; 5]), framed(HEADERS, END_HEADERS | PADDED | PRIORITY_FLAG, 1, &[2, 0, 0, 0, 0, 0, 0]),
+            framed(RST_STREAM, 0, 1, &[0; 3]), framed(RST_STREAM, 0, 1, &[]), framed(WINDOW_UPDATE, 0, 0, &[]), framed(WINDOW_UPDATE, 0, 1, &[0; 5]),
+            framed(PING, 0, 0, &[0; 7]), framed(GOAWAY, 0, 0, &[0; 7]), framed(SETTINGS, 0, 0, &[0; 5]), framed(SETTINGS, ACK, 0, &[0; 6]),
+            framed(SETTINGS, 0, 0, &setting(4, max + 1)), framed(WINDOW_UPDATE, 0, 0, &word(max - 65534)), framed(WINDOW_UPDATE, 0, 1, &word(max - 65534)),
+            [framed(WINDOW_UPDATE, 0, 1, &word(max - 65535)), framed(SETTINGS, 0, 0, &setting(4, 65536))].concat(),
+            // Incomplete, invalid and endless header blocks.
+            framed(HEADERS, END_HEADERS, 1, &[0x00, 0x05, b'x']), framed(HEADERS, END_HEADERS, 1, &[0xff, 0xff, 0xff, 0xff]),
+        ];
+        for frames in &wrong {
+            assert_eq!((passed(&[frames], false).0, passed(&[frames], false).1), (String::new(), End::Failed), "{}", frames[..frames.len().min(20)].escape_ascii());
+            assert_eq!(passed(&[&head, frames], false).1, End::Failed, "{}", frames[..frames.len().min(20)].escape_ascii());
+        }
+        // Not wrong: the server may open the windows, and set anything else.
+        let fine = [
+            framed(DATA, PADDED, 1, &[3, 0, 0, 0]), framed(PRIORITY, 0, 1, &[0; 4]), framed(SETTINGS, ACK, 0, &[]), framed(WINDOW_UPDATE, 0, 1, &[0; 4]),
+            framed(SETTINGS, 0, 0, &[setting(4, max), setting(4, 65535), setting(4, max)].concat()), framed(SETTINGS, 0, 0, &[setting(5, 0), setting(2, 2)].concat()),
+            framed(WINDOW_UPDATE, 0, 0, &word(max - 65535)), framed(WINDOW_UPDATE, 0, 1, &word(max - 65535)), framed(77, 0, 0, &[0; 16384]),
+        ];
+        for frames in &fine {
+            let last = framed(DATA, END_STREAM, 1, b"ok");
+            assert_eq!(passed(&[&head, frames, &last], false), ("HTTP/1.1 200 \r\n\r\nok".to_string(), End::Whole, Vec::new()), "{}", frames[..frames.len().min(20)].escape_ascii());
+        }
+        // The head has so many bytes, with its frames, in one or more of them.
+        let field = |n: usize| { let mut block = Vec::new(); literals(&mut block, [(b":status".to_vec(), b"200".to_vec()), (b"x".to_vec(), vec![b'~'; n])].iter()); block };
+        let long = |size: usize| (0..size).map(field).find(|b| b.len() == size).unwrap();
+        assert_eq!(passed(&[&framed(HEADERS, END_HEADERS, 1, &long(4096 - 9))], true).1, End::Closed);
+        assert_eq!(passed(&[&framed(HEADERS, END_HEADERS, 1, &long(4097 - 9))], false).1, End::Failed);
+        let endless = [framed(HEADERS, 0, 1, &[0x88]), framed(CONTINUATION, 0, 1, &[]).repeat(500)].concat();
+        assert_eq!(passed(&[&endless], false).1, End::Failed);
+    }
+
+    #[test]
+    fn bodies_go_in_frames_every_server_takes() {
+        // Whatever the largest frame the server says it takes, as nginx.
+        for size in [0, 1, 100, 16384, 1 << 24] {
+            crate::stream::block_on(async {
+                let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
+                tokio::task::spawn_local(upstream(Stream::Pipe(up), theirs, "http", 4096, Slot::default()));
+                ours.write_all(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 20000\r\n\r\n").await.unwrap();
+                server.write_all(&framed(SETTINGS, 0, 0, &[&[0, 5][..], &u32::to_be_bytes(size)].concat())).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                ours.write_all(&[b'x'; 20000]).await.unwrap();
+                let (mut got, mut at, mut body) = (Vec::new(), PREFACE.len(), 0);
+                loop {
+                    assert!(crate::stream::within(Some(Duration::from_secs(1)), server.read_buf(&mut got)).await.is_some_and(|n| n.unwrap() > 0), "{size}");
+                    while let Some(&[a, b, c, kind, flags, ..]) = got.get(at..at + 9) {
+                        let len = u32::from_be_bytes([0, a, b, c]) as usize;
+                        assert!(len <= 16384, "{size}");
+                        (at, body) = (at + 9 + len, body + if kind == DATA { len } else { 0 });
+                        if kind == DATA && flags == END_STREAM { assert_eq!(body, 20000, "{size}"); return }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn frames_at_random_end() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move |n: usize| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed % n as u64) as usize };
+        let block = header_block(200, &[(b"x-a".to_vec(), b"b".to_vec())], false);
+        crate::stream::block_on(async {
+            for _ in 0..3000 {
+                let mut sent = Vec::new();
+                for _ in 0..random(8) {
+                    match random(6) {
+                        0 => frame(&mut sent, HEADERS, END_HEADERS, 1, &block),
+                        1 => frame(&mut sent, DATA, 0, 1, b"data"),
+                        2 => sent.extend(framed(DATA, PADDED, 1, &[2, 0, 0, 0])),
+                        3 => frame(&mut sent, SETTINGS, 0, 0, &[0, 4, 0, 0, 0, 1]),
+                        _ => { let payload: Vec<u8> = (0..random(20)).map(|_| random(256) as u8).collect(); frame(&mut sent, random(11) as u8, random(256) as u8, random(3) as u32, &payload) }
+                    }
+                }
+                for _ in 0..random(4) { if !sent.is_empty() { let at = random(sent.len()); sent[at] = random(256) as u8; } }
+                let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
+                ours.write_all(if random(2) == 0 { b"GET / HTTP/1.1\r\nHost: h\r\n\r\n" } else { b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc" }).await.unwrap();
+                server.write_all(&sent).await.unwrap();
+                // The server keeps the connection, or closes it; what reads the answer goes, or not.
+                let (server, ours) = match random(3) { 0 => { drop(server); (None, Some(ours)) } 1 => { drop(ours); (Some(server), None) } _ => { drop((server, ours)); (None, None) } };
+                let ended = crate::stream::within(Some(Duration::from_secs(1)), upstream(Stream::Pipe(up), theirs, "http", 4096, Slot::default())).await;
+                assert!(ended.is_some(), "{}", sent.escape_ascii());
+                drop((server, ours));
+            }
+        });
     }
 
     #[test]
