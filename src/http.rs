@@ -1003,12 +1003,8 @@ async fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str, clie
         let path = PathBuf::from(format!("{}{rest}", base.display()));
         if std::fs::metadata(&path).is_ok_and(|m| m.is_dir() == *dir) {
             let to = Request { uri: name, ..r.clone() };
-            return match &level.proxy {
-                Some(p) => Box::pin(async move { proxy(p, level, &to, prefix, client).await }).await,
-                // A directory whose URI ends with "/" is answered by the index module.
-                None if to.uri.ends_with('/') => index(level, &to, &path),
-                None => file_at(level, &to, path),
-            };
+            // A directory whose URI ends with "/" is answered by the index module.
+            return match &level.proxy { Some(p) => Box::pin(async move { proxy(p, level, &to, prefix, client).await }).await, None if to.uri.ends_with('/') => index(level, &to, &path), None => file_at(level, &to, path) };
         }
     }
     match &tf.fallback {
