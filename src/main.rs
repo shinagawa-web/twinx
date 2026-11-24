@@ -11,6 +11,7 @@ mod http;
 mod log;
 mod ocsp;
 mod resolver;
+mod spool;
 mod stream;
 mod tls;
 mod upstream;

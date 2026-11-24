@@ -141,9 +141,15 @@ pub async fn read_until<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, dead
     until(deadline, read).await.and_then(Result::ok).unwrap_or(0)
 }
 
+/// What a future gives now; None when it has to wait, and is dropped.
+pub async fn at_once<F: Future>(f: F) -> Option<F::Output> {
+    let mut f = std::pin::pin!(f);
+    std::future::poll_fn(|cx| Poll::Ready(match f.as_mut().poll(cx) { Poll::Ready(out) => Some(out), Poll::Pending => None })).await
+}
+
 /// Reads what there is to read now; None when there is nothing.
 pub async fn read_ready<S: AsyncRead + Unpin>(s: &mut S, buf: &mut [u8]) -> Option<std::io::Result<usize>> {
-    std::future::poll_fn(|cx| Poll::Ready(match std::pin::pin!(s.read(buf)).poll(cx) { Poll::Ready(read) => Some(read), Poll::Pending => None })).await
+    at_once(s.read(buf)).await
 }
 
 thread_local! {
@@ -171,27 +177,73 @@ pub async fn write_all<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8], time: Opti
 
 /// Writes the slices one after another, as writev does, and flushes them;
 /// each write waits at most the time.
-pub async fn write_vectored<S: AsyncWrite + Unpin>(s: &mut S, bufs: &mut [IoSlice<'_>], time: Option<Duration>) -> bool {
-    write_counted(s, bufs, time, &mut 0).await
-}
-
-/// The same, adding the bytes written to a count, also when a write fails after others.
-pub async fn write_counted<S: AsyncWrite + Unpin>(s: &mut S, mut bufs: &mut [IoSlice<'_>], time: Option<Duration>, count: &mut usize) -> bool {
+pub async fn write_vectored<S: AsyncWrite + Unpin>(s: &mut S, mut bufs: &mut [IoSlice<'_>], time: Option<Duration>) -> bool {
     loop {
         // Empty slices are left out: a write of nothing would look like a closed connection.
         IoSlice::advance_slices(&mut bufs, 0);
         if bufs.is_empty() { break }
-        match within(time, s.write_vectored(bufs)).await {
-            Some(Ok(0)) | None => return false,
-            Some(Ok(n)) => {
-                *count += n;
-                IoSlice::advance_slices(&mut bufs, n);
-            }
-            Some(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Some(Err(_)) => return false,
-        }
+        let Some(n) = write_once(s, bufs, time).await else { return false };
+        IoSlice::advance_slices(&mut bufs, n);
     }
     matches!(within(time, s.flush()).await, Some(Ok(())))
+}
+
+/// Writes what one write takes of the slices, waiting at most the time for it: how much,
+/// which is nothing when it was interrupted, or None when it fails.
+pub async fn write_once<S: AsyncWrite + Unpin>(s: &mut S, bufs: &[IoSlice<'_>], time: Option<Duration>) -> Option<usize> {
+    match within(time, s.write_vectored(bufs)).await {
+        Some(Ok(0)) | None => None,
+        Some(Ok(n)) => Some(n),
+        Some(Err(e)) => (e.kind() == std::io::ErrorKind::Interrupted).then_some(0),
+    }
+}
+
+/// A connection that is written to while it is watched.
+pub struct Writing<'a, 'b>(pub &'a RefCell<&'b mut Stream>);
+
+impl AsyncWrite for Writing<'_, '_> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut **self.0.borrow_mut()).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context, bufs: &[IoSlice]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut **self.0.borrow_mut()).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.0.borrow().is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.0.borrow_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.0.borrow_mut()).poll_shutdown(cx)
+    }
+}
+
+impl Writing<'_, '_> {
+    /// Waits until the client has gone, as gone() does, between writes to it.
+    pub async fn gone(&self) {
+        use std::os::fd::AsRawFd;
+        let reader = match &**self.0.borrow() { Stream::Pipe(pipe) => pipe.reader.clone(), _ => None };
+        if let Some(mut reader) = reader { while reader.changed().await.is_ok() {} return }
+        loop {
+            let readable = |cx: &mut Context| self.0.borrow().tcp().map_or(Poll::Pending, |tcp| tcp.poll_read_ready(cx));
+            if std::future::poll_fn(readable).await.is_err() { return }
+            let fd = self.0.borrow().tcp().map(|tcp| tcp.as_raw_fd());
+            if fd.is_none_or(hung_up) { return }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// Whether the peer has closed its side of a connection, or it failed.
+fn hung_up(fd: std::os::fd::RawFd) -> bool {
+    let mut fd = libc::pollfd { fd, events: libc::POLLRDHUP, revents: 0 };
+    // SAFETY: fd is one pollfd that lives through the call.
+    unsafe { libc::poll(&mut fd, 1, 0) != 0 }
 }
 
 /// Waits until the client closes its side of the connection (or it fails),
@@ -205,9 +257,7 @@ pub async fn closed(tcp: &TcpStream) {
             Ok(ready) if !ready.is_read_closed() => {}
             _ => return,
         }
-        let mut fd = libc::pollfd { fd: tcp.as_raw_fd(), events: libc::POLLRDHUP, revents: 0 };
-        // SAFETY: fd is one pollfd that lives through the call.
-        if unsafe { libc::poll(&mut fd, 1, 0) } != 0 { return }
+        if hung_up(tcp.as_raw_fd()) { return }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -266,11 +316,9 @@ mod tests {
             s.tcp().unwrap().readable().await.unwrap();
             assert!(matches!(read_ready(&mut s, &mut buf).await, Some(Ok(1))) && buf == b"y");
             assert_eq!(within(Some(Duration::from_millis(10)), std::future::pending::<()>()).await, None);
-            // What was written before a write that fails is counted.
-            let (mut count, data) = (3, vec![b'x'; 1 << 24]);
-            assert!(write_counted(&mut s, &mut [IoSlice::new(b"ab")], None, &mut count).await && count == 5);
-            assert!(!write_counted(&mut s, &mut [IoSlice::new(&data)], Some(Duration::from_millis(50)), &mut count).await);
-            assert!((6..data.len()).contains(&count));
+            let data = vec![b'x'; 1 << 24];
+            assert!(matches!(write_once(&mut s, &[IoSlice::new(&data)], None).await, Some(n) if (1..data.len()).contains(&n)));
+            assert!(!write_vectored(&mut s, &mut [IoSlice::new(&data)], Some(Duration::from_millis(50))).await);
         });
     }
 
