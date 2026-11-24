@@ -561,6 +561,9 @@ struct Response {
     ranges: bool,
     /// Whether it may be only one range (r->single_range): several are answered with the whole.
     single_range: bool,
+    /// How many Content-Range headers it had before add_header: those of the proxied
+    /// server, the last of which nginx keeps as the answer's (r->headers_out.content_range).
+    content_ranges: usize,
     /// Whether a Location that starts with "/" is sent as it is: one a proxied
     /// server sent and proxy_redirect did not rewrite.
     relative: bool,
@@ -1066,6 +1069,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         sent.upstream_time.iter_mut().filter_map(|t| t.last_mut()).for_each(|t| t[2] = None);
         sent
     };
+    resp.content_ranges = resp.headers.iter().filter(|h| h.0.eq_ignore_ascii_case("content-range")).count();
     for (name, value, _) in level.add_header.iter().filter(|h| h.2 || added) {
         let value = value.render(r, &at_head(&resp));
         // These replace what the response has, and an empty value removes it.
@@ -1301,8 +1305,12 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
     };
     resp.status = 206;
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
+    // The answer's Content-Range, if the proxied server gave one, is replaced where it is
+    // for one range, and removed for several.
+    let given = resp.content_ranges.checked_sub(1).and_then(|n| resp.headers.iter().enumerate().filter(|h| h.1.0.eq_ignore_ascii_case("content-range")).nth(n).map(|h| h.0));
+    if let Some(i) = given { resp.headers.remove(i); }
     if let [(start, end)] = ranges[..] {
-        resp.headers.push(("Content-Range".into(), format!("bytes {start}-{}/{len}", end - 1)));
+        resp.headers.insert(given.unwrap_or(resp.headers.len()), ("Content-Range".into(), format!("bytes {start}-{}/{len}", end - 1)));
         match &mut resp.file {
             Some(file) => (file.start, file.len) = (file.start + start, end - start),
             None => resp.body = resp.body[start as usize..end as usize].to_vec(),
@@ -3151,6 +3159,18 @@ pub(crate) mod tests {
             let size = size_of_val(&future);
             assert!(size < 4096, "{size} bytes");
         });
+    }
+
+    #[test]
+    fn ranges_replace_the_content_range_of_the_proxied_server() {
+        let ranged = |h: &str| {
+            let headers = [("Content-Range", "stub"), ("X", "1"), ("Content-Range", "added")].map(|(n, v)| (n.to_string(), v.to_string())).to_vec();
+            let mut resp = Response { status: 200, body: b"0123456789".to_vec(), ranges: true, headers, content_ranges: 1, ..Response::default() };
+            range(&request(&format!("GET / HTTP/1.0\nRange: {h}\n\n")).1, &Level::default(), &mut resp);
+            (resp.status, resp.headers.into_iter().map(|h| h.1).collect::<Vec<_>>())
+        };
+        assert_eq!(ranged("bytes=0-1"), (206, vec!["bytes 0-1/10".to_string(), "1".into(), "added".into()]));
+        assert_eq!(ranged("bytes=0-1,3-4"), (206, vec!["1".to_string(), "added".into()]));
     }
 
     #[test]
