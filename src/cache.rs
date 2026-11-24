@@ -18,6 +18,9 @@ pub struct Entry {
     pub body: Vec<u8>,
     until: i64,
     updating: i64,
+    /// The request headers its Vary names, lowercase, and their values in the request it answered.
+    vary: Vec<String>,
+    variant: String,
 }
 
 impl Entry {
@@ -85,9 +88,27 @@ fn seconds(s: &str) -> Option<i64> {
     digits.bytes().try_fold(0i64, |n, c| c.is_ascii_digit().then(|| n.saturating_mul(10).saturating_add((c - b'0') as i64)))
 }
 
-/// A zone of keys (keys_zone=name:size of proxy_cache_path), with what it keeps.
+/// The request headers a Vary names, lowercase (none without one); None for "*",
+/// which no other request matches, so that the answer is not cached.
+pub fn vary(headers: &[(String, String)]) -> Option<Vec<String>> {
+    let names: Vec<String> = headers.iter().filter(|h| h.0.eq_ignore_ascii_case("vary")).flat_map(|h| h.1.split(',')).map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()).collect();
+    (!names.contains(&"*".to_string())).then_some(names)
+}
+
+/// The values of the headers a Vary names in a request, which tell its variant: those of
+/// a header are joined by "," without the spaces and empty ones between them.
+pub fn variant(names: &[String], request: &[(String, String)]) -> String {
+    names.iter().map(|n| {
+        let values: Vec<&str> = request.iter().filter(|h| h.0.eq_ignore_ascii_case(n)).flat_map(|h| h.1.split(',')).map(|v| v.trim_matches([' ', '\t'])).filter(|v| !v.is_empty()).collect();
+        format!("{n}:{}\n", values.join(","))
+    }).collect()
+}
+
+/// A zone of keys (keys_zone=name:size of proxy_cache_path), with what it keeps, also
+/// in files of its path, so that what it keeps outlives the process.
 #[derive(Debug, Default)]
 pub struct Zone {
+    dir: Option<std::path::PathBuf>,
     entries: Mutex<HashMap<String, Entry>>,
     /// proxy_cache_lock: what a request that asks the server for a key holds meanwhile.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -101,6 +122,30 @@ pub struct Zone {
 pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Zone {
+    /// A zone that keeps its answers in files under a path, with those already there.
+    pub fn at(dir: std::path::PathBuf) -> Zone {
+        let files = std::fs::read_dir(&dir).into_iter().flatten().flatten();
+        let entries = files.filter_map(|f| decode(&std::fs::read(f.path()).ok()?)).collect();
+        Zone { dir: Some(dir), entries: Mutex::new(entries), ..Zone::default() }
+    }
+
+    /// The key an answer to a request is kept by: that of the variant of the request when
+    /// what the key keeps has a Vary its headers do not match.
+    pub fn resolve(&self, key: &str, request: &[(String, String)]) -> String {
+        match self.entries.lock().unwrap().get(key).map(|e| (variant(&e.vary, request), e)) {
+            Some((v, e)) if !e.vary.is_empty() && v != e.variant => format!("{key}\n{v}"),
+            _ => key.to_string(),
+        }
+    }
+
+    /// Writes what is kept for a key to its file.
+    fn save(&self, key: &str, e: &Entry) {
+        let Some(dir) = &self.dir else { return };
+        let name = ring::digest::digest(&ring::digest::SHA256, key.as_bytes()).as_ref()[..16].iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let (file, temp) = (dir.join(&name), dir.join(format!("{name}.tmp")));
+        let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&temp, encode(key, e))).and_then(|()| std::fs::rename(&temp, &file));
+    }
+
     /// The answer kept for a key, while it is valid.
     pub fn get(&self, key: &str) -> Option<Entry> {
         self.entries.lock().unwrap().get(key).filter(|e| e.until >= crate::clock::seconds()).cloned()
@@ -122,12 +167,18 @@ impl Zone {
     /// Makes what is kept for a key valid again, until then and given while it is updated
     /// for so long after (a 304 of proxy_cache_revalidate).
     pub fn renew(&self, key: &str, (until, updating): (i64, i64)) {
-        if let Some(e) = self.entries.lock().unwrap().get_mut(key) { (e.until, e.updating) = (until, updating); }
+        if let Some(e) = self.entries.lock().unwrap().get_mut(key) { (e.until, e.updating) = (until, updating); self.save(key, e); }
     }
 
     /// Keeps an answer for a key, valid until then, and given while it is updated for so long after.
-    pub fn put(&self, key: String, (status, ctype, headers, body): (u16, Option<String>, Vec<(String, String)>, Vec<u8>), (until, updating): (i64, i64)) {
-        self.entries.lock().unwrap().insert(key, Entry { status, ctype, headers, body, until, updating });
+    /// One looked up by the key of a variant is kept by it when its Vary gives the same variant,
+    /// and else by the key itself, as nginx does (ngx_http_file_cache_update_variant()).
+    pub fn put(&self, (key, at): (&str, &str), (status, ctype, headers, body): (u16, Option<String>, Vec<(String, String)>, Vec<u8>), (until, updating): (i64, i64), (vary, request): (Vec<String>, &[(String, String)])) {
+        let variant = variant(&vary, request);
+        let key = if at == key || (!vary.is_empty() && at == format!("{key}\n{variant}")) { at } else { key };
+        let e = Entry { status, ctype, headers, body, until, updating, vary, variant };
+        self.save(key, &e);
+        self.entries.lock().unwrap().insert(key.to_string(), e);
     }
 
     /// Waits, for so long at most (proxy_cache_lock_timeout), until no other request asks the
@@ -148,6 +199,31 @@ impl Zone {
             if since() == asked { begin(); return Some(None) }
         }
     }
+}
+
+/// What the file of a kept answer holds: its key and fields, each after its length.
+fn encode(key: &str, e: &Entry) -> Vec<u8> {
+    let mut fields = vec![key.to_string(), e.status.to_string(), e.until.to_string(), e.updating.to_string(), e.vary.join(","), e.variant.clone(), e.ctype.is_some().to_string(), e.ctype.clone().unwrap_or_default()];
+    fields.extend(e.headers.iter().flat_map(|(n, v)| [n.clone(), v.clone()]));
+    let mut out = (fields.len() as u64).to_le_bytes().to_vec();
+    for f in fields.iter().map(String::as_bytes).chain([e.body.as_slice()]) {
+        out.extend_from_slice(&(f.len() as u64).to_le_bytes());
+        out.extend_from_slice(f);
+    }
+    out
+}
+
+/// The key and the answer the file of a kept answer holds; None when it holds no such thing.
+fn decode(b: &[u8]) -> Option<(String, Entry)> {
+    let count = u64::from_le_bytes(b.get(..8)?.try_into().ok()?) as usize;
+    let mut at = 8;
+    let mut field = || { let n = u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?) as usize; let f = b.get(at + 8..(at + 8).checked_add(n)?)?; at += 8 + n; Some(f) };
+    let strings = (0..count).map(|_| field().and_then(|f| String::from_utf8(f.to_vec()).ok())).collect::<Option<Vec<String>>>()?;
+    let body = field()?.to_vec();
+    let [key, status, until, updating, vary, variant, typed, ctype] = <[String; 8]>::try_from(strings.get(..8)?.to_vec()).ok()?;
+    let headers = strings[8..].chunks_exact(2).map(|h| (h[0].clone(), h[1].clone())).collect();
+    let vary = vary.split(',').filter(|n| !n.is_empty()).map(str::to_string).collect();
+    Some((key, Entry { status: status.parse().ok()?, ctype: (typed == "true").then_some(ctype), headers, body, until: until.parse().ok()?, updating: updating.parse().ok()?, vary, variant }))
 }
 
 /// The zone of a proxy_cache_path's parameters: the name keys_zone= gives it.
@@ -253,18 +329,64 @@ mod tests {
 
     #[test]
     fn conditions_of_what_is_kept() {
-        let entry = |status, headers: &[(&str, &str)]| Entry { status, ctype: None, headers: h(headers), body: Vec::new(), until: 0, updating: 0 };
+        let entry = |status, headers: &[(&str, &str)]| Entry { status, ctype: None, headers: h(headers), body: Vec::new(), until: 0, updating: 0, vary: Vec::new(), variant: String::new() };
         let both = [("Last-Modified", "Mon, 02 Mar 2015 17:20:58 GMT"), ("ETag", "\"x\"")];
         assert_eq!(entry(200, &both).conditions(), [("If-Modified-Since", "Mon, 02 Mar 2015 17:20:58 GMT".to_string()), ("If-None-Match", "\"x\"".to_string())]);
         assert_eq!(entry(206, &both[1..]).conditions(), [("If-None-Match", "\"x\"".to_string())]);
         assert!(entry(201, &both).conditions().is_empty());
         assert!(entry(200, &[("Last-Modified", "never")]).conditions().is_empty());
         let z = Zone::default();
-        z.put("k".into(), (200, None, Vec::new(), Vec::new()), (0, 0));
+        z.put(("k", "k"), (200, None, Vec::new(), Vec::new()), (0, 0), (Vec::new(), &[]));
         assert!(z.get("k").is_none());
         z.renew("k", (crate::clock::seconds() + 60, 0));
         z.renew("other", (0, 0));
         assert!(z.get("k").is_some() && z.stale("other").is_none());
+    }
+
+    #[test]
+    fn variants_by_vary() {
+        assert_eq!(vary(&h(&[("Vary", ",, Accept-encoding , ,"), ("vary", "Foo")])), Some(vec!["accept-encoding".to_string(), "foo".to_string()]));
+        assert_eq!(vary(&h(&[("Vary", "Foo, *")])), None);
+        assert_eq!(vary(&[]), Some(Vec::new()));
+        let names = vec!["accept-encoding".to_string()];
+        let v = |value| variant(&names, &h(&[("Accept-Encoding", value)]));
+        assert_eq!(v("foo, bar"), v("foo,,  ,bar , "));
+        assert_ne!(v("foo, bar"), v("foobar"));
+        assert_eq!(variant(&names, &h(&[("Accept-Encoding", "a"), ("accept-encoding", "b")])), v("a,b"));
+        let z = Zone::default();
+        let (gzip, deflate) = (h(&[("Accept-Encoding", "gzip")]), h(&[("Accept-Encoding", "deflate")]));
+        let answer = |body: &str| (200, None, Vec::new(), body.as_bytes().to_vec());
+        let valid = (crate::clock::seconds() + 60, 0);
+        assert_eq!(z.resolve("k", &gzip), "k");
+        z.put(("k", "k"), answer("g"), valid, (names.clone(), &gzip));
+        assert_eq!(z.resolve("k", &gzip), "k");
+        let other = z.resolve("k", &deflate);
+        assert_ne!(other, "k");
+        // A variant is kept by its own key; an answer without Vary replaces them by the key itself.
+        z.put(("k", &other), answer("d"), valid, (names.clone(), &deflate));
+        assert_eq!((z.get("k").unwrap().body, z.get(&other).unwrap().body), (b"g".to_vec(), b"d".to_vec()));
+        z.put(("k", &other), answer("n"), valid, (Vec::new(), &deflate));
+        assert_eq!((z.resolve("k", &deflate), z.get("k").unwrap().body), ("k".to_string(), b"n".to_vec()));
+    }
+
+    #[test]
+    fn kept_in_files() {
+        let dir = std::env::temp_dir().join(format!("twinx-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let z = Zone::at(dir.clone());
+        let valid = (crate::clock::seconds() + 60, 5);
+        let headers = h(&[("ETag", "\"x\""), ("Vary", "Foo")]);
+        z.put(("k", "k"), (200, Some("text/plain".into()), headers.clone(), b"body".to_vec()), valid, (vec!["foo".into()], &h(&[("Foo", "1")])));
+        z.put(("n", "n"), (404, None, Vec::new(), Vec::new()), valid, (Vec::new(), &[]));
+        z.renew("n", (valid.0 + 1, 0));
+        std::fs::write(dir.join("junk"), b"x").unwrap();
+        let again = Zone::at(dir.clone());
+        let e = again.get("k").unwrap();
+        assert_eq!((e.status, e.ctype.as_deref(), e.headers.clone(), e.body.clone(), e.updating), (200, Some("text/plain"), headers, b"body".to_vec(), 5));
+        assert_eq!(again.resolve("k", &h(&[("Foo", "2")])), "k\nfoo:2\n");
+        assert_eq!(again.get("n").map(|e| (e.status, e.ctype, e.until)), Some((404, None, valid.0 + 1)));
+        assert!(decode(&encode("k", &e)[..20]).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -277,13 +399,13 @@ mod tests {
     fn kept_while_valid() {
         let z = Zone::default();
         let now = crate::clock::seconds();
-        z.put("k".into(), (200, None, Vec::new(), b"x".to_vec()), (now + 60, 0));
+        z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (now + 60, 0), (Vec::new(), &[]));
         assert_eq!(z.get("k").unwrap().body, b"x");
-        z.put("k".into(), (200, None, Vec::new(), b"x".to_vec()), (now - 10, 0));
+        z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (now - 10, 0), (Vec::new(), &[]));
         assert!(z.get("k").is_none());
         assert_eq!(z.stale("k").unwrap().body, b"x");
         assert!(!z.stale("k").unwrap().updating());
-        z.put("k".into(), (200, None, Vec::new(), b"x".to_vec()), (now - 10, 60));
+        z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (now - 10, 60), (Vec::new(), &[]));
         assert!(z.stale("k").unwrap().updating());
         assert!(z.stale("other").is_none());
         assert!(z.get("other").is_none());
