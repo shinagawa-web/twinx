@@ -155,6 +155,9 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("send_timeout", HSL, 1, 1, false),
     ("proxy_buffer_size", HSL, 1, 1, false),
     ("proxy_buffering", HSL, 1, 1, false),
+    ("proxy_cache_path", HTTP, 2, usize::MAX, false),
+    ("proxy_cache", HSL, 1, 1, false),
+    ("proxy_cache_valid", HSL, 1, usize::MAX, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
     ("proxy_http_version", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
@@ -189,7 +192,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
 const REPEATED: &[&str] = &[
     "error_log", "index", "server", "upstream", "listen", "server_name", "location", "return", "break", "set", "if", "rewrite", "log_format", "access_log", "add_header", "add_trailer", "keepalive_disable", "error_page",
     "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_next_upstream",
-    "proxy_cookie_domain", "proxy_cookie_path", "proxy_redirect", "proxy_cookie_flags", "gzip_types",
+    "proxy_cookie_domain", "proxy_cookie_path", "proxy_redirect", "proxy_cookie_flags", "gzip_types", "proxy_cache_path", "proxy_cache_valid",
 ];
 
 const COMBINED: &str =
@@ -442,6 +445,10 @@ pub struct Level {
     /// proxy_buffering: what of a proxied answer's body is in full buffers is sent as they
     /// are full, not all that has come at once (off).
     pub proxy_buffering: bool,
+    /// proxy_cache: the zone answers are cached in, if any.
+    pub proxy_cache: Option<Arc<crate::cache::Zone>>,
+    /// proxy_cache_valid: for how long answers of each status (None: any) are valid.
+    pub proxy_cache_valid: Vec<(Option<u16>, Duration)>,
     /// proxy_buffers: the number and the size of the buffers the body is read into.
     pub proxy_buffers: (usize, usize),
     /// proxy_busy_buffers_size: how much of those is written at once, twice the size of
@@ -691,6 +698,8 @@ struct Builder<'a> {
     formats: HashMap<String, Arc<Format>>,
     logs: HashMap<PathBuf, Arc<File>>,
     upstreams: HashMap<String, Arc<Upstream>>,
+    /// The zones of proxy_cache_path, by name.
+    zones: HashMap<String, Arc<crate::cache::Zone>>,
     implicit: Implicit,
     /// error_log of the main block.
     errors: Vec<(Arc<File>, usize)>,
@@ -706,7 +715,7 @@ struct Builder<'a> {
 pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
-    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new() };
+    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), zones: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new() };
     let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
@@ -805,6 +814,12 @@ impl Builder<'_> {
             let mut upstream = Upstream::new(peers.collect::<Result<_, _>>()?);
             upstream.keepalive = upstream_keepalive(block)?;
             self.upstreams.insert(d.args[0].clone(), Arc::new(upstream));
+        }
+        // The zones of proxy_cache_path are known before proxy_cache names them.
+        for d in block.iter().filter(|d| d.name == "proxy_cache_path") {
+            self.check(d, HTTP)?;
+            let name = crate::cache::zone_name(&d.args[1..]).ok_or_else(|| format!("\"{}\" must have \"keys_zone\" parameter in {}", d.name, d.at))?;
+            self.zones.insert(name.to_string(), Arc::default());
         }
         // Named captures of server names are variables everywhere, so they are known first.
         let names = block.iter().filter(|d| d.name == "server").flat_map(|d| d.block.iter().flatten()).filter(|d| d.name == "server_name");
@@ -1052,6 +1067,15 @@ impl Builder<'_> {
                 "proxy_busy_buffers_size" => level.proxy_busy_buffers_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
                 "proxy_temp_file_write_size" => level.proxy_temp_file_write_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
                 "proxy_buffering" => level.proxy_buffering = flag(d).map_err(at)?,
+                "proxy_cache" => level.proxy_cache = match d.args[0].as_str() {
+                    "off" => None,
+                    name => Some(self.zones.get(name).cloned().ok_or_else(|| at(format!("\"proxy_cache\" zone \"{name}\" is unknown")))?),
+                },
+                // All of those of a level replace those it inherits.
+                "proxy_cache_valid" => {
+                    let valid = block.iter().filter(|v| v.name == "proxy_cache_valid").map(|v| seconds(&v.args[v.args.len() - 1]).and_then(|t| crate::cache::valid(&v.args[..v.args.len() - 1], t)).map_err(|e| format!("{e} in {}", v.at)));
+                    level.proxy_cache_valid = valid.collect::<Result<Vec<_>, _>>()?.concat();
+                }
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
                 "proxy_http_version" => {
                     let version = ["1.0", "1.1", "2"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\"", d.args[0])))?;
@@ -1682,6 +1706,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         build(&parse(text, Path::new("t.conf")).unwrap(), &dir)
+    }
+
+    #[test]
+    fn proxy_cache_zones() {
+        let c = build_text("http { proxy_cache_path c keys_zone=Z:1m; proxy_cache_valid 1m; proxy_cache_valid 404 any 2m; server { listen 127.0.0.1:8080; location / { proxy_cache Z; } location /off { proxy_cache off; proxy_cache_valid 200 0; } } }").unwrap();
+        let (outer, locations) = (&c.servers[0].level, &c.servers[0].locations);
+        assert!(outer.proxy_cache.is_none());
+        assert_eq!(outer.proxy_cache_valid.len(), 5);
+        let at = |path: &str| &locations.iter().find(|l| l.path == path).unwrap().level;
+        assert!(at("/").proxy_cache.is_some());
+        assert!(at("/off").proxy_cache.is_none() && at("/off").proxy_cache_valid.len() == 1);
+        assert_eq!(build_text("http { server { proxy_cache Z; } }").unwrap_err(), "\"proxy_cache\" zone \"Z\" is unknown in t.conf:1");
+        assert_eq!(build_text("http { proxy_cache_path c levels=1; }").unwrap_err(), "\"proxy_cache_path\" must have \"keys_zone\" parameter in t.conf:1");
     }
 
     #[test]

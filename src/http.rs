@@ -2040,6 +2040,13 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             None => return special(502),
         },
     };
+    // proxy_cache: a GET or HEAD is answered with what the cache keeps for its key
+    // ($scheme$proxy_host$request_uri) while that is valid.
+    let cache = level.proxy_cache.as_ref().filter(|_| matches!(r.method.as_str(), "GET" | "HEAD"));
+    let key = format!("{}://{host}{}", if r.ssl.is_some() { "https" } else { "http" }, r.request_uri());
+    if let Some(e) = cache.and_then(|z| z.get(&key)) {
+        return Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, ranges: true, proxy_host: Some(host), ..Response::default() };
+    }
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     // proxy_set_body replaces the client's body, whatever proxy_pass_request_body
@@ -2054,7 +2061,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &sent))).collect();
     let is_set = |name: &str| set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
     // proxy_method replaces the request's method.
-    let method = level.proxy_method.as_ref().map_or_else(|| r.method.clone(), |m| m.render(r, &sent));
+    // One that may be cached asks for the body of a HEAD too (proxy_cache_convert_head).
+    let method = level.proxy_method.as_ref().map_or_else(|| if cache.is_some() { "GET".to_string() } else { r.method.clone() }, |m| m.render(r, &sent));
     let mut req = format!("{method} {uri} HTTP/1.{}\r\n", level.proxy_http_11 as u8);
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     if !is_set("host") { req += &format!("Host: {host}\r\n"); }
@@ -2066,8 +2074,11 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     if set_body.is_some() { req += &format!("Content-Length: {}\r\n", body.len()); }
     let body = if pass_body && chunked && !body.is_empty() { chunk(&body) } else { body };
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
+    // With a cache, the server is asked for the whole answer, whatever the client's conditions and ranges.
+    const WHOLE: &[&str] = &["if-modified-since", "if-unmodified-since", "if-none-match", "if-match", "range", "if-range"];
+    let dropped = |n: &str| DROPPED.contains(&n) || level.proxy_cache.is_some() && WHOLE.contains(&n);
     // proxy_pass_request_headers off passes none of the client's headers.
-    let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !DROPPED.contains(&n.to_ascii_lowercase().as_str()) && !is_set(n));
+    let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !dropped(&n.to_ascii_lowercase()) && !is_set(n));
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     let mut req = crate::vars::bytes(&(req + "\r\n"));
     req.extend_from_slice(&body);
@@ -2221,6 +2232,11 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         if let Some(cookie) = rewrite_cookie(r, &h.1, level) { h.1 = cookie; }
     }
     resp.relative = !rewrite_redirect(r, level, &mut resp.headers);
+    // An answer whose status proxy_cache_valid names is read whole and kept.
+    if let Some((zone, valid)) = cache.zip(crate::cache::validity(&level.proxy_cache_valid, resp.status)) {
+        finish(&mut resp, (level, r)).await;
+        if resp.cut.is_none() { zone.put(key, (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid); }
+    }
     resp
 }
 
