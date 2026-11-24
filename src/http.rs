@@ -1283,10 +1283,10 @@ async fn pass<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(strea
 
 /// The body of a proxied answer as it is read: the rest of the answer until it has ended,
 /// how much of it was read, and what is sent of it; the buffers and the file, and whose
-/// answer it is; where is read to, and the second reading began in; whether anything came
+/// answer it is; where is read to, and how reading is paced; whether anything came
 /// since the last write, the answer has ended, a read failed, what came is malformed, and
 /// it is not buffered; and why a read failed.
-struct Incoming<'a> { rest: &'a mut Option<Box<Rest>>, read: &'a mut usize, resp: &'a mut Response, buffers: Buffers, spool: Spool<'a>, of: (&'a Level, &'a Request), buf: Vec<u8>, start: i64, came: bool, ended: bool, failed: bool, malformed: bool, unbuffered: bool, why: String }
+struct Incoming<'a> { rest: &'a mut Option<Box<Rest>>, read: &'a mut usize, resp: &'a mut Response, buffers: Buffers, spool: Spool<'a>, of: (&'a Level, &'a Request), buf: Vec<u8>, intake: Intake, came: bool, ended: bool, failed: bool, malformed: bool, unbuffered: bool, why: String }
 
 impl Incoming<'_> {
     /// Reads the next into what room there is for it, waiting for it or not: whether
@@ -1294,10 +1294,10 @@ impl Incoming<'_> {
     async fn next(&mut self, waits: bool) -> bool {
         let Some(from) = self.rest.as_mut() else { return false };
         if self.buf.is_empty() { self.buf.resize(from.sizes.map_or_else(|n| n, |s| 65536.min(s.first.saturating_add(s.count.saturating_mul(s.size)))).max(1), 0); }
-        let part = self.buffers.room().min(self.buf.len());
+        let part = if self.intake.rate > 0 { self.buffers.at_once() } else { self.buffers.room() }.min(self.buf.len());
         let part = &mut self.buf[..part];
         let got = if waits {
-            read_piece(&mut from.conn.stream, part, (from.rate, self.start, *self.read), from.wait).await
+            read_piece(&mut from.conn.stream, part, (&mut self.intake, *self.read), from.wait).await
         } else {
             match read_ready(&mut from.conn.stream, part).await { Some(got) => got, None => return false }
         };
@@ -1365,7 +1365,7 @@ impl Incoming<'_> {
         // That may have been dropped.
         if self.ended { self.finish().await; }
         if self.ended || self.unbuffered { std::future::pending::<()>().await; }
-        let paced = self.rest.as_ref().is_some_and(|rest| rest.rate > 0);
+        let paced = self.intake.rate > 0;
         while self.buffers.came() == Came::More && !self.ended {
             if self.buffers.room() == 0 && !self.to_file()? {
                 if self.came { break }
@@ -1433,10 +1433,12 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
     // Without buffering, a head that nothing came with is flushed.
     let alone = unbuffered && !came;
     *read = from.answer.len() - from.end;
+    buffers.late = rate > 0;
     buffers.take(&from.answer[from.end..]);
     let largest = level.proxy_buffer_size.max(level.proxy_buffers.1);
     let spool = Spool::new((&level.proxy_temp_path, &level.proxy_temp_levels), level.proxy_max_temp_file_size, level.proxy_temp_file_write_size.unwrap_or(2 * largest));
-    let mut incoming = Incoming { rest, read, resp, buffers, spool, of, buf: Vec::new(), start: seconds(), came, ended: false, failed: false, malformed: false, unbuffered, why: String::new() };
+    let intake = Intake::new(rate, *read);
+    let mut incoming = Incoming { rest, read, resp, buffers, spool, of, buf: Vec::new(), intake, came, ended: false, failed: false, malformed: false, unbuffered, why: String::new() };
     // A head as large as nginx's postpone_output does not wait for the body, nor does one
     // without buffering, if nothing came with it, or one to a client of HTTP/2.
     let postponed = !matches!(stream, Stream::Pipe(_)) && head.len() < 1460 && (!unbuffered || came);
@@ -2454,7 +2456,8 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// lines, where the body ends for nginx. With a rate it is read as ngx_event_pipe_read_upstream()
 /// paces proxy_limit_rate: by the end of each second since the body started
 /// (counted in whole seconds of the clock) up to the rate for each second has
-/// been read, and when that much has, it waits for the time it is worth.
+/// been read, and when that much has, it waits for the time it is worth, as it
+/// does after each read for what that read is worth.
 /// Returns the body, with what came of the chunk it is cut off in, the bytes read
 /// after the head, whether they end where the body does, and the cut, when
 /// the server closed the connection before the body's end, or a read failed or
@@ -2462,11 +2465,11 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// says whether the connection's end is the body's; the frames that fail an answer
 /// before any of the body are as malformed chunks. Last is what is logged of the cut.
 async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>, slot: Option<&crate::h2::Slot>) -> (Vec<u8>, usize, bool, Option<Box<Cut>>, String) {
-    let (start, mut chunk, mut failed, mut malformed, mut why) = (seconds(), vec![0u8; 4096], false, false, PREMATURE.to_string());
+    let (mut intake, mut chunk, mut failed, mut malformed, mut why) = (Intake::new(rate, after.len()), vec![0u8; 4096], false, false, PREMATURE.to_string());
     let (mut body, mut data, mut read) = (Body::new(length.map(|n| n as u64), chunked), Vec::new(), after.len());
     let mut came = body.take(after, &mut data);
     while came == Came::More {
-        let n = match read_piece(s, &mut chunk, (rate, start, read), wait).await {
+        let n = match read_piece(s, &mut chunk, (&mut intake, read), wait).await {
             Ok(n) => n,
             Err(e) => { (failed, why) = (true, read_failed("readv", &e)); break }
         };
@@ -2488,18 +2491,44 @@ async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked:
     (data, read, came == Came::Whole { followed: false }, cut, why)
 }
 
-/// Reads a piece of a proxied answer's body into the buffer, at the rate from the second
-/// the body started in, with so much of it read before; an error when the read fails or
-/// waits longer than the time.
-async fn read_piece(s: &mut Stream, buf: &mut [u8], (rate, start, read): (u64, i64, usize), wait: Option<Duration>) -> std::io::Result<usize> {
-    let rate = rate as i64;
-    let limit = loop {
-        let limit = if rate == 0 { buf.len() as i64 } else { rate * (seconds() - start + 1) - read as i64 };
-        if limit > 0 { break limit as usize }
-        tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await;
-    };
-    let limit = limit.min(buf.len());
-    within(wait, s.read(&mut buf[..limit])).await.unwrap_or_else(|| Err(std::io::ErrorKind::TimedOut.into()))
+/// How the reads of an answer's body are paced (proxy_limit_rate): the rate, the second
+/// the body started in, and when the next read may be.
+struct Intake { rate: i64, start: i64, until: Option<Instant> }
+
+impl Intake {
+    /// At the rate, with so much read with the head.
+    fn new(rate: u64, read: usize) -> Intake {
+        let mut intake = Intake { rate: rate as i64, start: if rate == 0 { 0 } else { seconds() }, until: None };
+        intake.took(read);
+        intake
+    }
+
+    /// Nothing is read for the time what was read is worth.
+    fn took(&mut self, n: usize) {
+        let delay = if self.rate == 0 { 0 } else { (n as i64).saturating_mul(1000) / self.rate };
+        if delay > 0 { self.until = Some(Instant::now() + Duration::from_millis(delay as u64)); }
+    }
+
+    /// How much may be read, with so much read before, once any may. When this is dropped,
+    /// the time goes on.
+    async fn limit(&mut self, read: usize) -> usize {
+        if self.rate == 0 { return usize::MAX }
+        loop {
+            if let Some(until) = self.until { tokio::time::sleep_until(until.into()).await; }
+            let limit = self.rate.saturating_mul(seconds() - self.start + 1) - read as i64;
+            self.until = (limit <= 0).then(|| Instant::now() + Duration::from_millis((-limit * 1000 / self.rate + 1) as u64));
+            if limit > 0 { return limit as usize }
+        }
+    }
+}
+
+/// Reads a piece of a proxied answer's body into the buffer, as it is paced, with so much
+/// of it read before; an error when the read fails or waits longer than the time.
+async fn read_piece(s: &mut Stream, buf: &mut [u8], (intake, read): (&mut Intake, usize), wait: Option<Duration>) -> std::io::Result<usize> {
+    let limit = intake.limit(read).await.min(buf.len());
+    let got = within(wait, s.read(&mut buf[..limit])).await.unwrap_or_else(|| Err(std::io::ErrorKind::TimedOut.into()));
+    if let Ok(n) = got { intake.took(n); }
+    got
 }
 
 /// Whether an answer over HTTP/2 whose connection has ended is cut off, and whether a
@@ -3412,12 +3441,13 @@ pub(crate) mod tests {
         block_on(async {
             let mut resp = fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &rate).await.unwrap();
             // The body is read after the head, 4000 bytes (what came with the head too)
-            // in each second of the clock: it ends in the third second.
+            // in each second of the clock, and nothing for the time they are worth after
+            // each read: the last at most 4096 of them.
             assert!(resp.body.is_empty() && resp.rest.is_some());
             resp.upstream_time = Some(vec![[None; 3]]);
             let started = Instant::now();
             finish(&mut resp, (&Level::default(), &request("GET / HTTP/1.1\n\n").1)).await;
-            assert!(started.elapsed() >= Duration::from_millis(900));
+            assert!(started.elapsed() >= Duration::from_millis(1900));
             assert_eq!((resp.body.len(), resp.rest.is_none()), (12000, true));
             assert!(resp.upstream_time.unwrap()[0][2].is_some());
         });
@@ -4026,6 +4056,35 @@ pub(crate) mod tests {
         let (addr, _count) = plays(&after_head(&length, &[&data, &data], 100), false);
         let got = block_on(arrivals(&passing(addr, "proxy_buffering off; limit_rate 100; proxy_limit_rate 100;"), HTTP11));
         assert!(got.len() == 2 && got[0].0 < 90 && got[1].0 < 600, "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reads_are_paced_by_the_time_they_are_worth() {
+        let _busy = serving_on();
+        // All of it is there at once, in buffers of 4096 bytes, of which the last is read
+        // after the time of those before it. It goes on while the client is behind.
+        let data = "x".repeat(9000);
+        let length = LENGTH.replace("30000", "9000") + &data;
+        let chunks = CHUNKED.to_string() + &chunk_of(&data) + "0\r\n\r\n";
+        for (answer, directives) in [(&length, ""), (&chunks, ""), (&length, "limit_rate 100k;"), (&length, "limit_rate 10000; limit_rate_after 1000;")] {
+            let (addr, _count) = plays(&vec![(0, answer.clone().into_bytes())], false);
+            let got = block_on(arrivals(&passing(addr, &format!("proxy_limit_rate 10000; {directives}")), HTTP11));
+            let all = got.iter().map(|g| g.1.as_str()).collect::<String>();
+            assert!(all.matches('x').count() >= 9000 && got[0].1.matches('x').count() <= 4096 && got.last().unwrap().0 >= 450, "{directives} {:?}", got.iter().map(|g| (g.0, g.1.len())).collect::<Vec<_>>());
+        }
+        // Nothing is waited for before the first read, and for nothing.
+        block_on(async {
+            let mut intake = Intake::new(1000, 0);
+            let started = Instant::now();
+            assert!(intake.limit(0).await >= 1000);
+            intake.took(0);
+            assert!(intake.limit(0).await >= 1000 && Intake::new(0, 5000).limit(5000).await == usize::MAX);
+            intake.took(100);
+            // When it is dropped, the time goes on.
+            assert!(within(Some(Duration::from_millis(1)), intake.limit(100)).await.is_none() && intake.until.is_some());
+            intake.limit(100).await;
+            assert!(started.elapsed() >= Duration::from_millis(100));
+        });
     }
 
     #[test]

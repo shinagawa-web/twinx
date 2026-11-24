@@ -159,6 +159,9 @@ pub struct Buffers {
     full: VecDeque<(usize, usize)>,
     lent: Vec<usize>,
     came: Came,
+    /// Whether a new buffer is taken only for what is read into it, as when reading is
+    /// paced (proxy_limit_rate), not to look for something to read.
+    pub late: bool,
 }
 
 impl Buffers {
@@ -167,7 +170,7 @@ impl Buffers {
         let s = sizes.unwrap_or(Sizes { first: 0, count: 0, size: 0, busy: 0 });
         let came = if body.need() == Some(0) { Came::Whole { followed: false } } else { Came::More };
         let need = if any { Some(1) } else { body.need() };
-        let mut buffers = Buffers { body, data, ready: 0, any, sizes, free: VecDeque::from([s.first]), room: s.first.saturating_sub(head), held: 0, more: s.count, need, full: VecDeque::new(), lent: Vec::new(), came };
+        let mut buffers = Buffers { body, data, ready: 0, any, sizes, free: VecDeque::from([s.first]), room: s.first.saturating_sub(head), held: 0, more: s.count, need, full: VecDeque::new(), lent: Vec::new(), came, late: false };
         if sizes.is_some() && buffers.room == 0 { buffers.pass(); }
         buffers
     }
@@ -185,7 +188,17 @@ impl Buffers {
     /// How much there may be read before what goes on is written.
     pub fn room(&self) -> usize {
         let Some(s) = self.sizes else { return usize::MAX };
-        self.room + self.free.iter().skip(1).sum::<usize>() + self.more.saturating_mul(s.size)
+        self.free() + self.more.saturating_mul(s.size)
+    }
+
+    /// The room in the buffers that are free.
+    fn free(&self) -> usize {
+        self.room + self.free.iter().skip(1).sum::<usize>()
+    }
+
+    /// How much is read at once when reading is paced: into the buffers that are free, or a new one.
+    pub fn at_once(&self) -> usize {
+        match (self.sizes, self.free()) { (Some(s), 0) if self.more > 0 => s.size, (_, free) => free }
     }
 
     /// Takes what was read.
@@ -198,6 +211,7 @@ impl Buffers {
             }
             // More than there are buffers for may come with the head.
             if let Some(s) = self.sizes.filter(|_| self.room == 0) {
+                self.more = self.more.saturating_sub(1);
                 self.free.push_back(s.size);
                 self.room = s.size.max(1);
             }
@@ -326,7 +340,7 @@ impl Buffers {
         } else {
             self.free.push_back(size);
         }
-        if self.free.is_empty() && self.more > 0 {
+        if self.free.is_empty() && self.more > 0 && !self.late {
             self.more -= 1;
             self.free.push_back(s.size);
         }
@@ -631,6 +645,26 @@ mod tests {
         assert!(lent == x[..9000] && b.ready == 0);
         b.returned();
         assert_eq!(b.room(), usize::MAX);
+    }
+
+    #[test]
+    fn new_buffers_are_taken_late_when_reading_is_paced() {
+        for late in [false, true] {
+            let mut b = buffers(Body::new(None, false), Some(Sizes { first: 100, count: 2, size: 200, busy: 8192 }), 40);
+            b.late = late;
+            assert_eq!((b.at_once(), b.room()), (60, 460));
+            b.take(&[b'x'; 60]);
+            assert_eq!((b.at_once(), b.room()), (200, 400));
+            // The buffer written is used again, with the one that was taken meanwhile.
+            b.written(60);
+            assert_eq!((b.at_once(), b.room()), if late { (100, 500) } else { (300, 500) });
+            // More than is free: new ones.
+            b.take(&[b'x'; 100]);
+            b.take(&[b'x'; 200]);
+            assert_eq!(b.at_once(), 200);
+            b.take(&[b'x'; 200]);
+            assert_eq!((b.at_once(), b.room(), b.ready), (0, 0, 500));
+        }
     }
 
     #[test]
