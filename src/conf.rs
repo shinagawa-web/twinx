@@ -1067,10 +1067,8 @@ impl Builder<'_> {
                 "proxy_busy_buffers_size" => level.proxy_busy_buffers_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
                 "proxy_temp_file_write_size" => level.proxy_temp_file_write_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
                 "proxy_buffering" => level.proxy_buffering = flag(d).map_err(at)?,
-                "proxy_cache" => level.proxy_cache = match d.args[0].as_str() {
-                    "off" => None,
-                    name => Some(self.zones.get(name).cloned().ok_or_else(|| at(format!("\"proxy_cache\" zone \"{name}\" is unknown")))?),
-                },
+                // "off" caches nothing.
+                "proxy_cache" => level.proxy_cache = (d.args[0] != "off").then(|| self.zones.get(&d.args[0]).cloned().ok_or_else(|| at(format!("\"proxy_cache\" zone \"{}\" is unknown", d.args[0])))).transpose()?,
                 // All of those of a level replace those it inherits.
                 "proxy_cache_valid" => {
                     let valid = block.iter().filter(|v| v.name == "proxy_cache_valid").map(|v| seconds(&v.args[v.args.len() - 1]).and_then(|t| crate::cache::valid(&v.args[..v.args.len() - 1], t)).map_err(|e| format!("{e} in {}", v.at)));
