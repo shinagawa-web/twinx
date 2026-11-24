@@ -120,6 +120,17 @@ pub async fn shut_down(accepting: Vec<JoinHandle<()>>, timeout: Option<Duration>
     for _ in 0..100 { if BUSY.load(Ordering::SeqCst) == 0 { break } tokio::task::yield_now().await; }
 }
 
+thread_local! {
+    /// The number of the last connection of the worker.
+    static NUMBER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of a new connection, accepted or to a proxied server, in error logs.
+fn number() -> u64 {
+    NUMBER.set(NUMBER.get() + 1);
+    NUMBER.get()
+}
+
 /// Accepts connections on the listening sockets, in a worker process: a task
 /// of the worker's event loop accepts on each socket, and each connection is
 /// served by a task of its own. Gives the tasks that accept, for shut_down.
@@ -139,7 +150,7 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
                 let (config, fresh) = (config.clone(), Busy::new());
                 // As in nginx, only a socket that listens on every address is asked which one it is.
                 let local = if addr.ip().is_unspecified() { stream.local_addr().unwrap_or(addr) } else { addr };
-                tokio::task::spawn_local(Box::pin(serving(config, stream, tls, (addr, local, peer), fresh)));
+                tokio::task::spawn_local(Box::pin(serving(config, stream, tls, (addr, local, (peer, number())), fresh)));
             }
         }));
     }
@@ -149,7 +160,7 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
 /// What the task of a connection runs. It is copied when it is made, spawned
 /// and done, so it is kept small: what few connections use is boxed where it
 /// is awaited.
-fn serving(config: Arc<Config>, stream: TcpStream, tls: bool, (addr, local, peer): (SocketAddr, SocketAddr, SocketAddr), fresh: Busy) -> impl Future<Output = ()> {
+fn serving(config: Arc<Config>, stream: TcpStream, tls: bool, (addr, local, peer): (SocketAddr, SocketAddr, (SocketAddr, u64)), fresh: Busy) -> impl Future<Output = ()> {
     async move {
         // As nginx does, a connection to an address that takes TLS but does not start with it is served as plain HTTP.
         let Some(plain) = (if tls { Box::pin(crate::tls::plain(&stream)).await } else { Some(true) }) else { return };
@@ -213,8 +224,8 @@ pub(crate) struct Origin {
 }
 
 /// Serves the requests of a connection accepted on a listening address,
-/// with its local and remote addresses, or a stream of an HTTP/2 connection.
-pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen, local, peer, ssl): (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>), fresh: Busy, mut origin: Option<Box<Origin>>) {
+/// with its local and remote addresses and its number, or a stream of an HTTP/2 connection.
+pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen, local, peer, ssl): crate::h2::Addrs, fresh: Busy, mut origin: Option<Box<Origin>>) {
     let mut fresh = Some(fresh);
     let mut buf = Vec::new();
     // After a kept-alive answer: how long the connection waits for the next request.
@@ -261,7 +272,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             headers: Vec::new(),
             host: None,
             server_name: String::new(),
-            peer,
+            peer: peer.0,
             local,
             started,
             pipelined,
@@ -274,7 +285,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             upstream_status: None,
             upstream: Vec::new(),
             captures: Vec::new(),
-            shared: Default::default(),
+            shared: Arc::new(crate::vars::Shared { number: peer.1, ..Default::default() }),
             ssl: ssl.clone(),
         };
         let parsed = parse(&mut r, &buf[..end], &default.level, matches!(stream, Stream::Pipe(_)));
@@ -685,16 +696,17 @@ impl Trailers {
 
 /// Reads the body of a proxied answer, if it is still to be read, noting how long
 /// the whole answer took and how many bytes it has, and gives its connection back.
-async fn finish(resp: &mut Response) {
+async fn finish(resp: &mut Response, (level, r): (&Level, &Request)) {
     let Some(mut rest) = resp.rest.take() else { return };
-    let (read, ended);
-    (resp.body, read, ended, resp.cut) = read_body(&mut rest.conn.stream, &rest.answer[rest.end..], rest.length, rest.chunked, rest.rate, rest.wait, rest.slot.as_ref()).await;
+    let (read, ended, why);
+    (resp.body, read, ended, resp.cut, why) = read_body(&mut rest.conn.stream, &rest.answer[rest.end..], rest.length, rest.chunked, rest.rate, rest.wait, rest.slot.as_ref()).await;
     if let Some(t) = rest.trailers.as_ref().filter(|_| resp.cut.is_none()) {
         let any = t.take(&mut rest.conn.stream, Some(rest.wait.unwrap_or_default())).await;
         // They come after a body in chunks, if it has no length of the server's.
         resp.unknown_length |= any && rest.length.is_none();
     }
     note(resp, &rest, read);
+    if !why.is_empty() { log_at(level, r, "error", &why, &rest.url()); }
     rest.give_back(ended);
 }
 
@@ -706,6 +718,11 @@ fn note(resp: &mut Response, rest: &Rest, read: usize) {
 }
 
 impl Rest {
+    /// The URL the request went to, for the error log.
+    fn url(&self) -> String {
+        self.to.as_ref().map_or_else(String::new, |(scheme, addr, uri)| format!("{scheme}://{addr}{uri}"))
+    }
+
     /// Gives the connection back for other requests, if the answer ended so that it may be.
     fn give_back(self, ended: bool) {
         if let Some((up, addr, tag)) = self.home.filter(|_| self.keep && ended) { up.put(self.conn, addr, tag); }
@@ -942,7 +959,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let streams = streams(r, &resp);
     if level.gunzip && gzipped {
         resp.vary = true;
-        if !streams { finish(&mut resp).await; }
+        if !streams { finish(&mut resp, (level, r)).await; }
         if !gzip_ok(r, level) {
             load(r, level, &mut resp);
             if streams || resp.told.is_some() { coded(&mut resp, Coder::gunzip()); } else { gunzip(&mut resp); }
@@ -975,7 +992,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         if ["etag", "last-modified"].contains(&name.to_ascii_lowercase().as_str()) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case(name)); }
         if !value.is_empty() { resp.headers.push((name.clone(), value)); }
     }
-    if !streams { finish(&mut resp).await; }
+    if !streams { finish(&mut resp, (level, r)).await; }
     // server_tokens off: the pages twinx generates give its name without the version.
     if resp.generated && !level.server_tokens {
         resp.body = String::from_utf8_lossy(&resp.body).replace(&format!("<hr><center>{NAME}</center>"), "<hr><center>twinx</center>").into_bytes();
@@ -1254,6 +1271,8 @@ async fn pass<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(strea
         biased;
         written = pass_pieces(stream, (&mut rest, &mut read, &mut passed), resp, head, &mut pace, of, ending) => written.unwrap_or_else(|| {
             if pace.sent == 0 { resp.status = 499; }
+            let action = |rest: &Rest| if rest.sizes.is_err() && pace.sent > 0 { "sending to client" } else { "reading upstream" };
+            if let Some((rest, gone)) = rest.as_ref().and_then(|rest| Some((rest, client_gone(stream, action(rest))?))) { log_at(of.0, of.1, "info", &gone, &rest.url()); }
             false
         }),
         () = halted() => false,
@@ -1264,10 +1283,10 @@ async fn pass<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(strea
 
 /// The body of a proxied answer as it is read: the rest of the answer until it has ended,
 /// how much of it was read, and what is sent of it; the buffers and the file, and whose
-/// answer it is; where is read to, and the second reading began in; whether anything came
+/// answer it is; where is read to, and how reading is paced; whether anything came
 /// since the last write, the answer has ended, a read failed, what came is malformed, and
-/// it is not buffered.
-struct Incoming<'a> { rest: &'a mut Option<Box<Rest>>, read: &'a mut usize, resp: &'a mut Response, buffers: Buffers, spool: Spool<'a>, of: (&'a Level, &'a Request), buf: Vec<u8>, start: i64, came: bool, ended: bool, failed: bool, malformed: bool, unbuffered: bool }
+/// it is not buffered; and why a read failed.
+struct Incoming<'a> { rest: &'a mut Option<Box<Rest>>, read: &'a mut usize, resp: &'a mut Response, buffers: Buffers, spool: Spool<'a>, of: (&'a Level, &'a Request), buf: Vec<u8>, intake: Intake, came: bool, ended: bool, failed: bool, malformed: bool, unbuffered: bool, why: String }
 
 impl Incoming<'_> {
     /// Reads the next into what room there is for it, waiting for it or not: whether
@@ -1275,10 +1294,10 @@ impl Incoming<'_> {
     async fn next(&mut self, waits: bool) -> bool {
         let Some(from) = self.rest.as_mut() else { return false };
         if self.buf.is_empty() { self.buf.resize(from.sizes.map_or_else(|n| n, |s| 65536.min(s.first.saturating_add(s.count.saturating_mul(s.size)))).max(1), 0); }
-        let part = self.buffers.room().min(self.buf.len());
+        let part = if self.intake.rate > 0 { self.buffers.at_once() } else { self.buffers.room() }.min(self.buf.len());
         let part = &mut self.buf[..part];
         let got = if waits {
-            read_piece(&mut from.conn.stream, part, (from.rate, self.start, *self.read), from.wait).await
+            read_piece(&mut from.conn.stream, part, (&mut self.intake, *self.read), from.wait).await
         } else {
             match read_ready(&mut from.conn.stream, part).await { Some(got) => got, None => return false }
         };
@@ -1286,6 +1305,7 @@ impl Incoming<'_> {
         self.ended = !matches!(got, Ok(1..));
         let all = got.as_ref().map_or_else(|e| self.came || e.kind() == std::io::ErrorKind::UnexpectedEof, |_| true);
         self.failed = got.is_err();
+        if let Err(e) = &got { self.why = read_failed(if self.unbuffered { "recv" } else { "readv" }, e); }
         let n = got.unwrap_or(0);
         *self.read += n;
         self.buffers.take(&part[..n]);
@@ -1316,8 +1336,26 @@ impl Incoming<'_> {
         self.resp.cut = self.buffers.cut(self.failed).then(|| Box::new(Cut { length: from.length, malformed: self.malformed, failed: None }));
         if let Some(t) = from.trailers.as_ref().filter(|_| self.resp.cut.is_none()) { t.take(&mut from.conn.stream, Some(from.wait.unwrap_or_default())).await; }
         note(self.resp, from, *self.read);
+        self.log();
         if let Some(rest) = self.rest.take() { rest.give_back(self.buffers.came() == Came::Whole { followed: false }); }
         self.buf = Vec::new();
+    }
+
+    /// Logs that the answer is cut off, and why, or that more came than it has.
+    fn log(&self) {
+        let Some(from) = self.rest.as_ref() else { return };
+        // Nothing is known of why a stream of HTTP/2 failed.
+        if from.slot.as_ref().is_some_and(|slot| slot.lock().unwrap().end == crate::h2::End::Failed) { return }
+        let (severity, msg) = match self.buffers.came() {
+            _ if self.malformed => ("error", "upstream sent invalid chunked response"),
+            Came::Whole { followed: true } if from.slot.is_none() => ("warn", if from.chunked { "upstream sent data after final chunk" } else { MORE }),
+            _ if self.resp.cut.is_none() => return,
+            _ if self.why.is_empty() => ("error", PREMATURE),
+            _ => ("error", self.why.as_str()),
+        };
+        // What came with the head is looked at with it, without buffering.
+        let with_head = self.unbuffered && *self.read == from.answer.len() - from.end && (self.malformed || severity == "warn");
+        log_at(self.of.0, self.of.1, severity, &format!("{msg} while {}", if with_head { READING_HEAD } else { "reading upstream" }), &from.url());
     }
 
     /// Reads ahead while the client is behind: waits for what comes next and takes what
@@ -1327,7 +1365,7 @@ impl Incoming<'_> {
         // That may have been dropped.
         if self.ended { self.finish().await; }
         if self.ended || self.unbuffered { std::future::pending::<()>().await; }
-        let paced = self.rest.as_ref().is_some_and(|rest| rest.rate > 0);
+        let paced = self.intake.rate > 0;
         while self.buffers.came() == Came::More && !self.ended {
             if self.buffers.room() == 0 && !self.to_file()? {
                 if self.came { break }
@@ -1350,7 +1388,7 @@ impl Incoming<'_> {
             Err(msg) => ("crit", msg),
         };
         if !severity.is_empty() {
-            let url = self.rest.as_ref().and_then(|r| r.to.as_ref()).map_or_else(String::new, |(scheme, addr, uri)| format!("{scheme}://{addr}{uri}"));
+            let url = self.rest.as_ref().map_or_else(String::new, |rest| rest.url());
             log_at(self.of.0, self.of.1, severity, &format!("{msg} while reading upstream"), &url);
         }
         if severity == "crit" { return Err(Some(false)) }
@@ -1395,10 +1433,12 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
     // Without buffering, a head that nothing came with is flushed.
     let alone = unbuffered && !came;
     *read = from.answer.len() - from.end;
+    buffers.late = rate > 0;
     buffers.take(&from.answer[from.end..]);
     let largest = level.proxy_buffer_size.max(level.proxy_buffers.1);
     let spool = Spool::new((&level.proxy_temp_path, &level.proxy_temp_levels), level.proxy_max_temp_file_size, level.proxy_temp_file_write_size.unwrap_or(2 * largest));
-    let mut incoming = Incoming { rest, read, resp, buffers, spool, of, buf: Vec::new(), start: seconds(), came, ended: false, failed: false, malformed: false, unbuffered };
+    let intake = Intake::new(rate, *read);
+    let mut incoming = Incoming { rest, read, resp, buffers, spool, of, buf: Vec::new(), intake, came, ended: false, failed: false, malformed: false, unbuffered, why: String::new() };
     // A head as large as nginx's postpone_output does not wait for the body, nor does one
     // without buffering, if nothing came with it, or one to a client of HTTP/2.
     let postponed = !matches!(stream, Stream::Pipe(_)) && head.len() < 1460 && (!unbuffered || came);
@@ -1792,12 +1832,14 @@ fn error_log(level: &Level, r: &Request, msg: &str) {
 /// logged, with the URL at the proxied server, if there is one.
 fn log_at(level: &Level, r: &Request, severity: &str, msg: &str, upstream: &str) {
     let least = crate::conf::LEVELS.iter().position(|l| *l == severity);
-    let Some((mut log, _)) = level.error_log.as_ref().filter(|l| least >= Some(l.1)).map(|l| (&*l.0, l.1)) else { return };
+    let mut logs = level.error_log.iter().filter(|l| least >= Some(l.1)).peekable();
+    if logs.peek().is_none() { return }
     let time = chrono::Local::now().format("%Y/%m/%d %H:%M:%S");
-    let host = r.host.as_ref().map(|h| format!(", host: \"{h}\"")).unwrap_or_default();
+    let host = header(r, "host").map(|h| format!(", host: \"{h}\"")).unwrap_or_default();
     let upstream = if upstream.is_empty() { String::new() } else { format!(", upstream: \"{upstream}\"") };
-    let line = format!("{time} [{severity}] {}#0: {msg}, client: {}, server: {}, request: \"{}\"{upstream}{host}\n", std::process::id(), r.peer.ip(), r.server_name, r.line);
-    let _ = log.write_all(line.as_bytes());
+    let number = if r.shared.number > 0 { format!("*{} ", r.shared.number) } else { String::new() };
+    let line = format!("{time} [{severity}] {}#0: {number}{msg}, client: {}, server: {}, request: \"{}\"{upstream}{host}\n", std::process::id(), r.peer.ip(), r.server_name, r.line);
+    logs.for_each(|l| { let _ = (&*l.0).write_all(line.as_bytes()); });
 }
 
 /// Serves the file at a path, or redirects to the directory there. Nothing of the file
@@ -1957,7 +1999,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let name = ((level.proxy_ssl_verify || level.proxy_ssl_server_name) && p.ssl).then(|| ssl_name(&level.proxy_ssl_name.as_ref().map_or_else(|| host.clone(), |t| t.render(r, &sent))).to_string());
     // What tells the location from others in the cache of connections: its settings live as long as the worker.
     let tag = level as *const Level as usize;
-    while let Some(i) = up.pick(&mut tried) {
+    let url = |peer: &dyn std::fmt::Display, uri: &str| format!("{}://{peer}{uri}", if p.ssl { "https" } else { "http" });
+    loop {
+        let Some(i) = up.pick(&mut tried) else { log_at(level, r, "error", "no live upstreams while connecting to upstream", &url(&host, &uri)); break };
         let addr = up.peers[i].addr;
         addrs.push(addr.to_string());
         // A kept connection is used wherever it was bound, as in nginx.
@@ -1995,24 +2039,37 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let slot = crate::h2::Slot::default();
         let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c.stream, theirs, if p.ssl { "https" } else { "http" }, level.proxy_buffer_size, slot.clone())); Conn::new(Stream::Pipe(ours.into()), connecting) } else { c });
         let begun = conn.is_ok();
-        // A kept connection whose handshake fails counts as closed, as in nginx; one that times out does not.
-        let mut closed = matches!(conn, Err(None));
-        let mut kept;
-        (answer, kept) = match conn {
+        let mut fetched = match conn {
             Ok(conn) => {
                 time[0] = Some(connecting.elapsed().as_millis());
-                let fetched = fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints)).await;
-                closed = matches!(fetched, Err(NoAnswer::Closed));
-                // A head that does not come in time is a timeout.
-                if matches!(fetched, Err(NoAnswer::TimedOut)) { (Some(special(504)), None) } else { fetched.ok().unzip() }
+                fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints)).await
             }
-            Err(resp) => (resp, None),
+            Err(e) => Err(e),
         };
-        // Over HTTP/2, what fails the stream before the head makes the answer invalid.
-        let failure = if slot.lock().unwrap().end == crate::h2::End::Failed { "invalid_header" } else { "error" };
         // proxy_pass_trailers: those of an answer without a body are taken now.
         let trailers = (level.proxy_pass_trailers && level.proxy_h2).then(|| Trailers { slot: slot.clone(), hide: level.proxy_hide_header.clone(), to: r.shared.clone() });
-        if let (Some(t), Some(Some(c))) = (&trailers, kept.as_mut()) { t.take(&mut c.stream, Some(level.proxy_read_timeout)).await; }
+        if let (Some(t), Ok((_, Some(c)))) = (&trailers, &mut fetched) { t.take(&mut c.stream, Some(level.proxy_read_timeout)).await; }
+        // A kept connection whose handshake fails counts as closed, as in nginx; one that times out does not.
+        let closed = matches!(fetched, Err(NoAnswer::Closed(_)));
+        // Over HTTP/2, what fails the stream before the head makes the answer invalid.
+        let failure = if slot.lock().unwrap().end == crate::h2::End::Failed { "invalid_header" } else { "error" };
+        let (mut kept, mut why) = (None, String::new());
+        answer = match fetched {
+            Ok((resp, conn)) => { kept = Some(conn); Some(resp) }
+            Err(NoAnswer::Gone(gone)) => {
+                if !gone.is_empty() { log_at(level, r, "info", &gone, &url(&addr, &uri)); }
+                Some(Response { status: 499, ..Response::default() })
+            }
+            // A head that does not come in time, or a connection that is not made, is a timeout.
+            Err(NoAnswer::TimedOut(action)) => { why = format!("{TIMED_OUT} while {action}"); Some(special(504)) }
+            Err(NoAnswer::Closed(msg) | NoAnswer::Other(msg)) => { why = msg; None }
+        };
+        // Nothing is known of why a stream of HTTP/2 failed.
+        if !why.is_empty() && failure == "error" { log_at(level, r, "error", &why, &url(&addr, &uri)); }
+        // More than the head of an answer without a body.
+        if counted[0] > 0 && r.method != "HEAD" && answer.as_ref().is_some_and(|a| a.rest.is_none() && !a.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect"))) {
+            log_at(level, r, "warn", &format!("{MORE} while {}", if level.proxy_buffering { "reading upstream" } else { READING_HEAD }), &url(&addr, &uri));
+        }
         time[2] = Some(start.elapsed().as_millis());
         times.push(time);
         bytes.push(counted);
@@ -2037,7 +2094,10 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             (rest.started, rest.trailers, rest.to) = (start, trailers, Some((if p.ssl { "https" } else { "http" }, addr, std::mem::take(&mut uri))));
             if level.proxy_h2 { rest.slot = Some(slot); } else { rest.home = Some((up.clone(), addr, tag)); }
         }
-        up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404)));
+        if up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404))) {
+            let action = why.rsplit_once(" while ").map_or(READING_HEAD, |w| w.1);
+            log_at(level, r, "warn", &format!("upstream server temporarily disabled while {action}"), &url(&addr, &uri));
+        }
         if !again || tries == 0 { break; }
         answer = None;
     }
@@ -2178,37 +2238,96 @@ fn ssl_name(name: &str) -> &str {
 }
 
 /// Opens a TCP connection to a proxied server, from the bound socket if one is given.
-/// The error is what answers the request instead, if anything does: a connection that
-/// is not made within proxy_connect_timeout is a timeout, answered with 504.
-async fn connect(peer: &SocketAddr, socket: Option<socket2::Socket>, level: &Level) -> Result<TcpStream, Option<Response>> {
+/// A connection that is not made within proxy_connect_timeout is a timeout, answered with 504.
+async fn connect(peer: &SocketAddr, socket: Option<socket2::Socket>, level: &Level) -> Result<TcpStream, NoAnswer> {
+    // It takes a number, as in nginx.
+    number();
     let connect = async {
         match socket {
             Some(socket) => { socket.set_nonblocking(true)?; tokio::net::TcpSocket::from_std_stream(socket.into()).connect(*peer).await }
             None => TcpStream::connect(peer).await,
         }
     };
-    tokio::time::timeout(level.proxy_connect_timeout, connect).await.map_err(|_| Some(special(504)))?.map_err(|_: std::io::Error| None)
+    tokio::time::timeout(level.proxy_connect_timeout, connect).await.map_err(|_| NoAnswer::TimedOut(CONNECTING))?.map_err(|e: std::io::Error| {
+        // Those connect() gives at once, not once the connection is made.
+        let to = if matches!(e.raw_os_error(), Some(libc::ENETUNREACH | libc::EADDRNOTAVAIL)) { format!(" to {peer}") } else { String::new() };
+        NoAnswer::Closed(format!("connect(){to} failed {} while {CONNECTING}", os_error(&e)))
+    })
 }
 
 /// Makes the TLS handshake of proxy_pass https:// on a TCP connection; one over
-/// TLS stays as it is. The error is what answers the request instead, if anything
-/// does: a handshake that does not end within proxy_connect_timeout is a timeout,
-/// answered with 504.
-async fn secure(mut conn: Conn, peer: &SocketAddr, (tls, name): (&Arc<rustls::ClientConfig>, Option<&str>), level: &Level) -> Result<Conn, Option<Response>> {
+/// TLS stays as it is. A handshake that does not end within proxy_connect_timeout is a
+/// timeout, answered with 504.
+async fn secure(mut conn: Conn, peer: &SocketAddr, (tls, name): (&Arc<rustls::ClientConfig>, Option<&str>), level: &Level) -> Result<Conn, NoAnswer> {
+    use std::io::ErrorKind::{UnexpectedEof, WouldBlock};
     if let Stream::Tcp(s) = conn.stream {
-        conn.stream = match crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls).await { Ok(s) => s, Err(e) => return Err((e.kind() == std::io::ErrorKind::WouldBlock).then(|| special(504))) };
+        conn.stream = crate::tls::connect(s, (peer.ip(), name), level.proxy_connect_timeout, tls).await.map_err(|e| match e.kind() {
+            WouldBlock => NoAnswer::TimedOut(HANDSHAKING),
+            UnexpectedEof => NoAnswer::Closed(format!("peer closed connection in SSL handshake while {HANDSHAKING}")),
+            _ if e.raw_os_error().is_some() => NoAnswer::Closed(format!("peer closed connection in SSL handshake {} while {HANDSHAKING}", os_error(&e))),
+            _ => NoAnswer::Closed(format!("SSL_do_handshake() failed (SSL: {e}) while {HANDSHAKING}")),
+        })?;
     }
     Ok(conn)
 }
 
-/// Why there is no answer of a proxied server.
+/// Why there is no answer of a proxied server, as it is logged, if it is not empty.
 enum NoAnswer {
     /// The connection failed or was closed before the whole head came.
-    Closed,
-    /// The answer's head did not come in time.
-    TimedOut,
+    Closed(String),
+    /// What was done when the time for it had passed.
+    TimedOut(&'static str),
+    /// The client has gone, or the worker's time to shut down has passed.
+    Gone(String),
     /// The answer's head is invalid, or the request's body could not be passed.
-    Other,
+    Other(String),
+}
+
+const CONNECTING: &str = "connecting to upstream";
+const HANDSHAKING: &str = "SSL handshaking to upstream";
+const READING_HEAD: &str = "reading response header from upstream";
+const TIMED_OUT: &str = "upstream timed out (110: Connection timed out)";
+const PREMATURE: &str = "upstream prematurely closed connection";
+const MORE: &str = "upstream sent more data than specified in \"Content-Length\" header";
+
+/// Why reading an answer failed: an end of TLS without its alert is an end.
+fn read_failed(call: &str, e: &std::io::Error) -> String {
+    match (e.raw_os_error(), e.kind()) {
+        (Some(_), _) => format!("{call}() failed {}", os_error(e)),
+        (None, std::io::ErrorKind::TimedOut) => TIMED_OUT.to_string(),
+        (None, std::io::ErrorKind::UnexpectedEof) => PREMATURE.to_string(),
+        (None, _) => format!("SSL_read() failed (SSL: {e})"),
+    }
+}
+
+/// What is logged of a client that went away meanwhile; not of one of HTTP/2.
+fn client_gone(client: &Stream, action: &str) -> Option<String> {
+    let error = client.tcp()?.take_error().ok().flatten().map_or_else(String::new, |e| format!(" {}", os_error(&e)));
+    Some(format!("epoll_wait() reported that client prematurely closed connection, so upstream connection is closed too{error} while {action}"))
+}
+
+/// What is invalid in a header line of an answer: what there is of it up to the first
+/// character that may not be there.
+fn invalid_header(line: &str) -> String {
+    let name = line.find(':').unwrap_or(line.len());
+    let at = line.bytes().enumerate().position(|(i, c)| if i < name { c <= 0x20 || c == 0x7f } else { name == 0 || i > name && matches!(c, 0 | b'\r') }).unwrap_or(0);
+    format!("upstream sent invalid header: \"{}\\x{:02x}...\"", &line[..at], line.as_bytes().get(at).unwrap_or(&0))
+}
+
+/// What is invalid in the headers of an answer that tell its body's length.
+fn invalid_length(headers: &[(String, String)]) -> String {
+    let (mut length, mut coding): (Option<&(String, String)>, Option<&(String, String)>) = (None, None);
+    for h in headers {
+        let is_length = h.0.eq_ignore_ascii_case("content-length");
+        if !is_length && !h.0.eq_ignore_ascii_case("transfer-encoding") { continue }
+        let (same, other) = if is_length { (&mut length, coding) } else { (&mut coding, length) };
+        if let Some(before) = same { return format!("upstream sent duplicate header line: \"{}: {}\", previous value: \"{}: {}\"", h.0, h.1, before.0, before.1) }
+        if other.is_some() { return "upstream sent \"Content-Length\" and \"Transfer-Encoding\" headers at the same time".to_string() }
+        if is_length && h.1.parse::<usize>().is_err() { return format!("upstream sent invalid \"Content-Length\" header: \"{}: {}\"", h.0, h.1) }
+        if !is_length && !h.1.eq_ignore_ascii_case("chunked") { return format!("upstream sent unknown \"Transfer-Encoding\": \"{}\"", h.1) }
+        *same = Some(h);
+    }
+    String::new()
 }
 
 /// Sends a request to a proxied server and reads the head of its answer; the
@@ -2217,35 +2336,44 @@ enum NoAnswer {
 /// server does not close it, and nothing came after the head.
 #[allow(clippy::too_many_arguments)]
 async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, (upgrade, hints): (bool, bool)) -> Result<(Response, Option<Conn>), NoAnswer> {
-    use NoAnswer::{Closed, Other, TimedOut};
+    use NoAnswer::{Closed, Gone, Other, TimedOut};
+    let invalid = |msg: &str| Other(format!("{msg} while {READING_HEAD}"));
     let s = &mut conn.stream;
     // proxy_read_timeout: how long each read may wait.
     let wait = Some(level.proxy_read_timeout).filter(|t| !t.is_zero());
     let (mut answer, mut chunk) = (Vec::new(), vec![0u8; 4096]);
-    if !write_all(s, req, None).await { return Err(Closed) }
+    let wrote = async { tokio::io::AsyncWriteExt::write_all(s, req).await?; tokio::io::AsyncWriteExt::flush(s).await }.await;
+    wrote.map_err(|e| Closed(format!("writev() failed {} while sending request to upstream", os_error(&e))))?;
     bytes[2] = req.len() as u64;
     // The rest of a body that is not buffered goes on as the client sends it.
-    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other)?, max, s).await.ok_or(Other)?; }
+    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other(String::new()))?, max, s).await.ok_or(Other(String::new()))?; }
     let (head, end, status) = loop {
         // A head that does not fit in proxy_buffer_size is too big: the answer is invalid.
         let end = loop {
             let buf = &answer[..answer.len().min(level.proxy_buffer_size)];
             if let Some(end) = line_end(buf).and_then(|at| lines_end(buf, at)) { break end; }
-            if answer.len() >= level.proxy_buffer_size { return Err(Other); }
+            if answer.len() >= level.proxy_buffer_size { return Err(invalid("upstream sent too big header")); }
             let closed = async { match client.as_deref() { Some(c) => crate::stream::gone(c).await, None => std::future::pending().await } };
             // So does the worker_shutdown_timeout of a worker shutting down.
-            let closed = async { tokio::select! { () = closed => {} () = halted() => {} } };
+            let closed = async { tokio::select! { () = closed => true, () = halted() => false } };
             let n = tokio::select! {
                 biased;
-                () = closed => return Ok((Response { status: 499, ..Response::default() }, None)),
-                n = within(wait, s.read(&mut chunk)) => n.ok_or(TimedOut)?.ok().filter(|n| *n > 0).ok_or(Closed)?,
+                gone = closed => {
+                    let action = if answer.is_empty() { "sending request to upstream" } else { READING_HEAD };
+                    return Err(Gone(client.as_deref().filter(|_| gone).and_then(|c| client_gone(c, action)).unwrap_or_default()))
+                }
+                n = within(wait, s.read(&mut chunk)) => match n.ok_or(TimedOut(READING_HEAD))? {
+                    Ok(0) => return Err(Closed(format!("{PREMATURE} while {READING_HEAD}"))),
+                    Ok(n) => n,
+                    Err(e) => return Err(Closed(format!("{} while {READING_HEAD}", read_failed("recv", &e)))),
+                },
             };
             answer.extend_from_slice(&chunk[..n]);
             bytes[1] = answer.len() as u64;
         };
         let head = crate::vars::text(&answer[..end]);
         let first = head.split('\n').next().unwrap_or_default();
-        let status: u16 = first.strip_prefix("HTTP/1.").and_then(|f| f.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()).ok_or(Other)?;
+        let status: u16 = first.strip_prefix("HTTP/1.").and_then(|f| f.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()).ok_or_else(|| invalid("upstream sent no valid HTTP/1.0 header"))?;
         if status != 103 { break (head, end, status) }
         // Early hints go to the client, with the headers of the answer that are
         // not hidden, when early_hints lets them and it has any; the answer comes after.
@@ -2262,7 +2390,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let mut resp = Response { status, proxied: true, ..Response::default() };
     const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
     for line in lines {
-        let (name, value) = upstream_header(line).ok_or(Other)?;
+        let (name, value) = upstream_header(line).ok_or_else(|| invalid(&invalid_header(line)))?;
         let (lower, value) = (name.to_ascii_lowercase(), value.to_string());
         resp.upstream.push((name.to_string(), value.clone()));
         if lower == "content-type" { resp.ctype = Some(value.into()); continue; }
@@ -2278,9 +2406,9 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let values = |name: &str| resp.upstream.iter().filter(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone()).collect::<Vec<_>>();
     let (length, chunked) = match (&values("content-length")[..], &values("transfer-encoding")[..]) {
         ([], []) => (None, false),
-        ([l], []) => (Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten().ok_or(Other)?), false),
+        ([l], []) => (Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten().ok_or_else(|| invalid(&invalid_length(&resp.upstream)))?), false),
         ([], [c]) if c.eq_ignore_ascii_case("chunked") => (None, true),
-        _ => return Err(Other),
+        _ => return Err(invalid(&invalid_length(&resp.upstream))),
     };
     // The body of an answer that redirects with X-Accel-Redirect is not read.
     let accel = resp.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect"));
@@ -2328,21 +2456,29 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// lines, where the body ends for nginx. With a rate it is read as ngx_event_pipe_read_upstream()
 /// paces proxy_limit_rate: by the end of each second since the body started
 /// (counted in whole seconds of the clock) up to the rate for each second has
-/// been read, and when that much has, it waits for the time it is worth.
+/// been read, and when that much has, it waits for the time it is worth, as it
+/// does after each read for what that read is worth.
 /// Returns the body, with what came of the chunk it is cut off in, the bytes read
 /// after the head, whether they end where the body does, and the cut, when
 /// the server closed the connection before the body's end, or a read failed or
 /// waited longer than the time, or the chunks are malformed. Over HTTP/2, the slot
 /// says whether the connection's end is the body's; the frames that fail an answer
-/// before any of the body are as malformed chunks.
-async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>, slot: Option<&crate::h2::Slot>) -> (Vec<u8>, usize, bool, Option<Box<Cut>>) {
-    let (start, mut chunk, mut failed, mut malformed) = (seconds(), vec![0u8; 4096], false, false);
+/// before any of the body are as malformed chunks. Last is what is logged of the cut.
+async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>, slot: Option<&crate::h2::Slot>) -> (Vec<u8>, usize, bool, Option<Box<Cut>>, String) {
+    let (mut intake, mut chunk, mut failed, mut malformed, mut why) = (Intake::new(rate, after.len()), vec![0u8; 4096], false, false, PREMATURE.to_string());
     let (mut body, mut data, mut read) = (Body::new(length.map(|n| n as u64), chunked), Vec::new(), after.len());
     let mut came = body.take(after, &mut data);
     while came == Came::More {
-        let Ok(n) = read_piece(s, &mut chunk, (rate, start, read), wait).await else { failed = true; break };
+        let n = match read_piece(s, &mut chunk, (&mut intake, read), wait).await {
+            Ok(n) => n,
+            Err(e) => { (failed, why) = (true, read_failed("readv", &e)); break }
+        };
         if n == 0 {
-            if let Some(slot) = slot { (failed, malformed) = ended_over_h2(slot); }
+            if let Some(slot) = slot {
+                (failed, malformed) = ended_over_h2(slot);
+                // Nothing is known of why a stream of HTTP/2 failed.
+                if malformed { why.clear(); }
+            }
             malformed &= data.is_empty();
             break;
         }
@@ -2350,21 +2486,49 @@ async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked:
         came = body.take(&chunk[..n], &mut data);
     }
     let cut = body.cut(failed).then(|| Box::new(Cut { length, malformed: malformed || came == Came::Malformed, failed: None }));
-    (data, read, came == Came::Whole { followed: false }, cut)
+    if came == Came::Malformed { why = "upstream sent invalid chunked response".to_string(); }
+    let why = if cut.is_none() || why.is_empty() { String::new() } else { format!("{why} while reading upstream") };
+    (data, read, came == Came::Whole { followed: false }, cut, why)
 }
 
-/// Reads a piece of a proxied answer's body into the buffer, at the rate from the second
-/// the body started in, with so much of it read before; an error when the read fails or
-/// waits longer than the time.
-async fn read_piece(s: &mut Stream, buf: &mut [u8], (rate, start, read): (u64, i64, usize), wait: Option<Duration>) -> std::io::Result<usize> {
-    let rate = rate as i64;
-    let limit = loop {
-        let limit = if rate == 0 { buf.len() as i64 } else { rate * (seconds() - start + 1) - read as i64 };
-        if limit > 0 { break limit as usize }
-        tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await;
-    };
-    let limit = limit.min(buf.len());
-    within(wait, s.read(&mut buf[..limit])).await.unwrap_or_else(|| Err(std::io::ErrorKind::TimedOut.into()))
+/// How the reads of an answer's body are paced (proxy_limit_rate): the rate, the second
+/// the body started in, and when the next read may be.
+struct Intake { rate: i64, start: i64, until: Option<Instant> }
+
+impl Intake {
+    /// At the rate, with so much read with the head.
+    fn new(rate: u64, read: usize) -> Intake {
+        let mut intake = Intake { rate: rate as i64, start: if rate == 0 { 0 } else { seconds() }, until: None };
+        intake.took(read);
+        intake
+    }
+
+    /// Nothing is read for the time what was read is worth.
+    fn took(&mut self, n: usize) {
+        let delay = if self.rate == 0 { 0 } else { (n as i64).saturating_mul(1000) / self.rate };
+        if delay > 0 { self.until = Some(Instant::now() + Duration::from_millis(delay as u64)); }
+    }
+
+    /// How much may be read, with so much read before, once any may. When this is dropped,
+    /// the time goes on.
+    async fn limit(&mut self, read: usize) -> usize {
+        if self.rate == 0 { return usize::MAX }
+        loop {
+            if let Some(until) = self.until { tokio::time::sleep_until(until.into()).await; }
+            let limit = self.rate.saturating_mul(seconds() - self.start + 1) - read as i64;
+            self.until = (limit <= 0).then(|| Instant::now() + Duration::from_millis((-limit * 1000 / self.rate + 1) as u64));
+            if limit > 0 { return limit as usize }
+        }
+    }
+}
+
+/// Reads a piece of a proxied answer's body into the buffer, as it is paced, with so much
+/// of it read before; an error when the read fails or waits longer than the time.
+async fn read_piece(s: &mut Stream, buf: &mut [u8], (intake, read): (&mut Intake, usize), wait: Option<Duration>) -> std::io::Result<usize> {
+    let limit = intake.limit(read).await.min(buf.len());
+    let got = within(wait, s.read(&mut buf[..limit])).await.unwrap_or_else(|| Err(std::io::ErrorKind::TimedOut.into()));
+    if let Ok(n) = got { intake.took(n); }
+    got
 }
 
 /// Whether an answer over HTTP/2 whose connection has ended is cut off, and whether a
@@ -2696,7 +2860,7 @@ pub(crate) mod tests {
             let Stream::Tcp(stream) = pair().await.0 else { unreachable!() };
             let addr = "127.0.0.1:80".parse().unwrap();
             // Not counted in BUSY, which another test waits for, so not dropped either.
-            let future = std::mem::ManuallyDrop::new(serving(Arc::new(config), stream, false, (addr, addr, addr), Busy));
+            let future = std::mem::ManuallyDrop::new(serving(Arc::new(config), stream, false, (addr, addr, (addr, 0)), Busy));
             let size = size_of_val(&future);
             assert!(size < 4096, "{size} bytes");
         });
@@ -2773,7 +2937,7 @@ pub(crate) mod tests {
         let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let (Stream::Tcp(stream), client) = pair().await else { unreachable!() };
         let addr = "127.0.0.1:80".parse().unwrap();
-        (client, tokio::task::spawn_local(serving(Arc::new(config), stream, false, (addr, addr, addr), Busy::new())))
+        (client, tokio::task::spawn_local(serving(Arc::new(config), stream, false, (addr, addr, (addr, 0)), Busy::new())))
     }
 
     #[test]
@@ -3142,7 +3306,7 @@ pub(crate) mod tests {
         let resp = block_on(async {
             let mut resp = fetched(&addr, None, &level, (&mut time, &mut bytes), &|_| 0).await.unwrap();
             resp.upstream_bytes = Some(vec![bytes]);
-            finish(&mut resp).await;
+            finish(&mut resp, (&Level::default(), &request("GET / HTTP/1.1\n\n").1)).await;
             resp
         });
         assert!(time[0].is_some() && time[1].is_some());
@@ -3277,12 +3441,13 @@ pub(crate) mod tests {
         block_on(async {
             let mut resp = fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &rate).await.unwrap();
             // The body is read after the head, 4000 bytes (what came with the head too)
-            // in each second of the clock: it ends in the third second.
+            // in each second of the clock, and nothing for the time they are worth after
+            // each read: the last at most 4096 of them.
             assert!(resp.body.is_empty() && resp.rest.is_some());
             resp.upstream_time = Some(vec![[None; 3]]);
             let started = Instant::now();
-            finish(&mut resp).await;
-            assert!(started.elapsed() >= Duration::from_millis(900));
+            finish(&mut resp, (&Level::default(), &request("GET / HTTP/1.1\n\n").1)).await;
+            assert!(started.elapsed() >= Duration::from_millis(1900));
             assert_eq!((resp.body.len(), resp.rest.is_none()), (12000, true));
             assert!(resp.upstream_time.unwrap()[0][2].is_some());
         });
@@ -3894,6 +4059,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reads_are_paced_by_the_time_they_are_worth() {
+        let _busy = serving_on();
+        // All of it is there at once, in buffers of 4096 bytes, of which the last is read
+        // after the time of those before it. It goes on while the client is behind.
+        let data = "x".repeat(9000);
+        let length = LENGTH.replace("30000", "9000") + &data;
+        let chunks = CHUNKED.to_string() + &chunk_of(&data) + "0\r\n\r\n";
+        for (answer, directives) in [(&length, ""), (&chunks, ""), (&length, "limit_rate 100k;"), (&length, "limit_rate 10000; limit_rate_after 1000;")] {
+            let (addr, _count) = plays(&vec![(0, answer.clone().into_bytes())], false);
+            let got = block_on(arrivals(&passing(addr, &format!("proxy_limit_rate 10000; {directives}")), HTTP11));
+            let all = got.iter().map(|g| g.1.as_str()).collect::<String>();
+            assert!(all.matches('x').count() >= 9000 && got[0].1.matches('x').count() <= 4096 && got.last().unwrap().0 >= 450, "{directives} {:?}", got.iter().map(|g| (g.0, g.1.len())).collect::<Vec<_>>());
+        }
+        // Nothing is waited for before the first read, and for nothing.
+        block_on(async {
+            let mut intake = Intake::new(1000, 0);
+            let started = Instant::now();
+            assert!(intake.limit(0).await >= 1000);
+            intake.took(0);
+            assert!(intake.limit(0).await >= 1000 && Intake::new(0, 5000).limit(5000).await == usize::MAX);
+            intake.took(100);
+            // When it is dropped, the time goes on.
+            assert!(within(Some(Duration::from_millis(1)), intake.limit(100)).await.is_none() && intake.until.is_some());
+            intake.limit(100).await;
+            assert!(started.elapsed() >= Duration::from_millis(100));
+        });
+    }
+
+    #[test]
     fn clients_may_go_away_at_any_point() {
         let _busy = serving_on();
         let log = log_path("gone");
@@ -4132,6 +4326,136 @@ pub(crate) mod tests {
         std::fs::remove_file(&dir).unwrap();
     }
 
+    /// The lines of an error log, without the time and the process, and from the client on.
+    fn messages(log: &std::path::Path) -> Vec<String> {
+        logged(log).lines().map(|l| {
+            let (level, msg) = (l.split(['[', ']']).nth(1).unwrap(), l.split_once("#0: ").unwrap().1);
+            format!("{level} {}", msg.split(", client: 127.0.0.1, server: ").next().unwrap())
+        }).collect()
+    }
+
+    #[test]
+    fn failures_of_servers_are_logged() {
+        let _busy = serving_on();
+        let errors = log_path("failures");
+        const HEAD: &str = "HTTP/1.1 200 OK\r\n";
+        let head = |headers: &str| format!("{HEAD}{headers}\r\n\r\n");
+        // As nginx logs them: at most one line of each.
+        for (pieces, directives, want) in [
+            (vec![], "", "error upstream prematurely closed connection while reading response header from upstream"),
+            (vec![HEAD.to_string()], "", "error upstream prematurely closed connection while reading response header from upstream"),
+            (vec![head(&format!("X: {}", "a".repeat(5000)))], "", "error upstream sent too big header while reading response header from upstream"),
+            (vec![head(" Bad: x")], "", "error upstream sent invalid header: \"\\x20...\" while reading response header from upstream"),
+            (vec![head("Good: x\r\nB\u{1}d: x")], "", "error upstream sent invalid header: \"B\\x01...\" while reading response header from upstream"),
+            (vec![head("X: a\0b")], "", "error upstream sent invalid header: \"X: a\\x00...\" while reading response header from upstream"),
+            (vec!["HTTP/1.1 abc\r\n\r\n".to_string()], "", "error upstream sent no valid HTTP/1.0 header while reading response header from upstream"),
+            (vec![head("Content-Length: 5\r\ncontent-length: 6")], "", "error upstream sent duplicate header line: \"content-length: 6\", previous value: \"Content-Length: 5\" while reading response header from upstream"),
+            (vec![head("Transfer-Encoding: chunked\r\nContent-Length: 5")], "", "error upstream sent \"Content-Length\" and \"Transfer-Encoding\" headers at the same time while reading response header from upstream"),
+            (vec![head("Content-Length: 5x")], "", "error upstream sent invalid \"Content-Length\" header: \"Content-Length: 5x\" while reading response header from upstream"),
+            (vec![head("Transfer-Encoding: gzip")], "", "error upstream sent unknown \"Transfer-Encoding\": \"gzip\" while reading response header from upstream"),
+            (vec![head("Content-Length: 10"), "ab".to_string()], "", "error upstream prematurely closed connection while reading upstream"),
+            (vec![head("Content-Length: 10"), "ab".to_string()], OFF, "error upstream prematurely closed connection while reading upstream"),
+            (vec![CHUNKED.to_string(), chunk_of("ab")], "proxy_limit_rate 1m;", "error upstream prematurely closed connection while reading upstream"),
+            (vec![CHUNKED.to_string() + "zz\r\n"], "", "error upstream sent invalid chunked response while reading upstream"),
+            (vec![CHUNKED.to_string() + "zz\r\n"], OFF, "error upstream sent invalid chunked response while reading response header from upstream"),
+            (vec![CHUNKED.to_string(), chunk_of("ab"), "zz\r\n".to_string()], OFF, "error upstream sent invalid chunked response while reading upstream"),
+            (vec![head("Content-Length: 2") + "abc"], "", "warn upstream sent more data than specified in \"Content-Length\" header while reading upstream"),
+            (vec![head("Content-Length: 2") + "abc"], OFF, "warn upstream sent more data than specified in \"Content-Length\" header while reading response header from upstream"),
+            (vec![head("Content-Length: 0") + "abc"], "", "warn upstream sent more data than specified in \"Content-Length\" header while reading upstream"),
+            (vec![CHUNKED.to_string() + &chunk_of("ab") + "0\r\n\r\nx"], "", "warn upstream sent data after final chunk while reading upstream"),
+            (vec![head("Content-Length: 2") + "ab"], "", ""),
+            (vec![head("Content-Length: 2") + "ab"], OFF, ""),
+            (vec![CHUNKED.to_string() + &chunk_of("ab") + "0\r\n\r\n"], "", ""),
+            (vec!["HTTP/1.1 204 No Content\r\n\r\n".to_string()], "", ""),
+        ] {
+            // The pieces after the first come once that has been taken.
+            let pieces = pieces.into_iter().enumerate().map(|(i, p)| (if i > 0 { 60 } else { 0 }, p.into_bytes())).collect();
+            let (addr, count) = plays(&pieces, true);
+            block_on(arrivals(&passing(addr, &format!("{directives} error_log {} info;", errors.display())), HTTP11));
+            let got = messages(&errors);
+            assert_eq!(got, if want.is_empty() { vec![] } else { vec![want.to_string()] }, "{pieces:?} {directives}");
+            assert_eq!(count.lock().unwrap()[0], 1);
+        }
+        // With the URL at the server.
+        let (addr, _count) = plays(&vec![], true);
+        block_on(arrivals(&passing(addr, &format!("error_log {};", errors.display())), "GET /a?b HTTP/1.0\r\nHost: h:81\r\n\r\n"));
+        let text = logged(&errors);
+        assert!(text.ends_with(&format!(", client: 127.0.0.1, server: , request: \"GET /a?b HTTP/1.0\", upstream: \"http://{addr}/a?b\", host: \"h:81\"\n")), "{text}");
+    }
+
+    #[test]
+    fn failures_to_reach_servers_are_logged() {
+        let _busy = serving_on();
+        let errors = log_path("unreached");
+        // Nothing listens on these, and nothing else takes their ports.
+        let bound = [(); 2].map(|_| socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap());
+        let [a, b] = [0, 1].map(|i| {
+            bound[i].bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
+            bound[i].local_addr().unwrap().as_socket().unwrap()
+        });
+        let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{}", "x".repeat(10));
+        let ((silent, _one), (resets, _two), (late, _three)) = (failing("", false), failing("", true), failing(&answer, false));
+        let refused = "error connect() failed (111: Connection refused) while connecting to upstream";
+        let disabled = "warn upstream server temporarily disabled while connecting to upstream";
+        for (servers, want) in [
+            (format!("server {a};"), vec![refused]),
+            (format!("server {a}; server {b};"), vec![refused, disabled, refused, disabled]),
+            (format!("server {a} max_fails=0; server {b} max_fails=0;"), vec![refused, refused]),
+            (format!("server {a} down;"), vec!["error no live upstreams while connecting to upstream"]),
+            (format!("server {silent};"), vec!["error upstream timed out (110: Connection timed out) while reading response header from upstream"]),
+            (format!("server {resets};"), vec!["error recv() failed (104: Connection reset by peer) while reading response header from upstream"]),
+            (format!("server {late};"), vec!["error upstream timed out (110: Connection timed out) while reading upstream"]),
+        ] {
+            let http = format!("upstream u {{ {servers} }} server {{ proxy_read_timeout 1s; location / {{ proxy_pass http://u/x/; error_log {} warn; }} }}", errors.display());
+            block_on(arrivals(&http, HTTP11));
+            let text = std::fs::read_to_string(&errors).unwrap();
+            if want[0].contains("no live") { assert!(text.contains(", upstream: \"http://u/x/\", host: "), "{text}"); }
+            assert_eq!(messages(&errors), want, "{servers}");
+        }
+    }
+
+    #[test]
+    fn clients_that_go_away_are_logged() {
+        let _busy = serving_on();
+        let errors = log_path("gone-errors");
+        let gone = "info epoll_wait() reported that client prematurely closed connection, so upstream connection is closed too while ";
+        let answer = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+        for (answer, action) in [("", "sending request to upstream"), ("HTTP/1.1", "reading response header from upstream"), (answer, "reading upstream")] {
+            let (addr, _count) = failing(answer, false);
+            block_on(async {
+                let (mut client, task) = served_by(&passing(addr, &format!("error_log {} info;", errors.display()))).await;
+                client.write_all(HTTP11.as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(client);
+                within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
+            });
+            assert_eq!(messages(&errors), [format!("{gone}{action}")]);
+        }
+    }
+
+    #[test]
+    fn connections_have_numbers_in_the_log() {
+        let _busy = serving_on();
+        let errors = log_path("numbers");
+        let (addr, _count) = plays(&vec![], true);
+        let text = format!("http {{ error_log {}; server {{ location / {{ proxy_pass http://{addr}; }} }} }}", errors.display());
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let to = listener.local_addr().unwrap();
+            let tasks = accept(config, &[(listener, to)]).unwrap();
+            // The connection to the server is the second one, that to it for the next the fourth.
+            for _ in 0..2 {
+                let mut client = tokio::net::TcpStream::connect(to).await.unwrap();
+                client.write_all(HTTP11.as_bytes()).await.unwrap();
+                let _ = within(Some(Duration::from_secs(2)), client.read_to_end(&mut Vec::new())).await.unwrap();
+            }
+            tasks.iter().for_each(JoinHandle::abort);
+        });
+        let failed = "upstream prematurely closed connection while reading response header from upstream";
+        assert_eq!(messages(&errors), [1, 3].map(|n| format!("error *{n} {failed}")));
+    }
+
     #[test]
     fn clients_that_are_behind_may_go_away() {
         let _busy = serving_on();
@@ -4361,7 +4685,8 @@ pub(crate) mod tests {
             let start = if got.is_empty() { 0 } else { head_end(&got).unwrap() };
             let line = logged(&log);
             assert!(line.starts_with(&format!("200 {} {} 200 ", got.len() - start, got.len())), "{line}");
-            let line = logged(&errors);
+            // Besides how the server failed.
+            let line = logged(&errors).lines().filter(|l| !l.contains(" while reading upstream")).collect::<String>();
             assert!(if error.is_empty() { line.is_empty() } else { line.contains(&format!(": {error}, client: ")) }, "{directives} {line}");
             assert_eq!(count.lock().unwrap()[0], 1);
         }
@@ -4695,7 +5020,7 @@ pub(crate) mod tests {
                 up.keepalive = Some(Default::default());
                 let up = Arc::new(up);
                 if let Some(rest) = &mut resp.rest { rest.home = Some((up.clone(), addr, 0)); }
-                finish(&mut resp).await;
+                finish(&mut resp, (&Level::default(), &request("GET / HTTP/1.1\n\n").1)).await;
                 Some(conn.is_some() || up.take(&addr, 0).is_some())
             }).unwrap();
             assert_eq!(back, kept, "{method} {answer}");
@@ -4752,7 +5077,7 @@ pub(crate) mod tests {
                 let found = located(&config.servers[0], &r, &r.uri);
                 let (mut resp, _, _) = answer(&config.servers[0], &r, parsed, found, None).await;
                 assert_eq!((resp.status, resp.rest.is_some()), (200, true));
-                finish(&mut resp).await;
+                finish(&mut resp, (&Level::default(), &request("GET / HTTP/1.1\n\n").1)).await;
                 assert!(resp.upstream_time.unwrap()[0].iter().all(Option::is_some));
                 bodies.push(String::from_utf8(resp.body).unwrap());
             }
@@ -4797,7 +5122,7 @@ pub(crate) mod tests {
             for connections in 1..3 {
                 let mut resp = answered(&config.servers[0], "GET / HTTP/1.0\n\n").await;
                 assert!(resp.rest.is_some());
-                finish(&mut resp).await;
+                finish(&mut resp, (&Level::default(), &request("GET / HTTP/1.1\n\n").1)).await;
                 assert_eq!((resp.body.as_slice(), resp.upstream_status.as_deref()), (&b"ab"[..], Some("200")));
                 assert_eq!(*came.lock().unwrap(), connections);
             }
@@ -5198,7 +5523,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             let mut answers = Vec::new();
             for target in requests {
                 let mut resp = answered(&config.servers[0], &format!("GET {target} HTTP/1.0\n\n")).await;
-                finish(&mut resp).await;
+                finish(&mut resp, (&Level::default(), &request("GET / HTTP/1.1\n\n").1)).await;
                 // $upstream_connect_time of the last try.
                 let times = resp.upstream_time.unwrap();
                 assert!(times.last().unwrap()[0].is_some(), "{times:?}");
@@ -5269,7 +5594,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let resp = block_on(async {
             let mut resp = fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &|_| 0).await.unwrap();
-            finish(&mut resp).await;
+            finish(&mut resp, (&Level::default(), &request("GET / HTTP/1.1\n\n").1)).await;
             resp
         });
         assert_eq!((resp.body.as_slice(), resp.headers), (&b"ab"[..], vec![("Expires".to_string(), "a".to_string())]));
