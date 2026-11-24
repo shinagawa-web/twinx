@@ -255,6 +255,30 @@ impl Table {
     }
 }
 
+/// Whether a field has a character in its name or value that nginx refuses.
+fn refused(name: &[u8], value: &[u8]) -> bool {
+    name.strip_prefix(b":").unwrap_or(name).iter().any(|&c| c <= 0x20 || c == 0x7f || c == b':' || c.is_ascii_uppercase()) || value.iter().any(|c| matches!(c, 0 | b'\n' | b'\r'))
+}
+
+/// The status of the head of a proxied server's answer; none when nginx refuses its
+/// fields: the only pseudo-header field is :status, before the others, of three digits,
+/// not one of 1xx but 103. Content-Length and Transfer-Encoding, of an answer, have no
+/// spaces, which would be lost on the way.
+fn status(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<u16> {
+    let mut status = None;
+    for (name, value) in fields {
+        if refused(name, value) { return None }
+        match (&name[..], status) {
+            (b":status", None) if value.len() == 3 && value.iter().all(u8::is_ascii_digit) => status = std::str::from_utf8(value).ok()?.parse().ok().filter(|s| *s == 103 || *s >= 200),
+            (b"content-length" | b"transfer-encoding", Some(200..)) if value.contains(&b' ') => return None,
+            _ if name.starts_with(b":") => return None,
+            _ => {}
+        }
+        status?;
+    }
+    status
+}
+
 /// The request of a stream as HTTP/1 writes it, without the empty line, with
 /// the version HTTP/2.0, whether it has Content-Length, and how many of its
 /// lines it makes; none for one nginx refuses with 400. The pseudo-header
@@ -264,10 +288,8 @@ fn request(fields: &[(Vec<u8>, Vec<u8>)], end: bool) -> Option<(Vec<u8>, bool, u
     let mut pseudo: [Option<&[u8]>; 4] = [None; 4];
     let (mut lines, mut cookies, mut host, mut length) = (Vec::new(), Vec::new(), None, None);
     for (name, value) in fields {
-        let own = name.strip_prefix(b":");
-        if own.unwrap_or(name).iter().any(|&c| c <= 0x20 || c == 0x7f || c == b':' || c.is_ascii_uppercase()) { return None }
-        if value.iter().any(|c| matches!(c, 0 | b'\n' | b'\r')) { return None }
-        if let Some(own) = own {
+        if refused(name, value) { return None }
+        if let Some(own) = name.strip_prefix(b":") {
             let i = [&b"method"[..], b"scheme", b"path", b"authority"].iter().position(|p| *p == own)?;
             if pseudo[i].replace(value).is_some() || value.is_empty() { return None }
             continue;
@@ -800,6 +822,8 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
     // Whether the head of the answer, not one of 1xx, has come: a header block after it has the trailers;
     // the bytes of the frames of the head so far; and whether the server takes no more.
     let (mut headed, mut size, mut deaf) = (false, 0, false);
+    // What the Content-Length of the answer, if it counts, has that has not come.
+    let mut left = None::<u64>;
     loop {
         if finished { buf.clear(); }
         finished |= body.take(&mut buf, &mut pending);
@@ -843,9 +867,10 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
         let (mut to_pipe, mut head_end, mut done, mut reset, mut failed) = (Vec::new(), 0, false, false, false);
         while got.len() >= 9 {
             let (len, kind, flags, sid) = (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize, got[3], got[4], u32::from_be_bytes([got[5], got[6], got[7], got[8]]) & 0x7fff_ffff);
-            // A head too long; data before it; and frames of the stream after its end.
+            // A head too long; data before it; frames of the stream after its end; and any
+            // other within a header block, or one that goes on without it.
             let block = sid == 1 && matches!(kind, HEADERS | CONTINUATION) && !headed;
-            failed = wrong_length(kind, flags, len) || block && size + 9 + len > head_size || sid == 1 && (kind == DATA && !headed || done && !matches!(kind, RST_STREAM | WINDOW_UPDATE));
+            failed = wrong_length(kind, flags, len) || block && size + 9 + len > head_size || sid == 1 && (kind == DATA && !headed || done && !matches!(kind, RST_STREAM | WINDOW_UPDATE)) || answer.is_some() != (kind == CONTINUATION);
             if failed || got.len() < 9 + len { break }
             if block { size += 9 + len; }
             let p: Vec<u8> = got.drain(..9 + len).skip(9).collect();
@@ -874,12 +899,15 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
                     done |= first & END_STREAM != 0;
                     if headed {
                         // Trailers end the stream.
-                        failed = !done;
-                        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-                        slot.lock().unwrap().trailers.extend(fields.iter().filter(|f| !f.0.starts_with(b":")).map(|(n, v)| (text(n), text(v))));
+                        failed = !done || fields.iter().any(|(n, v)| n.starts_with(b":") || refused(n, v));
+                        if failed { break }
+                        slot.lock().unwrap().trailers.extend(fields.iter().map(|(n, v)| (crate::vars::text(n), crate::vars::text(v))));
                     } else {
-                        let status = fields.iter().find(|f| f.0 == b":status").map(|f| String::from_utf8_lossy(&f.1).into_owned()).unwrap_or_default();
-                        (headed, size) = (!status.starts_with('1'), 0);
+                        // Early hints do not end the stream.
+                        let Some(status) = status(&fields).filter(|s| *s != 103 || !done) else { failed = true; break };
+                        (headed, size) = (status != 103, 0);
+                        let length = fields.iter().find(|f| f.0 == b"content-length" && method != "HEAD" && ![103, 204, 304].contains(&status));
+                        left = length.and_then(|f| std::str::from_utf8(&f.1).ok()?.parse().ok());
                         let mut head = format!("HTTP/1.1 {status} \r\n").into_bytes();
                         fields.iter().filter(|f| !f.0.starts_with(b":")).for_each(|(n, v)| head.extend([&n[..], b": ", v, b"\r\n"].concat()));
                         head.extend_from_slice(b"\r\n");
@@ -889,6 +917,8 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
                 }
                 DATA if sid == 1 => {
                     let Some(data) = unpadded(kind, flags, &p) else { failed = true; break };
+                    if left.is_some_and(|n| n < data.len() as u64) { failed = true; break }
+                    left = left.map(|n| n - data.len() as u64);
                     to_pipe.extend_from_slice(data);
                     done |= flags & END_STREAM != 0;
                     // What was taken is given back to the windows.
@@ -902,6 +932,7 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
             }
             if failed { break }
         }
+        failed |= done && left.is_some_and(|n| n > 0);
         if failed { to_pipe.truncate(head_end); }
         // The slot says how the stream ended before the pipe closes.
         if failed || done { slot.lock().unwrap().end = if failed { End::Failed } else { End::Whole }; }
@@ -1402,6 +1433,64 @@ mod tests {
         assert_eq!(passed(&[&framed(HEADERS, END_HEADERS, 1, &long(4097 - 9))], false).1, End::Failed);
         let endless = [framed(HEADERS, 0, 1, &[0x88]), framed(CONTINUATION, 0, 1, &[]).repeat(500)].concat();
         assert_eq!(passed(&[&endless], false).1, End::Failed);
+    }
+
+    #[test]
+    fn heads_nginx_refuses_fail_the_answer() {
+        let block = |fields: &[(&str, &str)]| fields.iter().flat_map(|(n, v)| [&[0, n.len() as u8], n.as_bytes(), &[v.len() as u8], v.as_bytes()].concat()).collect::<Vec<u8>>();
+        let head = |fields: &[(&str, &str)]| framed(HEADERS, END_HEADERS, 1, &block(fields));
+        let (ok, last) = ((":status", "200"), framed(DATA, END_STREAM, 1, b"ok"));
+        let names = ["x a", "x\ra", "x\na", "x\0", "x\x7f", "x:a", "X", "::x"];
+        let values = ["a\r\nb: c", "a\r", "\nb", "a\0"];
+        let fields = names.iter().map(|n| (*n, "v")).chain(values.iter().map(|v| ("x", *v)));
+        for field in fields {
+            assert_eq!(passed(&[&[head(&[ok, field]), last.clone()].concat()], false), (String::new(), End::Failed, vec![]), "{field:?}");
+            // In early hints, and in what follows them, which goes after them.
+            let hints = [(":status", "103"), field];
+            assert_eq!(passed(&[&[head(&hints), head(&[ok]), last.clone()].concat()], false), (String::new(), End::Failed, vec![]), "{field:?}");
+            assert_eq!(passed(&[&[head(&hints[..1]), head(&[ok, field])].concat()], false), ("HTTP/1.1 103 \r\n\r\n".to_string(), End::Failed, vec![]), "{field:?}");
+            // In trailers.
+            let trailers = framed(HEADERS, END_HEADERS | END_STREAM, 1, &block(&[("x-t", "1"), field]));
+            assert_eq!(passed(&[&head(&[ok]), &framed(DATA, 0, 1, b"ok"), &trailers], false), ("HTTP/1.1 200 \r\n\r\nok".to_string(), End::Failed, vec![]), "{field:?}");
+        }
+        for field in [(":status", "200"), (":x", "1")] {
+            let trailers = framed(HEADERS, END_HEADERS | END_STREAM, 1, &block(&[field]));
+            assert_eq!(passed(&[&[head(&[ok]), trailers].concat()], false), ("HTTP/1.1 200 \r\n\r\n".to_string(), End::Failed, vec![]), "{field:?}");
+        }
+        for fields in [
+            &[][..], &[("x", "1")], &[("x", "1"), ok], &[ok, ok], &[ok, ("x", "1"), ok], &[ok, (":x", "1")], &[ok, ("x", "1"), (":path", "/")],
+            &[(":status", "")], &[(":status", "20")], &[(":status", "0200")], &[(":status", "+20")], &[(":status", "2x0")], &[(":status", "000")], &[(":status", "100")], &[(":status", "101")], &[(":status", "199")],
+            &[ok, ("content-length", " 2")], &[ok, ("content-length", "2 ")], &[ok, ("transfer-encoding", " chunked")],
+        ] { assert_eq!(passed(&[&[head(fields), last.clone()].concat()], false), (String::new(), End::Failed, vec![]), "{fields:?}"); }
+        // An end of the stream with early hints, a head that only goes on, and one that another frame is in.
+        for frames in [
+            framed(HEADERS, END_HEADERS | END_STREAM, 1, &block(&[(":status", "103")])), framed(CONTINUATION, END_HEADERS, 1, &block(&[ok])),
+            [framed(HEADERS, 0, 1, &block(&[ok])), head(&[("x", "1")])].concat(), [framed(HEADERS, 0, 1, &block(&[ok])), framed(PING, 0, 0, &[0; 8])].concat(),
+        ] { assert_eq!(passed(&[&frames], false), (String::new(), End::Failed, vec![]), "{frames:?}"); }
+        // Not refused.
+        for (field, line) in [(("x", "\t\u{7f}"), "x: \t\u{7f}\r\n"), (("x_(/", ""), "x_(/: \r\n"), (("connection", "close"), "connection: close\r\n"), ((":status", "999"), "")] {
+            let (fields, status) = if line.is_empty() { (vec![field], "999") } else { (vec![ok, field], "200") };
+            assert_eq!(passed(&[&[head(&fields), last.clone()].concat()], false), (format!("HTTP/1.1 {status} \r\n{line}\r\nok"), End::Whole, vec![]), "{field:?}");
+        }
+        // The bytes of a trailer are kept.
+        let trailers = framed(HEADERS, END_HEADERS | END_STREAM, 1, &[&[0, 1, b'x', 1], &[0xff][..]].concat());
+        assert_eq!(passed(&[&[head(&[ok]), trailers].concat()], false).2, [("x".to_string(), crate::vars::text(&[0xff]))]);
+    }
+
+    #[test]
+    fn data_is_as_long_as_the_answer_says() {
+        let head = |length: &str, status: &str, flags: u8| { let mut block = Vec::new(); literals(&mut block, [(":status", status), ("content-length", length)].map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec())).iter()); framed(HEADERS, END_HEADERS | flags, 1, &block) };
+        let data = |data: &[u8], flags: u8| framed(DATA, flags, 1, data);
+        let trailers = framed(HEADERS, END_HEADERS | END_STREAM, 1, &[0, 1, b'x', 1, b'1']);
+        for (sent, body) in [
+            (vec![head("2", "200", 0), data(b"ok", END_STREAM)], Some("ok")), (vec![head("2", "200", 0), data(b"o", 0), data(b"", 0), data(b"k", 0), trailers.clone()], Some("ok")),
+            (vec![head("0", "200", END_STREAM)], Some("")), (vec![head("2", "304", END_STREAM)], Some("")), (vec![head("2", "204", END_STREAM)], Some("")),
+            (vec![head("2", "200", END_STREAM)], None), (vec![head("3", "200", 0), data(b"ok", END_STREAM)], None), (vec![head("1", "200", 0), data(b"ok", END_STREAM)], None),
+            (vec![head("3", "200", 0), data(b"ok", 0), data(b"!!", 0)], None), (vec![head("3", "200", 0), data(b"ok", 0), trailers], None),
+        ] {
+            let (answer, end, _) = passed(&[&sent.concat()], false);
+            assert_eq!((answer.split_once("\r\n\r\n").unwrap().1, end), (body.unwrap_or(""), if body.is_some() { End::Whole } else { End::Failed }), "{sent:?}");
+        }
     }
 
     #[test]

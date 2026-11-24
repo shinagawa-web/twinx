@@ -1996,20 +1996,20 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c.stream, theirs, if p.ssl { "https" } else { "http" }, level.proxy_buffer_size, slot.clone())); Conn::new(Stream::Pipe(ours.into()), connecting) } else { c });
         let begun = conn.is_ok();
         // A kept connection whose handshake fails counts as closed, as in nginx; one that times out does not.
-        let mut closed = matches!(conn, Err(None));
+        let (mut closed, mut invalid) = (matches!(conn, Err(None)), false);
         let mut kept;
         (answer, kept) = match conn {
             Ok(conn) => {
                 time[0] = Some(connecting.elapsed().as_millis());
                 let fetched = fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints)).await;
-                closed = matches!(fetched, Err(NoAnswer::Closed));
+                (closed, invalid) = (matches!(fetched, Err(NoAnswer::Closed)), matches!(fetched, Err(NoAnswer::Other)));
                 // A head that does not come in time is a timeout.
                 if matches!(fetched, Err(NoAnswer::TimedOut)) { (Some(special(504)), None) } else { fetched.ok().unzip() }
             }
             Err(resp) => (resp, None),
         };
-        // Over HTTP/2, what fails the stream before the head makes the answer invalid.
-        let failure = if slot.lock().unwrap().end == crate::h2::End::Failed { "invalid_header" } else { "error" };
+        // Over HTTP/2, what fails the stream before the head makes the answer invalid too.
+        let failure = if invalid || slot.lock().unwrap().end == crate::h2::End::Failed { "invalid_header" } else { "error" };
         // proxy_pass_trailers: those of an answer without a body are taken now.
         let trailers = (level.proxy_pass_trailers && level.proxy_h2).then(|| Trailers { slot: slot.clone(), hide: level.proxy_hide_header.clone(), to: r.shared.clone() });
         if let (Some(t), Some(Some(c))) = (&trailers, kept.as_mut()) { t.take(&mut c.stream, Some(level.proxy_read_timeout)).await; }
@@ -2244,24 +2244,24 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
             bytes[1] = answer.len() as u64;
         };
         let head = crate::vars::text(&answer[..end]);
-        let first = head.split('\n').next().unwrap_or_default();
+        let first = head.split('\n').next().unwrap_or_default().trim_end_matches('\r');
         let status: u16 = first.strip_prefix("HTTP/1.").and_then(|f| f.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()).ok_or(Other)?;
         if status != 103 { break (head, end, status) }
         // Early hints go to the client, with the headers of the answer that are
         // not hidden, when early_hints lets them and it has any; the answer comes after.
-        let shown = head.split('\n').skip(1).map(|l| l.trim_end_matches('\r')).filter_map(upstream_header).filter(|(n, _)| !hidden(&level.proxy_hide_header, n));
-        let lines: String = shown.map(|(n, v)| format!("{n}: {v}\r\n")).collect();
+        if first.starts_with("HTTP/1.0") { return Err(Other) }
+        let fields = upstream_lines(&head).map(upstream_header).collect::<Option<Vec<_>>>().ok_or(Other)?;
+        let lines: String = fields.iter().filter(|(n, _)| !hidden(&level.proxy_hide_header, n)).map(|(n, v)| format!("{n}: {v}\r\n")).collect();
         if let Some(c) = client.as_deref_mut().filter(|c| hints && !lines.is_empty() && !matches!(c, Stream::Pipe(_))) {
             write_all(c, format!("HTTP/1.1 103 Early Hints\r\n{lines}\r\n").as_bytes(), send_timeout(level)).await;
         }
         answer.drain(..end);
     };
     time[1] = Some(start.elapsed().as_millis());
-    let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
-    let version = lines.next().unwrap_or_default().split(' ').next().unwrap_or_default();
+    let version = head.split(['\r', '\n', ' ']).next().unwrap_or_default();
     let mut resp = Response { status, proxied: true, ..Response::default() };
     const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
-    for line in lines {
+    for line in upstream_lines(&head) {
         let (name, value) = upstream_header(line).ok_or(Other)?;
         let (lower, value) = (name.to_ascii_lowercase(), value.to_string());
         resp.upstream.push((name.to_string(), value.clone()));
@@ -2279,7 +2279,8 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let (length, chunked) = match (&values("content-length")[..], &values("transfer-encoding")[..]) {
         ([], []) => (None, false),
         ([l], []) => (Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten().ok_or(Other)?), false),
-        ([], [c]) if c.eq_ignore_ascii_case("chunked") => (None, true),
+        // Over HTTP/2 it says nothing about the body.
+        ([], [c]) if c.eq_ignore_ascii_case("chunked") => (None, !level.proxy_h2),
         _ => return Err(Other),
     };
     // The body of an answer that redirects with X-Accel-Redirect is not read.
@@ -2309,6 +2310,12 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
 fn hidden(hide: &[String], name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     ["date", "server", "x-pad"].contains(&lower.as_str()) || lower.starts_with("x-accel-") || hide.contains(&lower)
+}
+
+/// The header lines of the head of a proxied server's answer, up to the empty line that
+/// ends it, without those that look like another status line, which nginx ignores.
+fn upstream_lines(head: &str) -> impl Iterator<Item = &str> {
+    head.split('\n').skip(1).take_while(|l| !matches!(*l, "" | "\r")).filter(|l| !l.starts_with("HTTP/")).map(|l| l.trim_end_matches('\r'))
 }
 
 /// A header line of a proxied server's answer as ngx_http_parse_header_line()
@@ -3045,6 +3052,9 @@ pub(crate) mod tests {
         assert_eq!(upstream_header("X-A:  a b \t "), Some(("X-A", "a b \t")));
         assert_eq!(upstream_header("X_a!b"), Some(("X_a!b", "")));
         for bad in [" Folded: yes", ": a", "X a: 1", "X-A: a\rB: c", "X-A: a\0b", "X\x7f: a"] { assert_eq!(upstream_header(bad), None, "{bad:?}"); }
+        // Up to the empty line; a line with more CRs is not empty, and one like a status line is ignored.
+        assert_eq!(upstream_lines("HTTP/1.1 200\r\nA: b\r\r\nHTTP/1.1 301 x: \0\r\n\r\r\nC\n\r\n").collect::<Vec<_>>(), ["A: b", "", "C"]);
+        assert_eq!(upstream_lines("HTTP/1.1 200\nHTTP: b\n\n").collect::<Vec<_>>(), ["HTTP: b"]);
     }
 
     #[test]
@@ -4876,6 +4886,17 @@ pub(crate) mod tests {
             let ((a, sent), (b, again)) = (closing(first), closing(OK));
             assert_eq!(passed_to([a, b], directives, &format!("{method} / HTTP/1.0\n\n"), None), want, "{method} {directives}");
             assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, (want == 200) as usize), "{method} {directives}");
+        }
+        // An answer whose head is invalid is not an error, but invalid_header.
+        let hints = |fields: &str| format!("HTTP/1.1 103 E\r\n{fields}\r\n{OK}");
+        let ((b, again), invalid) = (closing(OK), "proxy_next_upstream invalid_header;");
+        for (first, directives, want) in [
+            (OK.replace("0\r", "x\r"), "", 502), (OK.replace("0\r", "0\r\nA: b\0\r"), invalid, 200), (OK.replace("0\r", "0\r\n\r\r"), invalid, 200),
+            (hints("A: b\0\r\n"), invalid, 200), (hints("A: b\r\n").replacen("1.1", "1.0", 1), invalid, 200),
+            (hints("A: b\r\n").replace("OK\r\n", "OK\r\nHTTP/1.1 301 x\r\n").replace(" OK", ""), "", 200),
+        ] {
+            let ((a, _), before) = (closing(first.clone().leak()), *again.lock().unwrap());
+            assert_eq!((passed_to([a, b], directives, "GET / HTTP/1.0\n\n", None), *again.lock().unwrap() - before), (want, !directives.is_empty() as usize), "{first:?} {directives}");
         }
         // Nothing was sent to a server that refuses the connection: its port is bound, but nothing listens.
         let refusing = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
