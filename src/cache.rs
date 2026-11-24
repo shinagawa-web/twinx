@@ -3,7 +3,7 @@
 //! for as long as proxy_cache_valid says for their status.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A cached answer: its status, Content-Type, headers and body, and until when it is valid.
@@ -20,7 +20,12 @@ pub struct Entry {
 #[derive(Debug, Default)]
 pub struct Zone {
     entries: Mutex<HashMap<String, Entry>>,
+    /// proxy_cache_lock: what a request that asks the server for a key holds meanwhile.
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
+
+/// How long a request waits for another that asks for the same key (proxy_cache_lock_timeout's default).
+pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Zone {
     /// The answer kept for a key, while it is valid.
@@ -31,6 +36,13 @@ impl Zone {
     /// Keeps an answer for a key, valid for so long.
     pub fn put(&self, key: String, (status, ctype, headers, body): (u16, Option<String>, Vec<(String, String)>, Vec<u8>), valid: Duration) {
         self.entries.lock().unwrap().insert(key, Entry { status, ctype, headers, body, until: Instant::now() + valid });
+    }
+
+    /// Waits, for so long at most, until no other request asks the server for the key, and
+    /// holds that until what it gives is dropped; None when the time ran out.
+    pub async fn lock(&self, key: &str, wait: Duration) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = self.locks.lock().unwrap().entry(key.to_string()).or_default().clone();
+        crate::stream::within(Some(wait), lock.lock_owned()).await
     }
 }
 
@@ -81,6 +93,19 @@ mod tests {
         let any = valid(&strings(&["404", "any"]), m).unwrap();
         assert_eq!(validity(&any, 500), Some(m));
         assert!(valid(&strings(&["abc"]), m).is_err());
+    }
+
+    #[test]
+    fn one_request_at_a_time_holds_a_key() {
+        let z = Zone::default();
+        crate::stream::block_on(async {
+            let held = z.lock("k", LOCK_TIMEOUT).await.unwrap();
+            // Another key is not held; the same one is, until the time runs out.
+            assert!(z.lock("other", Duration::from_millis(50)).await.is_some());
+            assert!(z.lock("k", Duration::from_millis(50)).await.is_none());
+            drop(held);
+            assert!(z.lock("k", Duration::from_millis(50)).await.is_some());
+        });
     }
 
     #[test]

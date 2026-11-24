@@ -158,6 +158,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_cache_path", HTTP, 2, usize::MAX, false),
     ("proxy_cache", HSL, 1, 1, false),
     ("proxy_cache_valid", HSL, 1, usize::MAX, false),
+    ("proxy_cache_lock", HSL, 1, 1, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
     ("proxy_http_version", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
@@ -447,6 +448,8 @@ pub struct Level {
     pub proxy_buffering: bool,
     /// proxy_cache: the zone answers are cached in, if any.
     pub proxy_cache: Option<Arc<crate::cache::Zone>>,
+    /// proxy_cache_lock: one request at a time asks the server for what is not cached yet.
+    pub proxy_cache_lock: bool,
     /// proxy_cache_valid: for how long answers of each status (None: any) are valid.
     pub proxy_cache_valid: Vec<(Option<u16>, Duration)>,
     /// proxy_buffers: the number and the size of the buffers the body is read into.
@@ -1074,6 +1077,7 @@ impl Builder<'_> {
                     let valid = block.iter().filter(|v| v.name == "proxy_cache_valid").map(|v| seconds(&v.args[v.args.len() - 1]).and_then(|t| crate::cache::valid(&v.args[..v.args.len() - 1], t)).map_err(|e| format!("{e} in {}", v.at)));
                     level.proxy_cache_valid = valid.collect::<Result<Vec<_>, _>>()?.concat();
                 }
+                "proxy_cache_lock" => level.proxy_cache_lock = flag(d).map_err(at)?,
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
                 "proxy_http_version" => {
                     let version = ["1.0", "1.1", "2"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\"", d.args[0])))?;
@@ -1715,6 +1719,9 @@ mod tests {
         let at = |path: &str| &locations.iter().find(|l| l.path == path).unwrap().level;
         assert!(at("/").proxy_cache.is_some());
         assert!(at("/off").proxy_cache.is_none() && at("/off").proxy_cache_valid.len() == 1);
+        let c = build_text("http { proxy_cache_path c keys_zone=Z:1m; proxy_cache_lock on; server { listen 127.0.0.1:8080; location / { } location /off { proxy_cache_lock off; } } }").unwrap();
+        assert_eq!(c.servers[0].locations.iter().map(|l| l.level.proxy_cache_lock).collect::<Vec<_>>(), [true, false]);
+        assert!(build_text("http { proxy_cache_lock yes; }").is_err());
         assert_eq!(build_text("http { server { proxy_cache Z; } }").unwrap_err(), "\"proxy_cache\" zone \"Z\" is unknown in t.conf:1");
         assert_eq!(build_text("http { proxy_cache_path c levels=1; }").unwrap_err(), "\"proxy_cache_path\" must have \"keys_zone\" parameter in t.conf:1");
     }

@@ -2044,9 +2044,15 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // ($scheme$proxy_host$request_uri) while that is valid.
     let cache = level.proxy_cache.as_ref().filter(|_| matches!(r.method.as_str(), "GET" | "HEAD"));
     let key = format!("{}://{host}{}", if r.ssl.is_some() { "https" } else { "http" }, r.request_uri());
-    if let Some(e) = cache.and_then(|z| z.get(&key)) {
-        return Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, ranges: true, proxy_host: Some(host), ..Response::default() };
-    }
+    let hit = |e: crate::cache::Entry| Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, ranges: true, proxy_host: Some(host.clone()), ..Response::default() };
+    if let Some(e) = cache.and_then(|z| z.get(&key)) { return hit(e) }
+    // proxy_cache_lock: while another request asks the server for the key, this one waits
+    // for what it caches; once that wait is over, it asks too, and its answer is not cached.
+    let locked = match cache.filter(|_| level.proxy_cache_lock) {
+        Some(zone) => Some(zone.lock(&key, crate::cache::LOCK_TIMEOUT).await),
+        None => None,
+    };
+    if let Some(e) = cache.filter(|_| locked.is_some()).and_then(|z| z.get(&key)) { return hit(e) }
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     // proxy_set_body replaces the client's body, whatever proxy_pass_request_body
@@ -2233,7 +2239,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     }
     resp.relative = !rewrite_redirect(r, level, &mut resp.headers);
     // An answer whose status proxy_cache_valid names is read whole and kept.
-    if let Some((zone, valid)) = cache.zip(crate::cache::validity(&level.proxy_cache_valid, resp.status)) {
+    if let Some((zone, valid)) = cache.filter(|_| !matches!(locked, Some(None))).zip(crate::cache::validity(&level.proxy_cache_valid, resp.status)) {
         finish(&mut resp, (level, r)).await;
         if resp.cut.is_none() { zone.put(key, (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid); }
     }
