@@ -206,6 +206,7 @@ pub enum Var {
     Args,
     RequestBody,
     RequestBodyFile,
+    Connection,
     ConnectionRequests,
     ConnectionTime,
     RequestPort,
@@ -265,7 +266,7 @@ impl Var {
             ("remote_addr", Var::RemoteAddr), ("remote_port", Var::RemotePort), ("binary_remote_addr", Var::BinaryRemoteAddr),
             ("server_addr", Var::ServerAddr), ("server_port", Var::ServerPort), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
-            ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
+            ("connection", Var::Connection), ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
             ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("upstream_status", Var::UpstreamStatus), ("upstream_cache_status", Var::UpstreamCacheStatus), ("pid", Var::Pid),
             ("upstream_connect_time", Var::UpstreamTime(0)), ("upstream_header_time", Var::UpstreamTime(1)), ("upstream_response_time", Var::UpstreamTime(2)),
             ("upstream_response_length", Var::UpstreamBytes(0)), ("upstream_bytes_received", Var::UpstreamBytes(1)), ("upstream_bytes_sent", Var::UpstreamBytes(2)),
@@ -313,6 +314,7 @@ impl Var {
             Var::ServerPort => r.local.port().to_string(),
             Var::RemoteUser => basic_user(r)?,
             Var::Request => r.line.clone(),
+            Var::Connection => r.shared.number.to_string(),
             Var::ConnectionRequests => r.requests.to_string(),
             Var::ConnectionTime => { let ms = r.connected.elapsed().as_millis(); format!("{}.{:03}", ms / 1000, ms % 1000) }
             Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
@@ -726,8 +728,9 @@ mod tests {
 
     #[test]
     fn connection_variables() {
-        let t = Template::parse("$connection_requests:$connection_time").unwrap();
-        assert!(t.render(&request(), &Sent::default()).starts_with("2:0."));
+        let t = Template::parse("$connection:$connection_requests:$connection_time").unwrap();
+        let r = Request { shared: std::sync::Arc::new(Shared { number: 7, ..Default::default() }), ..request() };
+        assert!(t.render(&r, &Sent::default()).starts_with("7:2:0."));
     }
 
     #[test]
