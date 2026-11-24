@@ -15,6 +15,7 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use crate::body::{Body, Buffers, Came, Sizes};
+use crate::coding::Coder;
 use crate::conf::{Condition, Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, Step, TryFiles};
 use crate::vars::{Part, Template};
 use crate::expires;
@@ -599,7 +600,7 @@ fn load(r: &Request, level: &Level, resp: &mut Response) {
     let mut body = vec![0; file.len as usize];
     // One read gives less than 2 GB.
     if body.chunks_mut(1 << 30).enumerate().all(|(i, part)| file.read((i as u64) << 30, part, (r, level))) { resp.body = body; return }
-    resp.cut = Some(Box::new(Cut { length: None, malformed: true }));
+    resp.cut = Some(Box::new(Cut { length: None, malformed: true, failed: None }));
 }
 
 /// Sends an answer whose body is in a file: the head with the first piece of it, then
@@ -636,9 +637,10 @@ async fn send_file<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(
 }
 
 /// A proxied answer cut off: the length its server gave it, if any, until a
-/// filter changes the body, and whether its chunks are malformed.
+/// filter changes the body, whether its chunks are malformed, and what is logged
+/// of it if it is not what its coding says.
 #[derive(Debug)]
-struct Cut { length: Option<usize>, malformed: bool }
+struct Cut { length: Option<usize>, malformed: bool, failed: Option<String> }
 
 /// The connection to a proxied server whose body is still to be read, with
 /// what has been read of the answer, where its head ends, how the body's end
@@ -646,10 +648,10 @@ struct Cut { length: Option<usize>, malformed: bool }
 /// whether the connection may be used again once the body has ended, and where it
 /// goes back to then: the upstream, the server's address and the location's tag;
 /// where the trailers are then, if they are passed, and, over HTTP/2, how the answer
-/// ended; and the sizes of the buffers it is read into, without proxy_buffering how
-/// much is read at once.
+/// ended; the sizes of the buffers it is read into, without proxy_buffering how
+/// much is read at once; and what compresses or decompresses the body sent as it comes.
 #[derive(Debug)]
-struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)>, trailers: Option<Trailers>, slot: Option<crate::h2::Slot>, sizes: Result<Sizes, usize> }
+struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)>, trailers: Option<Trailers>, slot: Option<crate::h2::Slot>, sizes: Result<Sizes, usize>, coder: Option<Box<Coder>> }
 
 /// The trailers of an answer over HTTP/2 (proxy_pass_trailers): the slot they come
 /// in, the headers proxy_hide_header names, and what they are passed through.
@@ -927,13 +929,13 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         h.1 = format!("http://{host}{port}{}", h.1);
     }
     let gzipped = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && h.1.eq_ignore_ascii_case("gzip"));
-    let streams = streams(r, level, &resp, gzipped);
+    let streams = streams(r, &resp);
     if level.gunzip && gzipped {
         resp.vary = true;
         if !streams { finish(&mut resp).await; }
         if !gzip_ok(r, level) {
             load(r, level, &mut resp);
-            gunzip(&mut resp);
+            if streams { coded(&mut resp, Coder::gunzip()); } else { gunzip(&mut resp); }
         }
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
@@ -969,8 +971,14 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         resp.body = String::from_utf8_lossy(&resp.body).replace(&format!("<hr><center>{NAME}</center>"), "<hr><center>twinx</center>").into_bytes();
     }
     match &resp.rest {
-        // As gzip() would: it is not compressed for this client, but may be for another.
-        Some(rest) => resp.vary |= rest.length.is_none_or(|n| n >= 20) && gzips(level, &resp),
+        // As gzip() does, looking at the length the server gave, if any. It may be compressed for another client.
+        Some(rest) => if rest.length.is_none_or(|n| n >= 20) && gzips(level, &resp) {
+            resp.vary = true;
+            if gzip_ok(r, level) {
+                coded(&mut resp, Coder::gzip());
+                resp.headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
+            }
+        },
         None => {
             if resp.file.as_ref().is_some_and(|f| f.len >= 20) && gzips(level, &resp) {
                 resp.vary = true;
@@ -1052,6 +1060,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         (written, (bytes, data), trailers) = Box::pin(pass(stream, rest, &mut resp, (&out, chunked), pace, send_timeout(level), ending)).await;
         // All that was written, whatever makes it chunks too.
         (body, cut) = (bytes.saturating_sub(head_len), resp.cut.is_some());
+        if let Some(failed) = resp.cut.as_ref().and_then(|c| c.failed.as_ref()) { error_log(level, r, failed); }
     } else if let Some(file) = resp.file.take().filter(|_| r.method != "HEAD" && !silent) {
         (written, (bytes, data), trailers) = Box::pin(send_file(stream, file, &resp, (&out, chunked), pace, (r, level), ending)).await;
         body = bytes.saturating_sub(head_len);
@@ -1190,12 +1199,18 @@ fn etag_match(list: &str, etag: Option<&str>, weak: bool) -> bool {
     list.split(',').map(|e| e.trim_matches([' ', '\t'])).any(|e| (if weak { e.strip_prefix("W/").unwrap_or(e) } else { e }) == etag)
 }
 
-/// Whether a proxied answer is sent as its body comes, not once all of it has: when it
-/// is neither decompressed nor compressed on its way. The gzip filter looks at the
-/// body's length too, which is not known yet.
-fn streams(r: &Request, level: &Level, resp: &Response, gzipped: bool) -> bool {
-    if resp.rest.is_none() || r.method == "HEAD" || [204, 304, 444, 499].contains(&resp.status) { return false; }
-    if gzip_ok(r, level) { !gzips(level, resp) } else { !(level.gunzip && gzipped) }
+/// Whether a proxied answer is sent as its body comes, not once all of it has: if it has
+/// one that is sent.
+fn streams(r: &Request, resp: &Response) -> bool {
+    resp.rest.is_some() && r.method != "HEAD" && ![204, 304, 444, 499].contains(&resp.status)
+}
+
+/// The body still to be read is sent as the coder makes it: of another length, and with
+/// what recoded() leaves.
+fn coded(resp: &mut Response, coder: Coder) {
+    recoded(resp);
+    resp.unknown_length = true;
+    if let Some(rest) = &mut resp.rest { rest.coder = Some(Box::new(coder)); }
 }
 
 /// Sends a proxied answer as its body comes: the head, with the first of the body that
@@ -1203,7 +1218,9 @@ fn streams(r: &Request, level: &Level, resp: &Response, gzipped: bool) -> bool {
 /// in a chunk if the body is chunked, and then what ends that. Without buffering, the
 /// head goes as soon as it has come. A body cut off has no last chunk; what has not gone
 /// on when a read fails or times out is not sent, and of one found malformed nothing
-/// that came in one go with that. The
+/// that came in one go with that. With a coder, what it makes of each part goes on, which
+/// is flushed without buffering, and when the body is cut off, then without its end; and
+/// the body is cut off where it is not what its coding says. The
 /// connection to the server goes back, or is closed, once the body has ended, before
 /// what is left is written, or when the client closes its connection, a write fails or
 /// worker_shutdown_timeout passes meanwhile. As in nginx, the status is 499 when the
@@ -1234,8 +1251,11 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
     let body = Body::new(from.length.map(|n| n as u64), from.chunked);
     let mut buffers = Buffers::new(body, from.slot.is_some(), from.sizes.ok(), from.end, buffer());
     let (mut ended, mut failed, mut malformed) = (false, false, false);
+    let (mut coder, unbuffered) = (from.coder.take(), from.sizes.is_err());
     // Whether anything came since the last write.
     let mut came = from.answer.len() > from.end;
+    // Without buffering, a head that nothing came with is flushed.
+    let alone = unbuffered && !came;
     *read = from.answer.len() - from.end;
     buffers.take(&from.answer[from.end..]);
     // A head as large as nginx's postpone_output does not wait for the body, nor does one
@@ -1254,7 +1274,15 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
                 match read_ready(&mut from.conn.stream, part).await { Some(got) => got, None => break }
             } else {
                 if !postponed && !head.is_empty() {
-                    if !send(stream, &[head], pace, time).await { return Some(false) }
+                    let mut part: &[u8] = &[];
+                    if let Some(c) = coder.as_mut().filter(|_| alone) {
+                        let _ = c.code(&[], true, false);
+                        part = c.ready();
+                    }
+                    in_chunk(chunked, part.len(), &mut size, &mut tail);
+                    if !send(stream, &[head, &size, part, &tail], pace, time).await { return Some(false) }
+                    *passed += part.len();
+                    if let Some(c) = &mut coder { c.written(); }
                     if let Some(tcp) = stream.tcp() { let _ = tcp.set_nodelay(true); }
                     head = &[];
                 }
@@ -1276,7 +1304,7 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
         ended |= buffers.came() != Came::More;
         came = false;
         if ended {
-            resp.cut = buffers.cut(failed).then(|| Box::new(Cut { length: from.length, malformed }));
+            resp.cut = buffers.cut(failed).then(|| Box::new(Cut { length: from.length, malformed, failed: None }));
             if let Some(t) = from.trailers.as_ref().filter(|_| resp.cut.is_none()) { unless_closed(stream, t.take(&mut from.conn.stream, Some(from.wait.unwrap_or_default()))).await?; }
             note(resp, from, *read);
             if let Some(rest) = rest.take() { rest.give_back(buffers.came() == Came::Whole { followed: false }); }
@@ -1286,24 +1314,50 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
         // A chunk, or what is paced, is a part of what goes on; all of it is, otherwise and at the end.
         while buffers.ready > 0 || ended && ending.is_some() {
             let end = buffers.part(ended || !chunked && pace.rate == 0);
-            size.clear();
-            tail.clear();
-            if chunked && end > 0 {
-                let _ = write!(size, "{end:x}\r\n");
-                tail.extend_from_slice(b"\r\n");
+            let (mut part, mut all, mut goes) = (&buffers.data[..end], true, true);
+            if let Some(c) = &mut coder {
+                let failed = |error| Some(Box::new(Cut { length: None, malformed: false, failed: Some(error) }));
+                let flush = unbuffered && end > 0;
+                match c.code(part, flush, ended && resp.cut.is_some()) {
+                    Ok(is) => all = is,
+                    Err(error) => {
+                        resp.cut = failed(error);
+                        // But the head, to a client of HTTP/2.
+                        return Some(!matches!(stream, Stream::Pipe(_)) || send(stream, &[head], pace, time).await);
+                    }
+                }
+                goes = all && ended;
+                if goes && resp.cut.is_none() { if let Err(error) = c.end() { (resp.cut, goes) = (failed(error), matches!(stream, Stream::Pipe(_))); } }
+                part = c.ready();
+                goes |= !part.is_empty() || all && flush && !head.is_empty();
             }
-            if let Some(ending) = ending.take_if(|_| ended) { if chunked && resp.cut.is_none() { ending(resp, &mut tail); } }
-            let (before, sent) = (pace.sent, send(stream, &[head, &size, &buffers.data[..end], &tail], pace, time).await);
-            *passed += (pace.sent - before).saturating_sub(head.len() + size.len()).min(end);
-            if !sent { return Some(false) }
-            // What follows, small as it may be, does not wait for the client to acknowledge that (tcp_nodelay).
-            if let Some(tcp) = stream.tcp().filter(|_| !head.is_empty() && !ended) { let _ = tcp.set_nodelay(true); }
-            head = &[];
-            buffers.written(end);
+            in_chunk(chunked, part.len(), &mut size, &mut tail);
+            let last = ended && all;
+            if let Some(ending) = ending.take_if(|_| last) { if chunked && resp.cut.is_none() { ending(resp, &mut tail); } }
+            if goes {
+                let (before, sent) = (pace.sent, send(stream, &[head, &size, part, &tail], pace, time).await);
+                *passed += (pace.sent - before).saturating_sub(head.len() + size.len()).min(part.len());
+                if !sent { return Some(false) }
+                // What follows, small as it may be, does not wait for the client to acknowledge that (tcp_nodelay).
+                if let Some(tcp) = stream.tcp().filter(|_| !head.is_empty() && !last) { let _ = tcp.set_nodelay(true); }
+                head = &[];
+            }
+            if let Some(c) = &mut coder { c.written(); }
+            if all { buffers.written(end); }
         }
     }
     recycle(buffers.data);
     Some(true)
+}
+
+/// What is before and after data of the length, if any, in a chunk.
+fn in_chunk(chunked: bool, length: usize, before: &mut Vec<u8>, after: &mut Vec<u8>) {
+    before.clear();
+    after.clear();
+    if chunked && length > 0 {
+        let _ = write!(before, "{length:x}\r\n");
+        after.extend_from_slice(b"\r\n");
+    }
 }
 
 /// How the writes of an answer are paced (limit_rate): the rate, what goes before it is
@@ -1587,7 +1641,7 @@ fn gzip_ok(r: &Request, level: &Level) -> bool {
         name.trim().eq_ignore_ascii_case("gzip") && q.trim().strip_prefix("q=").is_none_or(|q| q.parse::<f64>() != Ok(0.0))
     };
     let accepts = header(r, "accept-encoding").is_some_and(|v| v.split(',').any(gzip));
-    accepts && (r.line.ends_with("HTTP/1.1") || !level.gzip_http_11) && header(r, "via").is_none()
+    accepts && (["HTTP/1.1", "HTTP/2.0"].iter().any(|v| r.line.ends_with(v)) || !level.gzip_http_11) && header(r, "via").is_none()
 }
 
 /// Takes away what no longer holds once the body is recoded: Content-Encoding,
@@ -2036,7 +2090,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let sizes = if buffering { Ok(Sizes { first, count, size, busy: level.proxy_busy_buffers_size.unwrap_or(2 * first.max(size)) }) } else { Err(first) };
     // proxy_limit_rate is for answers that are buffered.
     let rate = if buffering { rate(&resp) } else { 0 };
-    Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None, trailers: None, slot: None, sizes })), unbuffered: !buffering, ..resp }, None))
+    Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None, trailers: None, slot: None, sizes, coder: None })), unbuffered: !buffering, ..resp }, None))
 }
 
 /// Whether a header of a proxied server's early hints is hidden, as those of
@@ -2084,7 +2138,7 @@ async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked:
         read += n;
         came = body.take(&chunk[..n], &mut data);
     }
-    let cut = body.cut(failed).then(|| Box::new(Cut { length, malformed: malformed || came == Came::Malformed }));
+    let cut = body.cut(failed).then(|| Box::new(Cut { length, malformed: malformed || came == Came::Malformed, failed: None }));
     (data, read, came == Came::Whole { followed: false }, cut)
 }
 
@@ -3023,8 +3077,8 @@ pub(crate) mod tests {
             (format!("{LENGTH}ab"), "", keep, format!("{length}ab")),
             // No trailers.
             (format!("{LENGTH}ab"), "add_trailer X 1;", http11, format!("{chunked}2\r\nab\r\n")),
-            // What gunzip changes has no length any more.
-            (format!("{LENGTH}ab").replace("Content-Length", "Content-Encoding: gzip\r\nContent-Length"), "gunzip on;", http11, chunked.clone()),
+            // Nothing of what gunzip finds malformed.
+            (format!("{LENGTH}ab").replace("Content-Length", "Content-Encoding: gzip\r\nContent-Length"), "gunzip on;", http11, String::new()),
         ] {
             // Nothing more comes, not even the answer to a second request.
             for (requests, rate) in [request.to_string(), request.repeat(2)].iter().flat_map(|r| RATES.map(|rate| (r, rate))) {
@@ -3165,11 +3219,11 @@ pub(crate) mod tests {
             assert!(text.contains("Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n") && text.contains("Content-Encoding: gzip\r\n") && !text.contains("Content-Length"), "{text}");
             let n = got[start..].iter().position(|&c| c == b'\n').unwrap() + start + 1;
             let size = usize::from_str_radix(std::str::from_utf8(&got[start..n - 2]).unwrap(), 16).unwrap();
-            // One chunk, and no last one.
-            assert_eq!(&got[n + size..], b"\r\n");
-            let mut plain = String::new();
-            flate2::read::GzDecoder::new(&got[n..n + size]).read_to_string(&mut plain).unwrap();
-            assert_eq!(plain, body);
+            // One chunk, and no last one; flushed, without the end of what is compressed.
+            assert_eq!(&got[n + size - 4..], b"\0\0\xff\xff\r\n");
+            let (mut plain, mut inflate) = (Vec::with_capacity(100), flate2::Decompress::new(false));
+            inflate.decompress_vec(&got[n + 10..n + size], &mut plain, flate2::FlushDecompress::None).unwrap();
+            assert_eq!(plain, body.as_bytes());
         }
     }
 
@@ -3643,24 +3697,219 @@ pub(crate) mod tests {
         }
     }
 
+    /// What comes at once, as arrivals() has it, but in bytes.
+    async fn bytes_arriving(http: &str, request: &str) -> Vec<Vec<u8>> {
+        let (mut client, task) = served_by(http).await;
+        client.write_all(request.as_bytes()).await.unwrap();
+        let (mut all, mut buf) = (Vec::new(), vec![0; 1 << 20]);
+        while let n @ 1.. = within(Some(Duration::from_secs(4)), client.read(&mut buf)).await.unwrap().unwrap() { all.push(buf[..n].to_vec()); }
+        drop(client);
+        within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
+        all
+    }
+
+    /// The head of an answer, the data in its chunks, decompressed as far as it came if
+    /// it is compressed, and whether there is a last chunk.
+    fn opened(got: &[u8]) -> (String, String, bool) {
+        if got.is_empty() { return (String::new(), String::new(), false) }
+        let (head, mut rest) = got.split_at(head_end(got).unwrap());
+        let (head, mut data, mut last) = (undated(head), rest.to_vec(), false);
+        if head.contains("Transfer-Encoding: chunked") {
+            data.clear();
+            while !rest.is_empty() && !last {
+                let at = rest.iter().position(|&c| c == b'\n').unwrap() + 1;
+                let n = usize::from_str_radix(std::str::from_utf8(&rest[..at - 2]).unwrap(), 16).unwrap();
+                data.extend_from_slice(&rest[at..at + n]);
+                rest = &rest[at + n + 2..];
+                last = n == 0;
+            }
+        }
+        if head.contains("Content-Encoding: gzip") && !data.is_empty() {
+            let mut plain = Vec::with_capacity(1 << 20);
+            flate2::Decompress::new(false).decompress_vec(&data[10..], &mut plain, flate2::FlushDecompress::None).unwrap();
+            data = plain;
+        }
+        (head, String::from_utf8(data).unwrap(), last)
+    }
+
+    pub(crate) const GZ: &str = "Content-Encoding: gzip\r\n";
+    const GZIP11: &str = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\nAccept-Encoding: gzip\r\n\r\n";
+
+    /// The head of such an answer.
+    pub(crate) fn with_length(length: usize, more: &str) -> String {
+        LENGTH.replace("30000", &length.to_string()).replacen("\r\n\r\n", &format!("\r\n{more}\r\n"), 1)
+    }
+
+    /// Data as a member of gzip, of several blocks, so that what came of it can be decompressed.
+    pub(crate) fn member(parts: &[&str]) -> Vec<Vec<u8>> {
+        let mut coder = Coder::gzip();
+        let mut gz: Vec<Vec<u8>> = parts.iter().map(|p| {
+            coder.code(p.as_bytes(), true, false).unwrap();
+            let part = coder.ready().to_vec();
+            coder.written();
+            part
+        }).collect();
+        coder.end().unwrap();
+        gz.last_mut().unwrap().extend(coder.ready());
+        gz
+    }
+
+    /// The pieces so far apart, the first with the head.
+    pub(crate) fn pieces_after(head: &str, pieces: &[Vec<u8>]) -> Pieces {
+        pieces.iter().enumerate().map(|(i, p)| if i == 0 { (0, [head.as_bytes(), p].concat()) } else { (100, p.clone()) }).collect()
+    }
+
     #[test]
-    fn what_gzip_may_change_is_not_sent_as_it_comes() {
+    fn what_gzip_changes_is_sent_as_it_comes() {
         let _busy = serving_on();
-        let length = LENGTH.replace("30000", "40");
-        let part = "x".repeat(20);
-        let pieces = after_head(&length, &[&part, &part], 60);
-        let takes_gzip = HTTP11.replace("\r\n\r\n", "\r\nAccept-Encoding: gzip\r\n\r\n");
-        for (directives, request, pieces, came, vary) in [
-            ("gzip on; gzip_vary on;", takes_gzip.as_str(), &pieces, 1, true),
-            // Not compressed, but may be for another client, or of another type.
-            ("gzip on; gzip_vary on;", HTTP11, &pieces, 2, true),
-            ("gzip on; gzip_vary on;", &takes_gzip, &after_head(&length.replace("html", "css"), &[&part, &part], 60), 2, false),
-            ("gunzip on; gzip_vary on;", HTTP11, &after_head(&length.replacen("\r\n\r\n", "\r\nContent-Encoding: gzip\r\n\r\n", 1), &[&part, &part], 60), 1, true),
-            ("gunzip on; gzip_vary on;", &takes_gzip, &after_head(&length.replacen("\r\n\r\n", "\r\nContent-Encoding: gzip\r\n\r\n", 1), &[&part, &part], 60), 2, true),
+        let strong = "ETag: \"1-2\"\r\nAccept-Ranges: bytes\r\n";
+        let parts = ["one-one-one-one-", "two-two-two-two-", "three-three-threeee"].map(|p| p.repeat(2));
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let (plain, raw) = (parts.concat(), parts.iter().map(|p| p.as_bytes().to_vec()).collect::<Vec<_>>());
+        let gz = member(&parts);
+        let gz_len = gz.iter().map(Vec::len).sum();
+        let chunks = |pieces: &[Vec<u8>]| pieces.iter().map(|p| [format!("{:x}\r\n", p.len()).as_bytes(), p, b"\r\n"].concat()).chain([b"0\r\n\r\n".to_vec()]).collect::<Vec<_>>();
+        let http10 = GZIP11.replace("1.1", "1.0");
+        let in_chunks = head("Transfer-Encoding: chunked\r\n", "close").replace("\r\n\r\n", "\r\nVary: Accept-Encoding\r\n");
+        let (recoded, kept) = ("ETag: W/\"1-2\"\r\n", head(&format!("Content-Length: {}\r\n", plain.len()), "close").replace("\r\n\r\n", "\r\nVary: Accept-Encoding\r\n"));
+        let css = plain.len().to_string();
+        let gzip = "gzip on; gzip_vary on;";
+        let gunzip = "gunzip on; gzip_vary on;";
+        let (length, chunked) = (with_length(plain.len(), strong), CHUNKED.to_string());
+        let (gz_length, gz_chunked) = (with_length(gz_len, &format!("{GZ}{strong}")), CHUNKED.replacen("\r\n\r\n", &format!("\r\n{GZ}\r\n"), 1));
+        let delimited = DELIMITED.to_string();
+        let none = String::new();
+        for (answer, pieces, closes, directives, request, want, came) in [
+            // Each read is flushed without buffering; else it waits for a buffer to be full, or the end.
+            (&length, raw.clone(), false, format!("{gzip} {OFF}"), GZIP11, format!("{in_chunks}{recoded}{GZ}\r\n"), &[32, 32, 38][..]),
+            (&chunked, chunks(&raw), false, format!("{gzip} {OFF}"), GZIP11, format!("{in_chunks}{GZ}\r\n"), &[32, 32, 38]),
+            (&delimited, raw.clone(), true, format!("{gzip} {OFF}"), GZIP11, format!("{in_chunks}{GZ}\r\n"), &[32, 32, 38]),
+            (&length, raw.clone(), false, gzip.to_string(), GZIP11, format!("{in_chunks}{recoded}{GZ}\r\n"), &[102]),
+            (&chunked, chunks(&raw), false, gzip.to_string(), GZIP11, format!("{in_chunks}{GZ}\r\n"), &[102]),
+            // HTTP/1.0, where the connection's end is that of the body.
+            (&length, raw.clone(), false, format!("gzip on; gzip_http_version 1.0; {OFF}"), &http10, head("", "close").replace("\r\n\r\n", &format!("\r\n{recoded}{GZ}\r\n")), &[32, 32, 38]),
+            // Without buffering, a head that comes alone goes alone, the beginning of gzip with it.
+            (&chunked, [vec![Vec::new()], chunks(&raw)].concat(), false, format!("{gzip} {OFF}"), GZIP11, format!("{in_chunks}{GZ}\r\n"), &[0, 32, 32, 38]),
+            // Not compressed for this client, not of a type that is, or too short.
+            (&length, raw.clone(), false, format!("{gzip} {OFF}"), HTTP11, format!("{kept}{strong}\r\n"), &[32, 32, 38]),
+            (&with_length(plain.len(), "").replace("html", "css"), raw.clone(), false, format!("{gzip} {OFF}"), GZIP11, head(&format!("Content-Length: {css}\r\n"), "close").replace("html", "css"), &[32, 32, 38]),
+            (&with_length(19, ""), vec![b"x".repeat(10), b"y".repeat(9)], false, format!("{gzip} {OFF}"), GZIP11, head("Content-Length: 19\r\n", "close"), &[10, 9]),
+            // Decompressed for one that does not take gzip, and what there is of it goes on.
+            (&gz_length, gz.clone(), false, format!("{gunzip} {OFF}"), HTTP11, format!("{in_chunks}{recoded}\r\n"), &[32, 32, 38]),
+            (&gz_chunked, chunks(&gz), false, gunzip.to_string(), HTTP11, format!("{in_chunks}\r\n"), &[32, 32, 38]),
+            (&gz_length, gz.clone(), false, gunzip.to_string(), HTTP11, format!("{in_chunks}{recoded}\r\n"), &[102]),
+            (&gz_length, gz.clone(), false, format!("gunzip on; {OFF}"), HTTP10, head("", "close").replace("\r\n\r\n", &format!("\r\n{recoded}\r\n")), &[32, 32, 38]),
+            (&gz_length, gz.clone(), false, format!("{gunzip} {OFF}"), GZIP11, none.clone(), &[]),
         ] {
-            let (addr, _count) = plays(pieces, false);
-            let got = block_on(arrivals(&passing(addr, &format!("{OFF} {directives}")), request));
-            assert_eq!((got.len(), got[0].1.contains("Vary: Accept-Encoding\r\n")), (came, vary), "{directives} {request} {got:?}");
+            let (addr, _count) = plays(&pieces_after(answer, &pieces), closes);
+            let got = block_on(bytes_arriving(&passing(addr, &directives), request));
+            let (head, data, last) = opened(&got.concat());
+            if want.is_empty() {
+                // It takes gzip: the answer stays as it is.
+                assert!(head.contains("Content-Length") && head.contains(GZ) && head.contains("Vary") && head.contains(strong), "{head}");
+                assert_eq!(got.concat()[got[0].len() - gz[0].len()..], gz.concat(), "{head}");
+                continue;
+            }
+            assert_eq!((&head, last), (&want, head.contains("chunked")), "{directives} {request}");
+            let all = if came.iter().sum::<usize>() == 19 { "x".repeat(10) + &"y".repeat(9) } else { plain.clone() };
+            assert_eq!(data, all);
+            // What there is after each arrival, but for those of the end alone.
+            let (mut sum, mut whole, mut is) = (0, Vec::new(), Vec::new());
+            for part in &got {
+                whole.extend_from_slice(part);
+                let n = opened(&whole).1.len();
+                if n > sum || is.is_empty() { is.push(n - sum); }
+                sum = n;
+            }
+            assert_eq!(is, came, "{answer} {directives} {request}");
+        }
+    }
+
+    #[test]
+    fn what_gzip_changes_ends_where_the_answer_does() {
+        let _busy = serving_on();
+        let log = log_path("coded");
+        let errors = log_path("coded-errors");
+        let (a, b) = ("a".repeat(50), "b".repeat(50));
+        let gz = member(&[&a, &b]);
+        let whole = gz.concat();
+        let (one, two) = (gz[0].clone(), gz[1].clone());
+        let bad = [&two[..two.len() - 8], b"12345678"].concat();
+        let (long, gz_long) = (with_length(30000, ""), with_length(30000, GZ));
+        let exact = |n: usize| with_length(n, GZ);
+        let response_end = "inflate() returned -5 on response end";
+        let in_chunks = head("Transfer-Encoding: chunked\r\n", "close");
+        let compressed = in_chunks.replace("\r\n\r\n", &format!("\r\n{GZ}\r\n"));
+        let (half, half_bad) = (exact(one.len() + 5), exact(one.len() + bad.len()));
+        let (alone, junk) = (exact(5), exact(whole.len() + 4));
+        let raw = [a.as_bytes().to_vec(), b.as_bytes().to_vec(), Vec::new()];
+        for (answer, pieces, closes, directives, request, want, data, error) in [
+            // Cut off: what was held goes on, without the end of gzip; but what is in a buffer
+            // not full when a read waits too long does not.
+            (&long, raw.to_vec(), true, "gzip on;", GZIP11, &compressed, a.clone() + &b, ""),
+            (&long, raw.to_vec(), true, "gzip on; proxy_buffering off;", GZIP11, &compressed, a.clone() + &b, ""),
+            (&long, raw[..2].to_vec(), false, "gzip on; proxy_read_timeout 1s;", GZIP11, &compressed, String::new(), ""),
+            (&long, raw[..2].to_vec(), false, "gzip on; proxy_read_timeout 1s; proxy_buffering off;", GZIP11, &compressed, a.clone() + &b, ""),
+            (&gz_long, vec![one.clone(), Vec::new()], true, "gunzip on;", HTTP11, &in_chunks, a.clone(), ""),
+            (&gz_long, vec![one.clone(), Vec::new()], true, "gunzip on; proxy_buffering off;", HTTP11, &in_chunks, a.clone(), ""),
+            (&gz_long, vec![one.clone()], false, "gunzip on; proxy_read_timeout 1s;", HTTP11, &in_chunks, String::new(), ""),
+            // It ends, but not what is compressed: then it is cut off, but what came goes on.
+            (&half, vec![one.clone(), two[..5].to_vec()], false, "gunzip on;", HTTP11, &in_chunks, a.clone(), response_end),
+            (&half, vec![one.clone(), two[..5].to_vec()], false, "gunzip on; proxy_buffering off;", HTTP11, &in_chunks, a.clone(), response_end),
+            (&alone, vec![whole[..5].to_vec()], false, "gunzip on;", HTTP11, &String::new(), String::new(), response_end),
+            (&alone, vec![whole[..5].to_vec()], false, "gunzip on; proxy_buffering off;", HTTP11, &in_chunks, String::new(), response_end),
+            // Malformed: nothing that came with that goes on.
+            (&half_bad, vec![one.clone(), bad.clone()], false, "gunzip on;", HTTP11, &String::new(), String::new(), "inflate() failed: 0, -3"),
+            (&half_bad, vec![one.clone(), bad.clone()], false, "gunzip on; proxy_buffering off;", HTTP11, &in_chunks, a.clone(), "inflate() failed: 2, -3"),
+            (&gz_long, vec![[&one[..], &bad].concat()], false, "gunzip on; proxy_buffering off;", HTTP11, &String::new(), String::new(), "inflate() failed: 2, -3"),
+            (&junk, vec![[&whole[..], b"junk"].concat()], false, "gunzip on;", HTTP11, &String::new(), String::new(), "inflate() failed: 0, -3"),
+            (&junk, vec![[&whole[..], b"junk"].concat()], false, "gunzip on; proxy_buffering off;", HTTP11, &in_chunks, a.clone() + &b, "inflate() failed: 0, -3"),
+        ] {
+            let (addr, count) = plays(&pieces_after(answer, &pieces), closes);
+            // The connection would stay open otherwise.
+            let request = request.replace("Connection: close\r\n", "");
+            let got = block_on(bytes_arriving(&passing(addr, &format!("{directives} access_log {} f; error_log {};", log.display(), errors.display())), &request)).concat();
+            let want = want.replace("Connection: close", "Connection: keep-alive");
+            assert_eq!(opened(&got), (want, data, false), "{directives} {pieces:?}");
+            let start = if got.is_empty() { 0 } else { head_end(&got).unwrap() };
+            let line = logged(&log);
+            assert!(line.starts_with(&format!("200 {} {} 200 ", got.len() - start, got.len())), "{line}");
+            let line = logged(&errors);
+            assert!(if error.is_empty() { line.is_empty() } else { line.contains(&format!(": {error}, client: ")) }, "{directives} {line}");
+            assert_eq!(count.lock().unwrap()[0], 1);
+        }
+    }
+
+    #[test]
+    fn what_becomes_much_is_not_held() {
+        let _busy = serving_on();
+        let data = "x".repeat(10 << 20);
+        let bomb = member(&[&data]).concat();
+        let (addr, _count) = plays(&pieces_after(&with_length(bomb.len(), GZ), &[bomb]), false);
+        let got = block_on(bytes_arriving(&passing(addr, "gunzip on;"), HTTP11)).concat();
+        // In chunks of all its buffers.
+        let start = head_end(&got).unwrap();
+        assert!(got[start..].starts_with(b"20000\r\n"));
+        let (_, plain, last) = opened(&got);
+        assert!(plain == data && last);
+    }
+
+    #[test]
+    fn answers_changed_by_gzip_leave_the_connections_open() {
+        let _busy = serving_on();
+        let data = "abc".repeat(30);
+        let gz = member(&[&data]).concat();
+        for (pieces, request, directives) in [
+            (pieces_after(&with_length(90, ""), &[data.as_bytes().to_vec()]), GZIP11, "gzip on; add_trailer X 1;"),
+            (pieces_after(&with_length(gz.len(), GZ), &[gz.clone()]), HTTP11, "gunzip on; add_trailer X 1;"),
+            (pieces_after(&with_length(gz.len(), GZ), &[gz.clone()]), HTTP11, "gunzip on; add_trailer X 1; proxy_buffering off;"),
+        ] {
+            let (addr, count) = plays(&pieces, false);
+            let requests = request.replace("Connection: close\r\n", "") + request;
+            let got = block_on(bytes_arriving(&passing(addr, directives), &requests)).concat();
+            let text = String::from_utf8_lossy(&got);
+            assert_eq!((text.matches("HTTP/1.1 200 OK\r\n").count(), text.matches("0\r\nX: 1\r\n\r\n").count()), (2, 2), "{text}");
+            assert_eq!((opened(&got).1, count.lock().unwrap()[0]), (data.clone(), 1));
         }
     }
 
@@ -5003,6 +5252,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert!(!ok("GET / HTTP/1.1\nHost: a\nAccept-Encoding: gzip\nVia: x\n\n", &level));
         assert!(!ok("GET / HTTP/1.0\nAccept-Encoding: gzip\n\n", &level));
         assert!(ok("GET / HTTP/1.0\nAccept-Encoding: gzip\n\n", &Level::default()));
+        assert!(gzip_ok(&Request { line: "GET / HTTP/2.0".to_string(), ..request("GET / HTTP/1.1\nHost: a\nAccept-Encoding: gzip\n\n").1 }, &level));
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(b"abc").unwrap();
         let member = gz.finish().unwrap();

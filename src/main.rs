@@ -2,6 +2,7 @@
 
 mod body;
 mod clock;
+mod coding;
 mod conf;
 mod expires;
 mod config;
