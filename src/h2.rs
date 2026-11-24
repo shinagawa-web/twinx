@@ -1069,7 +1069,7 @@ async fn exchange(config: Arc<Config>, request: Vec<u8>, body: Option<UnboundedR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::tests::{CHUNKED, DELIMITED, GZ, LENGTH, Pieces, after_head, log_path, logged, member, passing, pieces_after, plays, sends, served_by, serving_on, with_length};
+    use crate::http::tests::{CHUNKED, DELIMITED, GZ, LENGTH, Pieces, after_head, files, letters, log_path, logged, member, passing, pieces_after, plays, sends, served_by, serves_files, serving_on, with_length};
     use crate::stream::within;
 
     #[test]
@@ -1610,7 +1610,12 @@ mod tests {
     impl Client {
         /// One of a server with the directives.
         async fn new(directives: &str, window: u32) -> Client {
-            let (mut s, task) = served_by(&format!("http2 on; {directives}")).await;
+            Client::new_by(&format!("http2 on; {directives}"), window).await
+        }
+
+        /// One of what the http block has.
+        async fn new_by(http: &str, window: u32) -> Client {
+            let (mut s, task) = served_by(http).await;
             let settings = framed(SETTINGS, 0, 0, &[&[0, 4][..], &window.to_be_bytes()].concat());
             s.write_all(&[PREFACE, &settings].concat()).await.unwrap();
             Client { s, buf: Vec::new(), task, gives: false }
@@ -1914,6 +1919,50 @@ mod tests {
         // What is on its way from the server to the client is held, some 64 KB in each place.
         assert!(lines.len() == 2 && lines[0][1] == size && lines[0][4] == size, "{text}");
         assert!((25000..250_000).contains(&lines[1][1]) && lines[1][4] < 250_000, "{text}");
+    }
+
+    #[test]
+    fn files_come_piece_by_piece() {
+        let _busy = serving_on();
+        let dir = files("h2");
+        let http = format!("http2 on; {}", serves_files(&dir, "location / { index f; }"));
+        let asks = |window| Client::new_by(&http, window);
+        let body = |all: &[(u128, String)]| all[1..].iter().map(|f| f.1.trim_end_matches('|')).collect::<String>();
+        for n in [0, 32767, 32768, 32769, 65536, 65537, 102_400, 1_000_000] {
+            let data = letters(n);
+            std::fs::write(dir.join("f"), &data).unwrap();
+            for window in [1 << 21, 30_000] {
+                crate::stream::block_on(async {
+                    let mut c = asks(window).await;
+                    c.gives = true;
+                    for (sid, method) in [(1, "GET"), (3, "HEAD"), (5, "GET")] {
+                        c.get(sid, method).await;
+                        let all = c.all(sid).await;
+                        assert!(all[0].1.contains(&format!("content-length: {n};")) && all.last().unwrap().1.ends_with('|'), "{n} {}", all[0].1);
+                        assert!(body(&all).as_bytes() == if method == "GET" { &data[..] } else { b"" }, "{n} {window} {method}");
+                    }
+                    c.close().await;
+                });
+            }
+        }
+        // Of a file no more is read than waits to be sent: what became shorter meanwhile is
+        // reset there. Another stream is answered meanwhile.
+        std::fs::write(dir.join("f"), letters(4 << 20)).unwrap();
+        crate::stream::block_on(async {
+            let mut c = asks(0).await;
+            c.get(1, "GET").await;
+            assert!(c.next().await[0].0 == HEADERS);
+            c.get(3, "HEAD").await;
+            assert!(c.all(3).await.len() == 1);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            std::fs::File::options().write(true).open(dir.join("f")).unwrap().set_len(1 << 20).unwrap();
+            c.gives = true;
+            c.send(&[framed(WINDOW_UPDATE, 0, 1, &(1u32 << 20).to_be_bytes())]).await;
+            let all: String = c.all(1).await.into_iter().map(|f| f.1).collect();
+            assert!(all.ends_with("reset 2") && (1 << 20) - 32768 - 65535 <= all.len() && all.len() <= (1 << 20) + 7, "{}", all.len());
+            c.close().await;
+        });
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
