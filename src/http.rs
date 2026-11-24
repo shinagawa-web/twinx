@@ -2105,7 +2105,16 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     };
     // proxy_cache: a GET or HEAD is answered with what the cache keeps for its key
     // ($scheme$proxy_host$request_uri) while that is valid.
-    let cache = level.proxy_cache.as_ref().filter(|_| matches!(r.method.as_str(), "GET" | "HEAD"));
+    // One with variables names the zone for each request; nothing, or "off", is none.
+    let get = matches!(r.method.as_str(), "GET" | "HEAD");
+    let cache = match level.proxy_cache.as_ref().filter(|_| get) {
+        Some(crate::conf::CacheZone::Named(name, zones)) => match name.render(r, &Sent::default()) {
+            n if n.is_empty() || n == "off" => None,
+            n => match zones.get(&n) { Some(z) => Some(z), None => { error_log(level, r, &format!("cache \"{n}\" not found")); return special(500) } },
+        },
+        Some(crate::conf::CacheZone::Fixed(z)) => Some(z),
+        None => None,
+    };
     let to_host = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     let key = level.proxy_cache_key.as_ref().map_or_else(|| format!("{}://{host}{}", if r.ssl.is_some() { "https" } else { "http" }, r.request_uri()), |k| k.render(r, &to_host));
     // proxy_cache_bypass: the server is asked whatever the cache keeps.
@@ -2170,7 +2179,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
     // With a cache, the server is asked for the whole answer, whatever the client's conditions and ranges.
     const WHOLE: &[&str] = &["if-modified-since", "if-unmodified-since", "if-none-match", "if-match", "range", "if-range"];
-    let dropped = |n: &str| DROPPED.contains(&n) || level.proxy_cache.is_some() && !scarce && !far && WHOLE.contains(&n);
+    let dropped = |n: &str| DROPPED.contains(&n) || (if get { cache.is_some() } else { level.proxy_cache.is_some() }) && !scarce && !far && WHOLE.contains(&n);
     // proxy_pass_request_headers off passes none of the client's headers.
     let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !dropped(&n.to_ascii_lowercase()) && !is_set(n));
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));

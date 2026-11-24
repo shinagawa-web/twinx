@@ -332,6 +332,14 @@ pub struct CookieFlags {
 /// The flags proxy_cookie_flags knows, the bits of a set of them being their places here.
 pub const COOKIE_FLAGS: [&str; 8] = ["secure", "httponly", "nosecure", "nohttponly", "samesite=none", "samesite=lax", "samesite=strict", "nosamesite"];
 
+/// proxy_cache: a zone, or a value with variables that names one of the zones of
+/// proxy_cache_path for each request.
+#[derive(Debug, Clone)]
+pub enum CacheZone {
+    Fixed(Arc<crate::cache::Zone>),
+    Named(Template, Arc<HashMap<String, Arc<crate::cache::Zone>>>),
+}
+
 /// The settings of one level (http, server or location) after inheriting from the one above.
 #[derive(Debug, Clone, Default)]
 pub struct Level {
@@ -461,7 +469,7 @@ pub struct Level {
     /// are full, not all that has come at once (off).
     pub proxy_buffering: bool,
     /// proxy_cache: the zone answers are cached in, if any.
-    pub proxy_cache: Option<Arc<crate::cache::Zone>>,
+    pub proxy_cache: Option<CacheZone>,
     /// proxy_cache_lock: one request at a time asks the server for what is not cached yet.
     pub proxy_cache_lock: bool,
     /// proxy_cache_lock_timeout: how long a request waits for another that asks for the same key.
@@ -1114,7 +1122,10 @@ impl Builder<'_> {
                 "proxy_temp_file_write_size" => level.proxy_temp_file_write_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
                 "proxy_buffering" => level.proxy_buffering = flag(d).map_err(at)?,
                 // "off" caches nothing.
-                "proxy_cache" => level.proxy_cache = (d.args[0] != "off").then(|| self.zones.get(&d.args[0]).cloned().ok_or_else(|| at(format!("\"proxy_cache\" zone \"{}\" is unknown", d.args[0])))).transpose()?,
+                "proxy_cache" => level.proxy_cache = match Template::parse(&d.args[0]).map_err(at)? {
+                    t if t.fixed().is_none() => Some(CacheZone::Named(t, Arc::new(self.zones.clone()))),
+                    _ => (d.args[0] != "off").then(|| self.zones.get(&d.args[0]).cloned().map(CacheZone::Fixed).ok_or_else(|| at(format!("\"proxy_cache\" zone \"{}\" is unknown", d.args[0])))).transpose()?,
+                },
                 // All of those of a level replace those it inherits.
                 "proxy_cache_valid" => {
                     let valid = block.iter().filter(|v| v.name == "proxy_cache_valid").map(|v| seconds(&v.args[v.args.len() - 1]).and_then(|t| crate::cache::valid(&v.args[..v.args.len() - 1], t)).map_err(|e| format!("{e} in {}", v.at)));
@@ -1788,6 +1799,9 @@ mod tests {
         let at = |path: &str| &locations.iter().find(|l| l.path == path).unwrap().level;
         assert!(at("/").proxy_cache.is_some());
         assert!(at("/off").proxy_cache.is_none() && at("/off").proxy_cache_valid.len() == 1);
+        let c = build_text("http { proxy_cache_path c keys_zone=Z:1m; server { proxy_cache $arg_c; } }").unwrap();
+        assert!(matches!(&c.servers[0].level.proxy_cache, Some(CacheZone::Named(_, zones)) if zones.contains_key("Z")));
+        assert!(build_text("http { server { proxy_cache $nothing_known; } }").is_err());
         let c = build_text("http { proxy_cache_path c keys_zone=Z:1m; proxy_cache_lock on; server { listen 127.0.0.1:8080; location / { } location /off { proxy_cache_lock off; } } }").unwrap();
         assert_eq!(c.servers[0].locations.iter().map(|l| l.level.proxy_cache_lock).collect::<Vec<_>>(), [true, false]);
         assert!(build_text("http { proxy_cache_lock yes; }").is_err());
