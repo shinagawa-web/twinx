@@ -23,6 +23,8 @@ pub struct Shared {
     /// The variables set gives values to, and the captures of the last regular
     /// expression matched ("1", "2", ...).
     pub vars: std::sync::Mutex<Vec<(String, String)>>,
+    /// The target the request line had, once another replaced it ($request_uri).
+    pub unparsed: std::sync::OnceLock<String>,
     /// The trailers of a proxied server's answer that proxy_pass_trailers passes.
     pub trailers: std::sync::Mutex<Vec<(String, String)>>,
 }
@@ -32,7 +34,7 @@ pub struct Shared {
 pub struct Request {
     pub method: String,
     pub uri: String,
-    /// The URI as the request line has it, with the arguments ($request_uri).
+    /// The URI as the request line has it, with the arguments, or as the last rewrite or internal redirect left it.
     pub target: String,
     pub line: String,
     pub headers: Vec<(String, String)>,
@@ -78,6 +80,16 @@ impl Request {
             body: Vec::new(), body_file: None, upstream_addr: None, upstream_status: None, upstream: Vec::new(), captures: Vec::new(),
             shared: Default::default(), ssl,
         }
+    }
+
+    /// The URI as the request line has it, also after an internal redirect.
+    pub fn request_uri(&self) -> &str { self.shared.unparsed.get().unwrap_or(&self.target) }
+
+    /// Replaces the URI and the arguments, as a rewrite or an internal redirect does.
+    pub fn redirect(&mut self, uri: String, target: String) {
+        let old = std::mem::replace(&mut self.target, target);
+        self.shared.unparsed.get_or_init(|| old);
+        self.uri = uri;
     }
 
     /// Gives a variable of set, or a capture, its value for this request.
@@ -299,7 +311,7 @@ impl Var {
             Var::ConnectionRequests => r.requests.to_string(),
             Var::ConnectionTime => { let ms = r.connected.elapsed().as_millis(); format!("{}.{:03}", ms / 1000, ms % 1000) }
             Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
-            Var::RequestUri => r.target.clone(),
+            Var::RequestUri => r.request_uri().to_string(),
             Var::RequestPort => request_port(r).to_string(),
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
             Var::Pid => std::process::id().to_string(),
