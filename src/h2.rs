@@ -539,8 +539,8 @@ impl Connection {
         let head = request(&fields, ended);
         let declared = fields.iter().find(|f| f.0 == b"content-length").and_then(|f| std::str::from_utf8(&f.1).ok()?.parse().ok());
         let chunked = head.as_ref().is_some_and(|h| !h.1) && !ended;
-        let (body, taker) = tokio::sync::mpsc::unbounded_channel();
-        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head, ended, body: (!ended).then_some(body), taker: Some(taker), declared, chunked, number: self.requests, block: block.len(), ..Open::default() });
+        let (body, taker) = (!ended).then(tokio::sync::mpsc::unbounded_channel).unzip();
+        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head, ended, body, taker, declared, chunked, number: self.requests, block: block.len(), ..Open::default() });
         self.ready.push(sid);
         Ok(())
     }
@@ -723,7 +723,8 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
             let (request, made, taker) = match s.head.take().filter(|_| !bad) {
                 Some((mut head, _, made)) => {
                     if s.chunked { head.extend_from_slice(b"transfer-encoding: chunked\r\n"); }
-                    ([head, b"\r\n".to_vec()].concat(), made + usize::from(s.chunked), s.taker.take())
+                    head.extend_from_slice(b"\r\n");
+                    (head, made + usize::from(s.chunked), s.taker.take())
                 }
                 // A line HTTP/1 refuses, for the answer nginx gives with 400.
                 None => (b"-\r\n\r\n".to_vec(), 0, None),
@@ -1045,38 +1046,61 @@ impl Reply {
 /// Its body is passed as it comes, while the answer is read. What is there of the
 /// answer is told at once, and no more is read while too much of what was told is
 /// not sent. When the stream goes away before the answer has ended, so does all of it.
+/// It is all one task: an answer that does not wait for anything comes and is told the
+/// first time that runs.
 async fn exchange(config: Arc<Config>, request: Vec<u8>, body: Option<UnboundedReceiver<Vec<u8>>>, (listen, local, peer, ssl): Addrs, origin: Origin, tell: impl Fn(Part), mut sent: watch::Receiver<usize>) {
-    let ((ours, end), (_reads, reader)) = (tokio::io::duplex(65536), watch::channel(()));
+    let ((ours, end), (reads, reader)) = (tokio::io::duplex(65536), watch::channel(()));
     let theirs = Stream::Pipe(Pipe { end, reader: Some(Box::new(reader)) });
-    tokio::task::spawn_local(async move { crate::http::connection(&config, theirs, (listen, local, peer, ssl), Busy::new(), Some(Box::new(origin))).await });
+    let connection = Box::pin(crate::http::connection(&config, theirs, (listen, local, peer, ssl), Busy::new(), Some(Box::new(origin))));
     let (mut reply, mut part, mut told) = (Reply { buf: buffer(), bodiless: request.starts_with(b"HEAD "), comes: None }, Part::default(), 0);
     let (mut ours, mut to) = tokio::io::split(ours);
-    tokio::task::spawn_local(async move {
+    let passes = async move {
         let _ = to.write_all(&request).await;
         let mut body = body;
         while let Some(part) = match body.as_mut() { Some(b) => b.recv().await, None => None } {
             if to.write_all(&part).await.is_err() { return }
         }
         let _ = to.shutdown().await;
-    });
-    while part.ended.is_none() {
-        let (room, some) = ((*sent.borrow() + WAITING).saturating_sub(told + part.data.len()), part != Part::default());
-        reply.buf.reserve(8192);
-        let mut piece = (&mut ours).take(room as u64);
-        tokio::select! {
-            biased;
-            n = piece.read_buf(&mut reply.buf), if room > 0 => reply.take(&mut part, n.unwrap_or(0) == 0),
-            () = std::future::ready(()), if some => {
-                told += part.data.len();
-                tell(std::mem::take(&mut part));
+    };
+    let mut tell = Telling { tell, ended: false };
+    let reads = async move {
+        let _reads = reads;
+        while part.ended.is_none() {
+            let (room, some) = ((*sent.borrow() + WAITING).saturating_sub(told + part.data.len()), part != Part::default());
+            reply.buf.reserve(8192);
+            let mut piece = (&mut ours).take(room as u64);
+            tokio::select! {
+                biased;
+                n = piece.read_buf(&mut reply.buf), if room > 0 => reply.take(&mut part, n.unwrap_or(0) == 0),
+                () = std::future::ready(()), if some => {
+                    told += part.data.len();
+                    tell.tell(std::mem::take(&mut part));
+                }
+                gone = sent.changed() => if gone.is_err() { return },
             }
-            gone = sent.changed() => if gone.is_err() { return },
         }
+        tell.tell(part);
+        // The connection may have more to do after its answer, which it does as if it were still read.
+        while ours.read_buf(&mut reply.buf).await.is_ok_and(|n| n > 0) { reply.buf.clear(); }
+        recycle(reply.buf);
+    };
+    tokio::join!(passes, connection, reads);
+}
+
+/// What tells of a stream's answer, and that it was cut off when the exchange goes before it has ended.
+struct Telling<F: Fn(Part)> { tell: F, ended: bool }
+
+impl<F: Fn(Part)> Telling<F> {
+    fn tell(&mut self, part: Part) {
+        self.ended = part.ended.is_some();
+        (self.tell)(part);
     }
-    tell(part);
-    // The connection may have more to do after its answer, which it does as if it were still read.
-    while ours.read_buf(&mut reply.buf).await.is_ok_and(|n| n > 0) { reply.buf.clear(); }
-    recycle(reply.buf);
+}
+
+impl<F: Fn(Part)> Drop for Telling<F> {
+    fn drop(&mut self) {
+        if !self.ended { (self.tell)(Part { ended: Some(Ended::Cut), ..Part::default() }); }
+    }
 }
 
 #[cfg(test)]
@@ -1741,6 +1765,15 @@ mod tests {
             let all = got(&after_head(head, parts, 200), closes, directives, "GET");
             assert!(texts(&all) == want && all[0].0 < 150 && all[1].0 >= 180, "{all:?}");
         }
+    }
+
+    #[test]
+    fn exchanges_that_go_cut_their_answers_off() {
+        let told = std::cell::RefCell::new(Vec::new());
+        let telling = || Telling { tell: |part: Part| told.borrow_mut().push(part.ended), ended: false };
+        telling().tell(Part { ended: Some(Ended::Whole(Vec::new())), ..Part::default() });
+        telling().tell(Part { data: b"a".to_vec(), ..Part::default() });
+        assert_eq!(told.take(), [Some(Ended::Whole(Vec::new())), None, Some(Ended::Cut)]);
     }
 
     #[test]
