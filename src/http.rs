@@ -2132,7 +2132,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // proxy_cache_lock: while another request asks the server for the key, this one waits
     // for what it caches; once that wait is over, it asks too, and its answer is not cached.
     let locked = match cache.filter(|_| level.proxy_cache_lock && !bypass) {
-        Some(zone) => Some(zone.lock(&key, crate::cache::LOCK_TIMEOUT).await),
+        Some(zone) => Some(zone.lock(&key, level.proxy_cache_lock_timeout).await),
         None => None,
     };
     if let Some(e) = cache.filter(|_| locked.is_some()).and_then(|z| z.get(&key)) { noted("HIT"); return hit(e) }
