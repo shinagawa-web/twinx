@@ -173,6 +173,9 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("gunzip", HSL, 1, 1, false),
     ("gzip_vary", HSL, 1, 1, false),
     ("sendfile", HSL | LIF, 1, 1, false),
+    ("sendfile_max_chunk", HSL, 1, 1, false),
+    ("tcp_nopush", HSL, 1, 1, false),
+    ("tcp_nodelay", HSL, 1, 1, false),
     ("gzip_http_version", HSL, 1, 1, false),
     ("gzip_types", HSL, 1, usize::MAX, false),
     ("limit_rate", HSL | LIF, 1, 1, false),
@@ -476,6 +479,14 @@ pub struct Level {
     pub proxy_read_timeout: Duration,
     /// send_timeout: how long a write to the client may wait (60s).
     pub send_timeout: Duration,
+    /// sendfile and sendfile_max_chunk: files go to plain TCP connections without being
+    /// read, at most so much at a time (2 MB; zero: no limit).
+    pub sendfile: bool,
+    pub sendfile_max_chunk: u64,
+    /// tcp_nopush: with sendfile, the head and the file go in full packets.
+    pub tcp_nopush: bool,
+    /// tcp_nodelay (on): what is sent does not wait for what was sent before to be acknowledged.
+    pub tcp_nodelay: bool,
     /// proxy_bind: the local address, which may have variables, that
     /// connections to proxied servers are made from, and whether it may be
     /// a foreign one ("transparent"); None when off.
@@ -785,7 +796,7 @@ impl Builder<'_> {
         // Without root, files come from html under the prefix, as nginx's default root is.
         let mut level = Level { error_log: self.errors.clone(), root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, lingering_close: Some(false),
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), sendfile_max_chunk: 2 << 20, tcp_nodelay: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let block = d.block.as_deref().unwrap_or_default();
             if self.upstreams.keys().any(|u| u.eq_ignore_ascii_case(&d.args[0])) { return Err(format!("duplicate upstream \"{}\" in {}", d.args[0], d.at)); }
@@ -1103,8 +1114,10 @@ impl Builder<'_> {
                 }
                 "gzip_types" => level.gzip_types = d.args.iter().map(|t| t.to_ascii_lowercase()).collect(),
                 "gzip_vary" => level.gzip_vary = flag(d).map_err(at)?,
-                // twinx writes every body itself: sendfile changes nothing of what is sent.
-                "sendfile" => { flag(d).map_err(at)?; }
+                "sendfile" => level.sendfile = flag(d).map_err(at)?,
+                "sendfile_max_chunk" => level.sendfile_max_chunk = size(&d.args[0]).map_err(|_| invalid())?,
+                "tcp_nopush" => level.tcp_nopush = flag(d).map_err(at)?,
+                "tcp_nodelay" => level.tcp_nodelay = flag(d).map_err(at)?,
                 "gzip_http_version" => level.gzip_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))? == 1,
                 "post_action" => level.post_action = Some(d.args[0].clone()).filter(|a| a != "off"),
                 "expires" => level.expires = Some(expires(&d.args).map_err(at)?),
@@ -2372,6 +2385,25 @@ mod tests {
         assert_eq!((l[0].level.lingering_close, l[1].level.lingering_close, c.servers[1].level.lingering_close), (Some(false), Some(true), None));
         assert_eq!(build_text("http { server { } }").unwrap().servers[0].level.lingering_close, Some(false));
         assert_eq!(build_text("http { lingering_close yes; }").unwrap_err(), "invalid value \"yes\" in \"lingering_close\" directive, it must be \"off\", \"on\" or \"always\" in t.conf:1");
+    }
+
+    #[test]
+    fn sendfile() {
+        let of = |text: &str| build_text(&format!("http {{ server {{ listen 127.0.0.1:8080; {text} }} }}")).map(|c| { let l = c.servers[0].level.clone(); (l.sendfile, l.sendfile_max_chunk, l.tcp_nopush, l.tcp_nodelay) });
+        assert_eq!(of(""), Ok((false, 2 << 20, false, true)));
+        assert_eq!(of("sendfile on; sendfile_max_chunk 0; tcp_nopush ON; tcp_nodelay off;"), Ok((true, 0, true, false)));
+        for (text, error) in [
+            ("sendfile_max_chunk x;", "\"sendfile_max_chunk\" directive invalid value"),
+            ("sendfile_max_chunk 1g;", "\"sendfile_max_chunk\" directive invalid value"),
+            ("tcp_nopush 1;", "invalid value \"1\" in \"tcp_nopush\" directive, it must be \"on\" or \"off\""),
+            ("tcp_nodelay on; tcp_nodelay on;", "\"tcp_nodelay\" directive is duplicate"),
+            ("sendfile_max_chunk 1; sendfile_max_chunk 1;", "\"sendfile_max_chunk\" directive is duplicate"),
+            ("location / { if ($args) { sendfile_max_chunk 1; } }", "\"sendfile_max_chunk\" directive is not allowed here"),
+            ("location / { if ($args) { tcp_nopush on; } }", "\"tcp_nopush\" directive is not allowed here"),
+        ] {
+            assert!(of(text).unwrap_err().starts_with(error), "{text} {:?}", of(text));
+        }
+        assert!(of("location / { if ($args) { sendfile on; } }").is_ok());
     }
 
     #[test]
