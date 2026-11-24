@@ -16,7 +16,8 @@ use tokio::sync::watch;
 
 use crate::conf::Config;
 use crate::http::{Busy, Origin, Reading};
-use crate::stream::{Pipe, Stream, buffer, recycle, write_all};
+use crate::stream::{Pipe, Stream, at_once, buffer, recycle, within, write_all};
+use crate::upstream::{Conn, Upstream};
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -129,10 +130,21 @@ static HUFFMAN: [(u32, u8); 256] = [
     (0x7ffffeb, 27), (0xffffffe, 28), (0x7ffffec, 27), (0x7ffffed, 27), (0x7ffffee, 27), (0x7ffffef, 27), (0x7fffff0, 27), (0x3ffffee, 26),
 ];
 
-/// The octet of each Huffman code, by its length and the code.
-fn symbols() -> &'static HashMap<(u8, u32), u8> {
-    static SYMBOLS: OnceLock<HashMap<(u8, u32), u8>> = OnceLock::new();
-    SYMBOLS.get_or_init(|| HUFFMAN.iter().enumerate().map(|(c, &(code, len))| ((len, code), c as u8)).collect())
+/// The octets in the order of their Huffman codes, which is that of their lengths; and
+/// of each length the first code, how many there are, and how many octets come before.
+/// The codes of a length follow one another.
+fn symbols() -> &'static ([u8; 256], [(u32, u32, u32); 31]) {
+    static SYMBOLS: OnceLock<([u8; 256], [(u32, u32, u32); 31])> = OnceLock::new();
+    SYMBOLS.get_or_init(|| {
+        let (mut octets, mut lengths) = (std::array::from_fn(|c| c as u8), [(0, 0, 0); 31]);
+        octets.sort_by_key(|&c| { let (code, len) = HUFFMAN[usize::from(c)]; (len, code) });
+        for (i, &c) in octets.iter().enumerate() {
+            let (code, len) = HUFFMAN[usize::from(c)];
+            let of = &mut lengths[usize::from(len)];
+            *of = if of.1 == 0 { (code, 1, i as u32) } else { (of.0, of.1 + 1, of.2) };
+        }
+        (octets, lengths)
+    })
 }
 
 /// A string Huffman encoded, as nginx does it: only when that is shorter.
@@ -150,12 +162,20 @@ fn huffman(src: &[u8], lower: bool) -> Option<Vec<u8>> {
 /// A Huffman encoded string decoded, as nginx decodes it: what is left after
 /// the last octet is padding of ones, of whatever length, but not the code of EOS.
 fn unhuffman(src: &[u8]) -> Option<Vec<u8>> {
-    let (mut out, mut code, mut len) = (Vec::with_capacity(src.len() * 8 / 5), 0u32, 0u8);
-    for bit in src.iter().flat_map(|b| (0..8).rev().map(move |i| u32::from(b >> i & 1))) {
-        (code, len) = (code << 1 | bit, len + 1);
-        if let Some(&c) = symbols().get(&(len, code)) { out.push(c); (code, len) = (0, 0); } else if len == 30 { return None }
+    let (octets, lengths) = symbols();
+    let (mut out, mut acc, mut bits, mut rest) = (Vec::with_capacity(src.len() * 8 / 5), 0u64, 0, src.iter());
+    loop {
+        while bits <= 56 { let Some(&b) = rest.next() else { break }; (acc, bits) = (acc << 8 | u64::from(b), bits + 8); }
+        // The shortest code has 5 bits, the longest 30.
+        let found = (5..=bits.min(30)).find_map(|len| {
+            let ((first, count, before), code) = (lengths[len], (acc >> (bits - len)) as u32 & ((1 << len) - 1));
+            (code.wrapping_sub(first) < count).then(|| (octets[(before + code - first) as usize], len))
+        });
+        match found {
+            Some((c, len)) => { out.push(c); bits -= len; }
+            None => return (bits < 30 && acc & ((1 << bits) - 1) == (1 << bits) - 1).then_some(out),
+        }
     }
-    (code == (1 << len) - 1).then_some(out)
 }
 
 /// An integer of a header block with a prefix of so many bits (RFC 7541, 5.1),
@@ -774,20 +794,54 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
 pub enum End { Whole, #[default] Closed, Failed }
 
 /// What is known of a proxied server's answer once the pipe that passes it has
-/// closed, besides what came on it: how its stream ended, and its trailers.
+/// closed, besides what came on it: how its stream ended, its trailers, and whether
+/// its head ended it; the connection, if it may be used for another request, and
+/// where it goes then, with how long each read of the rest of its answer may wait, once
+/// that is known: whichever comes first waits for the other.
 #[derive(Debug, Default)]
-pub struct Ending { pub end: End, pub trailers: Vec<(String, String)> }
+pub struct Ending { pub end: End, pub trailers: Vec<(String, String)>, pub bodiless: bool, conn: Option<Conn>, home: Option<Home> }
+
+/// The upstream whose connection it is, the server's address and the location, and
+/// how long a read may wait.
+type Home = (Arc<Upstream>, SocketAddr, usize, Option<Duration>);
+
+/// Gives the connection of an answer that is not read any more back for other requests,
+/// once its stream has ended so that it may be.
+pub fn give_back(slot: &Slot, home: Home) {
+    let mut ending = slot.lock().unwrap();
+    match ending.conn.take() {
+        Some(conn) => home.0.put(conn, home.1, home.2),
+        None => ending.home = Some(home),
+    }
+}
+
+/// What stays with a connection to a proxied server from one request to the next, as nginx
+/// keeps it: the number of the next stream, the windows the server gives the connection and
+/// each new stream, and what is left of the connection's own. Its header blocks need nothing:
+/// neither side may use a dynamic table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Session { id: u32, window: i64, initial: i64, recv: i64 }
+
+impl Default for Session {
+    /// That of a new connection.
+    fn default() -> Session {
+        Session { id: 1, window: 65535, initial: 65535, recv: MAX_WINDOW }
+    }
+}
 
 /// Where what passes the answer tells it what reads the answer.
 pub type Slot = Arc<std::sync::Mutex<Ending>>;
 
 /// proxy_http_version 2: passes the HTTP/1 request that comes on a pipe to the
-/// proxied server on a connection of its own, as the one stream of an HTTP/2
-/// connection, and its answer back on the pipe, as HTTP/1 that ends when the
-/// pipe closes; the trailers that follow it, and how it ended, go in the slot. The
+/// proxied server, as the one stream of an HTTP/2 connection at a time, and its
+/// answer back on the pipe, as HTTP/1 that ends when the pipe closes; the trailers
+/// that follow it, how it ended, and the connection that may be kept, go in the slot. The
 /// frames of the head have the size of proxy_buffer_size at most. Whatever goes wrong
 /// closes both, and so does the answer not being wanted any more.
-pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot) {
+pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot) {
+    let kept = conn.h2.take();
+    let (up, mut out) = (&mut conn.stream, if kept.is_none() { PREFACE.to_vec() } else { Vec::new() });
+    let Session { id, mut window, mut initial, mut recv } = kept.as_deref().copied().unwrap_or_default();
     let (mut buf, mut got) = (Vec::new(), Vec::new());
     let end = loop {
         if let Some(n) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break n }
@@ -809,20 +863,25 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
         }
     }
     buf.drain(..end + 4);
-    let mut out = PREFACE.to_vec();
-    // nginx's settings: no dynamic table, no pushes, and the window of a stream as large as it goes.
-    frame(&mut out, SETTINGS, 0, 0, &[0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 4, 0x7f, 0xff, 0xff, 0xff]);
-    frame(&mut out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
+    if kept.is_none() {
+        // nginx's settings: no dynamic table, no pushes, and the window of a stream as large as it goes.
+        frame(&mut out, SETTINGS, 0, 0, &[0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 4, 0x7f, 0xff, 0xff, 0xff]);
+        frame(&mut out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
+    }
     let mut block = Vec::new();
     literals(&mut block, fields.iter());
     let mut ended = body == Body::Length(0);
-    header_frames(&mut out, 1, &block, 16384, ended);
-    // The windows the server gives the connection, a stream at first and the stream, and the body to send.
-    let (mut window, mut initial, mut stream_window, mut pending, mut finished) = (65535i64, 65535i64, 65535i64, Vec::new(), ended);
+    header_frames(&mut out, id, &block, 16384, ended);
+    // The windows of the stream, and the body to send.
+    let (mut stream_window, mut stream_recv, mut pending, mut finished) = (initial, MAX_WINDOW, Vec::new(), ended);
     let (mut table, mut answer) = (Table { entries: VecDeque::new(), size: 0, used: 0, limit: 0 }, None::<(u8, Vec<u8>)>);
     // Whether the head of the answer, not one of 1xx, has come: a header block after it has the trailers;
     // the bytes of the frames of the head so far; and whether the server takes no more.
     let (mut headed, mut size, mut deaf) = (false, 0, false);
+    // Whether the answer has no body, whatever follows its head; whether its head ended it;
+    // whether the connection may be kept, as far as the head says and the server takes more
+    // streams; and how long a read may wait once the answer is not read any more.
+    let (mut no_body, mut bodiless, mut keep, mut rest) = (method == "HEAD", false, true, None);
     // What the Content-Length of the answer, if it counts, has that has not come.
     let mut left = None::<u64>;
     loop {
@@ -834,26 +893,29 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
             let last = finished && n == pending.len();
             if ended || n == 0 && !last { break }
             ended = last;
-            frame(&mut out, DATA, if ended { END_STREAM } else { 0 }, 1, &pending.drain(..n).collect::<Vec<_>>());
+            frame(&mut out, DATA, if ended { END_STREAM } else { 0 }, id, &pending.drain(..n).collect::<Vec<_>>());
             (window, stream_window) = (window - n as i64, stream_window - n as i64);
         }
         let (frames, had) = (std::mem::take(&mut out), buf.len());
         if !frames.is_empty() && !deaf {
             tokio::select! {
                 // What the server sent before it took no more is still to be read.
-                sent = up.write_all(&frames) => deaf = sent.is_err(),
-                () = unwanted(&mut pipe, &mut buf) => return,
+                sent = within(rest.flatten(), up.write_all(&frames)) => deaf = !matches!(sent, Some(Ok(()))),
+                () = unwanted(&mut pipe, &mut buf), if rest.is_none() => return,
             }
             if buf.len() > had { continue }
         }
         // A read takes as much as a buffer of nginx's proxy_buffer_size would.
         got.reserve(4096);
         tokio::select! {
-            // The pipe ends when the answer is not wanted any more.
-            n = pipe.read_buf(&mut buf) => if n.unwrap_or(0) == 0 { return },
-            n = up.read_buf(&mut got) => if n.unwrap_or(0) == 0 {
+            // The pipe ends when the answer is not wanted any more, or all of it but the end of its stream came.
+            n = pipe.read_buf(&mut buf), if rest.is_none() => if n.unwrap_or(0) == 0 {
+                rest = slot.lock().unwrap().home.as_ref().map(|h| h.3);
+                if rest.is_none() || !keep || !ended { return }
+            },
+            n = within(rest.flatten(), up.read_buf(&mut got)) => if n.and_then(Result::ok).unwrap_or(0) == 0 {
                 // What came of the data of a frame cut off goes on too.
-                if let Some(&[a, b, c, DATA, flags, 0, 0, 0, 1]) = got.get(..9).filter(|_| headed) {
+                if let Some(&[a, b, c, DATA, flags, ..]) = got.get(..9).filter(|f| headed && f[5..] == id.to_be_bytes()) {
                     let (p, padded) = (&got[9..], usize::from(flags & PADDED != 0));
                     let padding = if padded == 1 { p.first().copied().unwrap_or(0) } else { 0 };
                     let end = (u32::from_be_bytes([0, a, b, c]) as usize).saturating_sub(padding.into());
@@ -868,10 +930,11 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
         let (mut to_pipe, mut head_end, mut done, mut reset, mut failed) = (Vec::new(), 0, false, false, false);
         while got.len() >= 9 {
             let (len, kind, flags, sid) = (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize, got[3], got[4], u32::from_be_bytes([got[5], got[6], got[7], got[8]]) & 0x7fff_ffff);
-            // A head too long; data before it; frames of the stream after its end; and any
-            // other within a header block, or one that goes on without it.
-            let block = sid == 1 && matches!(kind, HEADERS | CONTINUATION) && !headed;
-            failed = wrong_length(kind, flags, len) || block && size + 9 + len > head_size || sid == 1 && (kind == DATA && !headed || done && !matches!(kind, RST_STREAM | WINDOW_UPDATE)) || answer.is_some() != (kind == CONTINUATION);
+            // A head too long; data before it; frames of the stream after its end; those of other
+            // streams; data the windows do not let come; and any other within a header block, or
+            // one that goes on without it.
+            let block = sid == id && matches!(kind, HEADERS | CONTINUATION) && !headed;
+            failed = wrong_length(kind, flags, len) || block && size + 9 + len > head_size || sid == id && (kind == DATA && !headed || done && !matches!(kind, RST_STREAM | WINDOW_UPDATE)) || sid != id && (sid != 0 || kind == DATA) || kind == DATA && len as i64 > recv.min(stream_recv) || answer.is_some() != (kind == CONTINUATION);
             if failed || got.len() < 9 + len { break }
             if block { size += 9 + len; }
             let p: Vec<u8> = got.drain(..9 + len).skip(9).collect();
@@ -886,12 +949,13 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
                     frame(&mut out, SETTINGS, ACK, 0, &[]);
                 }
                 PING if flags & ACK == 0 => frame(&mut out, PING, ACK, 0, &p),
+                PING => failed = true,
                 WINDOW_UPDATE => {
                     let of = if sid == 0 { &mut window } else { &mut stream_window };
                     *of += i64::from(word(0) & 0x7fff_ffff);
                     failed = *of > MAX_WINDOW;
                 }
-                HEADERS | CONTINUATION if sid == 1 => {
+                HEADERS | CONTINUATION if sid == id => {
                     let (first, mut so_far) = answer.take().unwrap_or((flags, Vec::new()));
                     let Some(part) = unpadded(kind, flags, &p) else { failed = true; break };
                     so_far.extend_from_slice(part);
@@ -909,6 +973,10 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
                         (headed, size) = (status != 103, 0);
                         let length = fields.iter().find(|f| f.0 == b"content-length" && method != "HEAD" && ![103, 204, 304].contains(&status));
                         left = length.and_then(|f| std::str::from_utf8(&f.1).ok()?.parse().ok());
+                        no_body |= matches!(status, 204 | 304);
+                        // As in nginx, the head of an answer without a body must end it, and nothing come with it.
+                        if headed && no_body && !(done && got.is_empty()) { keep = false; }
+                        (bodiless, slot.lock().unwrap().bodiless) = (headed && done, headed && done);
                         let mut head = format!("HTTP/1.1 {status} \r\n").into_bytes();
                         fields.iter().filter(|f| !f.0.starts_with(b":")).for_each(|(n, v)| head.extend([&n[..], b": ", v, b"\r\n"].concat()));
                         head.extend_from_slice(b"\r\n");
@@ -916,19 +984,25 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
                         head_end = to_pipe.len();
                     }
                 }
-                DATA if sid == 1 => {
+                DATA if sid == id => {
                     let Some(data) = unpadded(kind, flags, &p) else { failed = true; break };
                     if left.is_some_and(|n| n < data.len() as u64) { failed = true; break }
                     left = left.map(|n| n - data.len() as u64);
                     to_pipe.extend_from_slice(data);
                     done |= flags & END_STREAM != 0;
-                    // What was taken is given back to the windows.
-                    if len > 0 { [0, 1].iter().for_each(|&sid| frame(&mut out, WINDOW_UPDATE, 0, sid, &(len as u32).to_be_bytes())); }
+                    (recv, stream_recv) = (recv - len as i64, stream_recv - len as i64);
+                    // As in nginx, the windows are made as large as they go once little of either is left.
+                    if recv.min(stream_recv) < MAX_WINDOW / 4 {
+                        for (sid, window) in [(0, &mut recv), (id, &mut stream_recv)] {
+                            frame(&mut out, WINDOW_UPDATE, 0, sid, &((MAX_WINDOW - *window) as u32).to_be_bytes());
+                            *window = MAX_WINDOW;
+                        }
+                    }
                 }
                 // A reset with NO_ERROR after the end of the stream is taken once; any other fails the answer.
-                RST_STREAM if sid == 1 => (failed, reset) = (word(0) != NO_ERROR || reset || !done, true),
+                RST_STREAM if sid == id => (failed, reset) = (word(0) != NO_ERROR || reset || !done, true),
                 // The connection goes away after the answer, unless the request is not among those taken.
-                GOAWAY => failed = word(0) & 0x7fff_ffff == 0,
+                GOAWAY => (failed, keep) = (word(0) & 0x7fff_ffff < id, false),
                 _ => {}
             }
             if failed { break }
@@ -937,7 +1011,20 @@ pub async fn upstream(mut up: Stream, mut pipe: tokio::io::DuplexStream, scheme:
         if failed { to_pipe.truncate(head_end); }
         // The slot says how the stream ended before the pipe closes.
         if failed || done { slot.lock().unwrap().end = if failed { End::Failed } else { End::Whole }; }
-        if pipe.write_all(&to_pipe).await.is_err() || failed || done { return }
+        if pipe.write_all(&to_pipe).await.is_err() || failed { return }
+        if done {
+            // What is to be sent still goes if it does at once; after a head that ended the
+            // answer it does not, as in nginx.
+            let mut sent = async || out.is_empty() || at_once(async { up.write_all(&out).await.is_ok() && up.flush().await.is_ok() }).await == Some(true);
+            if !keep || deaf || !ended || !got.is_empty() || bodiless && !out.is_empty() || !sent().await { return }
+            conn.h2 = Some(Box::new(Session { id: id + 2, window, initial, recv }));
+            let mut ending = slot.lock().unwrap();
+            match ending.home.take() {
+                Some((up, addr, tag, _)) => up.put(conn, addr, tag),
+                None => ending.conn = Some(conn),
+            }
+            return
+        }
     }
 }
 
@@ -1104,6 +1191,11 @@ mod tests {
     use crate::http::tests::{CHUNKED, DELIMITED, GZ, LENGTH, Pieces, after_head, files, letters, log_path, logged, member, passing, pieces_after, plays, sends, served_by, serves_files, serving_on, with_length};
     use crate::stream::within;
 
+    /// As upstream() does, on a new connection.
+    async fn upstream(up: Stream, pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot) {
+        super::upstream(Conn::new(up, Instant::now()), pipe, scheme, head_size, slot).await
+    }
+
     #[test]
     fn huffman_codes() {
         assert_eq!(huffman(b"www.example.com", false).unwrap(), [0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]);
@@ -1114,6 +1206,14 @@ mod tests {
         assert_eq!(unhuffman(&[0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xff]).unwrap(), b"localhost");
         assert_eq!(unhuffman(&[0xff, 0xff, 0xff, 0xff]), None);
         assert_eq!(unhuffman(&[0x00]), None);
+        // Every octet, and all of them.
+        let coded = |octets: &[u8]| {
+            let bits: String = octets.iter().map(|&c| { let (code, len) = HUFFMAN[usize::from(c)]; format!("{code:00$b}", usize::from(len)) }).collect();
+            bits.as_bytes().chunks(8).map(|b| u8::from_str_radix(&format!("{:1<8}", std::str::from_utf8(b).unwrap()), 2).unwrap()).collect::<Vec<_>>()
+        };
+        for c in 0..=255 { assert_eq!(unhuffman(&coded(&[c])), Some(vec![c])); }
+        let all: Vec<u8> = (0..=255).chain((0..=255).rev()).collect();
+        assert_eq!(unhuffman(&coded(&all)), Some(all));
     }
 
     #[test]
@@ -1434,6 +1534,200 @@ mod tests {
         assert_eq!(passed(&[&framed(HEADERS, END_HEADERS, 1, &long(4097 - 9))], false).1, End::Failed);
         let endless = [framed(HEADERS, 0, 1, &[0x88]), framed(CONTINUATION, 0, 1, &[]).repeat(500)].concat();
         assert_eq!(passed(&[&endless], false).1, End::Failed);
+    }
+
+    #[test]
+    fn what_stays_with_a_connection() {
+        let head = |sid: u32, end: u8| framed(HEADERS, END_HEADERS | end, sid, &header_block(200, &[], false));
+        let word = |n: u32| n.to_be_bytes();
+        // What a request sends on a connection, when the frames come at once, and how its
+        // answer ended and the connection that may be kept.
+        let exchange = |session: Option<Session>, request: &'static str, frames: Vec<u8>| crate::stream::block_on(async move {
+            let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
+            let slot = Slot::default();
+            let mut conn = Conn::new(Stream::Pipe(up.into()), Instant::now());
+            conn.h2 = session.map(Box::new);
+            ours.write_all(request.as_bytes()).await.unwrap();
+            server.write_all(&frames).await.unwrap();
+            super::upstream(conn, theirs, "http", 4096, slot.clone()).await;
+            let mut ending = slot.lock().unwrap();
+            let kept = ending.conn.take().map(|c| *c.h2.unwrap());
+            let mut sent = vec![0; 1 << 16];
+            let n = crate::stream::within(Some(Duration::from_millis(20)), server.read(&mut sent)).await.map_or(0, Result::unwrap);
+            sent.truncate(n);
+            (sent, ending.end, kept)
+        });
+        let get = "GET / HTTP/1.1\r\nHost: h\r\n\r\n";
+        let post = "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nabcde";
+        // The preface is sent once, and the streams are numbered; SETTINGS are for every stream,
+        // those that shrink a window too, and the window of the connection is what is left of it.
+        let settings = framed(SETTINGS, 0, 0, &[&[0, 4][..], &word(3), &[0, 1], &word(0)].concat());
+        let (sent, end, kept) = exchange(None, post, [settings, framed(WINDOW_UPDATE, 0, 0, &word(9)), head(1, 0), framed(DATA, END_STREAM, 1, b"ok")].concat());
+        assert!(sent.starts_with(PREFACE) && sent.ends_with(&framed(SETTINGS, ACK, 0, &[])) && end == End::Whole);
+        let session = Session { id: 3, window: 65535 - 5 + 9, initial: 3, recv: MAX_WINDOW - 2 };
+        assert_eq!(kept, Some(session));
+        let (sent, end, kept) = exchange(kept, post, [framed(WINDOW_UPDATE, 0, 3, &word(2)), head(3, END_STREAM)].concat());
+        let data = [framed(DATA, 0, 3, b"abc"), framed(DATA, END_STREAM, 3, b"de")].concat();
+        // The stream's end came with the window: the rest of the body is not sent any more.
+        assert!(sent[3..9] == [HEADERS, END_HEADERS, 0, 0, 0, 3] && sent.ends_with(&data[..12]) && end == End::Whole && kept.is_none());
+        let (sent, _, kept) = exchange(Some(session), get, [head(3, 0), framed(DATA, END_STREAM, 3, b"ok")].concat());
+        assert!(sent[3..9] == [HEADERS, END_HEADERS | END_STREAM, 0, 0, 0, 3]);
+        assert_eq!(kept, Some(Session { id: 5, recv: MAX_WINDOW - 4, ..session }));
+        // The windows of the answer grow once less than a quarter is left of one; nothing comes beyond them.
+        let little = Session { recv: MAX_WINDOW / 4 + 1, ..session };
+        let answer = |data: &[u8]| [head(3, 0), framed(DATA, 0, 3, data), framed(DATA, END_STREAM, 3, b"")].concat();
+        assert_eq!(exchange(Some(little), get, answer(b"a")).2, Some(Session { id: 5, recv: MAX_WINDOW / 4, ..session }));
+        let (sent, _, kept) = exchange(Some(little), get, answer(b"ab"));
+        let grown = [framed(WINDOW_UPDATE, 0, 0, &word((MAX_WINDOW - MAX_WINDOW / 4 + 1) as u32)), framed(WINDOW_UPDATE, 0, 3, &word(2))].concat();
+        assert!(sent.ends_with(&grown) && kept == Some(Session { id: 5, recv: MAX_WINDOW, ..session }));
+        let (_, end, kept) = exchange(Some(Session { recv: 1, ..session }), get, answer(b"ab"));
+        assert_eq!((end, kept), (End::Failed, None));
+        // Frames of other streams, the one before too, fail the answer.
+        for frame in [framed(WINDOW_UPDATE, 0, 1, &word(1)), framed(RST_STREAM, 0, 1, &word(0)), framed(DATA, 0, 5, b"a"), framed(DATA, 0, 0, b"a"), framed(PING, ACK, 0, &[0; 8])] {
+            let (_, end, kept) = exchange(Some(session), get, [frame, head(3, END_STREAM)].concat());
+            assert_eq!((end, kept), (End::Failed, None));
+        }
+    }
+
+    /// What a server of HTTP/2 sends for a stream: at once, and once the client has its answer;
+    /// when that is empty too, it closes the connection.
+    type Plays = fn(u32) -> (Vec<u8>, Option<Vec<u8>>);
+
+    /// The statuses of four requests, one after another, passed to a server that plays so, and
+    /// how many requests came on each connection to it; a connection on which another
+    /// request comes after it was closed counts it.
+    fn kept(plays: Plays, method: &str, (upstream, location): (&str, &str)) -> (Vec<u16>, Vec<usize>) {
+        use std::io::{Read, Write};
+        use std::sync::{Mutex, atomic::{AtomicUsize, Ordering::SeqCst}};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (came, sent, answered): (Arc<Mutex<Vec<usize>>>, Arc<AtomicUsize>, Arc<AtomicUsize>) = Default::default();
+        let (all, plays_on, seen) = (came.clone(), sent.clone(), answered.clone());
+        std::thread::spawn(move || for (i, s) in listener.incoming().enumerate() {
+            all.lock().unwrap().push(0);
+            let (mut s, came, sent, answered) = (s.unwrap(), all.clone(), plays_on.clone(), seen.clone());
+            s.set_nodelay(true).unwrap();
+            std::thread::spawn(move || {
+                if s.read_exact(&mut [0; 24]).is_err() { return }
+                loop {
+                    let mut ended = None;
+                    while ended.is_none() {
+                        let mut head = [0; 9];
+                        if s.read_exact(&mut head).is_err() { return }
+                        let mut payload = vec![0; u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize];
+                        if s.read_exact(&mut payload).is_err() { return }
+                        ended = (matches!(head[3], HEADERS | DATA) && head[4] & END_STREAM != 0).then(|| u32::from_be_bytes([head[5], head[6], head[7], head[8]]));
+                    }
+                    came.lock().unwrap()[i] += 1;
+                    let (at_once, then) = plays(ended.unwrap());
+                    let _ = s.write_all(&at_once);
+                    if let Some(then) = &then {
+                        while !at_once.is_empty() && sent.load(SeqCst) == answered.load(SeqCst) { std::thread::sleep(Duration::from_millis(1)); }
+                        let _ = s.write_all(then);
+                    }
+                    let closes = then.is_some_and(|t| t.is_empty());
+                    if closes { let _ = s.shutdown(std::net::Shutdown::Both); }
+                    if !at_once.is_empty() { sent.fetch_add(1, SeqCst); }
+                    if closes { return }
+                }
+            });
+        });
+        let _busy = serving_on();
+        let text = format!("access_log off; upstream u {{ server {addr}; {upstream} }} server {{ proxy_http_version 2; location / {{ proxy_pass http://u; {location} }} location /ok {{ return 200; }} }}");
+        let statuses = crate::stream::block_on(async {
+            let (mut client, _task) = served_by(&text).await;
+            let (mut statuses, length) = (Vec::new(), if method == "POST" { "Content-Length: 3\r\n\r\nabc" } else { "\r\n" });
+            for n in 1..=4 {
+                client.write_all(format!("{method} / HTTP/1.1\r\nHost: a\r\n{length}").as_bytes()).await.unwrap();
+                let mut got = Vec::new();
+                // The body is ok, in a chunk or not, or that of an error page.
+                let whole = |got: &[u8]| {
+                    let text = String::from_utf8_lossy(got).into_owned();
+                    let (head, body) = text.split_once("\r\n\r\n")?;
+                    let bodiless = method == "HEAD" || head.starts_with("HTTP/1.1 204") || head.contains("Content-Length: 0");
+                    (bodiless || body == "ok" || body.ends_with("0\r\n\r\n") || body.ends_with("</html>\r\n")).then(|| head[9..12].parse::<u16>().unwrap())
+                };
+                let status = loop {
+                    if let Some(status) = whole(&got) { break status }
+                    let n = crate::stream::within(Some(Duration::from_secs(5)), client.read_buf(&mut got)).await.expect("no answer").unwrap();
+                    assert!(n > 0, "{}", String::from_utf8_lossy(&got));
+                };
+                statuses.push(status);
+                answered.store(n, SeqCst);
+                for _ in 0..5000 { if sent.load(SeqCst) >= n || status >= 500 { break } tokio::time::sleep(Duration::from_millis(1)).await; }
+                // What came is read; those that fail are not answered, but counted.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                sent.store(n, SeqCst);
+            }
+            statuses
+        });
+        (statuses, std::mem::take(&mut *came.lock().unwrap()))
+    }
+
+    #[test]
+    fn connections_are_kept_as_nginx_keeps_them() {
+        fn head(sid: u32, status: u16, flags: u8) -> Vec<u8> { framed(HEADERS, END_HEADERS | flags, sid, &header_block(status, &[], false)) }
+        fn fields(sid: u32, fields: &[(&str, &str)], flags: u8) -> Vec<u8> { framed(HEADERS, END_HEADERS | flags, sid, &header_block(200, &fields.iter().map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec())).collect::<Vec<_>>(), false)) }
+        fn ok(sid: u32) -> Vec<u8> { [head(sid, 200, 0), framed(DATA, END_STREAM, sid, b"ok")].concat() }
+        fn with(sid: u32, frame: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) { ([ok(sid), frame].concat(), None) }
+        fn later(sid: u32, frame: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) { (ok(sid), Some(frame)) }
+        fn ping() -> Vec<u8> { framed(PING, 0, 0, &[0; 8]) }
+        fn goaway(last: u32) -> Vec<u8> { framed(GOAWAY, 0, 0, &[last.to_be_bytes(), [0; 4]].concat()) }
+        fn rst(sid: u32) -> Vec<u8> { framed(RST_STREAM, 0, sid, &[0; 4]) }
+        let (kept_all, kept_none) = (&[4][..], &[1, 1, 1, 1][..]);
+        let cases: Vec<(&str, &str, Plays, &[usize])> = vec![
+            ("the end with the data", "GET", |i| (ok(i), None), kept_all),
+            ("the same of a POST", "POST", |i| (ok(i), None), kept_all),
+            ("the end with the head", "GET", |i| (head(i, 200, END_STREAM), None), kept_all),
+            ("no content", "GET", |i| (head(i, 204, END_STREAM), None), kept_all),
+            ("HEAD", "HEAD", |i| (fields(i, &[("content-length", "2")], END_STREAM), None), kept_all),
+            ("no length in the head", "GET", |i| ([fields(i, &[("content-length", "0")], 0), framed(DATA, END_STREAM, i, b"")].concat(), None), kept_all),
+            ("the end after the length", "GET", |i| ([fields(i, &[("content-length", "2")], 0), framed(DATA, 0, i, b"ok")].concat(), Some(framed(DATA, END_STREAM, i, b""))), kept_all),
+            ("trailers", "GET", |i| ([head(i, 200, 0), framed(DATA, 0, i, b"ok"), framed(HEADERS, END_HEADERS | END_STREAM, i, b"\x00\x01x\x011")].concat(), None), kept_all),
+            ("a reset after the end", "GET", |i| with(i, rst(i)), kept_all),
+            ("windows after the end", "GET", |i| with(i, [framed(WINDOW_UPDATE, 0, 0, &[0, 0, 0, 1]), framed(WINDOW_UPDATE, 0, i, &[0, 0, 0, 1])].concat()), kept_all),
+            ("a ping after the end", "GET", |i| with(i, ping()), kept_all),
+            ("settings after the end", "GET", |i| with(i, framed(SETTINGS, 0, 0, &[0, 5, 0, 0, 0x40, 0])), kept_all),
+            ("an unknown frame after the end", "GET", |i| with(i, framed(77, 0, 0, b"a")), kept_all),
+            ("connection: close", "GET", |i| ([fields(i, &[("connection", "close")], 0), framed(DATA, END_STREAM, i, b"ok")].concat(), None), kept_all),
+            ("a reset after the end with the head", "GET", |i| ([head(i, 200, END_STREAM), rst(i)].concat(), None), kept_all),
+            // Not kept: what is not read, or goes away.
+            ("a reset later", "GET", |i| later(i, rst(i)), kept_none),
+            ("windows later", "GET", |i| later(i, framed(WINDOW_UPDATE, 0, 0, &[0, 0, 0, 1])), kept_none),
+            ("a ping later", "GET", |i| later(i, ping()), kept_none),
+            ("settings later", "GET", |i| later(i, framed(SETTINGS, 0, 0, &[])), kept_none),
+            ("going away later", "GET", |i| later(i, goaway(i)), kept_none),
+            ("the end of the connection later", "GET", |i| later(i, Vec::new()), kept_none),
+            ("going away", "GET", |i| ([goaway(i), ok(i)].concat(), None), kept_none),
+            ("going away after the end", "GET", |i| with(i, goaway(i)), kept_none),
+            ("a part of a frame", "GET", |i| with(i, vec![0, 0, 4]), kept_none),
+            ("no content, with the end after the head", "GET", |i| ([head(i, 204, 0), framed(DATA, END_STREAM, i, b"")].concat(), None), kept_none),
+            ("HEAD, with the end after the head", "HEAD", |i| ([head(i, 200, 0), framed(DATA, END_STREAM, i, b"")].concat(), None), kept_none),
+            ("no content, with a reset", "GET", |i| ([head(i, 204, END_STREAM), rst(i)].concat(), None), kept_none),
+            ("the end with the head, and a ping", "GET", |i| ([ping(), head(i, 200, END_STREAM)].concat(), None), kept_none),
+            ("the end with the head, and a ping after it", "GET", |i| ([head(i, 200, END_STREAM), ping()].concat(), None), kept_none),
+            ("more than the length", "GET", |i| ([fields(i, &[("content-length", "2")], 0), framed(DATA, 0, i, b"ok")].concat(), Some(framed(DATA, END_STREAM, i, b"!"))), kept_none),
+        ];
+        for (case, method, plays, connections) in cases {
+            let (statuses, came) = kept(plays, method, ("", ""));
+            assert!(statuses.iter().all(|s| *s < 300), "{case} {statuses:?}");
+            assert_eq!(came, connections, "{case}");
+        }
+        // One that is closed when the second request comes is tried again on another, once; with a reset, or
+        // when it goes away before the stream, it is not.
+        let second: Plays = |i| if i == 1 { (ok(i), None) } else { (Vec::new(), Some(Vec::new())) };
+        assert_eq!(kept(second, "GET", ("", "")), (vec![200; 4], vec![2, 2, 2, 1]));
+        assert_eq!(kept(second, "GET", ("", "proxy_next_upstream off;")), (vec![200, 502, 200, 502], vec![2, 2]));
+        assert_eq!(kept(second, "POST", ("", "")), (vec![200, 502, 200, 502], vec![2, 2]));
+        let fails: [Plays; 2] = [|i| if i == 1 { (ok(i), None) } else { (goaway(1), None) }, |i| if i == 1 { (ok(i), None) } else { (rst(i), None) }];
+        for fails in fails { assert_eq!(kept(fails, "GET", ("", "")), (vec![200, 502, 200, 502], vec![2, 2])); }
+        // The directives of the upstream, and an answer that is not used.
+        let plain: Plays = |i| (ok(i), None);
+        assert_eq!(kept(plain, "GET", ("keepalive_requests 3;", "")).1, [3, 1]);
+        assert_eq!(kept(plain, "GET", ("keepalive 0;", "")).1, kept_none);
+        assert_eq!(kept(|i| (fields(i, &[("x-accel-redirect", "/ok")], END_STREAM), None), "GET", ("", "")).1, kept_all);
+        assert_eq!(kept(|i| ([fields(i, &[("x-accel-redirect", "/ok")], 0), framed(DATA, END_STREAM, i, b"ok")].concat(), None), "GET", ("", "")).1, kept_none);
+        for buffering in ["proxy_buffering off;", "proxy_pass_trailers on;", "proxy_limit_rate 1m;"] { assert_eq!(kept(plain, "GET", ("", buffering)).1, kept_all, "{buffering}"); }
     }
 
     #[test]

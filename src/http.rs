@@ -778,7 +778,7 @@ async fn finish(resp: &mut Response, (level, r): (&Level, &Request)) {
     }
     note(resp, &rest, read);
     if !why.is_empty() { log_at(level, r, "error", &why, &rest.url()); }
-    rest.give_back(ended);
+    rest.give_back(ended, resp.cut.is_none());
 }
 
 /// Notes how long the last proxied server took for its answer, of whose body, with
@@ -794,9 +794,14 @@ impl Rest {
         self.to.as_ref().map_or_else(String::new, |(scheme, addr, uri)| format!("{scheme}://{addr}{uri}"))
     }
 
-    /// Gives the connection back for other requests, if the answer ended so that it may be.
-    fn give_back(self, ended: bool) {
-        if let Some((up, addr, tag)) = self.home.filter(|_| self.keep && ended) { up.put(self.conn, addr, tag); }
+    /// Gives the connection back for other requests, if the answer ended so that it may be,
+    /// or, over HTTP/2, is whole.
+    fn give_back(self, ended: bool, whole: bool) {
+        match (self.home, &self.slot) {
+            (Some((up, addr, tag)), Some(slot)) if whole => crate::h2::give_back(slot, (up, addr, tag, self.wait)),
+            (Some((up, addr, tag)), None) if self.keep && ended => up.put(self.conn, addr, tag),
+            _ => {}
+        }
     }
 }
 
@@ -1407,7 +1412,7 @@ impl Incoming<'_> {
         if let Some(t) = from.trailers.as_ref().filter(|_| self.resp.cut.is_none()) { t.take(&mut from.conn.stream, Some(from.wait.unwrap_or_default())).await; }
         note(self.resp, from, *self.read);
         self.log();
-        if let Some(rest) = self.rest.take() { rest.give_back(self.buffers.came() == Came::Whole { followed: false }); }
+        if let Some(rest) = self.rest.take() { rest.give_back(self.buffers.came() == Came::Whole { followed: false }, self.resp.cut.is_none()); }
         self.buf = Vec::new();
     }
 
@@ -2091,7 +2096,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let addr = up.peers[i].addr;
         addrs.push(addr.to_string());
         // A kept connection is used wherever it was bound, as in nginx.
-        let taken = up.take(&addr, tag);
+        let taken = up.take_for(&addr, tag, level.proxy_h2);
         let cached = taken.is_some();
         // A socket that cannot be bound fails the request without trying the next server.
         let socket = bind.filter(|_| taken.is_none()).map(|b| bound(&addr, b));
@@ -2123,7 +2128,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // proxy_http_version 2: the request goes through a pipe, over HTTP/2 beyond it.
         // Its trailers come in a slot of their own.
         let slot = crate::h2::Slot::default();
-        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c.stream, theirs, if p.ssl { "https" } else { "http" }, level.proxy_buffer_size, slot.clone())); Conn::new(Stream::Pipe(ours.into()), connecting) } else { c });
+        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c, theirs, if p.ssl { "https" } else { "http" }, level.proxy_buffer_size, slot.clone())); Conn::new(Stream::Pipe(ours.into()), connecting) } else { c });
         let begun = conn.is_ok();
         let mut fetched = match conn {
             Ok(conn) => {
@@ -2164,7 +2169,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // left to try, goes on to the next server; 403 and 404 are no failures.
         // A kept connection that turns out to be closed, which is in the cache no
         // more, does not use up a try.
-        if !(cached && closed) { tries -= 1; }
+        if !(cached && closed && failure == "error") { tries -= 1; }
         let status = answer.as_ref().map(|a| a.status);
         statuses.push(status.unwrap_or(502).to_string());
         // proxy_next_upstream_tries and proxy_next_upstream_timeout end the tries too.
@@ -2173,13 +2178,18 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let timed_out = answer.as_ref().is_some_and(|a| a.generated);
         let again = if timed_out { next("timeout") } else { status.map_or(next(failure), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout) && (resend || !begun);
         // The connection of an answer that is not used is closed.
-        // One over HTTP/2 is not kept.
-        if let Some(conn) = kept.flatten().filter(|_| !again && !level.proxy_h2) { up.put(conn, addr, tag); }
+        match kept.filter(|_| !again) {
+            // That of HTTP/2 under the pipe, whatever the headers say.
+            Some(conn) if level.proxy_h2 => if answer.as_ref().is_some_and(|a| a.rest.is_none()) && (conn.is_some() || slot.lock().unwrap().bodiless) {
+                crate::h2::give_back(&slot, (up.clone(), addr, tag, Some(level.proxy_read_timeout).filter(|t| !t.is_zero())));
+            }
+            conn => if let Some(conn) = conn.flatten() { up.put(conn, addr, tag) },
+        }
         // That of one whose body is still to be read goes back after it, when the
         // trailers are taken and the time is noted too.
         if let Some(rest) = answer.as_mut().and_then(|a| a.rest.as_mut()).filter(|_| !again) {
             (rest.started, rest.trailers, rest.to) = (start, trailers, Some((if p.ssl { "https" } else { "http" }, addr, std::mem::take(&mut uri))));
-            if level.proxy_h2 { rest.slot = Some(slot); } else { rest.home = Some((up.clone(), addr, tag)); }
+            (rest.slot, rest.home) = (Some(slot).filter(|_| level.proxy_h2), Some((up.clone(), addr, tag)));
         }
         if up.done(i, answer.is_none() || timed_out || again && !matches!(status, Some(403 | 404))) {
             let action = why.rsplit_once(" while ").map_or(READING_HEAD, |w| w.1);

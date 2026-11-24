@@ -61,10 +61,11 @@ impl Default for Keepalive {
 }
 
 /// A connection to a server, with when it was opened and how many requests it
-/// was used for.
+/// was used for; and the state of HTTP/2 on it, once it was used for that.
 #[derive(Debug)]
 pub struct Conn {
     pub stream: Stream,
+    pub h2: Option<Box<crate::h2::Session>>,
     opened: Instant,
     requests: u64,
 }
@@ -72,7 +73,7 @@ pub struct Conn {
 impl Conn {
     /// A new connection; the request it is opened for counts, as in nginx's c->requests.
     pub fn new(stream: Stream, opened: Instant) -> Conn {
-        Conn { stream, opened, requests: 1 }
+        Conn { stream, h2: None, opened, requests: 1 }
     }
 
     /// Whether there is nothing to read from it, not even its end: bytes a server
@@ -253,14 +254,15 @@ impl Upstream {
     }
 
     /// The idle connection to the server that was kept last, counted as used for
-    /// one more request; opened by the location if they are local to one. Those
-    /// found on the way that are not usable any more are closed.
-    pub fn take(&self, addr: &SocketAddr, tag: usize) -> Option<Conn> {
+    /// one more request; opened by the location if they are local to one; and used for
+    /// HTTP/2 or for HTTP/1 before, as neither is used for the other. Those found on
+    /// the way that are not usable any more are closed.
+    pub fn take_for(&self, addr: &SocketAddr, tag: usize, h2: bool) -> Option<Conn> {
         let keepalive = self.keepalive.as_ref()?;
         let (mut cache, now) = (self.cache.lock().unwrap(), Instant::now());
         let mut from = 0;
         loop {
-            from += cache.idle.iter().skip(from).position(|i| i.addr == *addr && (!keepalive.local || i.tag == tag))?;
+            from += cache.idle.iter().skip(from).position(|i| i.addr == *addr && (!keepalive.local || i.tag == tag) && i.conn.h2.is_some() == h2)?;
             let mut idle = cache.idle.remove(from)?;
             if !idle.fresh(now) || !idle.conn.quiet() { continue }
             idle.conn.requests += 1;
@@ -309,6 +311,13 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    impl Upstream {
+        /// Takes a connection used for HTTP/1.
+        pub(crate) fn take(&self, addr: &SocketAddr, tag: usize) -> Option<Conn> {
+            self.take_for(addr, tag, false)
+        }
+    }
 
     fn peers(n: usize, max_fails: u64) -> Upstream {
         let peers = (0..n).map(|i| Peer { max_fails, ..Peer::new(SocketAddr::from(([127, 0, 0, 1], 1000 + i as u16))) });
@@ -456,6 +465,20 @@ mod tests {
                 assert!(u.take(&addr, 1).is_none());
                 assert_eq!(port(&u.take(&addr2, 1)), Some(b_port));
             }
+        });
+    }
+
+    #[test]
+    fn a_connection_is_of_http2_or_not() {
+        block_on(async {
+            let (u, (l, addr)) = (keeping(Keepalive { local: false, ..Keepalive::default() }), server());
+            let ((mut a, _a, a_port), (b, _b, b_port)) = (open(&l).await, open(&l).await);
+            a.h2 = Some(Box::new(crate::h2::Session::default()));
+            u.put(a, addr, 0);
+            u.put(b, addr, 0);
+            assert_eq!(port(&u.take_for(&addr, 0, true)), Some(a_port));
+            assert!(u.take_for(&addr, 0, true).is_none());
+            assert_eq!(port(&u.take(&addr, 0)), Some(b_port));
         });
     }
 
