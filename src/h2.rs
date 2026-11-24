@@ -1069,7 +1069,7 @@ async fn exchange(config: Arc<Config>, request: Vec<u8>, body: Option<UnboundedR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::tests::{CHUNKED, DELIMITED, LENGTH, Pieces, after_head, log_path, logged, passing, plays, sends, served_by, serving_on};
+    use crate::http::tests::{CHUNKED, DELIMITED, GZ, LENGTH, Pieces, after_head, log_path, logged, member, passing, pieces_after, plays, sends, served_by, serving_on, with_length};
     use crate::stream::within;
 
     #[test]
@@ -1752,6 +1752,63 @@ mod tests {
         assert!(all.len() == 1 && all[0].1.ends_with('|'), "{all:?}");
         let all = got(&vec![(0, b"HTTP/1.1 204 No Content\r\n\r\n".to_vec())], false, "", "GET");
         assert!(all.len() == 1 && all[0].1.starts_with(":status: 204;") && all[0].1.ends_with('|'), "{all:?}");
+    }
+
+    #[test]
+    fn answers_changed_by_gzip_arrive_as_they_come() {
+        let _busy = serving_on();
+        let log = log_path("h2-coded");
+        let (a, b) = ("a".repeat(50), "b".repeat(50));
+        let gz = member(&[&a, &b]);
+        let bad = [&gz[1][..gz[1].len() - 8], b"12345678"].concat();
+        let length = |n: usize| with_length(n, GZ);
+        let (whole, half, with_bad) = (length(gz.concat().len()), length(gz[0].len() + 5), length(gz[0].len() + bad.len()));
+        let end = format!("{b}|");
+        for (head, pieces, closes, directives, want) in [
+            (&whole, gz.clone(), false, "gunzip on; proxy_buffering off;", vec![OK, &a, &end]),
+            (&length(30000), vec![gz[0].clone(), Vec::new()], true, "gunzip on; proxy_buffering off;", vec![OK, &a, "reset 2"]),
+            // What ends before its time, or is malformed, after the head of the answer.
+            (&half, vec![gz[0].clone(), gz[1][..5].to_vec()], false, "gunzip on; proxy_buffering off;", vec![OK, &a, "reset 2"]),
+            (&with_bad, vec![gz[0].clone(), bad.clone()], false, "gunzip on; proxy_buffering off;", vec![OK, &a, "reset 2"]),
+            (&with_bad, vec![[&gz[0][..], &bad].concat()], false, "gunzip on;", vec![OK, "reset 2"]),
+            (&length(5), vec![gz[0][..5].to_vec()], false, "gunzip on;", vec![OK, "reset 2"]),
+        ] {
+            let all = got(&pieces_after(head, &pieces), closes, &format!("{directives} access_log {} f;", log.display()), "GET");
+            let mut texts = texts(&all);
+            // The end of the stream may come with the last of the body, or alone.
+            let last = format!("{}|", texts[texts.len() - 2]);
+            if texts.last() == Some(&"|") { texts.truncate(texts.len() - 2); texts.push(&last); }
+            assert_eq!(texts, want, "{directives} {pieces:?}");
+            // $body_bytes_sent is what was decompressed, without what makes it chunks.
+            let body: usize = want.iter().map(|w| w.trim_end_matches('|').len()).filter(|n| *n == 50).sum();
+            let line = logged(&log);
+            assert!(line.starts_with(&format!("200 {body} ")), "{line}");
+        }
+        // To a client that takes gzip, each read flushed, the head with the beginning of it.
+        let (addr, _count) = plays(&pieces_after(&with_length(100, ""), &[Vec::new(), a.clone().into_bytes(), b.clone().into_bytes()]), false);
+        crate::stream::block_on(async {
+            let mut c = Client::new(&passing(addr, &format!("gzip on; proxy_buffering off; access_log {} f;", log.display())), 1 << 20).await;
+            let block = [&[0x82, 0x86, 0x84, 0x41, 0x01, b'h', 0x00, 15][..], b"accept-encoding", &[4], b"gzip"].concat();
+            c.send(&[framed(HEADERS, END_HEADERS | END_STREAM, 1, &block)]).await;
+            let (mut body, mut parts, mut ended) = (Vec::new(), Vec::new(), false);
+            while !ended {
+                for (kind, flags, _, payload) in c.next().await {
+                    if kind == HEADERS { assert_eq!(fields_of(&payload), ":status: 200;content-encoding: gzip;"); }
+                    if kind == DATA && !payload.is_empty() {
+                        body.extend(payload);
+                        let mut plain = Vec::with_capacity(1 << 10);
+                        flate2::Decompress::new(false).decompress_vec(&body[10..], &mut plain, flate2::FlushDecompress::None).unwrap();
+                        parts.push(String::from_utf8(plain).unwrap());
+                    }
+                    ended |= flags & END_STREAM != 0;
+                }
+            }
+            parts.dedup();
+            assert_eq!(parts, [String::new(), a.clone(), format!("{a}{b}")]);
+            c.close().await;
+            let line = logged(&log);
+            assert!(line.starts_with(&format!("200 {} ", body.len())), "{line}");
+        });
     }
 
     #[test]
