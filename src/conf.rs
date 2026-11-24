@@ -662,6 +662,8 @@ pub struct Config {
     /// The error_log files of the main block that take alerts, and those that take notices.
     pub alert_logs: Vec<Arc<File>>,
     pub notice_logs: Vec<Arc<File>>,
+    /// The directories of temporary files, which are made when the configuration is loaded.
+    pub temp_paths: Vec<PathBuf>,
     pub servers: Vec<Server>,
 }
 
@@ -671,6 +673,8 @@ struct Builder<'a> {
     logs: HashMap<PathBuf, Arc<File>>,
     upstreams: HashMap<String, Arc<Upstream>>,
     implicit: Implicit,
+    /// The directories of temporary files of all levels.
+    temp_paths: Vec<PathBuf>,
     /// The name of the location whose directives are being read, which
     /// "proxy_redirect default" puts in place of the proxy_pass URL.
     location: String,
@@ -680,8 +684,8 @@ struct Builder<'a> {
 pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
-    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), implicit: Implicit::default(), location: String::new() };
-    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), servers: Vec::new() };
+    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), implicit: Implicit::default(), temp_paths: Vec::new(), location: String::new() };
+    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().rev().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
     crate::tls::new_configuration(inheritable);
@@ -705,6 +709,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
             _ => {}
         }
     }
+    config.temp_paths = b.temp_paths;
     Ok(config)
 }
 
@@ -722,6 +727,13 @@ impl Builder<'_> {
 
     fn path(&self, p: &str) -> PathBuf {
         self.prefix.join(p)
+    }
+
+    /// Takes note of a directory of temporary files, as ngx_add_path() does. The name of one
+    /// that is not relative to the prefix keeps the "/" it ends with.
+    fn temp_path(&mut self, p: &str) {
+        let path = self.path(if p.starts_with('/') { p } else { p.strip_suffix('/').unwrap_or(p) });
+        if self.temp_paths.iter().all(|t| t.as_os_str() != path.as_os_str()) { self.temp_paths.push(path); }
     }
 
     /// Opens (creating it) a log file to append to; one handle per path.
@@ -765,6 +777,12 @@ impl Builder<'_> {
         // nginx merges the levels of the proxy module once all of the block is read. Those of
         // if and limit_except, where none of these directives may be, are as the one around them.
         servers.iter().flat_map(|s| [&s.level].into_iter().chain(s.locations.iter().map(|l| &l.level))).try_for_each(check_proxy_buffers)?;
+        // The default directories are those of servers without directives of their own or inherited.
+        let given = |block: &[Directive], name| block.iter().any(|d| d.name == name);
+        for (name, default) in [("client_body_temp_path", "client_body_temp"), ("proxy_temp_path", "proxy_temp")] {
+            let without = block.iter().any(|d| d.name == "server" && !given(d.block.as_deref().unwrap_or_default(), name));
+            if without && !given(block, name) { self.temp_path(default); }
+        }
         Ok(servers)
     }
 
@@ -993,6 +1011,7 @@ impl Builder<'_> {
                 "proxy_temp_path" => {
                     level.proxy_temp_path = self.path(&d.args[0]);
                     level.proxy_temp_levels = temp_levels(&d.args[1..]).ok_or_else(invalid)?;
+                    self.temp_path(&d.args[0]);
                 }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
                 "proxy_buffers" => match (scaled(&d.args[0], &[("", 1)]), size(&d.args[1])) {
@@ -1006,6 +1025,7 @@ impl Builder<'_> {
                 "client_body_temp_path" => {
                     level.body_temp_path = self.path(&d.args[0]);
                     level.body_temp_levels = temp_levels(&d.args[1..]).ok_or_else(|| at("invalid value".into()))?;
+                    self.temp_path(&d.args[0]);
                 }
                 "default_type" => level.default_type = d.args[0].clone(),
                 "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
@@ -1888,6 +1908,24 @@ mod tests {
         assert_eq!(settings(&c.servers[1].locations[1].level), (dir.join("u"), vec![2, 1], 0, Some(8192)));
         for v in ["0", "x", "5 6"] {
             assert_eq!(build_text(&format!("http {{ proxy_temp_path /t {v}; }}")).unwrap_err(), "\"proxy_temp_path\" directive invalid value in t.conf:1");
+        }
+    }
+
+    #[test]
+    fn directories_of_temporary_files() {
+        let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
+        for (http, want) in [
+            // The defaults are for servers without directives, also if they proxy nothing.
+            ("", &[][..]),
+            ("server { }", &["client_body_temp", "proxy_temp"]),
+            ("server { location / { client_body_temp_path a; } }", &["a", "client_body_temp", "proxy_temp"]),
+            ("server { client_body_temp_path a/; proxy_temp_path a; }", &["a"]),
+            ("server { client_body_temp_path a; proxy_temp_path b 1; } server { proxy_temp_path /c/; }", &["a", "b", "/c/", "client_body_temp"]),
+            ("client_body_temp_path a; proxy_temp_path b; server { client_body_temp_path c; location / { client_body_temp_path d; } } server { }", &["a", "b", "c", "d"]),
+        ] {
+            let paths = build_text(&format!("http {{ {http} }}")).unwrap().temp_paths;
+            let want: Vec<_> = want.iter().map(|p| dir.join(p).into_os_string()).collect();
+            assert_eq!(paths.into_iter().map(PathBuf::into_os_string).collect::<Vec<_>>(), want, "{http}");
         }
     }
 
