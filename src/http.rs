@@ -559,6 +559,8 @@ struct Response {
     /// Whether the range filter may answer a Range with a part of it: a
     /// static file's answer (r->allow_ranges).
     ranges: bool,
+    /// Whether it may be only one range (r->single_range): several are answered with the whole.
+    single_range: bool,
     /// Whether a Location that starts with "/" is sent as it is: one a proxied
     /// server sent and proxy_redirect did not rewrite.
     relative: bool,
@@ -1288,8 +1290,8 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
     if !header(r, "if-range").is_none_or(same) { return; }
     let len = resp.len() as u64;
     let ranges = match byte_ranges(spec, len) {
-        Ok(Some(ranges)) => ranges,
-        Ok(None) => return,
+        Ok(Some(ranges)) if !(resp.single_range && ranges.len() > 1) => ranges,
+        Ok(_) => return,
         Err(()) => { *resp = Response { headers: vec![("Content-Range".into(), format!("bytes */{len}"))], ..special(416) }; return }
     };
     resp.status = 206;
@@ -2352,6 +2354,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let valid = said.and_then(|(until, updating)| until.or_else(|| crate::cache::validity(&level.proxy_cache_valid, resp.status).map(|t| now.saturating_add(t.as_secs() as i64))).map(|u| (u, updating)));
     if let Some((zone, valid)) = cache.zip(valid) {
         finish(&mut resp, (level, r)).await;
+        // One range of what is being cached may be given, read whole as it is.
+        (resp.ranges, resp.single_range) = (true, true);
         if resp.cut.is_none() { zone.put(key, (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid); }
     }
     resp
@@ -5969,6 +5973,10 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(part(ranged("Range: bytes=-3")), (206, "789".into(), "bytes 7-9/10".into()));
         assert_eq!(part(ranged("Range: bytes=8-20\nIf-Range: \"e\"")), (206, "89".into(), "bytes 8-9/10".into()));
         assert_eq!(part(ranged("Range: bytes=0-0\nIf-Range: Sun, 06 Nov 1994 08:49:37 GMT")).0, 206);
+        // Several ranges of what may have only one are answered with the whole.
+        let single = |h: &str| { let mut resp = Response { single_range: true, ..file() }; range(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, &Level::default(), &mut resp); (resp.status, resp.body) };
+        assert_eq!(single("Range: bytes=0-1,4-5"), (200, b"0123456789".to_vec()));
+        assert_eq!(single("Range: bytes=4-5"), (206, b"45".to_vec()));
         // Past the end, or backwards, is 416; a 206 has no Accept-Ranges.
         assert_eq!(part(ranged("Range: bytes=10-")).2, "bytes */10");
         assert_eq!(ranged("Range: bytes=5-3").status, 416);
