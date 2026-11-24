@@ -94,6 +94,8 @@ files = [
 # requests. Files that need, besides the modules and test client features of
 # stages 1 to 4, only cache and upstream_keepalive; files that also need fastcgi,
 # grpc, HTTP/3, ssi or other modules wait for their stages.
+# The twinx_*.t files are twinx's own tests (harness/nginx-tests/extra): behaviour nginx-tests
+# does not check, found by the security checks in v0.4.0.
 [stage5]
 files = [
   "h2_proxy_cache.t", "h2_ssl_proxy_cache.t", "not_modified_finalize.t",
@@ -107,4 +109,10 @@ files = [
   "proxy_merge_headers.t", "proxy_non_idempotent.t",
   "proxy_request_buffering_keepalive.t", "proxy_ssl_keepalive.t", "range_clearing.t",
   "upstream_keepalive.t",
+  "twinx_body_buffer.t", "twinx_chunk_lines.t", "twinx_conditions.t",
+  "twinx_conditions_answers.t", "twinx_conf_refused.t", "twinx_gunzip_static.t",
+  "twinx_locations.t", "twinx_proxy_answer.t", "twinx_proxy_targets.t",
+  "twinx_proxy_xar.t", "twinx_ranges.t", "twinx_ranges_malformed.t",
+  "twinx_request_fields.t", "twinx_return_codes.t", "twinx_rewrite_escape.t",
+  "twinx_rewrite_order.t", "twinx_rewrite_regex.t", "twinx_uri.t", "twinx_variables.t",
 ]
