@@ -1,19 +1,79 @@
 //! proxy_cache: answers of proxied servers kept by the key of their request in a
 //! zone that proxy_cache_path names (keys_zone=), and given again while they are valid
-//! for as long as proxy_cache_valid says for their status.
+//! for as long as the headers of the answer (X-Accel-Expires, Cache-Control, Expires)
+//! or else proxy_cache_valid say for their status.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// A cached answer: its status, Content-Type, headers and body, and until when it is valid.
+/// A cached answer: its status, Content-Type, headers and body, until when (in seconds
+/// since the epoch) it is valid, and for how long after that it may be given while it
+/// is being updated (stale-while-revalidate).
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub status: u16,
     pub ctype: Option<String>,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
-    until: Instant,
+    until: i64,
+    updating: i64,
+}
+
+impl Entry {
+    /// Whether it may still be given while it is being updated (c->stale_updating).
+    pub fn updating(&self) -> bool {
+        self.until.saturating_add(self.updating) >= crate::clock::seconds()
+    }
+}
+
+/// What the headers of an answer say about caching it, as nginx reads them in turn
+/// (ngx_http_upstream_process_cache_control() and those of Expires, X-Accel-Expires
+/// and Set-Cookie): until when it is valid, if they say, and for how long after that
+/// it may be given while it is being updated; None when it is not cached at all.
+pub fn said(headers: &[(String, String)], ignored: &[String], now: i64) -> Option<(Option<i64>, i64)> {
+    let (mut valid, mut updating, mut accel, mut no_cache, mut expired) = (None, 0, false, false, false);
+    for (name, value) in headers {
+        let name = name.to_ascii_lowercase();
+        if ignored.contains(&name) { continue; }
+        let lower = value.to_ascii_lowercase();
+        match name.as_str() {
+            "set-cookie" => return None,
+            // Only the first one counts; "0" caches nothing, "@" gives the time it ends.
+            "x-accel-expires" if !accel => {
+                accel = true;
+                // As ngx_atoi() reads them: digits only.
+                let number = |v: &str| v.bytes().all(|c| c.is_ascii_digit()).then(|| v.parse::<i64>().ok()).flatten();
+                let n = match value.strip_prefix('@') {
+                    Some(at) => number(at),
+                    None => match number(value) { Some(0) => return None, n => n.map(|n| now.saturating_add(n)) },
+                };
+                if let Some(n) = n { (valid, no_cache, expired) = (Some(n), false, false); }
+            }
+            "cache-control" => {
+                if !(valid.is_some() && accel) {
+                    if ["no-cache", "no-store", "private"].iter().any(|d| lower.contains(d)) { no_cache = true; continue; }
+                    let age = lower.find("s-maxage=").map(|i| i + 9).or_else(|| lower.find("max-age=").map(|i| i + 8));
+                    // Other than digits goes no further; "0" caches nothing.
+                    match age.map(|age| seconds(&lower[age..])) { Some(None) => continue, Some(Some(0)) => { no_cache = true; continue } Some(Some(n)) => (valid, expired) = (Some(now.saturating_add(n)), false), None => {} }
+                }
+                if let Some(n) = lower.find("stale-while-revalidate=").and_then(|i| seconds(&lower[i + 23..])) { updating = n; }
+            }
+            "expires" if valid.is_none() => match crate::expires::http_time(value).filter(|t| *t >= now) {
+                Some(t) => valid = Some(t),
+                None => expired = true,
+            },
+            _ => {}
+        }
+    }
+    (!no_cache && !expired).then_some((valid, updating))
+}
+
+/// The seconds a directive of Cache-Control gives, up to ",", ";" or " " (as many as
+/// may be when they are more); None when something else comes first.
+fn seconds(s: &str) -> Option<i64> {
+    let digits = s.find([',', ';', ' ']).map_or(s, |end| &s[..end]);
+    digits.bytes().try_fold(0i64, |n, c| c.is_ascii_digit().then(|| n.saturating_mul(10).saturating_add((c - b'0') as i64)))
 }
 
 /// A zone of keys (keys_zone=name:size of proxy_cache_path), with what it keeps.
@@ -32,7 +92,7 @@ pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 impl Zone {
     /// The answer kept for a key, while it is valid.
     pub fn get(&self, key: &str) -> Option<Entry> {
-        self.entries.lock().unwrap().get(key).filter(|e| e.until > Instant::now()).cloned()
+        self.entries.lock().unwrap().get(key).filter(|e| e.until >= crate::clock::seconds()).cloned()
     }
 
     /// The answer kept for a key, also once it is no longer valid (proxy_cache_use_stale).
@@ -48,9 +108,9 @@ impl Zone {
         *n
     }
 
-    /// Keeps an answer for a key, valid for so long.
-    pub fn put(&self, key: String, (status, ctype, headers, body): (u16, Option<String>, Vec<(String, String)>, Vec<u8>), valid: Duration) {
-        self.entries.lock().unwrap().insert(key, Entry { status, ctype, headers, body, until: Instant::now() + valid });
+    /// Keeps an answer for a key, valid until then, and given while it is updated for so long after.
+    pub fn put(&self, key: String, (status, ctype, headers, body): (u16, Option<String>, Vec<(String, String)>, Vec<u8>), (until, updating): (i64, i64)) {
+        self.entries.lock().unwrap().insert(key, Entry { status, ctype, headers, body, until, updating });
     }
 
     /// Waits, for so long at most, until no other request asks the server for the key, and
@@ -123,6 +183,37 @@ mod tests {
         });
     }
 
+    fn h(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn headers_say_how_long() {
+        let none: &[String] = &[];
+        let said = |list: &[(&str, &str)]| said(&h(list), none, 1000);
+        assert_eq!(said(&[]), Some((None, 0)));
+        assert_eq!(said(&[("Cache-Control", "max-age=60")]), Some((Some(1060), 0)));
+        assert_eq!(said(&[("Cache-Control", "s-maxage=5, max-age=60")]), Some((Some(1005), 0)));
+        assert_eq!(said(&[("Cache-Control", "max-age=9223372036854775808")]), Some((Some(i64::MAX), 0)));
+        assert_eq!(said(&[("Cache-Control", "max-age=6x")]), Some((None, 0)));
+        assert_eq!(said(&[("Cache-Control", "max-age=0")]), None);
+        assert_eq!(said(&[("Cache-Control", "no-cache, max-age=60")]), None);
+        assert_eq!(said(&[("Cache-Control", "no-cache"), ("Cache-Control", "max-age=60")]), None);
+        assert_eq!(said(&[("Expires", "Thu, 01 Jan 1970 00:00:01 GMT")]), None);
+        assert_eq!(said(&[("Expires", "Thu, 01 Jan 1970 00:00:01 GMT"), ("Cache-Control", "max-age=60")]), Some((Some(1060), 0)));
+        assert_eq!(said(&[("Cache-Control", "max-age=60"), ("Expires", "Thu, 01 Jan 1970 00:00:01 GMT")]), Some((Some(1060), 0)));
+        assert_eq!(said(&[("X-Accel-Expires", "60"), ("X-Accel-Expires", "0")]), Some((Some(1060), 0)));
+        assert_eq!(said(&[("X-Accel-Expires", "@60")]), Some((Some(60), 0)));
+        assert_eq!(said(&[("X-Accel-Expires", "x")]), Some((None, 0)));
+        assert_eq!(said(&[("Cache-Control", "max-age=60"), ("X-Accel-Expires", "0")]), None);
+        assert_eq!(said(&[("Expires", "Thu, 01 Jan 1970 00:00:01 GMT"), ("Cache-Control", "no-cache"), ("X-Accel-Expires", "60")]), Some((Some(1060), 0)));
+        assert_eq!(said(&[("X-Accel-Expires", "@1"), ("Cache-Control", "no-cache, stale-while-revalidate=50")]), Some((Some(1), 50)));
+        assert_eq!(said(&[("Cache-Control", "stale-while-revalidate=50"), ("X-Accel-Expires", "@1")]), Some((Some(1), 50)));
+        assert_eq!(said(&[("Set-Cookie", "a"), ("Cache-Control", "max-age=60")]), None);
+        let ignored = ["set-cookie".to_string(), "cache-control".to_string()];
+        assert_eq!(super::said(&h(&[("Set-Cookie", "a"), ("Cache-Control", "no-cache")]), &ignored, 1000), Some((None, 0)));
+    }
+
     #[test]
     fn uses_counted_by_key() {
         let z = Zone::default();
@@ -132,11 +223,15 @@ mod tests {
     #[test]
     fn kept_while_valid() {
         let z = Zone::default();
-        z.put("k".into(), (200, None, Vec::new(), b"x".to_vec()), Duration::from_secs(60));
+        let now = crate::clock::seconds();
+        z.put("k".into(), (200, None, Vec::new(), b"x".to_vec()), (now + 60, 0));
         assert_eq!(z.get("k").unwrap().body, b"x");
-        z.put("k".into(), (200, None, Vec::new(), b"x".to_vec()), Duration::ZERO);
+        z.put("k".into(), (200, None, Vec::new(), b"x".to_vec()), (now - 10, 0));
         assert!(z.get("k").is_none());
         assert_eq!(z.stale("k").unwrap().body, b"x");
+        assert!(!z.stale("k").unwrap().updating());
+        z.put("k".into(), (200, None, Vec::new(), b"x".to_vec()), (now - 10, 60));
+        assert!(z.stale("k").unwrap().updating());
         assert!(z.stale("other").is_none());
         assert!(z.get("other").is_none());
     }

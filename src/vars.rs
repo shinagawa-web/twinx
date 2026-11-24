@@ -29,6 +29,8 @@ pub struct Shared {
     pub trailers: std::sync::Mutex<Vec<(String, String)>>,
     /// How the cache answered the request: MISS, HIT, EXPIRED, STALE ($upstream_cache_status).
     pub cache_status: std::sync::Mutex<Option<&'static str>>,
+    /// Whether the request updates the cache in the background (proxy_cache_background_update).
+    pub updater: bool,
 }
 
 /// What a request carries, as the variables see it.

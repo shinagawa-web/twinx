@@ -2117,6 +2117,16 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     if let Some(e) = cache.filter(|_| !bypass).and_then(|z| z.get(&key)) { noted("HIT"); return hit(e) }
     // What is kept but no longer valid may be given instead of the server's answer (proxy_cache_use_stale).
     let stale = cache.filter(|_| !bypass).and_then(|z| z.stale(&key));
+    // proxy_cache_background_update: what may be given while it is updated is given at
+    // once, and the server is asked for the update by a request of its own.
+    let updating = |e: &crate::cache::Entry| e.updating() || level.proxy_cache_use_stale.iter().any(|c| c == "updating");
+    if let Some(e) = stale.clone().filter(|e| level.proxy_cache_background_update && !r.shared.updater && updating(e)) {
+        noted("STALE");
+        let (p, level, mut update, prefix) = (p.clone(), level.clone(), r.clone(), prefix.to_string());
+        update.shared = Arc::new(crate::vars::Shared { number: r.shared.number, updater: true, ..Default::default() });
+        tokio::task::spawn_local(async move { Box::pin(proxy(&p, &level, &update, &prefix, None)).await });
+        return hit(e);
+    }
     noted(if bypass { "BYPASS" } else if stale.is_some() { "EXPIRED" } else { "MISS" });
     let uses = cache.map_or(0, |z| z.used(&key));
     // proxy_cache_lock: while another request asks the server for the key, this one waits
@@ -2297,7 +2307,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     (resp.upstream_addr, resp.upstream_status, resp.upstream_time, resp.upstream_bytes, resp.proxy_host) = (upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host);
     // X-Accel-Limit-Rate sets the rate the answer is sent at; X-Accel-Redirect
     // replaces the answer with an internal redirect to its URI.
-    let accel = |name: &str| resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
+    let ignored = |name: &str| level.proxy_ignore_headers.iter().any(|i| i == name);
+    let accel = |name: &str| resp.upstream.iter().filter(|_| !ignored(name)).find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     if let Some(rate) = accel("x-accel-limit-rate").and_then(|v| v.parse().ok()) { r.shared.limit_rate.set(rate); }
     // It keeps Content-Type and the headers below; an unsafe URI is 404.
     if let Some(to) = accel("x-accel-redirect") {
@@ -2321,7 +2332,11 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // Not before proxy_cache_min_uses requests asked for it, nor when proxy_no_cache says so.
     let no_cache = any_set(&level.proxy_no_cache);
     let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !no_cache;
-    if let Some((zone, valid)) = cache.filter(|_| cacheable).zip(crate::cache::validity(&level.proxy_cache_valid, resp.status)) {
+    // X-Accel-Expires, Cache-Control and Expires say for how long, before proxy_cache_valid.
+    let now = crate::clock::seconds();
+    let said = cache.filter(|_| cacheable).and_then(|_| crate::cache::said(&resp.upstream, &level.proxy_ignore_headers, now));
+    let valid = said.and_then(|(until, updating)| until.or_else(|| crate::cache::validity(&level.proxy_cache_valid, resp.status).map(|t| now.saturating_add(t.as_secs() as i64))).map(|u| (u, updating)));
+    if let Some((zone, valid)) = cache.zip(valid) {
         finish(&mut resp, (level, r)).await;
         if resp.cut.is_none() { zone.put(key, (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid); }
     }
