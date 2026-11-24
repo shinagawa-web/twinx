@@ -45,7 +45,8 @@ pub fn tokenize(text: &str) -> Result<Vec<(Tok, usize)>, (String, usize)> {
                 }
                 if i >= b.len() { return Err(("unexpected end of file, expecting \";\" or \"}\"".into(), line)); }
                 let next = b.get(i + 1).copied().unwrap_or(b' ');
-                if !b" \t\r\n;{}".contains(&next) { return Err((format!("unexpected \"{}\"", next as char), line)); }
+                // ")" may follow, as a word of its own (the end of a condition of if).
+                if !b" \t\r\n;{})".contains(&next) { return Err((format!("unexpected \"{}\"", next as char), line)); }
                 out.push((Tok::Word(unescape(&raw)), start));
             }
             _ => {
@@ -143,5 +144,6 @@ mod tests {
         assert_eq!(p("a {").unwrap_err(), "unexpected end of file, expecting \";\" or \"}\" in t.conf:1");
         assert_eq!(p(";").unwrap_err(), "unexpected \";\" in t.conf:1");
         assert_eq!(p("a \"b\"c;").unwrap_err(), "unexpected \"c\" in t.conf:1");
+        assert_eq!(p("if ($a = \"b\") { }").unwrap()[0].args, ["($a", "=", "b", ")"]);
     }
 }

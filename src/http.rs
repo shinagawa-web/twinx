@@ -2118,7 +2118,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         None => None,
     };
     let to_host = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
-    let key = level.proxy_cache_key.as_ref().map_or_else(|| format!("{}://{host}{}", if r.ssl.is_some() { "https" } else { "http" }, r.request_uri()), |k| k.render(r, &to_host));
+    let main = level.proxy_cache_key.as_ref().map_or_else(|| format!("{}://{host}{}", if r.ssl.is_some() { "https" } else { "http" }, r.request_uri()), |k| k.render(r, &to_host));
+    // That of the variant of the request when what the key keeps has a Vary it does not match.
+    let key = cache.map_or_else(|| main.clone(), |z| z.resolve(&main, &r.headers));
     // proxy_cache_bypass: the server is asked whatever the cache keeps.
     let any_set = |t: &[Template]| t.iter().any(|t| !matches!(t.render(r, &to_host).as_str(), "" | "0"));
     let bypass = cache.is_some() && any_set(&level.proxy_cache_bypass);
@@ -2362,7 +2364,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // An answer whose status proxy_cache_valid names is read whole and kept.
     // Not before proxy_cache_min_uses requests asked for it, nor when proxy_no_cache says so.
     let no_cache = any_set(&level.proxy_no_cache);
-    let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !far && !no_cache;
+    // Nor one whose Vary is "*", unless proxy_ignore_headers has Vary.
+    let vary = if ignored("vary") { Some(Vec::new()) } else { crate::cache::vary(&resp.upstream) };
+    let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !far && !no_cache && vary.is_some();
     // X-Accel-Expires, Cache-Control and Expires say for how long, before proxy_cache_valid.
     let now = crate::clock::seconds();
     let said = cache.filter(|_| cacheable).and_then(|_| crate::cache::said(&resp.upstream, &level.proxy_ignore_headers, now));
@@ -2371,7 +2375,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         finish(&mut resp, (level, r)).await;
         // One range of what is being cached may be given, read whole as it is.
         (resp.ranges, resp.single_range) = (true, true);
-        if resp.cut.is_none() { zone.put(key, (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid); }
+        if resp.cut.is_none() { zone.put((&main, &key), (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid, (vary.unwrap_or_default(), &r.headers)); }
     }
     resp
 }

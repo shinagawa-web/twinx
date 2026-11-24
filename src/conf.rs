@@ -877,7 +877,7 @@ impl Builder<'_> {
         for d in block.iter().filter(|d| d.name == "proxy_cache_path") {
             self.check(d, HTTP)?;
             let name = crate::cache::zone_name(&d.args[1..]).ok_or_else(|| format!("\"{}\" must have \"keys_zone\" parameter in {}", d.name, d.at))?;
-            self.zones.insert(name.to_string(), Arc::default());
+            self.zones.insert(name.to_string(), Arc::new(crate::cache::Zone::at(self.path(&d.args[0]))));
         }
         // Named captures of server names are variables everywhere, so they are known first.
         let names = block.iter().filter(|d| d.name == "server").flat_map(|d| d.block.iter().flatten()).filter(|d| d.name == "server_name");
