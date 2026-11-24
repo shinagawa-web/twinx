@@ -162,6 +162,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_cache_lock_timeout", HSL, 1, 1, false),
     ("proxy_cache_lock_age", HSL, 1, 1, false),
     ("proxy_cache_min_uses", HSL, 1, 1, false),
+    ("proxy_cache_max_range_offset", HSL, 1, 1, false),
     ("proxy_cache_use_stale", HSL, 1, usize::MAX, false),
     ("proxy_no_cache", HSL, 1, usize::MAX, false),
     ("proxy_cache_bypass", HSL, 1, usize::MAX, false),
@@ -472,6 +473,9 @@ pub struct Level {
     pub proxy_cache_valid: Vec<(Option<u16>, Duration)>,
     /// proxy_cache_min_uses: how many requests ask for a key before its answer is cached.
     pub proxy_cache_min_uses: u64,
+    /// proxy_cache_max_range_offset: a request whose range starts at this offset or
+    /// past it is passed to the server as it is, and its answer not cached (None: no limit).
+    pub proxy_cache_max_range_offset: Option<u64>,
     /// proxy_cache_use_stale: when an answer no longer valid is given rather than the
     /// server's ("error", "timeout", "http_500", ...).
     pub proxy_cache_use_stale: Vec<String>,
@@ -1120,6 +1124,7 @@ impl Builder<'_> {
                 "proxy_cache_lock_timeout" => level.proxy_cache_lock_timeout = millis(&d.args[0]).map_err(at)?,
                 "proxy_cache_lock_age" => level.proxy_cache_lock_age = millis(&d.args[0]).map_err(at)?,
                 "proxy_cache_min_uses" => level.proxy_cache_min_uses = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
+                "proxy_cache_max_range_offset" => level.proxy_cache_max_range_offset = Some(offset(&d.args[0]).map_err(|_| invalid())?),
                 "proxy_cache_use_stale" => {
                     const VALUES: &[&str] = &["error", "timeout", "invalid_header", "updating", "http_500", "http_502", "http_503", "http_504", "http_403", "http_404", "http_429", "off"];
                     if let Some(a) = d.args.iter().find(|a| !VALUES.contains(&a.as_str())) { return Err(at(format!("invalid value \"{a}\""))); }
@@ -1808,6 +1813,10 @@ mod tests {
         assert_eq!(l.proxy_ignore_headers, ["vary"]);
         assert!(build_text("http { proxy_ignore_headers Server; }").unwrap_err().starts_with("invalid value \"Server\" in "));
         assert!(build_text("http { proxy_cache_min_uses x; }").is_err());
+        let c = build_text("http { proxy_cache_max_range_offset 1k; server { location / { } } server { location / { proxy_cache_max_range_offset 0; } } }").unwrap();
+        let max = |i: usize| c.servers[i].locations[0].level.proxy_cache_max_range_offset;
+        assert_eq!((max(0), max(1), Level::default().proxy_cache_max_range_offset), (Some(1024), Some(0), None));
+        assert!(build_text("http { proxy_cache_max_range_offset x; }").is_err());
         assert_eq!(build_text("http { server { proxy_cache Z; } }").unwrap_err(), "\"proxy_cache\" zone \"Z\" is unknown in t.conf:1");
         assert_eq!(build_text("http { proxy_cache_path c levels=1; }").unwrap_err(), "\"proxy_cache_path\" must have \"keys_zone\" parameter in t.conf:1");
     }
