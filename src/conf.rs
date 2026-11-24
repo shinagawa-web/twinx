@@ -165,6 +165,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_cache_bypass", HSL, 1, usize::MAX, false),
     ("proxy_cache_key", HSL, 1, 1, false),
     ("proxy_cache_background_update", HSL, 1, 1, false),
+    ("proxy_cache_convert_head", HSL, 1, 1, false),
     ("proxy_ignore_headers", HSL, 1, usize::MAX, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
     ("proxy_http_version", HSL, 1, 1, false),
@@ -476,6 +477,8 @@ pub struct Level {
     /// proxy_cache_background_update: what is no longer valid but may be given while it is
     /// updated is given at once, and the server asked for the update meanwhile.
     pub proxy_cache_background_update: bool,
+    /// proxy_cache_convert_head: a HEAD that may be cached asks the server with GET (on by default).
+    pub proxy_cache_convert_head: bool,
     /// proxy_ignore_headers: the headers of proxied answers that are not acted on, lowercase.
     pub proxy_ignore_headers: Vec<String>,
     /// proxy_buffers: the number and the size of the buffers the body is read into.
@@ -834,7 +837,7 @@ impl Builder<'_> {
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let (temp, proxy_temp) = (self.path("client_body_temp"), self.path("proxy_temp"));
         // Without root, files come from html under the prefix, as nginx's default root is.
-        let mut level = Level { error_log: self.errors.clone(), root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, gzip_min_length: 20, proxy_cache_min_uses: 1, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
+        let mut level = Level { error_log: self.errors.clone(), root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, gzip_min_length: 20, proxy_cache_min_uses: 1, proxy_cache_convert_head: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, lingering_close: Some(false),
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), sendfile_max_chunk: 2 << 20, tcp_nodelay: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -1118,6 +1121,7 @@ impl Builder<'_> {
                 }
                 "proxy_cache_key" => level.proxy_cache_key = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_cache_background_update" => level.proxy_cache_background_update = flag(d).map_err(at)?,
+                "proxy_cache_convert_head" => level.proxy_cache_convert_head = flag(d).map_err(at)?,
                 // All of those of a level replace those it inherits.
                 "proxy_ignore_headers" => {
                     const VALUES: &[&str] = &["x-accel-redirect", "x-accel-expires", "x-accel-limit-rate", "x-accel-buffering", "x-accel-charset", "expires", "cache-control", "set-cookie", "vary"];
@@ -1775,6 +1779,9 @@ mod tests {
         assert_eq!(l.proxy_cache_use_stale, ["error", "http_404"]);
         assert!(c.servers[0].locations[0].level.proxy_cache_use_stale.is_empty());
         assert_eq!(build_text("http { proxy_cache_use_stale http_418; }").unwrap_err(), "invalid value \"http_418\" in t.conf:1");
+        let c = build_text("http { proxy_cache_convert_head off; server { location / { proxy_cache_convert_head on; } } }").unwrap();
+        assert_eq!((c.servers[0].level.proxy_cache_convert_head, c.servers[0].locations[0].level.proxy_cache_convert_head), (false, true));
+        assert!(build_text("http { server { } }").unwrap().servers[0].level.proxy_cache_convert_head);
         let c = build_text("http { proxy_cache_background_update on; proxy_ignore_headers Expires Set-Cookie; proxy_ignore_headers X-Accel-Expires; server { location / { proxy_ignore_headers vary; } } }").unwrap();
         let (http, l) = (&c.servers[0].level, &c.servers[0].locations[0].level);
         assert_eq!((http.proxy_cache_background_update, http.proxy_ignore_headers.clone()), (true, vec!["expires".to_string(), "set-cookie".into(), "x-accel-expires".into()]));

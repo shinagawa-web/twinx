@@ -2150,8 +2150,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &sent))).collect();
     let is_set = |name: &str| set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
     // proxy_method replaces the request's method.
-    // One that may be cached asks for the body of a HEAD too (proxy_cache_convert_head).
-    let method = level.proxy_method.as_ref().map_or_else(|| if cache.is_some() { "GET".to_string() } else { r.method.clone() }, |m| m.render(r, &sent));
+    // One that may be cached asks for the body of a HEAD too, unless proxy_cache_convert_head is off.
+    let method = level.proxy_method.as_ref().map_or_else(|| if cache.is_some() && level.proxy_cache_convert_head { "GET".to_string() } else { r.method.clone() }, |m| m.render(r, &sent));
     let mut req = format!("{method} {uri} HTTP/1.{}\r\n", level.proxy_http_11 as u8);
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     if !is_set("host") { req += &format!("Host: {host}\r\n"); }
