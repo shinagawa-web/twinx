@@ -13,13 +13,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
-use crate::body::{Body, Came};
+use crate::body::{Body, Buffers, Came, Sizes};
 use crate::conf::{Condition, Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, Step, TryFiles};
 use crate::vars::{Part, Template};
 use crate::expires;
 use crate::upstream::{Conn, Peer, Upstream};
 use crate::vars::{Request, Sent};
-use crate::stream::{Stream, buffer, read_into, read_until, recycle, unless_closed, within, write_all};
+use crate::stream::{Stream, buffer, read_into, read_ready, read_until, recycle, unless_closed, within, write_all};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
 
@@ -555,6 +555,8 @@ struct Response {
     /// closed the connection before the end of it, or a read of it having failed or
     /// waited longer than proxy_read_timeout, or its chunks being malformed.
     cut: Option<Box<Cut>>,
+    /// Whether it is a proxied answer that is not buffered, which limit_rate does not pace.
+    unbuffered: bool,
 }
 
 /// A proxied answer cut off: the length its server gave it, if any, until a
@@ -567,10 +569,11 @@ struct Cut { length: Option<usize>, malformed: bool }
 /// is found, the rate, when the request to it started, and how long a read may wait;
 /// whether the connection may be used again once the body has ended, and where it
 /// goes back to then: the upstream, the server's address and the location's tag;
-/// and where the trailers are then, if they are passed, and, over HTTP/2, how the
-/// answer ended.
+/// where the trailers are then, if they are passed, and, over HTTP/2, how the answer
+/// ended; and the sizes of the buffers it is read into, without proxy_buffering how
+/// much is read at once.
 #[derive(Debug)]
-struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)>, trailers: Option<Trailers>, slot: Option<crate::h2::Slot> }
+struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)>, trailers: Option<Trailers>, slot: Option<crate::h2::Slot>, sizes: Result<Sizes, usize> }
 
 /// The trailers of an answer over HTTP/2 (proxy_pass_trailers): the slot they come
 /// in, the headers proxy_hide_header names, and what they are passed through.
@@ -953,7 +956,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let pace = {
         // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
         let size = |t: &Template| if t.0.is_empty() { 0 } else { crate::conf::size(&t.value(r, &Sent::default())).unwrap_or(0) };
-        let rate = r.shared.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
+        let rate = if resp.unbuffered { 0 } else { r.shared.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate)) };
         Pace::new(rate, size(&level.limit_rate_after), r.started, streams)
     };
     let (written, mut bytes, mut body, trailers);
@@ -1098,10 +1101,12 @@ fn streams(r: &Request, level: &Level, resp: &Response, gzipped: bool) -> bool {
     if gzip_ok(r, level) { !gzips(level, resp) } else { !(level.gunzip && gzipped) }
 }
 
-/// Sends a proxied answer as its body comes: the head, with what of the body came with
-/// it or comes first, then each piece as it is read, the next one once it is written,
-/// in a chunk if the body is chunked, and then what ends that. A body cut off has no
-/// last chunk; of one found malformed before anything was sent nothing is. The
+/// Sends a proxied answer as its body comes: the head, with the first of the body that
+/// goes on, then each part as it does (Buffers), what is read next once it is written,
+/// in a chunk if the body is chunked, and then what ends that. Without buffering, the
+/// head goes as soon as it has come. A body cut off has no last chunk; what has not gone
+/// on when a read fails or times out is not sent, and of one found malformed nothing
+/// that came in one go with that. The
 /// connection to the server goes back, or is closed, once the body has ended, before
 /// what is left is written, or when the client closes its connection, a write fails or
 /// worker_shutdown_timeout passes meanwhile. As in nginx, the status is 499 when the
@@ -1125,47 +1130,78 @@ async fn pass<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(strea
 /// Does that, leaving the rest of an answer that has not ended, with how much of it was
 /// read; None when the client closes its connection while the server is waited for.
 async fn pass_pieces(stream: &mut Stream, (rest, read): (&mut Option<Box<Rest>>, &mut usize), resp: &mut Response, (mut head, chunked): (&[u8], bool), pace: &mut Pace, time: Option<Duration>, ending: impl FnOnce(&Response, &mut Vec<u8>)) -> Option<bool> {
-    let (start, mut buf, mut data, mut size, mut tail, mut ending) = (seconds(), Vec::new(), buffer(), Vec::new(), Vec::new(), Some(ending));
-    let (mut body, mut came, mut ended, mut failed, mut malformed) = (Body::new(None, false), Came::More, false, false, false);
-    if let Some(from) = rest {
-        body = Body::new(from.length.map(|n| n as u64), from.chunked);
-        *read = from.answer.len() - from.end;
-        came = body.take(&from.answer[from.end..], &mut data);
-    }
+    let Some(from) = rest else { return Some(true) };
+    let (start, mut buf, mut size, mut tail, mut ending) = (seconds(), Vec::new(), Vec::new(), Vec::new(), Some(ending));
+    let body = Body::new(from.length.map(|n| n as u64), from.chunked);
+    let mut buffers = Buffers::new(body, from.slot.is_some(), from.sizes.ok(), from.end, buffer());
+    let (mut ended, mut failed, mut malformed) = (false, false, false);
+    // Whether anything came since the last write.
+    let mut came = from.answer.len() > from.end;
+    *read = from.answer.len() - from.end;
+    buffers.take(&from.answer[from.end..]);
+    // A head as large as nginx's postpone_output does not wait for the body, nor does one
+    // without buffering, if nothing came with it.
+    let postponed = head.len() < 1460 && (from.sizes.is_ok() || came);
     while let Some(from) = rest.as_mut() {
-        while came == Came::More && data.is_empty() && !ended {
-            if buf.is_empty() { buf.resize(16384, 0); }
-            let n = unless_closed(stream, read_piece(&mut from.conn.stream, &mut buf, (from.rate, start, *read), from.wait)).await?;
-            let n = n.unwrap_or_else(|| { failed = true; 0 });
+        // Waits for the next that comes and takes what there is then, up to the size of
+        // the buffers, or only one read without them, or with a rate.
+        while buffers.came() == Came::More && !ended {
+            let room = buffers.room();
+            if room == 0 || came && (from.sizes.is_err() || from.rate > 0) { break }
+            if buf.is_empty() { buf.resize(from.sizes.map_or_else(|n| n, |s| 65536.min(s.first.saturating_add(s.count.saturating_mul(s.size)))).max(1), 0); }
+            let part = room.min(buf.len());
+            let part = &mut buf[..part];
+            let got = if came {
+                match read_ready(&mut from.conn.stream, part).await { Some(got) => got, None => break }
+            } else {
+                if !postponed && !head.is_empty() {
+                    if !send(stream, &[head], pace, time).await { return Some(false) }
+                    if let Some(tcp) = stream.tcp() { let _ = tcp.set_nodelay(true); }
+                    head = &[];
+                }
+                unless_closed(stream, read_piece(&mut from.conn.stream, part, (from.rate, start, *read), from.wait)).await?
+            };
+            // An end of TLS without its alert is an end for what came before it.
+            ended = !matches!(got, Ok(1..));
+            let all = got.as_ref().map_or_else(|e| came || e.kind() == std::io::ErrorKind::UnexpectedEof, |_| true);
+            failed = got.is_err();
+            let n = got.unwrap_or(0);
             *read += n;
-            came = body.take(&buf[..n], &mut data);
-            ended = n == 0;
+            buffers.take(&part[..n]);
+            came = true;
             if let Some(slot) = from.slot.as_ref().filter(|_| ended && !failed) { (failed, malformed) = ended_over_h2(slot); }
+            if ended { if all { buffers.let_go() } else { buffers.drop_held() } }
         }
-        malformed |= came == Came::Malformed;
-        ended |= came != Came::More;
+        if !ended { buffers.pause(); }
+        malformed |= buffers.came() == Came::Malformed;
+        ended |= buffers.came() != Came::More;
+        came = false;
         if ended {
-            resp.cut = body.cut(failed).then(|| Box::new(Cut { length: from.length, malformed }));
+            resp.cut = buffers.cut(failed).then(|| Box::new(Cut { length: from.length, malformed }));
             if let Some(t) = from.trailers.as_ref().filter(|_| resp.cut.is_none()) { unless_closed(stream, t.take(&mut from.conn.stream, Some(from.wait.unwrap_or_default()))).await?; }
             note(resp, from, *read);
-            if let Some(rest) = rest.take() { rest.give_back(came == Came::Whole { followed: false }); }
-            // Nothing is sent of what came in one read with what is malformed.
+            if let Some(rest) = rest.take() { rest.give_back(buffers.came() == Came::Whole { followed: false }); }
+            // Nothing is sent of what came in one go with what is malformed.
             if malformed { return Some(true) }
         }
-        size.clear();
-        tail.clear();
-        if chunked && !data.is_empty() {
-            let _ = write!(size, "{:x}\r\n", data.len());
-            tail.extend_from_slice(b"\r\n");
+        // A chunk, or what is paced, is a part of what goes on; all of it is, otherwise and at the end.
+        while buffers.ready > 0 || ended && ending.is_some() {
+            let end = buffers.part(ended || !chunked && pace.rate == 0);
+            size.clear();
+            tail.clear();
+            if chunked && end > 0 {
+                let _ = write!(size, "{end:x}\r\n");
+                tail.extend_from_slice(b"\r\n");
+            }
+            if let Some(ending) = ending.take_if(|_| ended) { if chunked && resp.cut.is_none() { ending(resp, &mut tail); } }
+            if !send(stream, &[head, &size, &buffers.data[..end], &tail], pace, time).await { return Some(false) }
+            // What follows, small as it may be, does not wait for the client to acknowledge that (tcp_nodelay).
+            if let Some(tcp) = stream.tcp().filter(|_| !head.is_empty() && !ended) { let _ = tcp.set_nodelay(true); }
+            head = &[];
+            buffers.written(end);
         }
-        if let Some(ending) = ending.take_if(|_| chunked && ended && resp.cut.is_none()) { ending(resp, &mut tail); }
-        if !send(stream, &[head, &size, &data, &tail], pace, time).await { return Some(false) }
-        // What follows, small as it may be, does not wait for the client to acknowledge that (tcp_nodelay).
-        if let Some(tcp) = stream.tcp().filter(|_| !head.is_empty() && !ended) { let _ = tcp.set_nodelay(true); }
-        head = &[];
-        data.clear();
     }
-    recycle(data);
+    recycle(buffers.data);
     Some(true)
 }
 
@@ -1875,8 +1911,13 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         (bytes[0], bytes[1]) = ((answer.len() - end) as u64, answer.len() as u64);
         return Ok((resp, Some(conn).filter(|_| keep && answer.len() == end)));
     }
-    let rate = rate(&resp);
-    Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None, trailers: None, slot: None })), ..resp }, None))
+    // X-Accel-Buffering, the last of them that is "yes" or "no", comes before proxy_buffering.
+    let buffering = values("x-accel-buffering").iter().rev().find_map(|v| match v.to_ascii_lowercase().as_str() { "yes" => Some(true), "no" => Some(false), _ => None }).unwrap_or(level.proxy_buffering);
+    let (first, (count, size)) = (level.proxy_buffer_size, level.proxy_buffers);
+    let sizes = if buffering { Ok(Sizes { first, count, size, busy: level.proxy_busy_buffers_size.unwrap_or(2 * first.max(size)) }) } else { Err(first) };
+    // proxy_limit_rate is for answers that are buffered.
+    let rate = if buffering { rate(&resp) } else { 0 };
+    Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None, trailers: None, slot: None, sizes })), unbuffered: !buffering, ..resp }, None))
 }
 
 /// Whether a header of a proxied server's early hints is hidden, as those of
@@ -1915,7 +1956,7 @@ async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked:
     let (mut body, mut data, mut read) = (Body::new(length.map(|n| n as u64), chunked), Vec::new(), after.len());
     let mut came = body.take(after, &mut data);
     while came == Came::More {
-        let Some(n) = read_piece(s, &mut chunk, (rate, start, read), wait).await else { failed = true; break };
+        let Ok(n) = read_piece(s, &mut chunk, (rate, start, read), wait).await else { failed = true; break };
         if n == 0 {
             if let Some(slot) = slot { (failed, malformed) = ended_over_h2(slot); }
             malformed &= data.is_empty();
@@ -1929,9 +1970,9 @@ async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked:
 }
 
 /// Reads a piece of a proxied answer's body into the buffer, at the rate from the second
-/// the body started in, with so much of it read before; None when the read fails or
+/// the body started in, with so much of it read before; an error when the read fails or
 /// waits longer than the time.
-async fn read_piece(s: &mut Stream, buf: &mut [u8], (rate, start, read): (u64, i64, usize), wait: Option<Duration>) -> Option<usize> {
+async fn read_piece(s: &mut Stream, buf: &mut [u8], (rate, start, read): (u64, i64, usize), wait: Option<Duration>) -> std::io::Result<usize> {
     let rate = rate as i64;
     let limit = loop {
         let limit = if rate == 0 { buf.len() as i64 } else { rate * (seconds() - start + 1) - read as i64 };
@@ -1939,7 +1980,7 @@ async fn read_piece(s: &mut Stream, buf: &mut [u8], (rate, start, read): (u64, i
         tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await;
     };
     let limit = limit.min(buf.len());
-    within(wait, s.read(&mut buf[..limit])).await.and_then(Result::ok)
+    within(wait, s.read(&mut buf[..limit])).await.unwrap_or_else(|| Err(std::io::ErrorKind::TimedOut.into()))
 }
 
 /// Whether an answer over HTTP/2 whose connection has ended is cut off, and whether a
@@ -2784,7 +2825,7 @@ mod tests {
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12000\r\nX-Rate: 4000\r\n\r\n").unwrap();
             s.write_all(&[b'x'; 12000]).unwrap();
         });
-        let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
+        let level = Level { proxy_buffering: true, proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(5), ..Level::default() };
         let rate = |resp: &Response| resp.upstream.iter().find(|h| h.0 == "X-Rate").map_or(0, |h| h.1.parse().unwrap());
         block_on(async {
             let mut resp = fetched(&addr, None, &level, (&mut [None; 3], &mut [0; 3]), &rate).await.unwrap();
@@ -2967,7 +3008,7 @@ mod tests {
     #[test]
     fn servers_that_send_malformed_chunks_have_not_failed() {
         let _busy = counted();
-        for (body, rate) in [MALFORMED[0], "zz\r\n", "2\r\nab\r\n0\r\nX\r: 1\r\n\r\n"].into_iter().flat_map(|body| RATES.map(|rate| (body, rate))) {
+        for (body, rate) in [MALFORMED[0], "zz\r\nz", "2\r\nab\r\n0\r\nX\r: 1\r\n\r\n"].into_iter().flat_map(|body| RATES.map(|rate| (body, rate))) {
             let answer = format!("{CHUNKED}{body}");
             let servers = [failing(&answer, false), failing(&answer, false)];
             let text = format!("http {{ upstream u {{ server {}; server {}; keepalive 2; }} server {{ proxy_read_timeout 1s; proxy_next_upstream error timeout invalid_header http_502 non_idempotent; \
@@ -3110,6 +3151,7 @@ mod tests {
         log
     }
 
+    const OFF: &str = "proxy_buffering off;";
     const DELIMITED: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
     const HTTP11: &str = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
     const HTTP10: &str = "GET / HTTP/1.0\r\n\r\n";
@@ -3134,11 +3176,12 @@ mod tests {
         let chunked = [&chunks[..], &["0\r\n\r\n"]].concat();
         let (with_length, in_chunks, plain) = (head("Content-Length: 30\r\n", "close"), head("Transfer-Encoding: chunked\r\n", "close"), head("", "close"));
         let cases = [
-            (&length, &parts[..], false, HTTP11, "", &with_length, &parts[..]), (&length, &parts, false, HTTP10, "", &with_length, &parts),
+            (&length, &parts[..], false, HTTP11, OFF, &with_length, &parts[..]), (&length, &parts, false, HTTP10, OFF, &with_length, &parts),
             (&CHUNKED.to_string(), &chunked, false, HTTP11, "", &in_chunks, &chunked), (&CHUNKED.to_string(), &chunked, false, HTTP10, "", &plain, &parts),
-            (&DELIMITED.to_string(), &parts, true, HTTP11, "", &in_chunks, &chunked), (&DELIMITED.to_string(), &parts, true, HTTP10, "", &plain, &parts),
+            (&CHUNKED.to_string(), &chunked, false, HTTP11, OFF, &in_chunks, &chunked), (&CHUNKED.to_string(), &chunked, false, HTTP10, OFF, &plain, &parts),
+            (&DELIMITED.to_string(), &parts, true, HTTP11, OFF, &in_chunks, &chunked), (&DELIMITED.to_string(), &parts, true, HTTP10, OFF, &plain, &parts),
             (&CHUNKED.to_string(), &chunked, false, HTTP11, "chunked_transfer_encoding off;", &plain, &parts),
-            (&length, &parts, false, HTTP11, "proxy_limit_rate 1m;", &with_length, &parts),
+            (&CHUNKED.to_string(), &chunked, false, HTTP11, "proxy_limit_rate 1m;", &in_chunks, &chunked),
         ];
         block_on(async {
             let all = cases.map(|(head, pieces, closes, request, directives, sent_head, want)| {
@@ -3158,6 +3201,85 @@ mod tests {
             });
             for task in all { task.await.unwrap(); }
         });
+    }
+
+    /// What a case of the next test is: the head, the pieces and whether the server
+    /// closes the connection after them, what the location has and the client's request,
+    /// and the steps something came in, with how many bytes of the body, as sent, did.
+    type Steps = (String, Vec<String>, bool, &'static str, &'static str, Vec<(u128, usize)>);
+
+    /// What comes of the cases in each step, as long as the time between their pieces.
+    fn steps(cases: Vec<Steps>) {
+        let _busy = serving_on();
+        block_on(async {
+            let all: Vec<_> = cases.into_iter().map(|(head, pieces, closes, directives, request, want)| {
+                let (addr, count) = plays(&after_head(&head, &pieces.iter().map(String::as_str).collect::<Vec<_>>(), 200), closes);
+                let (http, name) = (passing(addr, directives), format!("{head} {:?} {directives} {request}", pieces.iter().map(String::len).collect::<Vec<_>>()));
+                tokio::task::spawn_local(async move {
+                    let (_count, got) = (count, arrivals(&http, request).await);
+                    let mut steps: Vec<(u128, usize)> = Vec::new();
+                    let mut head = true;
+                    for (ms, text) in got {
+                        // Those of one step may come in parts.
+                        assert!((ms + 20) % 200 < 190, "{name} {ms}");
+                        let body = if std::mem::take(&mut head) { text.len() - head_end(text.as_bytes()).unwrap() } else { text.len() };
+                        match steps.last_mut().filter(|s| s.0 == (ms + 20) / 200) { Some(s) => s.1 += body, None => steps.push(((ms + 20) / 200, body)) }
+                    }
+                    assert_eq!(steps, want, "{name}");
+                })
+            }).collect();
+            for task in all { task.await.unwrap(); }
+        });
+    }
+
+    #[test]
+    fn what_came_goes_on_when_a_buffer_is_full_or_at_the_end() {
+        let x = "x".repeat(8192);
+        let (parts, whole, each) = (vec!["part-"; 6], [(5, 30)], [0, 1, 2, 3, 4, 5].map(|i| (i, 5)));
+        let of = |n: usize, more: &str| LENGTH.replace("30000\r\n", &format!("{n}\r\n{more}"));
+        // As many bytes of a chunk, with what makes it one.
+        let c = |n: usize| n + format!("{n:x}").len() + 4;
+        let chunks = [["5\r\npart-\r\n"; 3].as_slice(), &["0\r\n\r\n"]].concat();
+        let on = |head: String, pieces: &[&'static str], want: &[(u128, usize)]| (head, pieces.iter().map(|p| p.to_string()).collect(), false, "", HTTP11, want.to_vec());
+        let xs = |sizes: &[usize]| sizes.iter().map(|n| x[..*n].to_string()).collect::<Vec<_>>();
+        let (long, ten, six) = (of(20000, ""), of(10000, ""), of(6000, ""));
+        let (room, of_ten) = (4096 - long.len(), 4096 - ten.len());
+        let mut cases: Vec<Steps> = vec![
+            on(of(30, ""), &parts, &whole),
+            (of(30, ""), xs(&[5; 6]), false, "", HTTP10, whole.to_vec()),
+            (of(30, ""), xs(&[5; 6]), false, "proxy_limit_rate 1m;", HTTP11, whole.to_vec()),
+            (DELIMITED.into(), xs(&[5; 6]), true, "", HTTP11, vec![(5, c(30) + 5)]),
+            (DELIMITED.into(), xs(&[5; 6]), true, "", HTTP10, whole.to_vec()),
+            on(CHUNKED.into(), &chunks, &[(0, 10), (1, 10), (2, 10), (3, 5)]),
+            // Parts of chunks: what is less than the rest of one and the end of the body waits.
+            on(CHUNKED.into(), &["a\r\nhello", "world\r\n", "a\r\nhello", "world\r\n", "0\r\n\r\n"], &[(0, c(5)), (2, c(10)), (4, c(5) + 5)]),
+            on(CHUNKED.into(), &["5\r\n", "abcde", "\r\n", "2", "\r\nhe\r\n", "0\r\n\r\n"], &[(1, c(5)), (4, c(2)), (5, 5)]),
+            on(CHUNKED.into(), &["5\r\nabcde\r\n", "3\r\na", "b", "c\r\n", "0\r\n\r\n"], &[(0, c(5)), (2, c(2)), (4, c(1) + 5)]),
+            (CHUNKED.into(), [vec!["2710\r\n".to_string()], xs(&[4000, 4000, 2000]), vec!["\r\n0\r\n\r\n".into()]].concat(), false, "", HTTP11, vec![(2, c(4096)), (3, c(4096)), (4, c(1808) + 5)]),
+            // Up to the last byte of a buffer, the first of which has the head too.
+            (long.clone(), xs(&[room - 1, 1, 4095, 1, 8191, 1, 20000 - room - 3 * 4096]), false, "", HTTP11, vec![(1, room), (3, 4096), (4, 4096), (5, 4096), (6, 20000 - room - 3 * 4096)]),
+            (ten.clone(), xs(&[1000; 10]), false, "", HTTP11, vec![(4, of_ten), (8, 4096), (9, 10000 - of_ten - 4096)]),
+            (DELIMITED.into(), xs(&[1000; 10]), true, "", HTTP10, vec![(4, 4096 - DELIMITED.len()), (8, 4096), (9, 10000 - 2 * 4096 + DELIMITED.len())]),
+            (six.clone(), xs(&[1000; 6]), false, "proxy_buffer_size 1k; proxy_buffers 4 1k;", HTTP11, vec![(0, 1024 - six.len()), (1, 1024), (3, 1024), (4, 1024), (5, 6000 - 4096 + six.len())]),
+            // A head waits for the body, but for a large one, or without buffering.
+            on(of(30, ""), &["", "part-", "part-part-part-part-part-"], &[(2, 30)]),
+            on(of(30, &format!("X-Big: {}\r\n", &x[..1500])), &["", "part-", "part-part-part-part-part-"], &[(0, 0), (2, 30)]),
+            (of(30, ""), xs(&[0, 10, 20]), false, OFF, HTTP11, vec![(0, 0), (1, 10), (2, 20)]),
+            (CHUNKED.into(), ["", "5\r\npart-\r\n", "0\r\n\r\n"].map(String::from).to_vec(), false, OFF, HTTP11, vec![(0, 0), (1, 10), (2, 5)]),
+            (CHUNKED.into(), ["5\r\n", "part-\r\n", "0\r\n\r\n"].map(String::from).to_vec(), false, OFF, HTTP11, vec![(1, 10), (2, 5)]),
+            // Of what fails, what has gone on.
+            (long.clone(), xs(&[2000, 3000]), false, "proxy_read_timeout 1s;", HTTP11, vec![(1, room)]),
+            (long.clone(), xs(&[2000, 3000]), false, "proxy_read_timeout 1s; proxy_buffering off;", HTTP11, vec![(0, 2000), (1, 3000)]),
+            (long.clone(), xs(&[2000, 3000, 0]), true, "", HTTP11, vec![(1, room), (2, 5000 - room)]),
+            (long, xs(&[2000, 3000, 0]), true, OFF, HTTP11, vec![(0, 2000), (1, 3000)]),
+        ];
+        // X-Accel-Buffering, whatever proxy_buffering is.
+        for (value, passes) in [("no", Some(true)), ("No", Some(true)), ("yes", Some(false)), ("YES", Some(false)), ("off", None), ("", None), ("no\r\nX-Accel-Buffering: yes", Some(false)), ("yes\r\nx-accel-buffering: no", Some(true)), ("no\r\nX-Accel-Buffering: x", Some(true))] {
+            for (directives, off) in [("", false), (OFF, true)] {
+                cases.push((of(30, &format!("X-Accel-Buffering: {value}\r\n")), xs(&[5; 6]), false, directives, HTTP11, if passes.unwrap_or(off) { each.to_vec() } else { whole.to_vec() }));
+            }
+        }
+        steps(cases);
     }
 
     #[test]
@@ -3261,22 +3383,27 @@ mod tests {
         let (with_length, in_chunks, plain) = (head("Content-Length: 30000\r\n", "close"), head("Transfer-Encoding: chunked\r\n", "close"), head("", "close"));
         // The Date line, which is left out of what comes, is counted.
         let counted = |head: &str, body: usize| format!("200 {body} {} 200", head.len() + 37 + body);
-        for (head, pieces, closes, request, want, received) in [
-            (LENGTH, &["ab", "cd", ""][..], true, HTTP11, vec![with_length.clone() + "ab", "cd".into()], 4),
-            (LENGTH, &["ab", ""], true, HTTP11, vec![with_length.clone() + "ab"], 2),
-            (LENGTH, &["", ""], true, HTTP11, vec![with_length.clone()], 0),
-            (CHUNKED, &["2\r\nab\r\n", "3\r\ncd", ""], true, HTTP11, vec![in_chunks.clone() + "2\r\nab\r\n", "2\r\ncd\r\n".into()], 12),
-            (CHUNKED, &["2\r\nab\r\n", "0\r\n", ""], true, HTTP10, vec![plain.clone() + "ab"], 10),
-            (CHUNKED, &["", ""], true, HTTP11, vec![in_chunks.clone()], 0),
+        for (head, pieces, closes, request, directives, want, received) in [
+            (LENGTH, &["ab", "cd", ""][..], true, HTTP11, "", vec![with_length.clone() + "abcd"], 4),
+            (LENGTH, &["ab", "cd", ""], true, HTTP11, OFF, vec![with_length.clone() + "ab", "cd".into()], 4),
+            (LENGTH, &["ab", ""], true, HTTP11, "", vec![with_length.clone() + "ab"], 2),
+            (LENGTH, &["", ""], true, HTTP11, "", vec![with_length.clone()], 0),
+            (CHUNKED, &["2\r\nab\r\n", "3\r\ncd", ""], true, HTTP11, "", vec![in_chunks.clone() + "2\r\nab\r\n", "2\r\ncd\r\n".into()], 12),
+            (CHUNKED, &["2\r\nab\r\n", "0\r\n", ""], true, HTTP10, "", vec![plain.clone() + "ab"], 10),
+            (CHUNKED, &["", ""], true, HTTP11, "", vec![in_chunks.clone()], 0),
             // Malformed, where nothing more is sent, not what came with it either.
-            (CHUNKED, &["2\r\nab\r\n", "zz"], false, HTTP11, vec![in_chunks.clone() + "2\r\nab\r\n"], 9),
-            (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\nzz"], false, HTTP11, vec![in_chunks.clone() + "2\r\nab\r\n"], 16),
-            (CHUNKED, &["2\r\nab\r\n", "zz"], false, HTTP10, vec![plain.clone() + "ab"], 9),
-            (CHUNKED, &["", "2\r\nab\r\nzz"], false, HTTP11, vec![], 9),
-            (CHUNKED, &["2\r\nab\r\nzz"], false, HTTP11, vec![], 9),
+            (CHUNKED, &["2\r\nab\r\n", "zz\r\nz"], false, HTTP11, "", vec![in_chunks.clone() + "2\r\nab\r\n"], 12),
+            (CHUNKED, &["2\r\nab\r\n", "zz"], false, HTTP11, OFF, vec![in_chunks.clone() + "2\r\nab\r\n"], 9),
+            (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\nzz"], false, HTTP11, "", vec![in_chunks.clone() + "2\r\nab\r\n"], 16),
+            (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\nzz"], false, HTTP11, OFF, vec![in_chunks.clone() + "2\r\nab\r\n"], 16),
+            (CHUNKED, &["2\r\nab\r\n", "zz"], false, HTTP10, OFF, vec![plain.clone() + "ab"], 9),
+            (CHUNKED, &["", "2\r\nab\r\nzz"], false, HTTP11, "", vec![], 9),
+            (CHUNKED, &["2\r\nab\r\nzz"], false, HTTP11, "", vec![], 9),
+            // Too little to be looked at before the server closes the connection.
+            (CHUNKED, &["2\r\nab\r\n", "zz", ""], true, HTTP11, "", vec![in_chunks.clone() + "2\r\nab\r\n"], 9),
         ] {
             let (addr, count) = plays(&after_head(head, pieces, 60), closes);
-            let got = block_on(arrivals(&passing(addr, &format!("access_log {} f;", log.display())), request));
+            let got = block_on(arrivals(&passing(addr, &format!("{directives} access_log {} f;", log.display())), request));
             assert_eq!(got.iter().map(|g| &g.1).collect::<Vec<_>>(), want.iter().collect::<Vec<_>>(), "{head} {pieces:?}");
             let sent: usize = want.iter().map(String::len).sum();
             let start = want.first().map_or(0, |w| head_end(w.as_bytes()).unwrap());
@@ -3285,10 +3412,12 @@ mod tests {
             assert_eq!(count.lock().unwrap()[0], 1);
         }
         // A read of it that waits longer than proxy_read_timeout.
-        let (addr, count) = plays(&after_head(LENGTH, &["ab", "cd"], 60), false);
-        let got = block_on(arrivals(&passing(addr, "proxy_read_timeout 1s;"), HTTP11));
-        assert_eq!(got.iter().map(|g| g.1.as_str()).collect::<String>(), with_length + "abcd");
-        while count.lock().unwrap()[1] == 0 { thread::sleep(Duration::from_millis(1)); }
+        for (directives, want) in [("", ""), (OFF, "abcd")] {
+            let (addr, count) = plays(&after_head(LENGTH, &["ab", "cd"], 60), false);
+            let got = block_on(arrivals(&passing(addr, &format!("proxy_read_timeout 1s; {directives}")), HTTP11));
+            assert_eq!(got.iter().map(|g| g.1.as_str()).collect::<String>(), with_length.clone() + want);
+            while count.lock().unwrap()[1] == 0 { thread::sleep(Duration::from_millis(1)); }
+        }
     }
 
     #[test]
@@ -3299,13 +3428,20 @@ mod tests {
         let pieces = after_head(&length, &[&data, &data], 100);
         let (addr, _count) = plays(&pieces, false);
         let run = |directives: &str| block_on(arrivals(&passing(addr, directives), HTTP11));
-        // Head and body are paced together: 2000 bytes in the first second of the clock, or 4000 in two.
+        // Head and body are paced together: 2000 bytes in the first second of the clock, in
+        // which the last of the body comes, or 4000 in two.
+        while now().subsec_millis() > 600 { thread::sleep(Duration::from_millis(1)); }
         let got = run("limit_rate 2000;");
         assert_eq!(got.iter().map(|g| g.1.as_str()).collect::<String>(), head("Content-Length: 3000\r\n", "close") + &data + &data);
         assert!((600..2000).contains(&got.last().unwrap().0), "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
         // What goes before limit_rate_after is not waited for.
         let got = run("limit_rate 100; limit_rate_after 10000;");
-        assert!(got.len() == 2 && got[1].0 < 600, "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
+        assert!(got.len() == 1 && got[0].0 < 600, "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
+        // Without buffering there is no rate, the server's neither.
+        let length = LENGTH.replacen("30000\r\n", "3000\r\nX-Accel-Limit-Rate: 100\r\n", 1);
+        let (addr, _count) = plays(&after_head(&length, &[&data, &data], 100), false);
+        let got = block_on(arrivals(&passing(addr, "proxy_buffering off; limit_rate 100; proxy_limit_rate 100;"), HTTP11));
+        assert!(got.len() == 2 && got[0].0 < 90 && got[1].0 < 600, "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
     }
 
     #[test]
@@ -3318,8 +3454,10 @@ mod tests {
             for (pieces, directives, reads, status) in [
                 // Before the body, after the first of it, in it, while it is paced, and while the client takes no more.
                 (vec![(0, length.clone().into_bytes())], "", 0, "499"),
-                (after_head(&length, &["ab"], 0), "", 1, "200"),
-                (after_head(&length, &["ab", "cd", "ef"], 60), "", 2, "200"),
+                (vec![(0, length.clone().into_bytes())], OFF, 1, "200"),
+                (after_head(&length, &["ab"], 0), "", 0, "499"),
+                (after_head(&length, &["ab"], 0), OFF, 1, "200"),
+                (after_head(&length, &["ab", "cd", "ef"], 60), OFF, 2, "200"),
                 (after_head(&length, &["ab", &"x".repeat(5000)], 0), "limit_rate 500;", 1, "200"),
                 (after_head(&length, &["ab", &big, &big], 0), "", 1, "200"),
                 (after_head(CHUNKED, &["2\r\nab\r\n"], 0), "", 1, "200"),
@@ -3347,7 +3485,7 @@ mod tests {
         // One that closes its side only has gone away too; one that takes nothing for send_timeout as well.
         let (addr, count) = plays(&after_head(&length, &["ab"], 0), false);
         block_on(async {
-            let (mut client, _task) = served_by(&passing(addr, "")).await;
+            let (mut client, _task) = served_by(&passing(addr, OFF)).await;
             client.write_all(HTTP11.as_bytes()).await.unwrap();
             assert!(client.read(&mut [0; 512]).await.unwrap() > 0);
             client.shutdown().await.unwrap();
@@ -3370,7 +3508,8 @@ mod tests {
         let in_chunks = head("Transfer-Encoding: chunked\r\n", "close");
         let trailer = "0\r\nX: 4-200\r\n\r\n";
         for (answer, pieces, directives, request, want, body, read) in [
-            (&length, &["ab", "cd"][..], "add_trailer X $upstream_response_length-$upstream_status;", HTTP11, in_chunks.clone() + "4\r\nabcd\r\n" + trailer, 29, "4 4-200"),
+            (&length, &["ab", "cd"][..], "add_trailer X $upstream_response_length-$upstream_status;", HTTP11, in_chunks.clone() + "4\r\nabcd\r\n" + trailer, 24, "4 4-200"),
+            (&length, &["ab", "cd"], "proxy_buffering off; add_trailer X $upstream_response_length-$upstream_status;", HTTP11, in_chunks.clone() + "4\r\nabcd\r\n" + trailer, 29, "4 4-200"),
             (&length, &["ab", "cd"], "add_trailer X 1;", HTTP10, head("Content-Length: 4\r\n", "close") + "abcd", 4, "4 -"),
             (&CHUNKED.to_string(), &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], "", HTTP11, in_chunks.clone() + "4\r\nabcd\r\n0\r\n\r\n", 19, "19 -"),
             (&CHUNKED.to_string(), &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], "", HTTP10, head("", "close") + "abcd", 4, "19 -"),
@@ -3401,7 +3540,7 @@ mod tests {
             ("gunzip on; gzip_vary on;", &takes_gzip, &after_head(&length.replacen("\r\n\r\n", "\r\nContent-Encoding: gzip\r\n\r\n", 1), &[&part, &part], 60), 2, true),
         ] {
             let (addr, _count) = plays(pieces, false);
-            let got = block_on(arrivals(&passing(addr, directives), request));
+            let got = block_on(arrivals(&passing(addr, &format!("{OFF} {directives}")), request));
             assert_eq!((got.len(), got[0].1.contains("Vary: Accept-Encoding\r\n")), (came, vary), "{directives} {request} {got:?}");
         }
     }
@@ -3410,10 +3549,11 @@ mod tests {
     fn answers_being_passed_end_when_the_time_to_shut_down_has_passed() {
         let _busy = serving_on();
         let log = log_path("halted");
-        for (pieces, line) in [(after_head(LENGTH, &["ab"], 0), "200 2 "), (vec![(0, LENGTH.as_bytes().to_vec())], "200 0 0 ")] {
+        let head_only = vec![(0, LENGTH.as_bytes().to_vec())];
+        for (pieces, directives, line) in [(after_head(LENGTH, &["ab"], 0), OFF, "200 2 "), (after_head(LENGTH, &["ab"], 0), "", "200 0 0 "), (head_only, "", "200 0 0 ")] {
             let (addr, count) = plays(&pieces, false);
             block_on(async {
-                let (mut client, task) = served_by(&passing(addr, &format!("access_log {} f;", log.display()))).await;
+                let (mut client, task) = served_by(&passing(addr, &format!("{directives} access_log {} f;", log.display()))).await;
                 client.write_all(HTTP11.as_bytes()).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 HALTED.store(true, Ordering::SeqCst);
@@ -3428,15 +3568,18 @@ mod tests {
     }
 
     /// A server that reads a request, sends the answer and then nothing until the
-    /// connection is closed, or resets it; and how many connections came.
+    /// connection is closed, or resets it; and how many connections came. It ends once
+    /// that count is dropped.
     fn failing(answer: &str, resets: bool) -> (SocketAddr, Arc<Mutex<usize>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
         let (all, answer) = (came.clone(), answer.to_string());
+        listener.set_nonblocking(true).unwrap();
         thread::spawn(move || {
-            for s in listener.incoming() {
+            while Arc::strong_count(&all) > 1 {
+                let Ok((mut s, _)) = listener.accept() else { thread::sleep(Duration::from_millis(1)); continue };
                 *all.lock().unwrap() += 1;
-                let mut s = s.unwrap();
+                s.set_nonblocking(false).unwrap();
                 assert!(s.read(&mut [0u8; 1024]).unwrap() > 0);
                 s.write_all(answer.as_bytes()).unwrap();
                 if resets {
@@ -3586,31 +3729,39 @@ mod tests {
         SHUTTING.store(false, Ordering::SeqCst);
         HALTED.store(false, Ordering::SeqCst);
         let (big, delimited) = ("x".repeat(20000), LENGTH.replace("Content-Length: 30000\r\n", ""));
+        // What is in the full buffers of 4k, the first of which has the head.
+        let full = "x".repeat(4 * 4096 - LENGTH.len());
         let cases = [
-            (format!("{LENGTH}ab"), http11, format!("{length}ab")),
-            (LENGTH.to_string(), http11, length.clone()),
-            (format!("{LENGTH}{big}"), http11, format!("{length}{big}")),
+            (format!("{LENGTH}ab"), http11, "", length.clone()),
+            (format!("{LENGTH}ab"), http11, OFF, format!("{length}ab")),
+            (LENGTH.to_string(), http11, "", length.clone()),
+            (format!("{LENGTH}{big}"), http11, "", format!("{length}{full}")),
+            (format!("{LENGTH}{big}"), http11, OFF, format!("{length}{big}")),
             // After a chunk, in one, before any, and after the last one.
-            (format!("{CHUNKED}2\r\nab\r\n"), http11, format!("{chunked}2\r\nab\r\n")),
-            (format!("{CHUNKED}2\r\nab\r\n5\r\ncd"), http11, format!("{chunked}4\r\nabcd\r\n")),
-            (CHUNKED.to_string(), http11, chunked.clone()),
-            (format!("{CHUNKED}2\r\nab\r\n0\r\n"), http11, format!("{chunked}2\r\nab\r\n")),
-            (format!("{CHUNKED}2\r\nab\r\n"), http10, format!("{}ab", head("", "close"))),
+            (format!("{CHUNKED}2\r\nab\r\n"), http11, "", format!("{chunked}2\r\nab\r\n")),
+            (format!("{CHUNKED}2\r\nab\r\n5\r\ncd"), http11, "", format!("{chunked}4\r\nabcd\r\n")),
+            (CHUNKED.to_string(), http11, "", chunked.clone()),
+            (format!("{CHUNKED}2\r\nab\r\n0\r\n"), http11, "", format!("{chunked}2\r\nab\r\n")),
+            (format!("{CHUNKED}2\r\nab\r\n"), http10, "", format!("{}ab", head("", "close"))),
             // In what cannot become a chunk, where nothing is sent.
-            (format!("{CHUNKED}2\r\nab\r\nzz"), http11, String::new()),
+            (format!("{CHUNKED}2\r\nab\r\nzz"), http11, "", String::new()),
             // A body that only the connection's end delimits.
-            (format!("{delimited}ab"), http11, format!("{chunked}2\r\nab\r\n")),
-            (format!("{delimited}ab"), http10, format!("{}ab", head("", "close"))),
+            (format!("{delimited}ab"), http11, "", chunked.clone()),
+            (format!("{delimited}ab"), http11, OFF, format!("{chunked}2\r\nab\r\n")),
+            (format!("{delimited}ab"), http10, "", head("", "close")),
+            (format!("{delimited}ab"), http10, OFF, format!("{}ab", head("", "close"))),
             // After a whole body nothing more is read.
-            (format!("{}ab", LENGTH.replace("30000", "2")), http10, format!("{}ab", head("Content-Length: 2\r\n", "close"))),
+            (format!("{}ab", LENGTH.replace("30000", "2")), http10, "", format!("{}ab", head("Content-Length: 2\r\n", "close"))),
         ];
         block_on(async {
             // At once, as each waits for the timeout.
-            let ways = [false, true].into_iter().flat_map(|resets| RATES.map(|rate| (resets, rate)));
-            let all: Vec<_> = ways.flat_map(|way| cases.iter().cloned().map(move |c| (c, way))).map(|((answer, request, want), (resets, rate))| tokio::task::spawn_local(async move {
-                assert_eq!(failed_on(&answer, resets, rate, request).await, want, "{answer} {resets} {rate}");
-            })).collect();
-            for task in all { task.await.unwrap(); }
+            for rate in RATES {
+                let all: Vec<_> = [false, true].into_iter().flat_map(|resets| cases.iter().cloned().map(move |c| (c, resets))).map(|((answer, request, directives, want), resets)| tokio::task::spawn_local(async move {
+                    let directives = format!("{directives} {rate}");
+                    assert_eq!(failed_on(&answer, resets, &directives, request).await, want, "{answer} {resets} {directives}");
+                })).collect();
+                for task in all { task.await.unwrap(); }
+            }
         });
     }
 
@@ -3619,10 +3770,10 @@ mod tests {
         let _busy = counted();
         let log = std::env::temp_dir().join(format!("twinx-failed-{}", std::process::id()));
         let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n{}", "x".repeat(100));
-        for (resets, rate) in [false, true].into_iter().flat_map(|resets| RATES.map(|rate| (resets, rate))) {
+        for (resets, rate) in [false, true].into_iter().flat_map(|resets| [RATES[0], RATES[1], OFF].map(|rate| (resets, rate))) {
             let _ = std::fs::remove_file(&log);
             let got = block_on(failed_on(&answer, resets, &format!("access_log {} f; {rate}", log.display()), "GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
-            assert!(got.ends_with(&"x".repeat(100)), "{got}");
+            assert!(got.ends_with(&if rate == OFF { "x".repeat(100) } else { "\r\n\r\n".into() }), "{got}");
             assert_eq!(std::fs::read_to_string(&log).unwrap(), "200 200 142 100\n");
         }
     }

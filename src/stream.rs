@@ -130,6 +130,11 @@ pub async fn read_until<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, dead
     until(deadline, read).await.and_then(Result::ok).unwrap_or(0)
 }
 
+/// Reads what there is to read now; None when there is nothing.
+pub async fn read_ready<S: AsyncRead + Unpin>(s: &mut S, buf: &mut [u8]) -> Option<std::io::Result<usize>> {
+    std::future::poll_fn(|cx| Poll::Ready(match std::pin::pin!(s.read(buf)).poll(cx) { Poll::Ready(read) => Some(read), Poll::Pending => None })).await
+}
+
 thread_local! {
     /// Buffers used before, to use again: a worker, which serves its connections
     /// on one thread, needs few at a time.
@@ -234,6 +239,10 @@ mod tests {
             assert_eq!(read_into(&mut s, &mut buf, Some(Duration::from_millis(50))).await, 0);
             other.write_all(b"x").await.unwrap();
             assert_eq!((read_into(&mut s, &mut buf, None).await, buf.as_slice()), (1, &b"x"[..]));
+            assert!(read_ready(&mut s, &mut buf).await.is_none());
+            other.write_all(b"y").await.unwrap();
+            s.tcp().unwrap().readable().await.unwrap();
+            assert!(matches!(read_ready(&mut s, &mut buf).await, Some(Ok(1))) && buf == b"y");
             assert_eq!(within(Some(Duration::from_millis(10)), std::future::pending::<()>()).await, None);
             // What was written before a write that fails is counted.
             let (mut count, data) = (3, vec![b'x'; 1 << 24]);
