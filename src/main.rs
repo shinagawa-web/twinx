@@ -1,6 +1,8 @@
 //! twinx: an HTTP server that reads nginx's configuration and behaves as nginx does.
 
+mod body;
 mod clock;
+mod coding;
 mod conf;
 mod expires;
 mod config;
@@ -9,6 +11,7 @@ mod http;
 mod log;
 mod ocsp;
 mod resolver;
+mod spool;
 mod stream;
 mod tls;
 mod upstream;

@@ -30,7 +30,7 @@ const HSL: u16 = HTTP | SRV | LOC;
 /// Every directive twinx knows: where it may appear, its argument counts, and
 /// whether it takes a block.
 /// The levels of error_log, from the lowest.
-const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
+pub const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
 
 const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("daemon", MAIN, 1, 1, false),
@@ -161,6 +161,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_buffers", HSL, 2, 2, false),
     ("proxy_busy_buffers_size", HSL, 1, 1, false),
     ("proxy_max_temp_file_size", HSL, 1, 1, false),
+    ("proxy_temp_file_write_size", HSL, 1, 1, false),
     ("proxy_cookie_domain", HSL, 1, 2, false),
     ("proxy_cookie_path", HSL, 1, 2, false),
     ("proxy_redirect", HSL, 1, 2, false),
@@ -333,8 +334,8 @@ pub struct Level {
     /// with "/" is a URI redirected to whether it exists or not.
     pub index: Vec<Template>,
     /// error_log of http, server or location: where errors of requests are
-    /// written, when its level lets errors through.
-    pub error_log: Option<Arc<File>>,
+    /// written, and from which of the levels on.
+    pub error_log: Option<(Arc<File>, usize)>,
     /// log_not_found: whether files that are not found are logged.
     pub log_not_found: bool,
     pub proxy: Option<Arc<Proxy>>,
@@ -427,6 +428,22 @@ pub struct Level {
     pub proxy_pass_trailers: bool,
     /// proxy_buffer_size: the buffer the proxied server's response head must fit in.
     pub proxy_buffer_size: usize,
+    /// proxy_buffering: what of a proxied answer's body is in full buffers is sent as they
+    /// are full, not all that has come at once (off).
+    pub proxy_buffering: bool,
+    /// proxy_buffers: the number and the size of the buffers the body is read into.
+    pub proxy_buffers: (usize, usize),
+    /// proxy_busy_buffers_size: how much of those is written at once, twice the size of
+    /// the larger buffers without it.
+    pub proxy_busy_buffers_size: Option<usize>,
+    /// proxy_temp_file_write_size: how much of an answer is written to its file at once,
+    /// twice the size of the larger buffers without it.
+    pub proxy_temp_file_write_size: Option<usize>,
+    /// proxy_max_temp_file_size: how large the file of an answer may be, 0 for no file.
+    pub proxy_max_temp_file_size: usize,
+    /// proxy_temp_path and its levels, as client_body_temp_path's.
+    pub proxy_temp_path: PathBuf,
+    pub proxy_temp_levels: Vec<usize>,
     /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
     pub proxy_next_upstream: Vec<String>,
     /// proxy_next_upstream_tries: how many servers a request may try, 0 for any.
@@ -718,9 +735,9 @@ impl Builder<'_> {
     }
 
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
-        let temp = self.path("client_body_temp");
+        let (temp, proxy_temp) = (self.path("client_body_temp"), self.path("proxy_temp"));
         // Without root, files come from html under the prefix, as nginx's default root is.
-        let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
+        let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, lingering_close: Some(false),
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -744,7 +761,11 @@ impl Builder<'_> {
         declare(block);
         self.level(block, HTTP, &mut level)?;
         let servers = block.iter().filter(|d| d.name == "server");
-        servers.map(|d| self.server(d.block.as_deref().unwrap_or_default(), &level)).collect()
+        let servers: Vec<Server> = servers.map(|d| self.server(d.block.as_deref().unwrap_or_default(), &level)).collect::<Result<_, _>>()?;
+        // nginx merges the levels of the proxy module once all of the block is read. Those of
+        // if and limit_except, where none of these directives may be, are as the one around them.
+        servers.iter().flat_map(|s| [&s.level].into_iter().chain(s.locations.iter().map(|l| &l.level))).try_for_each(check_proxy_buffers)?;
+        Ok(servers)
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
@@ -817,9 +838,12 @@ impl Builder<'_> {
         // proxy_redirect of this level, Some(None) once "off"; and whether proxy_pass is here.
         let (mut redirects, mut own_proxy): (Option<Option<Vec<CookieRewrite>>>, bool) = (None, false);
         let (mut ifs, mut limit, mut own_tls) = (Vec::new(), None, false);
-        for d in block {
+        for (i, d) in block.iter().enumerate() {
             self.check(d, ctx)?;
             let at = |e: String| format!("{e} in {}", d.at);
+            const ONCE: &[&str] = &["proxy_buffer_size", "proxy_buffers", "proxy_busy_buffers_size", "proxy_temp_file_write_size", "proxy_max_temp_file_size", "proxy_temp_path"];
+            if ONCE.contains(&d.name.as_str()) && block[..i].iter().any(|b| b.name == d.name) { return Err(at(format!("\"{}\" directive is duplicate", d.name))); }
+            let invalid = || at(format!("\"{}\" directive invalid value", d.name));
             match d.name.as_str() {
                 "return" => level.rewrite.push(ret(&d.args).map(|(code, text)| Step::Return(code, text)).map_err(at)?),
                 "rewrite" => level.rewrite.push(rewrite(&d.args).map(Step::Rewrite).map_err(at)?),
@@ -949,26 +973,32 @@ impl Builder<'_> {
                 "log_not_found" => level.log_not_found = flag(d).map_err(at)?,
                 "error_log" => {
                     let file = self.open(&d.args[0]).map_err(at)?;
-                    level.error_log = d.args.get(1).is_none_or(|l| LEVELS.iter().position(|v| v == l) <= Some(4)).then_some(file);
+                    level.error_log = Some((file, d.args.get(1).and_then(|l| LEVELS.iter().position(|v| v == l)).unwrap_or(4)));
                 }
                 "ignore_invalid_headers" => level.ignore_invalid_headers = flag(d).map_err(at)?,
                 "underscores_in_headers" => level.underscores_in_headers = flag(d).map_err(at)?,
                 "merge_slashes" => level.merge_slashes = flag(d).map_err(at)?,
                 "chunked_transfer_encoding" => level.chunked = flag(d).map_err(at)?,
                 "client_body_buffer_size" => level.body_buffer = size(&d.args[0]).map_err(at)?,
-                "proxy_buffer_size" => level.proxy_buffer_size = size(&d.args[0]).map_err(at)? as usize,
-                // Answers are not kept in buffers while they are sent: only the size is checked.
-                "proxy_busy_buffers_size" => { size(&d.args[0]).map_err(at)?; }
-                // How the proxied answer's body is read changes nothing that is sent: the value is only checked.
-                "proxy_buffering" => { flag(d).map_err(at)?; }
+                "proxy_buffer_size" => level.proxy_buffer_size = size(&d.args[0]).map_err(|_| invalid())? as usize,
+                "proxy_busy_buffers_size" => level.proxy_busy_buffers_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
+                "proxy_temp_file_write_size" => level.proxy_temp_file_write_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
+                "proxy_buffering" => level.proxy_buffering = flag(d).map_err(at)?,
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
                 "proxy_http_version" => {
                     let version = ["1.0", "1.1", "2"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\"", d.args[0])))?;
                     (level.proxy_http_11, level.proxy_h2) = (version > 0, version == 2);
                 }
-                "proxy_max_temp_file_size" => { size(&d.args[0]).map_err(at)?; }
+                "proxy_max_temp_file_size" => level.proxy_max_temp_file_size = size(&d.args[0]).map_err(|_| invalid())? as usize,
+                "proxy_temp_path" => {
+                    level.proxy_temp_path = self.path(&d.args[0]);
+                    level.proxy_temp_levels = temp_levels(&d.args[1..]).ok_or_else(invalid)?;
+                }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
-                "proxy_buffers" => if d.args[0].parse::<u64>().map_or(true, |n| n == 0) || size(&d.args[1]).map_or(true, |n| n == 0) { return Err(at("\"proxy_buffers\" directive invalid value".into())); }
+                "proxy_buffers" => match (scaled(&d.args[0], &[("", 1)]), size(&d.args[1])) {
+                    (Ok(n @ 1..), Ok(size @ 1..)) => level.proxy_buffers = (n as usize, size as usize),
+                    _ => return Err(invalid()),
+                },
                 "client_body_in_file_only" => {
                     let value = ["off", "on", "clean"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))?;
                     (level.body_in_file_only, level.body_clean) = (value > 0, value == 2);
@@ -1445,6 +1475,21 @@ fn size_value(s: &str) -> Result<Template, String> {
     Ok(t)
 }
 
+/// What nginx checks of a level's buffers of proxied answers once it has those inherited,
+/// in its order (ngx_http_proxy_merge_loc_conf). Products wrap around as nginx's do.
+fn check_proxy_buffers(l: &Level) -> Result<(), String> {
+    let (first, (count, size)) = (l.proxy_buffer_size, l.proxy_buffers);
+    let largest = first.max(size);
+    let busy = l.proxy_busy_buffers_size.unwrap_or(2 * largest);
+    let least = |name| format!("\"{name}\" must be equal to or greater than the maximum of the value of \"proxy_buffer_size\" and one of the \"proxy_buffers\"");
+    if count < 2 { return Err("there must be at least 2 \"proxy_buffers\"".into()); }
+    if busy < largest { return Err(least("proxy_busy_buffers_size")); }
+    if busy > (count - 1).wrapping_mul(size) { return Err("\"proxy_busy_buffers_size\" must be less than the size of all \"proxy_buffers\" minus one buffer".into()); }
+    if l.proxy_temp_file_write_size.is_some_and(|n| n < largest) { return Err(least("proxy_temp_file_write_size")); }
+    if l.proxy_max_temp_file_size != 0 && l.proxy_max_temp_file_size < largest { return Err("\"proxy_max_temp_file_size\" must be equal to zero to disable temporary files usage or must be equal to or greater than the maximum of the value of \"proxy_buffer_size\" and one of the \"proxy_buffers\"".into()); }
+    Ok(())
+}
+
 /// The levels of a temporary path: each a number above 0, ten digits at most in all.
 fn temp_levels(args: &[String]) -> Option<Vec<usize>> {
     let levels: Vec<usize> = args.iter().map(|a| a.parse().ok().filter(|&n| n > 0 && a.bytes().all(|c| c.is_ascii_digit()))).collect::<Option<_>>()?;
@@ -1741,7 +1786,7 @@ mod tests {
 
     #[test]
     fn proxy_busy_buffers_size() {
-        assert!(build_text("http { proxy_busy_buffers_size 65k; server { } }").is_ok());
+        assert_eq!(build_text("http { proxy_busy_buffers_size 20k; server { } }").unwrap().servers[0].level.proxy_busy_buffers_size, Some(20480));
         assert!(build_text("http { proxy_busy_buffers_size x; server { } }").is_err());
     }
 
@@ -1810,8 +1855,8 @@ mod tests {
 
     #[test]
     fn checks_proxy_buffers() {
-        assert!(build_text("http { server { proxy_buffers 4 128; location / { proxy_buffers 8 4k; } } }").is_ok());
-        for v in ["0 4k", "x 4k", "4 0", "4 x"] {
+        assert!(build_text("http { server { proxy_buffer_size 128; proxy_buffers 4 128; location / { proxy_buffers 8 4k; } } }").is_ok());
+        for v in ["0 4k", "x 4k", "+4 4k", "4 0", "4 x"] {
             assert_eq!(build_text(&format!("http {{ proxy_buffers {v}; }}")).unwrap_err(), "\"proxy_buffers\" directive invalid value in t.conf:1");
         }
     }
@@ -1821,10 +1866,68 @@ mod tests {
         assert!(build_text("http { server { location / { proxy_buffer_size 512; proxy_buffering off; } } }").is_ok());
         let c = build_text("http { server { location /a { proxy_buffer_size 8k; } location /b { } } }").unwrap();
         assert_eq!(c.servers[0].locations.iter().map(|l| (l.level.proxy_buffer_size, l.level.proxy_http_11)).collect::<Vec<_>>(), [(8192, true), (4096, true)]);
-        assert!(build_text("http { proxy_buffer_size 5x; }").unwrap_err().starts_with("\"5x\" is invalid"));
+        for name in ["proxy_buffer_size", "proxy_busy_buffers_size", "proxy_temp_file_write_size", "proxy_max_temp_file_size"] {
+            for v in ["5x", "1g", "-1", "''"] { assert_eq!(build_text(&format!("http {{ {name} {v}; }}")).unwrap_err(), format!("\"{name}\" directive invalid value in t.conf:1")); }
+        }
         assert!(build_text("http { proxy_max_temp_file_size 0; server { proxy_max_temp_file_size 4k; } }").is_ok());
-        assert!(build_text("http { proxy_max_temp_file_size 1x; }").unwrap_err().starts_with("\"1x\" is invalid"));
         assert!(build_text("http { proxy_buffering of; }").is_err());
+        let c = build_text("http { proxy_buffers 4 8k; server { location /a { proxy_buffering off; proxy_busy_buffers_size 16k; } location /b { proxy_buffers 16 2k; } location /c { proxy_buffering on; } } }").unwrap();
+        let settings: Vec<_> = c.servers[0].locations.iter().map(|l| (l.level.proxy_buffering, l.level.proxy_buffers, l.level.proxy_busy_buffers_size)).collect();
+        assert_eq!(settings, [(false, (4, 8192), Some(16384)), (true, (16, 2048), None), (true, (4, 8192), None)]);
+        let c = build_text("http { server { location / { } } }").unwrap();
+        assert_eq!((c.servers[0].locations[0].level.proxy_buffering, c.servers[0].locations[0].level.proxy_buffers), (true, (8, 4096)));
+    }
+
+    #[test]
+    fn proxy_temp_files() {
+        let c = build_text("http { server { location / { } } server { proxy_temp_path /t; proxy_max_temp_file_size 0; proxy_temp_file_write_size 8k; location / { } location /b { proxy_temp_path u 2 1; } } }").unwrap();
+        let settings = |l: &Level| (l.proxy_temp_path.clone(), l.proxy_temp_levels.clone(), l.proxy_max_temp_file_size, l.proxy_temp_file_write_size);
+        let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
+        assert_eq!(settings(&c.servers[0].locations[0].level), (dir.join("proxy_temp"), vec![1, 2], 1 << 30, None));
+        assert_eq!(settings(&c.servers[1].locations[0].level), ("/t".into(), vec![], 0, Some(8192)));
+        assert_eq!(settings(&c.servers[1].locations[1].level), (dir.join("u"), vec![2, 1], 0, Some(8192)));
+        for v in ["0", "x", "5 6"] {
+            assert_eq!(build_text(&format!("http {{ proxy_temp_path /t {v}; }}")).unwrap_err(), "\"proxy_temp_path\" directive invalid value in t.conf:1");
+        }
+    }
+
+    #[test]
+    fn checks_merged_proxy_buffers() {
+        const TWO: &str = "there must be at least 2 \"proxy_buffers\"";
+        const BUSY: &str = "\"proxy_busy_buffers_size\" must be equal to or greater than the maximum of the value of \"proxy_buffer_size\" and one of the \"proxy_buffers\"";
+        const ALL: &str = "\"proxy_busy_buffers_size\" must be less than the size of all \"proxy_buffers\" minus one buffer";
+        const WRITE: &str = "\"proxy_temp_file_write_size\" must be equal to or greater than the maximum of the value of \"proxy_buffer_size\" and one of the \"proxy_buffers\"";
+        const MAX: &str = "\"proxy_max_temp_file_size\" must be equal to zero to disable temporary files usage or must be equal to or greater than the maximum of the value of \"proxy_buffer_size\" and one of the \"proxy_buffers\"";
+        for (http, want) in [
+            ("server { proxy_buffers 1 4k; }", TWO),
+            ("proxy_buffers 1 4k; server { }", TWO),
+            ("server { proxy_buffers 2 4k; }", ALL),
+            ("server { proxy_buffer_size 8k; proxy_busy_buffers_size 4k; }", BUSY),
+            ("server { proxy_busy_buffers_size 0; }", BUSY),
+            ("server { proxy_busy_buffers_size 28673; }", ALL),
+            ("server { proxy_temp_file_write_size 4095; }", WRITE),
+            ("server { proxy_max_temp_file_size 4095; }", MAX),
+            // A location without proxy_pass, with what it inherits.
+            ("proxy_busy_buffers_size 8k; server { location / { location /a { proxy_buffers 2 8k; } } location /b { proxy_buffer_size 16k; } }", BUSY),
+            ("proxy_buffers 8 16k; server { proxy_max_temp_file_size 8k; location / { proxy_temp_file_write_size 8k; } }", MAX),
+            // The order of the checks, and all of what is read before all of them.
+            ("server { proxy_max_temp_file_size 1; proxy_temp_file_write_size 1; proxy_busy_buffers_size 1; proxy_buffers 1 4k; }", TWO),
+            ("server { proxy_max_temp_file_size 1; proxy_temp_file_write_size 1; proxy_busy_buffers_size 1; }", BUSY),
+            ("server { proxy_max_temp_file_size 1; proxy_temp_file_write_size 1; proxy_busy_buffers_size 1m; }", ALL),
+            ("server { proxy_max_temp_file_size 1; proxy_temp_file_write_size 1; }", WRITE),
+            ("server { proxy_buffers 1 4k; } server { proxy_buffers 0 4k; }", "\"proxy_buffers\" directive invalid value in t.conf:1"),
+        ] {
+            assert_eq!(build_text(&format!("http {{ {http} }}")).err().as_deref(), Some(want), "{http}");
+        }
+        // Nothing to merge, values in the levels that are replaced, and the least and the most that fit.
+        for http in ["proxy_buffers 1 4k;", "proxy_buffers 1 4k; server { proxy_buffers 3 4k; }", "proxy_buffer_size 0; server { }", "server { proxy_buffers 2 8k; proxy_busy_buffers_size 8k; proxy_temp_file_write_size 8k; proxy_max_temp_file_size 8k; }"] {
+            assert!(build_text(&format!("http {{ {http} }}")).is_ok(), "{http}");
+        }
+        for d in ["proxy_buffer_size 4k;", "proxy_buffers 8 4k;", "proxy_busy_buffers_size 8k;", "proxy_temp_file_write_size 8k;", "proxy_max_temp_file_size 8k;", "proxy_temp_path /t;"] {
+            let name = d.split(' ').next().unwrap();
+            assert_eq!(build_text(&format!("http {{ {d}\n{d} }}")).unwrap_err(), format!("\"{name}\" directive is duplicate in t.conf:2"));
+            assert!(build_text(&format!("http {{ {d} server {{ {d} location / {{ {d} }} }} }}")).is_ok());
+        }
     }
 
     #[test]

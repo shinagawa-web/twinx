@@ -18,7 +18,18 @@ pub enum Stream {
     Client(Box<tokio_rustls::client::TlsStream<TcpStream>>),
     /// One end of a pipe in memory: a stream of an HTTP/2 connection, which
     /// the other end passes as an HTTP/1 request and its answer.
-    Pipe(tokio::io::DuplexStream),
+    Pipe(Pipe),
+}
+
+/// One end of a pipe in memory, and what tells, if anything does, that what reads the
+/// answer at the other end has gone: the sender is dropped.
+#[derive(Debug)]
+pub struct Pipe { pub end: tokio::io::DuplexStream, pub reader: Option<Box<tokio::sync::watch::Receiver<()>>> }
+
+impl From<tokio::io::DuplexStream> for Pipe {
+    fn from(end: tokio::io::DuplexStream) -> Pipe {
+        Pipe { end, reader: None }
+    }
 }
 
 impl Stream {
@@ -56,14 +67,14 @@ impl Stream {
 
 macro_rules! each {
     ($self:ident, $s:ident => $e:expr) => {
-        match $self.get_mut() { Stream::Tcp($s) => $e, Stream::Server($s) => $e, Stream::Client($s) => $e, Stream::Pipe($s) => $e }
+        match $self.get_mut() { Stream::Tcp($s) => $e, Stream::Server($s) => $e, Stream::Client($s) => $e, Stream::Pipe(Pipe { end: $s, .. }) => $e }
     };
 }
 
 impl AsyncRead for Stream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut ReadBuf) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let read = match this { Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf), Stream::Server(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Client(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Pipe(s) => Pin::new(s).poll_read(cx, buf) };
+        let read = match this { Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf), Stream::Server(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Client(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Pipe(s) => Pin::new(&mut s.end).poll_read(cx, buf) };
         // What TLS answers to what it read, such as the alert refusing a
         // renegotiation, is sent at once, not with the next write.
         let wants = match this { Stream::Tcp(_) | Stream::Pipe(_) => false, Stream::Server(s) => s.get_ref().1.wants_write(), Stream::Client(s) => s.get_ref().1.wants_write() };
@@ -82,7 +93,7 @@ impl AsyncWrite for Stream {
     }
 
     fn is_write_vectored(&self) -> bool {
-        match self { Stream::Tcp(s) => s.is_write_vectored(), Stream::Server(s) => s.is_write_vectored(), Stream::Client(s) => s.is_write_vectored(), Stream::Pipe(s) => s.is_write_vectored() }
+        match self { Stream::Tcp(s) => s.is_write_vectored(), Stream::Server(s) => s.is_write_vectored(), Stream::Client(s) => s.is_write_vectored(), Stream::Pipe(s) => s.end.is_write_vectored() }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
@@ -130,6 +141,17 @@ pub async fn read_until<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, dead
     until(deadline, read).await.and_then(Result::ok).unwrap_or(0)
 }
 
+/// What a future gives now; None when it has to wait, and is dropped.
+pub async fn at_once<F: Future>(f: F) -> Option<F::Output> {
+    let mut f = std::pin::pin!(f);
+    std::future::poll_fn(|cx| Poll::Ready(match f.as_mut().poll(cx) { Poll::Ready(out) => Some(out), Poll::Pending => None })).await
+}
+
+/// Reads what there is to read now; None when there is nothing.
+pub async fn read_ready<S: AsyncRead + Unpin>(s: &mut S, buf: &mut [u8]) -> Option<std::io::Result<usize>> {
+    at_once(s.read(buf)).await
+}
+
 thread_local! {
     /// Buffers used before, to use again: a worker, which serves its connections
     /// on one thread, needs few at a time.
@@ -160,14 +182,68 @@ pub async fn write_vectored<S: AsyncWrite + Unpin>(s: &mut S, mut bufs: &mut [Io
         // Empty slices are left out: a write of nothing would look like a closed connection.
         IoSlice::advance_slices(&mut bufs, 0);
         if bufs.is_empty() { break }
-        match within(time, s.write_vectored(bufs)).await {
-            Some(Ok(0)) | None => return false,
-            Some(Ok(n)) => IoSlice::advance_slices(&mut bufs, n),
-            Some(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Some(Err(_)) => return false,
-        }
+        let Some(n) = write_once(s, bufs, time).await else { return false };
+        IoSlice::advance_slices(&mut bufs, n);
     }
     matches!(within(time, s.flush()).await, Some(Ok(())))
+}
+
+/// Writes what one write takes of the slices, waiting at most the time for it: how much,
+/// which is nothing when it was interrupted, or None when it fails.
+pub async fn write_once<S: AsyncWrite + Unpin>(s: &mut S, bufs: &[IoSlice<'_>], time: Option<Duration>) -> Option<usize> {
+    match within(time, s.write_vectored(bufs)).await {
+        Some(Ok(0)) | None => None,
+        Some(Ok(n)) => Some(n),
+        Some(Err(e)) => (e.kind() == std::io::ErrorKind::Interrupted).then_some(0),
+    }
+}
+
+/// A connection that is written to while it is watched.
+pub struct Writing<'a, 'b>(pub &'a RefCell<&'b mut Stream>);
+
+impl AsyncWrite for Writing<'_, '_> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut **self.0.borrow_mut()).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context, bufs: &[IoSlice]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut **self.0.borrow_mut()).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.0.borrow().is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.0.borrow_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.0.borrow_mut()).poll_shutdown(cx)
+    }
+}
+
+impl Writing<'_, '_> {
+    /// Waits until the client has gone, as gone() does, between writes to it.
+    pub async fn gone(&self) {
+        use std::os::fd::AsRawFd;
+        let reader = match &**self.0.borrow() { Stream::Pipe(pipe) => pipe.reader.clone(), _ => None };
+        if let Some(mut reader) = reader { while reader.changed().await.is_ok() {} return }
+        loop {
+            let readable = |cx: &mut Context| self.0.borrow().tcp().map_or(Poll::Pending, |tcp| tcp.poll_read_ready(cx));
+            if std::future::poll_fn(readable).await.is_err() { return }
+            let fd = self.0.borrow().tcp().map(|tcp| tcp.as_raw_fd());
+            if fd.is_none_or(hung_up) { return }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// Whether the peer has closed its side of a connection, or it failed.
+fn hung_up(fd: std::os::fd::RawFd) -> bool {
+    let mut fd = libc::pollfd { fd, events: libc::POLLRDHUP, revents: 0 };
+    // SAFETY: fd is one pollfd that lives through the call.
+    unsafe { libc::poll(&mut fd, 1, 0) != 0 }
 }
 
 /// Waits until the client closes its side of the connection (or it fails),
@@ -181,11 +257,26 @@ pub async fn closed(tcp: &TcpStream) {
             Ok(ready) if !ready.is_read_closed() => {}
             _ => return,
         }
-        let mut fd = libc::pollfd { fd: tcp.as_raw_fd(), events: libc::POLLRDHUP, revents: 0 };
-        // SAFETY: fd is one pollfd that lives through the call.
-        if unsafe { libc::poll(&mut fd, 1, 0) } != 0 { return }
+        if hung_up(tcp.as_raw_fd()) { return }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Waits until a client has gone: it has closed its side of the connection, or the
+/// stream of its HTTP/2 connection has ended before its answer.
+pub async fn gone(client: &Stream) {
+    match client {
+        Stream::Pipe(pipe) => match pipe.reader.clone() {
+            Some(mut reader) => Box::pin(async move { while reader.changed().await.is_ok() {} }).await,
+            None => std::future::pending().await,
+        },
+        _ => if let Some(tcp) = client.tcp() { closed(tcp).await },
+    }
+}
+
+/// What a future gives, None when the client goes away before.
+pub async fn unless_closed<F: Future>(client: &Stream, f: F) -> Option<F::Output> {
+    tokio::select! { biased; out = f => Some(out), () = gone(client) => None }
 }
 
 #[cfg(test)]
@@ -220,7 +311,14 @@ mod tests {
             assert_eq!(read_into(&mut s, &mut buf, Some(Duration::from_millis(50))).await, 0);
             other.write_all(b"x").await.unwrap();
             assert_eq!((read_into(&mut s, &mut buf, None).await, buf.as_slice()), (1, &b"x"[..]));
+            assert!(read_ready(&mut s, &mut buf).await.is_none());
+            other.write_all(b"y").await.unwrap();
+            s.tcp().unwrap().readable().await.unwrap();
+            assert!(matches!(read_ready(&mut s, &mut buf).await, Some(Ok(1))) && buf == b"y");
             assert_eq!(within(Some(Duration::from_millis(10)), std::future::pending::<()>()).await, None);
+            let data = vec![b'x'; 1 << 24];
+            assert!(matches!(write_once(&mut s, &[IoSlice::new(&data)], None).await, Some(n) if (1..data.len()).contains(&n)));
+            assert!(!write_vectored(&mut s, &mut [IoSlice::new(&data)], Some(Duration::from_millis(50))).await);
         });
     }
 
@@ -278,6 +376,8 @@ mod tests {
             other.shutdown().await.unwrap();
             assert!(within(Some(Duration::from_secs(2)), closed(&s)).await.is_some());
             let s = Stream::Tcp(s);
+            assert_eq!(unless_closed(&s, std::future::ready(1)).await, Some(1));
+            assert_eq!(unless_closed(&s, std::future::pending::<()>()).await, None);
             s.close();
             let mut buf = [0u8; 16];
             assert_eq!(other.read(&mut buf).await.unwrap(), 0);
