@@ -5660,6 +5660,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn an_end_without_close_notify_is_an_end() {
+        let _busy = serving_on();
         // What the server sends before it closes, the body of the answer as it goes to the
         // client, whether the client's connection stays, and the log.
         const CASES: [(&str, &str, bool, &str); 7] = [
