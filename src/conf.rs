@@ -144,6 +144,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("default_type", HSL, 1, 1, false),
     ("proxy_set_header", HSL, 2, 2, false),
     ("proxy_hide_header", HSL, 1, 1, false),
+    ("proxy_pass_header", HSL, 1, 1, false),
     ("proxy_next_upstream", HSL, 1, usize::MAX, false),
     ("proxy_next_upstream_tries", HSL, 1, 1, false),
     ("proxy_next_upstream_timeout", HSL, 1, 1, false),
@@ -208,7 +209,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
 /// their own for it are checked where they are read.
 const REPEATED: &[&str] = &[
     "error_log", "index", "server", "upstream", "listen", "server_name", "location", "return", "break", "set", "if", "rewrite", "log_format", "access_log", "add_header", "add_trailer", "keepalive_disable", "error_page",
-    "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_next_upstream",
+    "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_pass_header", "proxy_next_upstream",
     "proxy_cookie_domain", "proxy_cookie_path", "proxy_redirect", "proxy_cookie_flags", "gzip_types", "proxy_cache_path", "proxy_cache_valid",
     "proxy_no_cache", "proxy_cache_bypass", "proxy_ignore_headers",
 ];
@@ -450,6 +451,9 @@ pub struct Level {
     /// proxy_hide_header: the headers of the proxied server's answer not passed
     /// to the client besides those nginx never passes, lowercased.
     pub proxy_hide_header: Vec<String>,
+    /// proxy_pass_header: the headers of the proxied server's answer passed to the
+    /// client although nginx or proxy_hide_header hides them, lowercased.
+    pub proxy_pass_header: Vec<String>,
     /// proxy_intercept_errors: error_page replaces the answers of proxied servers too.
     pub proxy_intercept_errors: bool,
     /// proxy_pass_request_headers, proxy_pass_request_body: whether the
@@ -982,7 +986,7 @@ impl Builder<'_> {
         let mut commands: Option<Vec<(String, String)>> = None;
         let mut ticket_keys: Option<Vec<PathBuf>> = None;
         let mut proxy_headers: Option<Vec<(String, Template)>> = None;
-        let mut hidden: Option<Vec<String>> = None;
+        let (mut hidden, mut passed): (Option<Vec<String>>, Option<Vec<String>>) = (None, None);
         // proxy_cookie_domain and proxy_cookie_path of this level: Some(None) once "off".
         let mut cookies: [Option<Option<Vec<CookieRewrite>>>; 2] = [None, None];
         let mut flags: Option<Option<Vec<CookieFlags>>> = None;
@@ -1212,6 +1216,7 @@ impl Builder<'_> {
                 "proxy_next_upstream_tries" => level.proxy_next_upstream_tries = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
                 "proxy_next_upstream_timeout" => level.proxy_next_upstream_timeout = millis(&d.args[0]).map_err(at)?,
                 "proxy_hide_header" => hidden.get_or_insert_default().push(d.args[0].to_ascii_lowercase()),
+                "proxy_pass_header" => passed.get_or_insert_default().push(d.args[0].to_ascii_lowercase()),
                 "gzip_static" => level.gzip_static = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"gzip_static\" directive, it must be \"on\", \"off\" or \"always\"", d.args[0])))?.1,
                 "gunzip" => level.gunzip = flag(d).map_err(at)?,
                 "gzip" => level.gzip = flag(d).map_err(at)?,
@@ -1263,6 +1268,7 @@ impl Builder<'_> {
         if let Some(k) = ticket_keys { level.ssl_session_ticket_key = k; }
         if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
         if let Some(hidden) = hidden { level.proxy_hide_header = hidden; }
+        if let Some(passed) = passed { level.proxy_pass_header = passed; }
         let [domain, path] = cookies;
         if let Some(domain) = domain { level.proxy_cookie_domain = domain; }
         if let Some(path) = path { level.proxy_cookie_path = path; }
@@ -2082,6 +2088,13 @@ mod tests {
         let c = build_text("http { proxy_hide_header X-A; server { location /a { proxy_hide_header X-B; proxy_hide_header x-c; } location /b { } } }").unwrap();
         let (a, b) = (&c.servers[0].locations[0].level, &c.servers[0].locations[1].level);
         assert_eq!((a.proxy_hide_header.clone(), b.proxy_hide_header.clone()), (vec!["x-b".to_string(), "x-c".into()], vec!["x-a".to_string()]));
+    }
+
+    #[test]
+    fn proxy_pass_header_inherits_as_a_whole() {
+        let c = build_text("http { proxy_pass_header Date; server { location /a { proxy_pass_header X-Pad; proxy_pass_header server; } location /b { proxy_hide_header X-B; } } }").unwrap();
+        let (a, b) = (&c.servers[0].locations[0].level, &c.servers[0].locations[1].level);
+        assert_eq!((a.proxy_pass_header.clone(), b.proxy_pass_header.clone()), (vec!["x-pad".to_string(), "server".into()], vec!["date".to_string()]));
     }
 
     #[test]

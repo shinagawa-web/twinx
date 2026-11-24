@@ -751,9 +751,9 @@ struct Cut { length: Option<usize>, malformed: bool, failed: Option<String> }
 struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, SocketAddr, usize)>, trailers: Option<Trailers>, slot: Option<crate::h2::Slot>, sizes: Result<Sizes, usize>, coder: Option<Box<Coder>>, to: Option<(&'static str, SocketAddr, String)> }
 
 /// The trailers of an answer over HTTP/2 (proxy_pass_trailers): the slot they come
-/// in, the headers proxy_hide_header names, and what they are passed through.
+/// in, the headers proxy_hide_header names and those proxy_pass_header passes, and what they are passed through.
 #[derive(Debug)]
-struct Trailers { slot: crate::h2::Slot, hide: Vec<String>, to: Arc<crate::vars::Shared> }
+struct Trailers { slot: crate::h2::Slot, hide: Vec<String>, pass: Vec<String>, to: Arc<crate::vars::Shared> }
 
 impl Trailers {
     /// Takes the trailers, which are there once the answer's stream has ended as it
@@ -763,7 +763,7 @@ impl Trailers {
         while read_into(s, &mut Vec::new(), wait).await > 0 {}
         let mut ending = self.slot.lock().unwrap();
         let whole = ending.end == crate::h2::End::Whole;
-        let passed: Vec<_> = std::mem::take(&mut ending.trailers).into_iter().filter(|(n, _)| whole && !hidden(&self.hide, n)).collect();
+        let passed: Vec<_> = std::mem::take(&mut ending.trailers).into_iter().filter(|(n, _)| whole && !hidden(&self.hide, &self.pass, n)).collect();
         let any = !passed.is_empty();
         *self.to.trailers.lock().unwrap() = passed;
         any
@@ -1134,8 +1134,11 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     if !silent && !http09(r.line.as_bytes()) {
         let mut add = |parts: &[&str]| parts.iter().for_each(|p| out.extend_from_slice(p.as_bytes()));
         let server = if level.server_tokens { NAME } else { "twinx" };
-        add(&["HTTP/1.1 ", decimal(&mut [0; 20], status.into()), " ", reason(status), "\r\nServer: ", server, "\r\nDate: "]);
-        crate::clock::date(|date| add(&[date, "\r\n"]));
+        add(&["HTTP/1.1 ", decimal(&mut [0; 20], status.into()), " ", reason(status), "\r\n"]);
+        // Those proxy_pass_header passes are the proxied server's, among its other headers, or none.
+        let passes = |name: &str| resp.proxied && level.proxy_pass_header.iter().any(|p| p == name);
+        if !passes("server") { add(&["Server: ", server, "\r\n"]); }
+        if !passes("date") { crate::clock::date(|date| add(&["Date: ", date, "\r\n"])); }
         if let Some(ctype) = &resp.ctype { add(&["Content-Type: ", ctype, "\r\n"]); }
         if chunked { add(&["Transfer-Encoding: chunked\r\n"]); }
         if let Some(n) = length.filter(|_| (!chunked || h2) && (![204, 304].contains(&status) || resp.told.is_some() && (status == 304 || !r.line.ends_with("HTTP/2.0"))) && !upgraded) { add(&["Content-Length: ", decimal(&mut [0; 20], n as u64), "\r\n"]); }
@@ -2261,7 +2264,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             Err(e) => Err(e),
         };
         // proxy_pass_trailers: those of an answer without a body are taken now.
-        let trailers = (level.proxy_pass_trailers && level.proxy_h2).then(|| Trailers { slot: slot.clone(), hide: level.proxy_hide_header.clone(), to: r.shared.clone() });
+        let trailers = (level.proxy_pass_trailers && level.proxy_h2).then(|| Trailers { slot: slot.clone(), hide: level.proxy_hide_header.clone(), pass: level.proxy_pass_header.clone(), to: r.shared.clone() });
         if let (Some(t), Ok((_, Some(c)))) = (&trailers, &mut fetched) { t.take(&mut c.stream, Some(level.proxy_read_timeout)).await; }
         // A kept connection whose handshake fails counts as closed, as in nginx; one that times out does not.
         let closed = matches!(fetched, Err(NoAnswer::Closed(_)));
@@ -2353,7 +2356,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let Some((uri, args)) = (if named { Some((to, None)) } else { unsafe_uri(&to) }) else { return special(404) };
         return Response { internal: Some(args.map_or_else(|| uri.clone(), |a| format!("{uri}?{a}"))), as_get: !named, ..resp };
     }
-    let hidden = |name: &str| level.proxy_hide_header.iter().any(|h| h.eq_ignore_ascii_case(name));
+    let hidden = |name: &str| hidden(&level.proxy_hide_header, &level.proxy_pass_header, name);
     resp.headers.retain(|h| !hidden(&h.0));
     // The page generated for a timeout keeps its own.
     if hidden("content-type") && !resp.generated { resp.ctype = None; }
@@ -2655,7 +2658,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         // not hidden, when early_hints lets them and it has any; the answer comes after.
         if first.starts_with("HTTP/1.0") { return Err(invalid("upstream sent HTTP/1.0 response with early hints")) }
         let fields = upstream_lines(&head).map(|l| upstream_header(l).ok_or_else(|| invalid(&invalid_header(l)))).collect::<Result<Vec<_>, _>>()?;
-        let lines: String = fields.iter().filter(|(n, _)| !hidden(&level.proxy_hide_header, n)).map(|(n, v)| format!("{n}: {v}\r\n")).collect();
+        let lines: String = fields.iter().filter(|(n, _)| !hidden(&level.proxy_hide_header, &level.proxy_pass_header, n)).map(|(n, v)| format!("{n}: {v}\r\n")).collect();
         if let Some(c) = client.as_deref_mut().filter(|c| hints && !lines.is_empty() && !matches!(c, Stream::Pipe(_))) {
             write_all(c, format!("HTTP/1.1 103 Early Hints\r\n{lines}\r\n").as_bytes(), send_timeout(level)).await;
         }
@@ -2664,7 +2667,8 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     time[1] = Some(start.elapsed().as_millis());
     let version = head.split(['\r', '\n', ' ']).next().unwrap_or_default();
     let mut resp = Response { status, proxied: true, ..Response::default() };
-    const HIDDEN: &[&str] = &["date", "server", "connection", "keep-alive", "transfer-encoding", "content-length", "x-pad"];
+    // Those of the connection, which nginx never passes, and those it hides unless proxy_pass_header passes them.
+    const HOP: &[&str] = &["connection", "keep-alive", "transfer-encoding", "content-length"];
     for line in upstream_lines(&head) {
         let (name, value) = upstream_header(line).ok_or_else(|| invalid(&invalid_header(line)))?;
         let (lower, value) = (name.to_ascii_lowercase(), value.to_string());
@@ -2672,7 +2676,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         if lower == "content-type" { resp.ctype = Some(value.into()); continue; }
         // A second Expires is ignored.
         let again = lower == "expires" && resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("expires"));
-        if !again && !HIDDEN.contains(&lower.as_str()) && !lower.starts_with("x-accel-") { resp.headers.push((name.to_string(), value)); }
+        if !again && !HOP.contains(&lower.as_str()) && !hidden(&[], &level.proxy_pass_header, &lower) { resp.headers.push((name.to_string(), value)); }
     }
     // 101 to a request with Upgrade: what came after the head goes to the client first.
     if status == 101 && upgrade { return Ok((Response { body: answer[end..].to_vec(), tunnel: Some(conn.stream), ..resp }, None)); }
@@ -2709,11 +2713,11 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None, trailers: None, slot: None, sizes, coder: None, to: None })), unbuffered: !buffering, ..resp }, None))
 }
 
-/// Whether a header of a proxied server's early hints is hidden, as those of
-/// proxy_hide_header and those nginx hides by default are.
-fn hidden(hide: &[String], name: &str) -> bool {
+/// Whether a header of a proxied server's answer is hidden, as those of
+/// proxy_hide_header and those nginx hides by default are, unless proxy_pass_header passes it.
+fn hidden(hide: &[String], pass: &[String], name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    ["date", "server", "x-pad"].contains(&lower.as_str()) || lower.starts_with("x-accel-") || hide.contains(&lower)
+    (["date", "server", "x-pad"].contains(&lower.as_str()) || lower.starts_with("x-accel-") || hide.contains(&lower)) && !pass.contains(&lower)
 }
 
 /// The header lines of the head of a proxied server's answer, up to the empty line that
@@ -3515,7 +3519,9 @@ pub(crate) mod tests {
         assert_eq!(head_end(b"GET / HTTP/1.0\nHost: a\n\nrest"), Some(24));
         assert_eq!(head_end(b"GET / HTTP/1.0\r\n\r\n"), Some(18));
         let level = Level { proxy_hide_header: vec!["x-b".into()], ..Level::default() };
-        assert_eq!(["Date", "X-Accel-A", "x-pad", "X-B", "Link"].map(|n| hidden(&level.proxy_hide_header, n)), [true, true, true, true, false]);
+        assert_eq!(["Date", "X-Accel-A", "x-pad", "X-B", "Link"].map(|n| hidden(&level.proxy_hide_header, &[], n)), [true, true, true, true, false]);
+        let pass = ["date".to_string(), "x-b".into()];
+        assert_eq!(["Date", "Server", "X-B"].map(|n| hidden(&level.proxy_hide_header, &pass, n)), [false, true, false]);
         // A status line without a reason is no HTTP/0.9 request line.
         let answer = b"HTTP/1.1 103 \r\nLink: a\r\n\r\nHTTP/1.1 200 \r\n";
         assert_eq!((head_end(answer), line_end(answer).and_then(|at| lines_end(answer, at))), (Some(15), Some(26)));
@@ -5403,6 +5409,18 @@ pub(crate) mod tests {
             let (_, came) = proxied(settings, lines, &requests);
             assert_eq!(came.iter().map(|c| c.0).collect::<Vec<_>>(), connections, "{settings} {lines}");
         }
+    }
+
+    #[test]
+    fn proxy_pass_header_passes_what_is_hidden() {
+        let _busy = serving_on();
+        let (addr, _) = answering("Date: then\r\nX-Pad: pad\r\nX-Accel-A: a\r\n");
+        let text = format!("http {{ proxy_hide_header X-A; server {{ location /a {{ proxy_pass http://{addr}; }} location /b {{ proxy_pass http://{addr}; proxy_pass_header Date; proxy_pass_header Server; proxy_pass_header X-Pad; }} }} }}");
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let (a, b) = (exchanged(&config.servers[0], "/a"), exchanged(&config.servers[0], "/b"));
+        assert!(a.contains(&format!("Server: {NAME}\r\n")) && a.contains("Date: ") && !a.contains("then") && !a.contains("X-Pad") && !a.contains("X-Accel"), "{a}");
+        // The server sent no Server: there is none.
+        assert!(!b.contains("Server: ") && b.contains("\r\nDate: then\r\n") && b.contains("X-Pad: pad\r\n") && !b.contains("X-Accel"), "{b}");
     }
 
     #[test]
