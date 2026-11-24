@@ -574,9 +574,9 @@ impl Response {
 const PIECE: u64 = 32768;
 
 /// The file an answer's body is in, open, with its path, and where the part of it that
-/// is still to be sent starts and how long that is.
+/// is still to be sent starts and how long that is, and what compresses it.
 #[derive(Debug)]
-struct FileBody { file: std::fs::File, path: PathBuf, start: u64, len: u64 }
+struct FileBody { file: std::fs::File, path: PathBuf, start: u64, len: u64, coder: Option<Box<Coder>> }
 
 impl FileBody {
     /// Fills the buffer with what is at so many bytes after the start. Logs, as nginx
@@ -605,8 +605,9 @@ fn load(r: &Request, level: &Level, resp: &mut Response) {
 
 /// Sends an answer whose body is in a file: the head with the first piece of it, then
 /// each piece, read once the one before is written, in a chunk if the body is chunked,
-/// with what ends that. A file that has become shorter ends it there, with no more
-/// sent. It ends too when a write fails or worker_shutdown_timeout passes. Gives whether
+/// with what ends that. What compresses it makes of each piece what is sent, which may be
+/// nothing or more than one part. A file that has become shorter ends it there, with no
+/// more sent. It ends too when a write fails or worker_shutdown_timeout passes. Gives whether
 /// all was written, how much was, and how much of that of the body, and the trailers.
 async fn send_file<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(stream: &mut Stream, mut file: Box<FileBody>, resp: &Response, (mut head, chunked): (&[u8], bool), mut pace: Pace, asked: (&Request, &Level), ending: E) -> (bool, (usize, usize), Vec<(String, String)>) {
     let (mut buf, mut size, mut tail, mut passed, mut trailers) = (vec![0; file.len.min(PIECE) as usize], Vec::new(), Vec::new(), 0, Vec::new());
@@ -617,19 +618,28 @@ async fn send_file<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(
             let piece = &mut buf[..n as usize];
             if !file.read(0, piece, asked) { return false }
             (file.start, file.len) = (file.start + n, file.len - n);
-            size.clear();
-            tail.clear();
-            if chunked {
-                let _ = write!(size, "{n:x}\r\n");
-                tail.extend_from_slice(b"\r\n");
-                if let Some(ending) = ending.take_if(|_| file.len == 0) { trailers = ending(resp, &mut tail); }
+            loop {
+                let (mut part, mut all) = (&*piece, true);
+                if let Some(c) = &mut file.coder {
+                    let Ok(is) = c.code(piece, false, false) else { return false };
+                    all = is;
+                    if all && file.len == 0 && c.end().is_err() { return false }
+                    part = c.ready();
+                }
+                let last = all && file.len == 0;
+                in_chunk(chunked, part.len(), &mut size, &mut tail);
+                if let Some(ending) = ending.take_if(|_| chunked && last) { trailers = ending(resp, &mut tail); }
+                if last || !part.is_empty() {
+                    // The last of it, small as it may be, does not wait for the client to acknowledge what was before (tcp_nodelay).
+                    if let Some(tcp) = stream.tcp().filter(|_| last) { let _ = tcp.set_nodelay(true); }
+                    let (before, sent) = (pace.sent, send(stream, &[head, &size, part, &tail], &mut pace, time).await);
+                    passed += (pace.sent - before).saturating_sub(head.len() + size.len()).min(part.len());
+                    if !sent || last { return sent }
+                    head = &[];
+                }
+                if let Some(c) = &mut file.coder { c.written(); }
+                if all { break }
             }
-            // The last of it, small as it may be, does not wait for the client to acknowledge what was before (tcp_nodelay).
-            if let Some(tcp) = stream.tcp().filter(|_| file.len == 0) { let _ = tcp.set_nodelay(true); }
-            let (before, sent) = (pace.sent, send(stream, &[head, &size, piece, &tail], &mut pace, time).await);
-            passed += (pace.sent - before).saturating_sub(head.len() + size.len()).min(piece.len());
-            if !sent || file.len == 0 { return sent }
-            head = &[];
         }
     };
     let written = tokio::select! { biased; written = written => written, () = halted() => false };
@@ -982,7 +992,12 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         None => {
             if resp.file.as_ref().is_some_and(|f| f.len >= 20) && gzips(level, &resp) {
                 resp.vary = true;
-                if gzip_ok(r, level) { load(r, level, &mut resp); }
+                if gzip_ok(r, level) {
+                    if resp.len() as u64 > PIECE || r.method == "HEAD" {
+                        coded(&mut resp, Coder::gzip());
+                        resp.headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
+                    } else { load(r, level, &mut resp); }
+                }
             }
             gzip(r, level, &mut resp);
         }
@@ -1210,7 +1225,8 @@ fn streams(r: &Request, resp: &Response) -> bool {
 fn coded(resp: &mut Response, coder: Coder) {
     recoded(resp);
     resp.unknown_length = true;
-    if let Some(rest) = &mut resp.rest { rest.coder = Some(Box::new(coder)); }
+    let coder = Some(Box::new(coder));
+    match (&mut resp.rest, &mut resp.file) { (Some(rest), _) => rest.coder = coder, (_, Some(file)) => file.coder = coder, _ => {} }
 }
 
 /// Sends a proxied answer as its body comes: the head, with the first of the body that
@@ -1627,7 +1643,7 @@ fn file_at(level: &Level, r: &Request, path: PathBuf) -> Response {
     headers.extend(gz.as_ref().map(|_| ("Content-Encoding".to_string(), "gzip".to_string())));
     headers.push(("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", meta.len())));
     headers.push(("Accept-Ranges".to_string(), "bytes".to_string()));
-    let file = Some(Box::new(FileBody { file, path: gz.unwrap_or(path), start: 0, len: meta.len() }));
+    let file = Some(Box::new(FileBody { file, path: gz.unwrap_or(path), start: 0, len: meta.len(), coder: None }));
     Response { status: 200, ctype: Some(ctype), headers, file, vary, ranges: true, ..Response::default() }
 }
 
@@ -1661,13 +1677,14 @@ fn gzip(r: &Request, level: &Level, resp: &mut Response) {
     if !gzip_ok(r, level) { return; }
     recoded(resp);
     resp.headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
-    // The header nginx writes: no name, no time, the Unix OS code.
-    let mut crc = flate2::Crc::new();
-    crc.update(&resp.body);
-    let mut deflate = flate2::write::DeflateEncoder::new(vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3], flate2::Compression::new(1));
-    let _ = deflate.write_all(&resp.body);
-    let mut body = deflate.finish().unwrap_or_default();
-    body.extend(crc.sum().to_le_bytes().into_iter().chain((resp.body.len() as u32).to_le_bytes()));
+    let (mut coder, mut body) = (Coder::gzip(), Vec::new());
+    loop {
+        let all = coder.code(&resp.body, false, false).unwrap_or(true);
+        if all { let _ = coder.end(); }
+        body.extend_from_slice(coder.ready());
+        coder.written();
+        if all { break }
+    }
     (resp.body, resp.unknown_length) = (body, true);
 }
 
@@ -5275,7 +5292,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let mut resp = make(404, "text/plain; charset=utf-8", 64);
         gzip(&r, &level, &mut resp);
         assert!(resp.vary && resp.unknown_length);
-        assert_eq!(&resp.body[..10], &[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
+        assert_eq!(&resp.body[..10], &[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 4, 3]);
         let mut plain = Vec::new();
         flate2::read::GzDecoder::new(resp.body.as_slice()).read_to_end(&mut plain).unwrap();
         assert_eq!(plain, vec![b'X'; 64]);
@@ -5481,6 +5498,33 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             assert_eq!(log, [line(head("keep-alive").len(), n), line(head("keep-alive").len(), 0), line(head("close").len(), n)].concat());
             assert!(got("GET /f\r\n") == data);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn files_are_compressed_piece_by_piece() {
+        let _busy = serving_on();
+        let dir = files("coded");
+        // What compresses to nearly as much, so that a piece gives more than one buffer.
+        let mut x = 1u32;
+        let data: Vec<u8> = (0..300_001).map(|_| { x ^= x << 13; x ^= x >> 17; x ^= x << 5; x as u8 }).collect();
+        std::fs::write(dir.join("f"), &data).unwrap();
+        let http = serves_files(&dir, "gzip on; gzip_types *; location /t { alias DIR/f; add_trailer X-T v; }".replace("DIR", &dir.display().to_string()).as_str());
+        let got = |line: &str, more: &str| block_on(received(&http, &format!("{line}\r\nHost: a\r\nConnection: close\r\nAccept-Encoding: gzip\r\n{more}\r\n")));
+        for (line, trailer) in [("GET /f HTTP/1.1", false), ("GET /t HTTP/1.1", true)] {
+            let answer = got(line, "");
+            let (head, body, sizes) = parted(&answer);
+            assert!(head.contains("\r\nContent-Encoding: gzip\r\n") && head.contains("ETag: W/") && !head.contains("Content-Length") && !head.contains("Accept-Ranges"), "{head}");
+            let mut plain = Vec::new();
+            flate2::read::GzDecoder::new(body.as_slice()).read_to_end(&mut plain).unwrap();
+            assert!(plain == data && sizes.len() > 4 && sizes.iter().all(|n| *n <= 1 << 17), "{sizes:?}");
+            assert_eq!(answer.ends_with(b"0\r\nX-T: v\r\n\r\n"), trailer);
+        }
+        // A range of what is compressed is not given.
+        assert!(parted(&got("GET /f HTTP/1.1", "Range: bytes=1-2\r\n")).0.starts_with("HTTP/1.1 200 "));
+        // The head for HEAD is that for GET, but for how the body comes.
+        let heads = ["GET", "HEAD"].map(|m| { let answer = got(&format!("{m} /f HTTP/1.1"), ""); undated(&answer[..head_end(&answer).unwrap()]) });
+        assert_eq!(heads[1], heads[0].replace("Transfer-Encoding: chunked\r\n", ""));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
