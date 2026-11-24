@@ -18,11 +18,13 @@ pub enum Expires {
 /// A time such as "2048", "1h30m" or "10s", in seconds, as ngx_parse_time() reads it.
 pub fn parse_time(s: &str) -> Option<i64> {
     const UNITS: &[(char, i64)] = &[('y', 31_536_000), ('M', 2_592_000), ('w', 604_800), ('d', 86_400), ('h', 3600), ('m', 60), ('s', 1)];
-    let (mut total, mut number) = (0i64, String::new());
+    // The units go from the largest to the smallest, as the steps of ngx_parse_time() do.
+    let (mut total, mut number, mut next) = (0i64, String::new(), 0);
     for c in s.chars() {
         if c.is_ascii_digit() { number.push(c); continue; }
-        let unit = UNITS.iter().find(|u| u.0 == c)?.1;
-        total += std::mem::take(&mut number).parse::<i64>().ok()? * unit;
+        let i = UNITS.iter().position(|u| u.0 == c).filter(|i| *i >= next)?;
+        next = i;
+        total += std::mem::take(&mut number).parse::<i64>().ok()? * UNITS[i].1;
     }
     let rest = if number.is_empty() { 0 } else { number.parse::<i64>().ok()? };
     (!s.is_empty()).then_some(total + rest)
@@ -117,6 +119,14 @@ fn next_day_start(secs: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn times_go_from_the_largest_unit() {
+        assert_eq!(parse_time("1h30m"), Some(5400));
+        assert_eq!(parse_time("1m1m30"), Some(150));
+        assert_eq!(parse_time("30s1m"), None);
+        assert_eq!(parse_time("1d1y"), None);
+    }
 
     #[test]
     fn parses_values() {

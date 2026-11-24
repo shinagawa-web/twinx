@@ -1360,7 +1360,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         crate::stream::block_on(async {
             let (l, addr) = listener().await;
             let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; }} server {{ listen {addr}; server_name virtual1; }} server {{ listen {addr}; server_name virtual2; ssl_reject_handshake on; }} }}");
-            let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+            let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), Path::new("t")).unwrap(), &dir).unwrap());
             let accepted = tokio::task::spawn_local(async move {
                 let mut names = Vec::new();
                 for _ in 0..2 { names.push(accept(l.accept().await.unwrap().0, &config, addr).await.map(|a| a.1.server_name)); }
@@ -1382,7 +1382,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         crate::stream::block_on(async {
             let (l, addr) = listener().await;
             let text = format!("http {{ server {{ listen {addr} ssl; ssl_certificate c.pem; ssl_certificate_key k.pem; ssl_verify_client optional_no_ca; ssl_trusted_certificate c.pem; }} }}");
-            let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+            let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), Path::new("t")).unwrap(), &dir).unwrap());
             assert_eq!(config.servers[0].ssl, [addr]);
             let accepted = tokio::task::spawn_local(async move { accept(l.accept().await.unwrap().0, &config, addr).await.unwrap() });
             let c = dir.join("c.pem");
@@ -1415,7 +1415,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         crate::stream::block_on(async {
             let (l, addr) = listener().await;
             let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; http2 on; }} server {{ listen {addr}; server_name plain; }} }}");
-            let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+            let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), Path::new("t")).unwrap(), &dir).unwrap());
             let accepted = tokio::task::spawn_local(async move {
                 let mut alpn = Vec::new();
                 for _ in 0..2 { alpn.push(accept(l.accept().await.unwrap().0, &config, addr).await.unwrap().1.alpn); }
@@ -1441,7 +1441,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         crate::stream::block_on(async {
             let (l, addr) = listener().await;
             let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; http2 on; }} }}");
-            let config = Arc::new(crate::conf::build(&crate::config::parse(&text, Path::new("t")).unwrap(), &dir).unwrap());
+            let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), Path::new("t")).unwrap(), &dir).unwrap());
             let accepted = tokio::task::spawn_local(async move { accept(l.accept().await.unwrap().0, &config, addr).await.unwrap().1.alpn });
             drop(connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_secs(5), &h2(&base)).await.unwrap());
             assert_eq!(accepted.await.unwrap(), "h2");
@@ -1465,7 +1465,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             assert!(connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_secs(5), &client((true, false), None, None).unwrap()).await.is_err());
             peer.await.unwrap();
             // A client that closes before its ClientHello, or sends what is not TLS, is no connection.
-            let config = crate::conf::build(&crate::config::parse("http { }", Path::new("t")).unwrap(), &dir()).unwrap();
+            let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", "http { }"), Path::new("t")).unwrap(), &dir()).unwrap();
             let (l, addr) = listener().await;
             let mut other = TcpStream::connect(addr).await.unwrap();
             other.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();

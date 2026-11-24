@@ -247,7 +247,7 @@ mod tests {
     fn alert_goes_to_the_main_error_logs() {
         let dir = std::env::temp_dir().join(format!("twinx-alert-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let main = config::parse("error_log a.log; error_log b.log emerg;", Path::new("t.conf")).unwrap();
+        let main = config::parse("error_log a.log; error_log b.log emerg; events { }", Path::new("t.conf")).unwrap();
         alert(&conf::build(&main, &dir).unwrap(), "chdir(\"wd\") failed");
         let a = std::fs::read_to_string(dir.join("a.log")).unwrap();
         assert!(a.ends_with(&format!(" [alert] {}#0: chdir(\"wd\") failed\n", std::process::id())));
