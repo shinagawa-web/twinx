@@ -78,8 +78,13 @@ impl AsyncRead for Stream {
         // What TLS answers to what it read, such as the alert refusing a
         // renegotiation, is sent at once, not with the next write.
         let wants = match this { Stream::Tcp(_) | Stream::Pipe(_) => false, Stream::Server(s) => s.get_ref().1.wants_write(), Stream::Client(s) => s.get_ref().1.wants_write() };
-        if wants { let _ = Pin::new(this).poll_flush(cx); }
-        read
+        if wants { let _ = Pin::new(&mut *this).poll_flush(cx); }
+        // A proxied server that closes the connection without close_notify ends it like
+        // any other, as with nginx's SSL_OP_IGNORE_UNEXPECTED_EOF.
+        match read {
+            Poll::Ready(Err(e)) if matches!(this, Stream::Client(_)) && e.kind() == std::io::ErrorKind::UnexpectedEof => Poll::Ready(Ok(())),
+            read => read,
+        }
     }
 }
 

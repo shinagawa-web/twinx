@@ -1282,9 +1282,8 @@ impl Incoming<'_> {
         } else {
             match read_ready(&mut from.conn.stream, part).await { Some(got) => got, None => return false }
         };
-        // An end of TLS without its alert is an end for what came before it.
         self.ended = !matches!(got, Ok(1..));
-        let all = got.as_ref().map_or_else(|e| self.came || e.kind() == std::io::ErrorKind::UnexpectedEof, |_| true);
+        let all = got.is_ok() || self.came;
         self.failed = got.is_err();
         let n = got.unwrap_or(0);
         *self.read += n;
@@ -5145,6 +5144,8 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         More(usize),
         /// Closes the connection, without an answer or a handshake.
         Close,
+        /// Sends that, and closes the connection without close_notify.
+        End(&'static str),
     }
 
     /// Reads a request and gives its request line.
@@ -5198,10 +5199,12 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                         };
                         let Some(line) = request_line(&mut rustls::Stream::new(tls, &mut s)) else { return };
                         // What is written at once comes at once: the answer is one record.
-                        tls.writer().write_all(echo(&line, act).as_bytes()).unwrap();
+                        let answer = if let Act::End(answer) = act { answer.to_string() } else { echo(&line, act) };
+                        tls.writer().write_all(answer.as_bytes()).unwrap();
                         if act == Act::Notify { tls.send_close_notify(); }
                         came.lock().unwrap().push((i, line));
                         while tls.wants_write() { tls.write_tls(&mut s).unwrap(); }
+                        if matches!(act, Act::End(_)) { return }
                     }
                 });
             }
@@ -5227,6 +5230,45 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             }
             answers
         })
+    }
+
+    #[test]
+    fn an_end_without_close_notify_is_an_end() {
+        // What the server sends before it closes, the body of the answer as it goes to the
+        // client, whether the client's connection stays, and the log.
+        const CASES: [(&str, &str, bool, &str); 7] = [
+            ("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody", "body", true, "200 200 4"),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nbody", "body", false, "200 200 4"),
+            ("HTTP/1.1 200 OK\r\n\r\nbody", "4\r\nbody\r\n0\r\n\r\n", true, "200 200 14"),
+            ("HTTP/1.1 200 OK\r\n\r\n", "0\r\n\r\n", true, "200 200 5"),
+            ("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n", "4\r\nbody\r\n", false, "200 200 9"),
+            ("HTTP/1.1 200 OK\r\nX: ", "", true, "502 502"),
+            ("", "", true, "502 502"),
+        ];
+        // The case of a connection to the server: each request has one.
+        let act = |i, _| Act::End(CASES.iter().flat_map(|c| vec![c.0; 1 + c.2 as usize]).cycle().nth(i).unwrap());
+        for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+            let (addr, _) = securing(version, act);
+            for directives in ["", OFF] {
+                for (_, body, stays, log) in CASES {
+                    let path = log_path("tls-end");
+                    let http = format!("log_format f '$status $upstream_status $body_bytes_sent'; access_log {} f; server {{ location / {{ proxy_pass https://{addr}; {directives} }} }}", path.display());
+                    let got = block_on(async {
+                        let (mut client, task) = served_by(&http).await;
+                        client.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").await.unwrap();
+                        let mut got = Vec::new();
+                        within(Some(Duration::from_secs(4)), client.read_to_end(&mut got)).await.unwrap().unwrap();
+                        drop(client);
+                        within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
+                        String::from_utf8(got).unwrap()
+                    });
+                    let (logged, status) = (logged(&path), format!("HTTP/1.1 {} ", &log[..3]));
+                    assert_eq!((got.matches(&status).count(), logged.lines().count()), if stays { (2, 2) } else { (1, 1) }, "{got}");
+                    assert!(got.starts_with(&status) && logged.starts_with(log), "{got} {logged}");
+                    if !body.is_empty() { assert!(got.split_once("\r\n\r\n").unwrap().1.starts_with(body) && got.ends_with(body), "{got}"); }
+                }
+            }
+        }
     }
 
     #[test]
