@@ -181,6 +181,14 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("if_modified_since", HSL, 1, 1, false),
 ];
 
+/// The directives that may be given more than once at a level; those that have rules of
+/// their own for it are checked where they are read.
+const REPEATED: &[&str] = &[
+    "error_log", "index", "server", "upstream", "listen", "server_name", "location", "return", "break", "set", "if", "rewrite", "log_format", "access_log", "add_header", "add_trailer", "keepalive_disable", "error_page",
+    "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_next_upstream",
+    "proxy_cookie_domain", "proxy_cookie_path", "proxy_redirect", "proxy_cookie_flags", "gzip_types",
+];
+
 const COMBINED: &str =
     "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\"";
 
@@ -333,9 +341,9 @@ pub struct Level {
     /// index: the files looked for in a directory, in order; one that starts
     /// with "/" is a URI redirected to whether it exists or not.
     pub index: Vec<Template>,
-    /// error_log of http, server or location: where errors of requests are
-    /// written, and from which of the levels on.
-    pub error_log: Option<(Arc<File>, usize)>,
+    /// error_log, of the main block if not of http, server or location: where errors
+    /// of requests are written, and from which of the levels on.
+    pub error_log: Vec<(Arc<File>, usize)>,
     /// log_not_found: whether files that are not found are logged.
     pub log_not_found: bool,
     pub proxy: Option<Arc<Proxy>>,
@@ -662,6 +670,8 @@ pub struct Config {
     /// The error_log files of the main block that take alerts, and those that take notices.
     pub alert_logs: Vec<Arc<File>>,
     pub notice_logs: Vec<Arc<File>>,
+    /// The directories of temporary files, which are made when the configuration is loaded.
+    pub temp_paths: Vec<PathBuf>,
     pub servers: Vec<Server>,
 }
 
@@ -671,6 +681,11 @@ struct Builder<'a> {
     logs: HashMap<PathBuf, Arc<File>>,
     upstreams: HashMap<String, Arc<Upstream>>,
     implicit: Implicit,
+    /// error_log of the main block.
+    errors: Vec<(Arc<File>, usize)>,
+    /// The directories of temporary files of all levels, with their levels of subdirectories
+    /// and where the directives are, the defaults having none.
+    temp_paths: Vec<(PathBuf, Vec<usize>, Option<String>)>,
     /// The name of the location whose directives are being read, which
     /// "proxy_redirect default" puts in place of the proxy_pass URL.
     location: String,
@@ -680,13 +695,20 @@ struct Builder<'a> {
 pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
-    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), implicit: Implicit::default(), location: String::new() };
-    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), servers: Vec::new() };
+    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new() };
+    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
-    let inheritable = main.iter().rev().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
+    let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
     crate::tls::new_configuration(inheritable);
-    for d in main {
+    // So are the error logs, which the http block inherits wherever they are.
+    for d in main.iter().filter(|d| d.name == "error_log") {
         b.check(d, MAIN)?;
+        let log = b.error_log(d)?;
+        b.errors.push(log);
+    }
+    for (i, d) in main.iter().enumerate() {
+        b.check(d, MAIN)?;
+        once(&main[..i], d)?;
         match d.name.as_str() {
             "pid" => config.pid = b.path(&d.args[0]),
             "worker_rlimit_nofile" => config.rlimit_nofile = Some(d.args[0].parse().map_err(|_| format!("invalid number in {}", d.at))?),
@@ -705,6 +727,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
             _ => {}
         }
     }
+    config.temp_paths = b.temp_paths.into_iter().map(|t| t.0).collect();
     Ok(config)
 }
 
@@ -724,6 +747,23 @@ impl Builder<'_> {
         self.prefix.join(p)
     }
 
+    /// Takes note of a directory of temporary files, as ngx_add_path() does. The name of one
+    /// that is not relative to the prefix keeps the "/" it ends with.
+    fn temp_path(&mut self, p: &str, levels: &[usize], at: Option<&str>) -> Result<(), String> {
+        let path = self.path(if p.starts_with('/') { p } else { p.strip_suffix('/').unwrap_or(p) });
+        let Some((_, other, first)) = self.temp_paths.iter().find(|t| t.0.as_os_str() == path.as_os_str()) else {
+            self.temp_paths.push((path, levels.to_vec(), at.map(str::to_string)));
+            return Ok(())
+        };
+        if other == levels { return Ok(()) }
+        let (name, first) = (path.to_string_lossy(), first.as_deref().unwrap_or_default());
+        let name = name.strip_suffix('/').unwrap_or(&name);
+        Err(match at {
+            Some(at) => format!("the same path name \"{name}\" in {first} has the different levels than in {at}"),
+            None => format!("the path name \"{name}\" in {first} has the same name as default path, but the different levels, you need to define default path in http section"),
+        })
+    }
+
     /// Opens (creating it) a log file to append to; one handle per path.
     fn open(&mut self, p: &str) -> Result<Arc<File>, String> {
         let path = self.path(p);
@@ -734,15 +774,22 @@ impl Builder<'_> {
         Ok(file)
     }
 
+    /// The file of an error_log, and the level from which on it is written to.
+    fn error_log(&mut self, d: &Directive) -> Result<(Arc<File>, usize), String> {
+        let file = self.open(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
+        Ok((file, d.args.get(1).and_then(|l| LEVELS.iter().position(|v| v == l)).unwrap_or(4)))
+    }
+
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let (temp, proxy_temp) = (self.path("client_body_temp"), self.path("proxy_temp"));
         // Without root, files come from html under the prefix, as nginx's default root is.
-        let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
+        let mut level = Level { error_log: self.errors.clone(), root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, lingering_close: Some(false),
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let block = d.block.as_deref().unwrap_or_default();
-            block.iter().try_for_each(|s| self.check(s, UPS))?;
+            if self.upstreams.keys().any(|u| u.eq_ignore_ascii_case(&d.args[0])) { return Err(format!("duplicate upstream \"{}\" in {}", d.args[0], d.at)); }
+            block.iter().enumerate().try_for_each(|(i, s)| self.check(s, UPS).and_then(|()| once(&block[..i], s)))?;
             let peers = block.iter().filter(|s| s.name == "server").map(|s| peer(&s.args).map_err(|e| format!("{e} in {}", s.at)));
             let mut upstream = Upstream::new(peers.collect::<Result<_, _>>()?);
             upstream.keepalive = upstream_keepalive(block)?;
@@ -764,17 +811,29 @@ impl Builder<'_> {
         let servers: Vec<Server> = servers.map(|d| self.server(d.block.as_deref().unwrap_or_default(), &level)).collect::<Result<_, _>>()?;
         // nginx merges the levels of the proxy module once all of the block is read. Those of
         // if and limit_except, where none of these directives may be, are as the one around them.
+        // The default directories are those of servers without directives of their own or inherited.
+        let given = |block: &[Directive], name| block.iter().any(|d| d.name == name);
+        let default = |name| !given(block, name) && block.iter().any(|d| d.name == "server" && !given(d.block.as_deref().unwrap_or_default(), name));
+        if default("client_body_temp_path") { self.temp_path("client_body_temp", &[], None)?; }
         servers.iter().flat_map(|s| [&s.level].into_iter().chain(s.locations.iter().map(|l| &l.level))).try_for_each(check_proxy_buffers)?;
+        if default("proxy_temp_path") { self.temp_path("proxy_temp", &[1, 2], None)?; }
+        block.iter().filter(|d| d.name == "server").try_for_each(|d| same_locations(d.block.as_deref().unwrap_or_default()))?;
         Ok(servers)
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
         let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), http2: Vec::new() };
         self.level(block, SRV, &mut s.level)?;
+        let mut listens = Vec::new();
         for d in block {
             match d.name.as_str() {
                 "listen" => {
                     let addrs = listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
+                    let quic = d.args[1..].iter().any(|a| a == "quic");
+                    for a in &addrs {
+                        if listens.contains(&(*a, quic)) { return Err(format!("a duplicate listen {a} in {}", d.at)); }
+                        listens.push((*a, quic));
+                    }
                     if d.args[1..].iter().any(|a| a == "ssl") { s.ssl.extend(&addrs); }
                     if d.args[1..].iter().any(|a| a == "http2") { s.http2.extend(&addrs); }
                     if d.args[1..].iter().any(|a| a == "default_server" || a == "default") { s.defaults.extend(&addrs); }
@@ -821,9 +880,10 @@ impl Builder<'_> {
     }
 
     /// Applies the directives of one level that are not blocks of their own;
-    /// access_log replaces what the level above set as a whole.
+    /// access_log and error_log replace what the level above set as a whole.
     fn level(&mut self, block: &[Directive], ctx: u16, level: &mut Level) -> Result<(), String> {
         let mut logs: Option<Vec<Arc<AccessLog>>> = None;
+        let mut errors: Option<Vec<(Arc<File>, usize)>> = None;
         let (mut headers, mut trailers): (Option<Vec<(String, Template, bool)>>, Option<Vec<_>>) = (None, None);
         let mut pages: Option<Vec<ErrorPage>> = None;
         // ssl_certificate and ssl_certificate_key of this level, which replace those inherited.
@@ -840,9 +900,8 @@ impl Builder<'_> {
         let (mut ifs, mut limit, mut own_tls) = (Vec::new(), None, false);
         for (i, d) in block.iter().enumerate() {
             self.check(d, ctx)?;
+            once(&block[..i], d)?;
             let at = |e: String| format!("{e} in {}", d.at);
-            const ONCE: &[&str] = &["proxy_buffer_size", "proxy_buffers", "proxy_busy_buffers_size", "proxy_temp_file_write_size", "proxy_max_temp_file_size", "proxy_temp_path"];
-            if ONCE.contains(&d.name.as_str()) && block[..i].iter().any(|b| b.name == d.name) { return Err(at(format!("\"{}\" directive is duplicate", d.name))); }
             let invalid = || at(format!("\"{}\" directive invalid value", d.name));
             match d.name.as_str() {
                 "return" => level.rewrite.push(ret(&d.args).map(|(code, text)| Step::Return(code, text)).map_err(at)?),
@@ -881,6 +940,7 @@ impl Builder<'_> {
                 "server_name_in_redirect" => level.server_name_in_redirect = flag(d).map_err(at)?,
                 "port_in_redirect" => level.port_in_redirect = flag(d).map_err(at)?,
                 "log_format" => {
+                    if self.formats.contains_key(&d.args[0]) { return Err(at(format!("duplicate \"log_format\" name \"{}\"", d.args[0]))); }
                     let escape = d.args[1].strip_prefix("escape=").map(|e| log_escape(e).map_err(at)).transpose()?;
                     let line = Template::parse(&d.args[1 + escape.is_some() as usize..].concat()).map_err(at)?;
                     self.formats.insert(d.args[0].clone(), Arc::new(Format { line, escape: escape.unwrap_or(Escape::Default) }));
@@ -971,10 +1031,7 @@ impl Builder<'_> {
                 "max_headers" => level.max_headers = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
                 "index" => level.index = d.args.iter().map(|a| Template::parse(a)).collect::<Result<_, _>>().map_err(at)?,
                 "log_not_found" => level.log_not_found = flag(d).map_err(at)?,
-                "error_log" => {
-                    let file = self.open(&d.args[0]).map_err(at)?;
-                    level.error_log = Some((file, d.args.get(1).and_then(|l| LEVELS.iter().position(|v| v == l)).unwrap_or(4)));
-                }
+                "error_log" => errors.get_or_insert_default().push(self.error_log(d)?),
                 "ignore_invalid_headers" => level.ignore_invalid_headers = flag(d).map_err(at)?,
                 "underscores_in_headers" => level.underscores_in_headers = flag(d).map_err(at)?,
                 "merge_slashes" => level.merge_slashes = flag(d).map_err(at)?,
@@ -993,6 +1050,7 @@ impl Builder<'_> {
                 "proxy_temp_path" => {
                     level.proxy_temp_path = self.path(&d.args[0]);
                     level.proxy_temp_levels = temp_levels(&d.args[1..]).ok_or_else(invalid)?;
+                    self.temp_path(&d.args[0], &level.proxy_temp_levels, Some(&d.at))?;
                 }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
                 "proxy_buffers" => match (scaled(&d.args[0], &[("", 1)]), size(&d.args[1])) {
@@ -1006,6 +1064,7 @@ impl Builder<'_> {
                 "client_body_temp_path" => {
                     level.body_temp_path = self.path(&d.args[0]);
                     level.body_temp_levels = temp_levels(&d.args[1..]).ok_or_else(|| at("invalid value".into()))?;
+                    self.temp_path(&d.args[0], &level.body_temp_levels, Some(&d.at))?;
                 }
                 "default_type" => level.default_type = d.args[0].clone(),
                 "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
@@ -1060,6 +1119,7 @@ impl Builder<'_> {
             }
         }
         if let Some(logs) = logs { level.access_log = logs; }
+        if let Some(errors) = errors { level.error_log = errors; }
         if let Some(headers) = headers { level.add_header = headers; }
         if let Some(trailers) = trailers { level.add_trailer = trailers; }
         if let Some(pages) = pages { level.error_page = pages; }
@@ -1163,6 +1223,32 @@ impl Builder<'_> {
         let upstream = upstream.map_err(|_| format!("host not found in upstream \"{host}\""))?;
         Ok(Proxy { host: host.to_string(), ssl, upstream, uri, url: None, groups: HashMap::new(), implicit: Implicit::default() })
     }
+}
+
+/// Refuses a directive that was given before at its level, as most of nginx's do; root and
+/// alias are one.
+fn once(before: &[Directive], d: &Directive) -> Result<(), String> {
+    // Nothing goes after "off" of these.
+    let off = (d.name == "proxy_redirect" || d.name.starts_with("proxy_cookie_")) && before.iter().any(|b| b.name == d.name && b.args == ["off"]);
+    if !off && REPEATED.contains(&d.name.as_str()) { return Ok(()) }
+    let other = match d.name.as_str() { "root" => "alias", "alias" => "root", _ => "" };
+    let Some(b) = before.iter().find(|b| b.name == d.name || b.name == other) else { return Ok(()) };
+    let earlier = if b.name == other { format!(", \"{other}\" directive was specified earlier") } else { String::new() };
+    Err(format!("\"{}\" directive is duplicate{earlier} in {}", d.name, d.at))
+}
+
+/// Refuses two locations of a block for the same URI, or the same prefix, as
+/// ngx_http_join_exact_locations() does. Named ones and regular expressions may be the same.
+fn same_locations(block: &[Directive]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for d in block.iter().filter(|d| d.name == "location") {
+        let key = match &d.args[..] {
+            [p] if !p.starts_with(['@', '~']) => (false, p),
+            [m, p] if m == "=" || m == "^~" => (m == "=", p), _ => continue,
+        };
+        if !seen.insert(key) { return Err(format!("duplicate location \"{}\" in {}", key.1, d.at)); }
+    }
+    block.iter().filter(|d| d.name == "location").try_for_each(|d| same_locations(d.block.as_deref().unwrap_or_default()))
 }
 
 /// The name and port of host[:port], the default port when it has none; an
@@ -1305,10 +1391,9 @@ fn peer(args: &[String]) -> Result<Peer, String> {
 /// keepalive_timeout in an upstream block; None when it keeps no connection.
 fn upstream_keepalive(block: &[Directive]) -> Result<Option<Keepalive>, String> {
     let mut k = Keepalive::default();
-    for (i, d) in block.iter().enumerate().filter(|(_, d)| d.name.starts_with("keepalive")) {
+    for d in block.iter().filter(|d| d.name.starts_with("keepalive")) {
         let at = |e: String| format!("{e} in {}", d.at);
         let directive = |e: &str| at(format!("\"{}\" directive {e}", d.name));
-        if block[..i].iter().any(|b| b.name == d.name) { return Err(directive("is duplicate")); }
         let time = || millis(&d.args[0]).map_err(|e| directive(&e));
         match d.name.as_str() {
             "keepalive" => {
@@ -1716,6 +1801,15 @@ mod tests {
     }
 
     #[test]
+    fn inherits_and_overrides_error_log() {
+        let c = build_text("http { server { location /a { error_log a2.log; error_log b2.log info; } location /b { } } } error_log m.log; error_log n.log warn;").unwrap();
+        let logs = |l: usize| c.servers[0].locations[l].level.error_log.iter().map(|e| e.1).collect::<Vec<_>>();
+        // Those of the main block, wherever they are.
+        assert_eq!((logs(0), logs(1)), (vec![4, 1], vec![4, 3]));
+        assert!(build_text("http { } error_log;").is_err());
+    }
+
+    #[test]
     fn worker_rlimit_nofile() {
         assert_eq!(build_text("worker_rlimit_nofile 32; http { }").unwrap().rlimit_nofile, Some(32));
         assert_eq!(build_text("http { }").unwrap().rlimit_nofile, None);
@@ -1889,6 +1983,86 @@ mod tests {
         for v in ["0", "x", "5 6"] {
             assert_eq!(build_text(&format!("http {{ proxy_temp_path /t {v}; }}")).unwrap_err(), "\"proxy_temp_path\" directive invalid value in t.conf:1");
         }
+    }
+
+    #[test]
+    fn directories_of_temporary_files() {
+        let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
+        for (http, want) in [
+            // The defaults are for servers without directives, also if they proxy nothing.
+            ("", &[][..]),
+            ("server { }", &["client_body_temp", "proxy_temp"]),
+            ("server { location / { client_body_temp_path a; } }", &["a", "client_body_temp", "proxy_temp"]),
+            ("server { client_body_temp_path a/; proxy_temp_path a; }", &["a"]),
+            ("server { client_body_temp_path a; proxy_temp_path b 1; } server { proxy_temp_path /c/; }", &["a", "b", "/c/", "client_body_temp"]),
+            ("client_body_temp_path a; proxy_temp_path b; server { client_body_temp_path c; location / { client_body_temp_path d; } } server { }", &["a", "b", "c", "d"]),
+        ] {
+            let paths = build_text(&format!("http {{ {http} }}")).unwrap().temp_paths;
+            let want: Vec<_> = want.iter().map(|p| dir.join(p).into_os_string()).collect();
+            assert_eq!(paths.into_iter().map(PathBuf::into_os_string).collect::<Vec<_>>(), want, "{http}");
+        }
+    }
+
+    #[test]
+    fn levels_of_temporary_files() {
+        let prefix = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
+        let default = |name: &str, line: usize| format!("the path name \"{}\" in t.conf:{line} has the same name as default path, but the different levels, you need to define default path in http section", prefix.join(name).display());
+        let same = |name: &str, first: usize, second: usize| format!("the same path name \"{}\" in t.conf:{first} has the different levels than in t.conf:{second}", prefix.join(name).display());
+        for (http, want) in [
+            ("client_body_temp_path /a;\nproxy_temp_path /a 1;", same("/a", 1, 2)),
+            ("client_body_temp_path /a/ 1;\nproxy_temp_path /a/;", same("/a", 1, 2)),
+            ("client_body_temp_path a/ 1;\nproxy_temp_path a 2;", same("a", 1, 2)),
+            ("server { client_body_temp_path /a 1;\n}\nserver { location / { client_body_temp_path /a 1 1; } }", same("/a", 1, 3)),
+            ("client_body_temp_path proxy_temp;\nserver { }", default("proxy_temp", 1)),
+            ("\nproxy_temp_path client_body_temp 1; server { }", default("client_body_temp", 2)),
+            // It comes before the check of the buffers, the one of the other directory after it.
+            ("server { proxy_buffers 1 4k; }\nserver { proxy_temp_path client_body_temp 1; }", default("client_body_temp", 2)),
+            ("server { proxy_buffers 1 4k; }\nserver { client_body_temp_path proxy_temp; }", "there must be at least 2 \"proxy_buffers\"".into()),
+        ] {
+            assert_eq!(build_text(&format!("http {{ {http} }}")).err(), Some(want), "{http}");
+        }
+        for http in ["client_body_temp_path /a 1 2; proxy_temp_path /a 1 2; server { }", "client_body_temp_path /a/ 1; proxy_temp_path /a 2;", "client_body_temp_path proxy_temp 1 2; server { }", "proxy_temp_path client_body_temp 1;"] {
+            assert!(build_text(&format!("http {{ {http} }}")).is_ok(), "{http}");
+        }
+    }
+
+    #[test]
+    fn directives_given_twice() {
+        let again = |d: &str| format!("\"{d}\" directive is duplicate in t.conf:2");
+        for (conf, want) in [
+            ("daemon on;\ndaemon on;", again("daemon")),
+            ("events { }\nevents { }", again("events")),
+            ("http { }\nhttp { }", again("http")),
+            ("http { gzip on;\ngzip off; }", again("gzip")),
+            // Before its value is looked at.
+            ("http { server { http2 on;\nhttp2 x; } }", again("http2")),
+            ("ssl_object_cache_inheritable on;\nssl_object_cache_inheritable x;", again("ssl_object_cache_inheritable")),
+            ("http { proxy_cookie_path off;\nproxy_cookie_path x; }", again("proxy_cookie_path")),
+            ("http { proxy_redirect off;\nproxy_redirect default; }", again("proxy_redirect")),
+            ("http { server { location / { proxy_pass http://127.0.0.1:1;\nproxy_pass http://$host; } } }", again("proxy_pass")),
+            ("http { server { location / { limit_except GET { }\nlimit_except PUT { } } } }", again("limit_except")),
+            ("http { server { location / { if ($uri) { root /a;\nroot /b; } } } }", again("root")),
+            ("http { server { location / { root /a;\nalias /b; } } }", "\"alias\" directive is duplicate, \"root\" directive was specified earlier in t.conf:2".into()),
+            ("http { server { location / { alias /a;\nroot /b; } } }", "\"root\" directive is duplicate, \"alias\" directive was specified earlier in t.conf:2".into()),
+            ("http { upstream u { server 127.0.0.1:1; keepalive 1;\nkeepalive 1; } }", again("keepalive")),
+            ("http { upstream u { server 127.0.0.1:1; }\nupstream U { server 127.0.0.1:1; } }", "duplicate upstream \"U\" in t.conf:2".into()),
+            ("http { log_format a x;\nlog_format a y; }", "duplicate \"log_format\" name \"a\" in t.conf:2".into()),
+            ("http { log_format combined x; }", "duplicate \"log_format\" name \"combined\" in t.conf:1".into()),
+            ("http { server { listen 8080;\nlisten 0.0.0.0:8080 ssl; } }", "a duplicate listen 0.0.0.0:8080 in t.conf:2".into()),
+            ("http { server { location /a { }\nlocation ^~ /a { } } }", "duplicate location \"/a\" in t.conf:2".into()),
+            ("http { server { location / { location = /a { }\nlocation = /a { } } } }", "duplicate location \"/a\" in t.conf:2".into()),
+        ] {
+            assert_eq!(build_text(conf).err(), Some(want), "{conf}");
+        }
+        for conf in [
+            // One at each level, and what may be given more than once.
+            "http { gzip on; root /a; server { gzip on; root /a; location / { gzip on; root /a; if ($uri) { gzip on; root /a; } if ($uri) { gzip on; } } } server { gzip on; } }",
+            "http { index a; index a; server { listen 8080; listen 8081; listen 8080 quic; location / { } location = / { } location ~ a { } location ~ a { } location @a { } location @a { } } }",
+            "http { server { listen 8080; location /a { location /a { } } } server { listen 8080; location /a { } } }",
+        ] {
+            assert!(build_text(conf).is_ok(), "{conf}");
+        }
+        assert!(REPEATED.iter().all(|r| DIRECTIVES.iter().any(|d| d.0 == *r)));
     }
 
     #[test]

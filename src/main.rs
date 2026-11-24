@@ -58,13 +58,18 @@ fn args(list: &[String]) -> Result<Args, String> {
     Ok(Args { prefix: p.into(), conf: c.into(), error_log: e.into(), globals: g, version })
 }
 
-/// Reads the configuration: the -g directives first, then the file.
+/// Reads the configuration: the -g directives first, then the file. The directories it
+/// keeps temporary files in are made.
 fn load(a: &Args) -> Result<conf::Config, String> {
     let file = a.prefix.join(&a.conf);
     let text = std::fs::read_to_string(&file).map_err(|e| format!("open() \"{}\" failed ({e})", file.display()))?;
     let mut main = config::parse(&a.globals, Path::new("command line"))?;
     main.extend(config::parse(&text, &file)?);
-    conf::build(&main, &a.prefix)
+    // As in nginx, errors go to the file of -e, or its default, when no other is given.
+    if !main.iter().any(|d| d.name == "error_log") { main.extend(config::parse(&format!("error_log \"{}\" error;", a.error_log.display()), &file)?); }
+    let config = conf::build(&main, &a.prefix)?;
+    spool::make_dirs(&config.temp_paths)?;
+    Ok(config)
 }
 
 /// The signals the master and its worker wait for. They are blocked, and taken with `sigwait`.

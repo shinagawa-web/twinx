@@ -237,17 +237,19 @@ impl Upstream {
         })
     }
 
-    /// Records how a server answered, as ngx_http_upstream_free_round_robin_peer() does.
-    pub fn done(&self, i: usize, failed: bool) {
+    /// Records how a server answered, as ngx_http_upstream_free_round_robin_peer() does:
+    /// whether it is not tried for a while.
+    pub fn done(&self, i: usize, failed: bool) -> bool {
         let mut state = self.state.lock().unwrap();
         let (p, s) = (&self.peers[i], &mut state[i]);
         if !failed {
             if s.accessed < s.checked { s.fails = 0; }
-            return;
+            return false;
         }
         let now = now();
         (s.fails, s.accessed, s.checked) = (s.fails + 1, now, now);
         if p.max_fails > 0 { s.effective = (s.effective - p.weight / p.max_fails as i64).max(0); }
+        self.peers.len() > 1 && p.max_fails > 0 && s.fails >= p.max_fails
     }
 
     /// The idle connection to the server that was kept last, counted as used for

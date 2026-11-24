@@ -32,6 +32,17 @@ fn failed(call: &str, path: &Path, e: &Error) -> String {
     format!("{call} \"{}\" failed ({}: {})", path.display(), e.raw_os_error().unwrap_or(0), text.split(" (os error").next().unwrap_or_default())
 }
 
+/// Makes the directories of temporary files that are not there, as ngx_create_paths() does.
+pub fn make_dirs(dirs: &[PathBuf]) -> Result<(), String> {
+    for dir in dirs {
+        match DirBuilder::new().mode(0o700).create(dir) {
+            Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(failed("mkdir()", dir, &e)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// The file of one answer: where files are made, how large it may be, all that was ever
 /// written counting, and how much is written at once; how much was written to it and
 /// read from it, and how much there was of it when it was last read.
@@ -120,6 +131,21 @@ mod tests {
         assert_eq!(numbered(Path::new("/t"), &[], 2), PathBuf::from("/t/0000000002"));
         assert_eq!(numbered(Path::new("/t"), &[1, 2], 2), PathBuf::from("/t/2/00/0000000002"));
         assert_eq!(numbered(Path::new("/t"), &[2, 1, 3], 1234567890), PathBuf::from("/t/90/8/567/1234567890"));
+    }
+
+    #[test]
+    fn makes_directories_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = dir("dirs");
+        let dirs = [dir.clone(), dir.join("a")];
+        make_dirs(&dirs).unwrap();
+        assert!(dirs.iter().all(|d| d.metadata().unwrap().permissions().mode() & 0o777 == 0o700));
+        // What is there is left as it is, a file too; the directories around one are not made.
+        std::fs::write(dir.join("b"), "").unwrap();
+        make_dirs(&[dir.join("a"), dir.join("b")]).unwrap();
+        let missing = dir.join("c/d");
+        assert_eq!(make_dirs(&[missing.clone()]), Err(format!("mkdir() \"{}\" failed (2: No such file or directory)", missing.display())));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
