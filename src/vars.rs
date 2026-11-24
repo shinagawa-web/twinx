@@ -12,6 +12,8 @@ use chrono::{DateTime, Local};
 /// What the internal redirects of a request share with it.
 #[derive(Debug, Default)]
 pub struct Shared {
+    /// The number of the connection, for the error log; 0 for none.
+    pub number: u64,
     /// With proxy_request_buffering off: the body still to be read from the
     /// client, sent on to the proxied server as it comes; what the proxy does
     /// not take is read and dropped afterwards.

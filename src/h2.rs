@@ -59,8 +59,9 @@ const WAITING: usize = 65536;
 const TABLE_SIZE: usize = 4096;
 
 type Fields = Vec<(Vec<u8>, Vec<u8>)>;
-/// The listening, local and remote addresses of a connection, and its TLS session.
-pub type Addrs = (SocketAddr, SocketAddr, SocketAddr, Option<Arc<crate::tls::Session>>);
+/// The listening, local and remote addresses of a connection, this with its number in
+/// error logs, and its TLS session.
+pub type Addrs = (SocketAddr, SocketAddr, (SocketAddr, u64), Option<Arc<crate::tls::Session>>);
 /// How an answer ended: whole, with the trailers that follow it, or cut off.
 #[derive(Debug, PartialEq)]
 enum Ended { Whole(Fields), Cut }
