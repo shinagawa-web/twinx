@@ -162,6 +162,8 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_cache_min_uses", HSL, 1, 1, false),
     ("proxy_cache_use_stale", HSL, 1, usize::MAX, false),
     ("proxy_no_cache", HSL, 1, usize::MAX, false),
+    ("proxy_cache_bypass", HSL, 1, usize::MAX, false),
+    ("proxy_cache_key", HSL, 1, 1, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
     ("proxy_http_version", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
@@ -198,7 +200,7 @@ const REPEATED: &[&str] = &[
     "error_log", "index", "server", "upstream", "listen", "server_name", "location", "return", "break", "set", "if", "rewrite", "log_format", "access_log", "add_header", "add_trailer", "keepalive_disable", "error_page",
     "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_next_upstream",
     "proxy_cookie_domain", "proxy_cookie_path", "proxy_redirect", "proxy_cookie_flags", "gzip_types", "proxy_cache_path", "proxy_cache_valid",
-    "proxy_no_cache",
+    "proxy_no_cache", "proxy_cache_bypass",
 ];
 
 const COMBINED: &str =
@@ -464,6 +466,11 @@ pub struct Level {
     pub proxy_cache_use_stale: Vec<String>,
     /// proxy_no_cache: the answer is not cached when one of these is neither empty nor "0".
     pub proxy_no_cache: Vec<Template>,
+    /// proxy_cache_bypass: the server is asked, and its answer cached, when one of these is
+    /// neither empty nor "0".
+    pub proxy_cache_bypass: Vec<Template>,
+    /// proxy_cache_key: what an answer is cached by ($scheme$proxy_host$request_uri without it).
+    pub proxy_cache_key: Option<Template>,
     /// proxy_buffers: the number and the size of the buffers the body is read into.
     pub proxy_buffers: (usize, usize),
     /// proxy_busy_buffers_size: how much of those is written at once, twice the size of
@@ -1098,10 +1105,11 @@ impl Builder<'_> {
                     if let Some(a) = d.args.iter().find(|a| !VALUES.contains(&a.as_str())) { return Err(at(format!("invalid value \"{a}\""))); }
                     level.proxy_cache_use_stale = if d.args.iter().any(|a| a == "off") { Vec::new() } else { d.args.clone() };
                 }
-                "proxy_no_cache" => {
-                    let all = block.iter().filter(|v| v.name == "proxy_no_cache").flat_map(|v| v.args.iter().map(move |a| Template::parse(a).map_err(|e| format!("{e} in {}", v.at))));
-                    level.proxy_no_cache = all.collect::<Result<_, _>>()?;
+                "proxy_no_cache" | "proxy_cache_bypass" => {
+                    let all = block.iter().filter(|v| v.name == d.name).flat_map(|v| v.args.iter().map(move |a| Template::parse(a).map_err(|e| format!("{e} in {}", v.at))));
+                    *if d.name == "proxy_no_cache" { &mut level.proxy_no_cache } else { &mut level.proxy_cache_bypass } = all.collect::<Result<_, _>>()?;
                 }
+                "proxy_cache_key" => level.proxy_cache_key = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
                 "proxy_http_version" => {
                     let version = ["1.0", "1.1", "2"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\"", d.args[0])))?;
@@ -1747,6 +1755,13 @@ mod tests {
         let c = build_text("http { proxy_cache_path c keys_zone=Z:1m; proxy_cache_lock on; server { listen 127.0.0.1:8080; location / { } location /off { proxy_cache_lock off; } } }").unwrap();
         assert_eq!(c.servers[0].locations.iter().map(|l| l.level.proxy_cache_lock).collect::<Vec<_>>(), [true, false]);
         assert!(build_text("http { proxy_cache_lock yes; }").is_err());
+        let c = build_text("http { proxy_cache_bypass $arg_a; proxy_cache_bypass $arg_b $arg_c; proxy_no_cache $arg_d; proxy_cache_key $uri; proxy_cache_min_uses 2; proxy_cache_use_stale error http_404; server { location / { proxy_cache_use_stale off; } } }").unwrap();
+        let l = &c.servers[0].level;
+        assert_eq!((l.proxy_cache_bypass.len(), l.proxy_no_cache.len(), l.proxy_cache_key.is_some(), l.proxy_cache_min_uses), (3, 1, true, 2));
+        assert_eq!(l.proxy_cache_use_stale, ["error", "http_404"]);
+        assert!(c.servers[0].locations[0].level.proxy_cache_use_stale.is_empty());
+        assert_eq!(build_text("http { proxy_cache_use_stale http_418; }").unwrap_err(), "invalid value \"http_418\" in t.conf:1");
+        assert!(build_text("http { proxy_cache_min_uses x; }").is_err());
         assert_eq!(build_text("http { server { proxy_cache Z; } }").unwrap_err(), "\"proxy_cache\" zone \"Z\" is unknown in t.conf:1");
         assert_eq!(build_text("http { proxy_cache_path c levels=1; }").unwrap_err(), "\"proxy_cache_path\" must have \"keys_zone\" parameter in t.conf:1");
     }
