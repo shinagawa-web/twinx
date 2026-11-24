@@ -443,13 +443,25 @@ fn dechunk(buf: &[u8], max: u64) -> Result<Option<(Vec<u8>, usize)>, u16> {
     decode_chunked(buf, max).map(|(body, used)| used.map(|used| (body, used)))
 }
 
+/// A line of a chunked body from the byte at, and where the next one starts;
+/// None while it has not all come. As ngx_http_parse_chunked() reads it, a line
+/// ends with CRLF and only that: an LF alone, or a CR not followed by an LF, is
+/// invalid.
+fn chunk_line(buf: &[u8], at: usize) -> Result<Option<(String, usize)>, u16> {
+    let Some(n) = buf[at..].iter().position(|&c| c == b'\r' || c == b'\n') else { return Ok(None) };
+    match (buf[at + n], buf.get(at + n + 1)) {
+        (b'\r', None) => Ok(None),
+        (b'\r', Some(b'\n')) => Ok(Some((String::from_utf8_lossy(&buf[at..at + n]).to_string(), at + n + 2))),
+        _ => Err(400),
+    }
+}
+
 /// The data of a chunked body that has come, and the bytes the whole body took
 /// in the buffer once it has all come.
 fn decode_chunked(buf: &[u8], max: u64) -> Result<(Vec<u8>, Option<usize>), u16> {
     let (mut body, mut at) = (Vec::new(), 0);
-    let line = |at: usize| buf[at..].iter().position(|&c| c == b'\n').map(|n| (String::from_utf8_lossy(&buf[at..at + n]).trim_end_matches('\r').to_string(), at + n + 1));
     loop {
-        let Some((size, next)) = line(at) else { return Ok((body, None)) };
+        let Some((size, next)) = chunk_line(buf, at)? else { return Ok((body, None)) };
         let size = chunk_size(&size).ok_or(400u16)?;
         at = next;
         if size == 0 { break; }
@@ -457,12 +469,12 @@ fn decode_chunked(buf: &[u8], max: u64) -> Result<(Vec<u8>, Option<usize>), u16>
         let end = at + size as usize;
         let after = buf.get(end..).unwrap_or_default();
         if after.is_empty() || after == b"\r" { body.extend_from_slice(&buf[at..end.min(buf.len())]); return Ok((body, None)); }
-        let skip = if after.starts_with(b"\r\n") { 2 } else if after.starts_with(b"\n") { 1 } else { return Err(400) };
+        if !after.starts_with(b"\r\n") { return Err(400) }
         body.extend_from_slice(&buf[at..end]);
-        at = end + skip;
+        at = end + 2;
     }
     loop {
-        let Some((trailer, next)) = line(at) else { return Ok((body, None)) };
+        let Some((trailer, next)) = chunk_line(buf, at)? else { return Ok((body, None)) };
         at = next;
         if trailer.is_empty() { return Ok((body, Some(at))); }
     }
@@ -6599,6 +6611,17 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(decode_chunked(b"3\r\nabc\r\n0\r\n\r\nX", 100), Ok((b"abc".to_vec(), Some(13))));
         assert_eq!(decode_chunked(b"3\r\nabc\r\n0\r\n", 100), Ok((b"abc".to_vec(), None)));
         assert_eq!(decode_chunked(b"3\r\nabc\r\n", 2), Err(413));
+        assert_eq!(decode_chunked(b"3\r\nabc\r", 100), Ok((b"abc".to_vec(), None)));
+        assert_eq!(decode_chunked(b"3\r\nabc\r\n0\r\nA: b\r", 100), Ok((b"abc".to_vec(), None)));
+    }
+
+    #[test]
+    fn chunk_lines_end_with_crlf_only() {
+        for bad in [&b"3\nabc\r\n0\r\n\r\n"[..], b"3\r\nabc\n0\r\n\r\n", b"3\r\nabc\r\n0\r\n\n", b"3;a\rb\r\nabc\r\n0\r\n\r\n", b"3\r\nabc\r\n0\r\nA: b\rc\r\n\r\n", b"3\r\nabc\rx"] {
+            assert_eq!(decode_chunked(bad, 100), Err(400), "{:?}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(chunk_line(b"a\r\nb", 0), Ok(Some(("a".to_string(), 3))));
+        assert_eq!(chunk_line(b"a\r", 0), Ok(None));
     }
 
     #[test]
