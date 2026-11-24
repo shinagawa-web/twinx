@@ -720,7 +720,7 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut preface = false;
     // As in nginx (tcp_nodelay), what is written does not wait for the client to acknowledge what was before.
-    if let Some(tcp) = stream.tcp() { let _ = tcp.set_nodelay(true); }
+    if let Some(tcp) = stream.tcp().filter(|_| level.tcp_nodelay) { let _ = tcp.set_nodelay(true); }
     loop {
         if crate::http::shutting() && !c.goaway { c.goaway(); }
         let read = if preface { c.read(&mut buf) } else if buf.len() < PREFACE.len() { Ok(()) } else if buf.starts_with(PREFACE) { preface = true; buf.drain(..PREFACE.len()); c.read(&mut buf) } else { Err(PROTOCOL_ERROR) };

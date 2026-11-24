@@ -203,6 +203,20 @@ pub async fn write_once<S: AsyncWrite + Unpin>(s: &mut S, bufs: &[IoSlice<'_>], 
     }
 }
 
+/// Sends so much of a file from there on (sendfile), if it need not wait: how much was
+/// sent, which is nothing at the end of the file.
+pub fn sendfile(tcp: &TcpStream, file: &std::fs::File, at: u64, n: usize) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    let mut at = at as libc::off_t;
+    tcp.try_io(tokio::io::Interest::WRITABLE, || {
+        // SAFETY: both descriptors are open, and the offset lives through the call.
+        match unsafe { libc::sendfile(tcp.as_raw_fd(), file.as_raw_fd(), &mut at, n) } {
+            -1 => Err(std::io::Error::last_os_error()),
+            n => Ok(n as usize),
+        }
+    })
+}
+
 /// A connection that is written to while it is watched.
 pub struct Writing<'a, 'b>(pub &'a RefCell<&'b mut Stream>);
 
@@ -324,6 +338,29 @@ mod tests {
             let data = vec![b'x'; 1 << 24];
             assert!(matches!(write_once(&mut s, &[IoSlice::new(&data)], None).await, Some(n) if (1..data.len()).contains(&n)));
             assert!(!write_vectored(&mut s, &mut [IoSlice::new(&data)], Some(Duration::from_millis(50))).await);
+        });
+    }
+
+    #[test]
+    fn sends_files() {
+        block_on(async {
+            let (s, mut other) = pair().await;
+            let path = std::env::temp_dir().join(format!("twinx-sendfile-{}", std::process::id()));
+            std::fs::write(&path, b"abcdefgh").unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            s.writable().await.unwrap();
+            assert_eq!([sendfile(&s, &file, 2, 3).unwrap(), sendfile(&s, &file, 6, 10).unwrap(), sendfile(&s, &file, 8, 1).unwrap()], [3, 2, 0]);
+            let mut got = [0; 5];
+            other.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"cdegh");
+            // Until it would have to wait.
+            std::fs::write(&path, vec![b'x'; 1 << 24]).unwrap();
+            while sendfile(&s, &file, 0, 1 << 24).is_ok() {}
+            assert_eq!(sendfile(&s, &file, 0, 1).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            drop(other);
+            s.writable().await.unwrap();
+            assert!(sendfile(&s, &file, 0, 1).is_err());
+            std::fs::remove_file(path).unwrap();
         });
     }
 
