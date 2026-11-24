@@ -73,7 +73,7 @@ jobs:
       # every pull request until main changes, and no regression would be seen.
       - name: Check that main was built
         if: steps.baseline-cache.outputs.cache-hit != 'true'
-        run: test -x "$JUDGE_DIR/main/target/release/twinx"
+        run: test -x "$JUDGE_DIR/main-twinx"
 
       - name: Save main's results
         if: steps.baseline-cache.outputs.cache-hit != 'true'
