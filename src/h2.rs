@@ -66,11 +66,11 @@ pub type Addrs = (SocketAddr, SocketAddr, (SocketAddr, u64), Option<Arc<crate::t
 /// How an answer ended: whole, with the trailers that follow it, or cut off.
 #[derive(Debug, PartialEq)]
 enum Ended { Whole(Fields), Cut }
-/// What has come of a stream's answer: at first its status and headers, and whether
+/// What has come of a stream's answer: at first the header block of its head, and whether
 /// it comes in chunks, which trailers may follow; then so much of its body; at last
 /// how it ended. One that ends without a head resets the stream.
 #[derive(Debug, Default, PartialEq)]
-struct Part { head: Option<(u16, Fields, bool)>, data: Vec<u8>, ended: Option<Ended> }
+struct Part { head: Option<(Vec<u8>, bool)>, data: Vec<u8>, ended: Option<Ended> }
 /// What an exchange tells of a stream: how its body is read, then its answer, part by part.
 enum Told { Reading(Reading), Answer(Part) }
 
@@ -130,50 +130,46 @@ static HUFFMAN: [(u32, u8); 256] = [
     (0x7ffffeb, 27), (0xffffffe, 28), (0x7ffffec, 27), (0x7ffffed, 27), (0x7ffffee, 27), (0x7ffffef, 27), (0x7fffff0, 27), (0x3ffffee, 26),
 ];
 
-/// The octets in the order of their Huffman codes, which is that of their lengths; and
-/// of each length the first code, how many there are, and how many octets come before.
-/// The codes of a length follow one another.
-fn symbols() -> &'static ([u8; 256], [(u32, u32, u32); 31]) {
-    static SYMBOLS: OnceLock<([u8; 256], [(u32, u32, u32); 31])> = OnceLock::new();
-    SYMBOLS.get_or_init(|| {
-        let (mut octets, mut lengths) = (std::array::from_fn(|c| c as u8), [(0, 0, 0); 31]);
-        octets.sort_by_key(|&c| { let (code, len) = HUFFMAN[usize::from(c)]; (len, code) });
-        for (i, &c) in octets.iter().enumerate() {
-            let (code, len) = HUFFMAN[usize::from(c)];
-            let of = &mut lengths[usize::from(len)];
-            *of = if of.1 == 0 { (code, 1, i as u32) } else { (of.0, of.1 + 1, of.2) };
-        }
-        (octets, lengths)
-    })
+/// The Huffman codes of each length: that, the first code, the end of them, as the first
+/// bits of 32, and their octets, as the codes of a length follow one another.
+fn symbols() -> &'static [(u32, u32, u32, Vec<u8>)] {
+    static SYMBOLS: OnceLock<Vec<(u32, u32, u32, Vec<u8>)>> = OnceLock::new();
+    SYMBOLS.get_or_init(|| (5..=30).filter_map(|len| {
+        let mut of: Vec<_> = (0..=255u8).map(|c| (HUFFMAN[usize::from(c)], c)).filter(|(code, _)| u32::from(code.1) == len).map(|(code, c)| (code.0, c)).collect();
+        of.sort();
+        Some((len, of.first()?.0, (of.last()?.0 + 1) << (32 - len), of.into_iter().map(|(_, c)| c).collect()))
+    }).collect())
 }
 
-/// A string Huffman encoded, as nginx does it: only when that is shorter.
-fn huffman(src: &[u8], lower: bool) -> Option<Vec<u8>> {
-    let (mut out, mut acc, mut bits) = (Vec::with_capacity(src.len()), 0u64, 0);
-    for &c in src {
-        let (code, len) = HUFFMAN[usize::from(if lower { c.to_ascii_lowercase() } else { c })];
+/// Writes a string, Huffman encoded, as nginx does it, only when that is shorter.
+fn write_string(out: &mut Vec<u8>, s: &[u8], lower: bool) {
+    let octet = |c: u8| if lower { c.to_ascii_lowercase() } else { c };
+    let len = s.iter().map(|&c| usize::from(HUFFMAN[usize::from(octet(c))].1)).sum::<usize>().div_ceil(8);
+    if len >= s.len() {
+        write_integer(out, 0, 7, s.len());
+        return out.extend(s.iter().map(|&c| octet(c)));
+    }
+    write_integer(out, 0x80, 7, len);
+    let (mut acc, mut bits) = (0u64, 0);
+    for &c in s {
+        let (code, len) = HUFFMAN[usize::from(octet(c))];
         (acc, bits) = (acc << len | u64::from(code), bits + len);
         while bits >= 8 { bits -= 8; out.push((acc >> bits) as u8); }
     }
     if bits > 0 { out.push((acc << (8 - bits)) as u8 | 0xff >> bits); }
-    (out.len() < src.len()).then_some(out)
 }
 
-/// A Huffman encoded string decoded, as nginx decodes it: what is left after
+/// Decodes a Huffman encoded string to the end of out, as nginx decodes it: what is left after
 /// the last octet is padding of ones, of whatever length, but not the code of EOS.
-fn unhuffman(src: &[u8]) -> Option<Vec<u8>> {
-    let (octets, lengths) = symbols();
-    let (mut out, mut acc, mut bits, mut rest) = (Vec::with_capacity(src.len() * 8 / 5), 0u64, 0, src.iter());
+fn unhuffman(src: &[u8], out: &mut Vec<u8>) -> bool {
+    let (mut src, mut acc, mut bits) = (src.iter(), 0u64, 0u32);
     loop {
-        while bits <= 56 { let Some(&b) = rest.next() else { break }; (acc, bits) = (acc << 8 | u64::from(b), bits + 8); }
-        // The shortest code has 5 bits, the longest 30.
-        let found = (5..=bits.min(30)).find_map(|len| {
-            let ((first, count, before), code) = (lengths[len], (acc >> (bits - len)) as u32 & ((1 << len) - 1));
-            (code.wrapping_sub(first) < count).then(|| (octets[(before + code - first) as usize], len))
-        });
-        match found {
-            Some((c, len)) => { out.push(c); bits -= len; }
-            None => return (bits < 30 && acc & ((1 << bits) - 1) == (1 << bits) - 1).then_some(out),
+        while bits < 32 && let Some(&b) = src.next() { (acc, bits) = (acc << 8 | u64::from(b), bits + 8); }
+        // The next 32 bits, of which those past the end are ones.
+        let next = if bits < 32 { (acc << (32 - bits)) as u32 | u32::MAX >> bits } else { (acc >> (bits - 32)) as u32 };
+        match symbols().iter().find(|s| next < s.2 && s.0 <= bits) {
+            Some((len, first, _, octets)) => { out.push(octets[((next >> (32 - len)) - first) as usize]); bits -= len; }
+            None => return bits < 30 && next == u32::MAX,
         }
     }
 }
@@ -204,26 +200,27 @@ fn write_integer(out: &mut Vec<u8>, first: u8, bits: u8, mut value: usize) {
     out.push(value as u8);
 }
 
-/// Writes a string, Huffman encoded when that is shorter.
-fn write_string(out: &mut Vec<u8>, s: &[u8], lower: bool) {
-    let huff = huffman(s, lower);
-    let raw = |s: &[u8]| if lower { s.to_ascii_lowercase() } else { s.to_vec() };
-    let (flag, s) = huff.map_or_else(|| (0, raw(s)), |h| (0x80, h));
-    write_integer(out, flag, 7, s.len());
-    out.extend_from_slice(&s);
-}
-
 /// The table of the fields the client added (RFC 7541, 2.3.2), newest first, as nginx keeps it.
 #[derive(Clone)]
 /// The dynamic table of a decoder: its fields, newest first, its size, what they use of it,
 /// and the most a size update may make it, the size the decoder announced.
 struct Table { entries: VecDeque<(Vec<u8>, Vec<u8>)>, size: usize, used: usize, limit: usize }
 
+/// The fields of a header block: their names and values, one after another, and where each of those ends.
+#[derive(Default)]
+struct Block { bytes: Vec<u8>, ends: Vec<(usize, usize)> }
+
+impl Block {
+    fn fields(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        let starts = std::iter::once(0).chain(self.ends.iter().map(|e| e.1));
+        starts.zip(&self.ends).map(|(start, &(name, value))| (&self.bytes[start..name], &self.bytes[name..value]))
+    }
+}
+
 impl Table {
-    fn field(&self, index: usize) -> Option<(Vec<u8>, Vec<u8>)> {
-        let fixed = |(n, v): (&str, &str)| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
-        if index <= STATIC.len() { return index.checked_sub(1).map(|i| fixed(STATIC[i])) }
-        self.entries.get(index - STATIC.len() - 1).cloned()
+    fn field(&self, index: usize) -> Option<(&[u8], &[u8])> {
+        if index <= STATIC.len() { return index.checked_sub(1).map(|i| (STATIC[i].0.as_bytes(), STATIC[i].1.as_bytes())) }
+        self.entries.get(index - STATIC.len() - 1).map(|(n, v)| (&n[..], &v[..]))
     }
 
     fn evict(&mut self, size: usize) {
@@ -243,16 +240,22 @@ impl Table {
     /// has come, or the connection error it is. Each field is at most the size
     /// of a buffer of large_client_header_buffers, and all of them the size of
     /// all those buffers.
-    fn decode(&mut self, block: &[u8], length: usize, (number, size): (usize, usize)) -> Result<Fields, u32> {
-        let (mut fields, mut at, mut left) = (Vec::new(), 0, number * size);
-        let string = |at: &mut usize| -> Result<Vec<u8>, u32> {
+    fn decode(&mut self, block: &[u8], length: usize, limits: (usize, usize)) -> Result<Fields, u32> {
+        self.block(block, length, limits).map(|b| b.fields().map(|(n, v)| (n.to_vec(), v.to_vec())).collect())
+    }
+
+    /// The fields of a header block, as decode() gives them.
+    fn block(&mut self, block: &[u8], length: usize, (number, size): (usize, usize)) -> Result<Block, u32> {
+        let (mut fields, mut at, mut left) = (Block { bytes: Vec::with_capacity(256), ends: Vec::with_capacity(16) }, 0, number * size);
+        let string = |at: &mut usize, to: &mut Vec<u8>| -> Result<(), u32> {
             let huff = block.get(*at).ok_or(if *at < length { AGAIN } else { FRAME_SIZE_ERROR })? & 0x80 != 0;
             let len = integer(block, at, 7, length)?;
             if len > size { return Err(ENHANCE_YOUR_CALM) }
             if *at + len > length { return Err(FRAME_SIZE_ERROR) }
             let raw = block.get(*at..*at + len).ok_or(AGAIN)?;
             *at += len;
-            if huff { unhuffman(raw).ok_or(COMPRESSION_ERROR) } else { Ok(raw.to_vec()) }
+            if !huff { to.extend_from_slice(raw); } else if !unhuffman(raw, to) { return Err(COMPRESSION_ERROR) }
+            Ok(())
         };
         while at < block.len() {
             // An indexed field, a literal one added to the table, a table size update, or a literal one.
@@ -263,14 +266,16 @@ impl Table {
                 (self.size, _) = (index, self.evict(index));
                 continue;
             }
-            let (name, value) = if bits == 7 { self.field(index).ok_or(COMPRESSION_ERROR)? } else {
-                let name = if index == 0 { string(&mut at)? } else { self.field(index).ok_or(COMPRESSION_ERROR)?.0 };
-                if name.is_empty() { return Err(PROTOCOL_ERROR) }
-                (name, string(&mut at)?)
-            };
-            left = left.checked_sub(name.len() + value.len()).ok_or(ENHANCE_YOUR_CALM)?;
-            if add { self.add(&name, &value); }
-            fields.push((name, value));
+            let (to, start) = (&mut fields.bytes, fields.ends.last().map_or(0, |e| e.1));
+            if index == 0 && bits != 7 { string(&mut at, to)?; } else { to.extend_from_slice(self.field(index).ok_or(COMPRESSION_ERROR)?.0); }
+            let name = to.len();
+            if bits == 7 { to.extend_from_slice(self.field(index).ok_or(COMPRESSION_ERROR)?.1); } else {
+                if name == start { return Err(PROTOCOL_ERROR) }
+                string(&mut at, to)?;
+            }
+            left = left.checked_sub(to.len() - start).ok_or(ENHANCE_YOUR_CALM)?;
+            if add { self.add(&to[start..name], &to[name..]); }
+            fields.ends.push((name, to.len()));
         }
         Ok(fields)
     }
@@ -305,7 +310,7 @@ fn status(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<u16> {
 /// lines it makes; none for one nginx refuses with 400. The pseudo-header
 /// fields give the request line and the host, and cookie fields are joined
 /// into one, as nginx does.
-fn request(fields: &[(Vec<u8>, Vec<u8>)], end: bool) -> Option<(Vec<u8>, bool, usize)> {
+fn request<'a>(fields: impl Iterator<Item = (&'a [u8], &'a [u8])>, end: bool) -> Option<(Vec<u8>, bool, usize)> {
     let mut pseudo: [Option<&[u8]>; 4] = [None; 4];
     let (mut lines, mut cookies, mut host, mut length) = (Vec::new(), Vec::new(), None, None);
     for (name, value) in fields {
@@ -315,7 +320,7 @@ fn request(fields: &[(Vec<u8>, Vec<u8>)], end: bool) -> Option<(Vec<u8>, bool, u
             if pseudo[i].replace(value).is_some() || value.is_empty() { return None }
             continue;
         }
-        match &name[..] { b"cookie" => { cookies.push(&value[..]); continue } b"host" => host = Some(&value[..]), b"content-length" => length = Some(&value[..]), _ => {} }
+        match name { b"cookie" => { cookies.push(value); continue } b"host" => host = Some(value), b"content-length" => length = Some(value), _ => {} }
         lines.push((name, value));
     }
     let [Some(method), Some(scheme), Some(path), authority] = pseudo else { return None };
@@ -324,23 +329,25 @@ fn request(fields: &[(Vec<u8>, Vec<u8>)], end: bool) -> Option<(Vec<u8>, bool, u
     // Content-Length with a stream that has ended is a body that did not come.
     let missing = end && length.and_then(|l| std::str::from_utf8(l).ok()?.parse::<u64>().ok()).is_some_and(|n| n > 0);
     if !valid || missing || host.or(authority).is_none() || authority.zip(host).is_some_and(|(a, h)| a != h) { return None }
-    let mut head = [method, b" ", path, b" HTTP/2.0\r\n"].concat();
-    lines.iter().for_each(|(n, v)| head.extend([n, &b": "[..], v, b"\r\n"].concat()));
-    if !cookies.is_empty() { head.extend([&b"cookie: "[..], &cookies.join(&b"; "[..]), b"\r\n"].concat()); }
-    if let (Some(a), None) = (authority, host) { head.extend([&b"host: "[..], a, b"\r\n"].concat()); }
+    let mut head = Vec::with_capacity(512);
+    let mut write = |parts: &[&[u8]]| parts.iter().for_each(|part| head.extend_from_slice(part));
+    write(&[method, b" ", path, b" HTTP/2.0\r\n"]);
+    lines.iter().for_each(|(n, v)| write(&[n, b": ", v, b"\r\n"]));
+    if !cookies.is_empty() { write(&[b"cookie: ", &cookies.join(&b"; "[..]), b"\r\n"]); }
+    if let (Some(a), None) = (authority, host) { write(&[b"host: ", a, b"\r\n"]); }
     Some((head, length.is_some(), usize::from(!cookies.is_empty()) + usize::from(host.is_none())))
 }
 
 /// The status and headers of an HTTP/1 answer's head, without those only
 /// HTTP/1 connections have.
-fn answer_head(head: &[u8]) -> Option<(u16, Fields)> {
+fn answer_head(head: &[u8]) -> Option<(u16, Vec<(&[u8], &[u8])>)> {
     let mut lines = head.split(|&c| c == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let status = std::str::from_utf8(lines.next()?.split(|&c| c == b' ').nth(1)?).ok()?.parse().ok()?;
     let mut headers = Vec::new();
     for line in lines {
         let at = line.iter().position(|&c| c == b':')?;
         let (name, value) = (&line[..at], line[at + 1..].trim_ascii());
-        if !["connection", "keep-alive", "transfer-encoding"].iter().any(|h| name.eq_ignore_ascii_case(h.as_bytes())) { headers.push((name.to_vec(), value.to_vec())); }
+        if !["connection", "keep-alive", "transfer-encoding"].iter().any(|h| name.eq_ignore_ascii_case(h.as_bytes())) { headers.push((name, value)); }
     }
     Some((status, headers))
 }
@@ -348,9 +355,8 @@ fn answer_head(head: &[u8]) -> Option<(u16, Fields)> {
 /// The header block of an answer as nginx writes it: the status, then the
 /// headers it has its own places for, added to the client's table, then the
 /// others in order, their names in lower case.
-fn header_block(status: u16, headers: &[(Vec<u8>, Vec<u8>)], table_update: bool) -> Vec<u8> {
-    let mut out = Vec::new();
-    if table_update { out.push(0x20); }
+fn header_block(status: u16, headers: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
     match [200, 204, 206, 304, 400, 404, 500].iter().position(|&s| s == status) {
         Some(i) => out.push(0x88 + i as u8),
         None => out.extend(format!("\x48\x03{status:03}").bytes()),
@@ -360,7 +366,7 @@ fn header_block(status: u16, headers: &[(Vec<u8>, Vec<u8>)], table_update: bool)
     for (name, index) in OWN {
         let Some(i) = headers.iter().position(|h| h.0.eq_ignore_ascii_case(name.as_bytes())) else { continue };
         out.push(0x40 | index);
-        if index == 28 { write_integer(&mut out, 0, 7, headers[i].1.len()); out.extend_from_slice(&headers[i].1); } else { write_string(&mut out, &headers[i].1, false); }
+        if index == 28 { write_integer(&mut out, 0, 7, headers[i].1.len()); out.extend_from_slice(headers[i].1); } else { write_string(&mut out, headers[i].1, false); }
         placed.push(i);
     }
     literals(&mut out, headers.iter().enumerate().filter(|(i, _)| !placed.contains(i)).map(|(_, h)| h));
@@ -369,11 +375,11 @@ fn header_block(status: u16, headers: &[(Vec<u8>, Vec<u8>)], table_update: bool)
 
 /// Writes fields as literals not added to the table, their names in lower
 /// case, as nginx writes the headers it has no place for and trailers.
-fn literals<'a>(out: &mut Vec<u8>, fields: impl Iterator<Item = &'a (Vec<u8>, Vec<u8>)>) {
+fn literals<'a, T: AsRef<[u8]> + 'a>(out: &mut Vec<u8>, fields: impl Iterator<Item = &'a (T, T)>) {
     for (name, value) in fields {
         out.push(0);
-        write_string(out, name, true);
-        write_string(out, value, false);
+        write_string(out, name.as_ref(), true);
+        write_string(out, value.as_ref(), false);
     }
 }
 
@@ -544,8 +550,9 @@ impl Connection {
 
     /// Adds a frame's part of the header block, and takes the request once it has come whole.
     fn header_block(&mut self, flags: u8, p: &[u8]) -> Result<(), u32> {
-        let Some((sid, first, block, refused)) = self.block.take() else { return Ok(()) };
-        self.block = Some((sid, first | flags, [&block[..], p].concat(), refused));
+        let Some((_, first, block, _)) = &mut self.block else { return Ok(()) };
+        *first |= flags;
+        block.extend_from_slice(p);
         if flags & END_HEADERS != 0 { self.headers_done() } else { Ok(()) }
     }
 
@@ -574,15 +581,15 @@ impl Connection {
     /// Takes a request once its header block has come whole.
     fn headers_done(&mut self) -> Result<(), u32> {
         let Some((sid, flags, block, refused)) = self.block.take() else { return Ok(()) };
-        let fields = self.table.decode(&block, block.len(), self.limits)?;
+        let fields = self.table.block(&block, block.len(), self.limits)?;
         if refused { self.rst(sid, REFUSED_STREAM); return Ok(()) }
         let ended = flags & END_STREAM != 0;
         // As nginx does, the request is passed on once its head has come, and its body as it comes.
-        let head = request(&fields, ended);
-        let declared = fields.iter().find(|f| f.0 == b"content-length").and_then(|f| std::str::from_utf8(&f.1).ok()?.parse().ok());
+        let head = request(fields.fields(), ended);
+        let declared = fields.fields().find(|f| f.0 == b"content-length").and_then(|f| std::str::from_utf8(f.1).ok()?.parse().ok());
         let chunked = head.as_ref().is_some_and(|h| !h.1) && !ended;
-        let (body, taker) = tokio::sync::mpsc::unbounded_channel();
-        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head, ended, body: (!ended).then_some(body), taker: Some(taker), declared, chunked, number: self.requests, block: block.len(), ..Open::default() });
+        let (body, taker) = (!ended).then(tokio::sync::mpsc::unbounded_channel).unzip();
+        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head, ended, body, taker, declared, chunked, number: self.requests, block: block.len(), ..Open::default() });
         self.ready.push(sid);
         Ok(())
     }
@@ -667,8 +674,8 @@ impl Connection {
     /// frame ends the stream of an answer that is whole, has no body and is not in chunks.
     fn answer(&mut self, sid: u32, part: Part) {
         let Some(s) = self.streams.get_mut(&sid) else { return };
-        if let Some((status, headers, chunked)) = part.head {
-            let block = header_block(status, &headers, std::mem::take(&mut self.table_update));
+        if let Some((mut block, chunked)) = part.head {
+            if std::mem::take(&mut self.table_update) { block.insert(0, 0x20); }
             s.closed = !chunked && part.data.is_empty() && part.ended == Some(Ended::Whole(Vec::new()));
             header_frames(&mut self.out, sid, &block, self.frame_size, s.closed);
             s.answer = Some(Vec::new());
@@ -681,6 +688,13 @@ impl Connection {
         s.end = part.ended;
     }
 
+    /// Takes what an exchange tells of a stream, unless it is not the one whose answer
+    /// the stream gets, and sends what the windows let of it.
+    fn told(&mut self, (sid, number, told): (u32, u32, Told)) {
+        if self.streams.get(&sid).is_none_or(|s| s.exchange != number) { return }
+        match told { Told::Reading(r) => self.reading(sid, r), Told::Answer(part) => { self.answer(sid, part); self.send(sid); } }
+    }
+
     /// Sends what the windows let of the bodies of answers, in DATA frames no larger
     /// than the client takes, and forgets the streams answered whole. The last DATA
     /// frame ends the stream of one that is whole, an empty one when that shows only
@@ -689,37 +703,40 @@ impl Connection {
         let waits = |s: &Open| s.answer.as_ref().is_some_and(|body| s.sent < body.len() || s.end.is_some());
         let mut order: Vec<_> = self.streams.iter().filter(|(_, s)| waits(s)).map(|(&sid, _)| (self.rank(sid), sid)).collect();
         order.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        for (_, sid) in order {
-            let Some(s) = self.streams.get_mut(&sid) else { continue };
-            let Some(body) = &mut s.answer else { continue };
-            while s.sent < body.len() {
-                let n = (body.len() - s.sent).min(self.frame_size).min(s.send.min(self.send).max(0) as usize);
-                if n == 0 { break }
-                s.closed = s.sent + n == body.len() && s.end == Some(Ended::Whole(Vec::new()));
-                frame(&mut self.out, DATA, if s.closed { END_STREAM } else { 0 }, sid, &body[s.sent..s.sent + n]);
-                (s.sent, s.send, self.send, s.untold) = (s.sent + n, s.send - n as i64, self.send - n as i64, s.untold + n);
-            }
-            // The exchange waits for that only when, for all it knows, too much waits.
-            let held = s.untold > 0 && s.untold + body.len() - s.sent >= WAITING;
-            if let Some(taken) = s.taken.as_ref().filter(|_| held) { taken.send_modify(|t| *t += std::mem::take(&mut s.untold)); }
-            if s.sent < body.len() { continue }
-            // What has been sent is not kept.
-            (*body, s.sent) = (Vec::new(), 0);
-            match s.end.take() {
-                Some(Ended::Cut) => { self.rst(sid, INTERNAL_ERROR); continue }
-                Some(Ended::Whole(trailers)) if !s.closed => {
-                    let mut block = Vec::new();
-                    literals(&mut block, trailers.iter());
-                    if block.is_empty() { frame(&mut self.out, DATA, END_STREAM, sid, &[]); } else { header_frames(&mut self.out, sid, &block, self.frame_size, true); }
-                    s.closed = true;
-                }
-                _ => {}
-            }
-            if !s.closed { continue }
-            // A stream answered whole before its request ended is reset without an error, as nginx does.
-            if !s.ended { frame(&mut self.out, RST_STREAM, 0, sid, &NO_ERROR.to_be_bytes()); }
-            self.streams.remove(&sid);
+        order.into_iter().for_each(|(_, sid)| self.send(sid));
+    }
+
+    /// Sends what the windows let of the body of a stream's answer.
+    fn send(&mut self, sid: u32) {
+        let Some(s) = self.streams.get_mut(&sid) else { return };
+        let Some(body) = &mut s.answer else { return };
+        while s.sent < body.len() {
+            let n = (body.len() - s.sent).min(self.frame_size).min(s.send.min(self.send).max(0) as usize);
+            if n == 0 { break }
+            s.closed = s.sent + n == body.len() && s.end == Some(Ended::Whole(Vec::new()));
+            frame(&mut self.out, DATA, if s.closed { END_STREAM } else { 0 }, sid, &body[s.sent..s.sent + n]);
+            (s.sent, s.send, self.send, s.untold) = (s.sent + n, s.send - n as i64, self.send - n as i64, s.untold + n);
         }
+        // The exchange waits for that only when, for all it knows, too much waits.
+        let held = s.untold > 0 && s.untold + body.len() - s.sent >= WAITING;
+        if let Some(taken) = s.taken.as_ref().filter(|_| held) { taken.send_modify(|t| *t += std::mem::take(&mut s.untold)); }
+        if s.sent < body.len() { return }
+        // What has been sent is not kept.
+        (*body, s.sent) = (Vec::new(), 0);
+        match s.end.take() {
+            Some(Ended::Cut) => return self.rst(sid, INTERNAL_ERROR),
+            Some(Ended::Whole(trailers)) if !s.closed => {
+                let mut block = Vec::new();
+                literals(&mut block, trailers.iter());
+                if block.is_empty() { frame(&mut self.out, DATA, END_STREAM, sid, &[]); } else { header_frames(&mut self.out, sid, &block, self.frame_size, true); }
+                s.closed = true;
+            }
+            _ => {}
+        }
+        if !s.closed { return }
+        // A stream answered whole before its request ended is reset without an error, as nginx does.
+        if !s.ended { frame(&mut self.out, RST_STREAM, 0, sid, &NO_ERROR.to_be_bytes()); }
+        self.streams.remove(&sid);
     }
 }
 
@@ -755,7 +772,8 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
             let (request, made, taker) = match s.head.take().filter(|_| !bad) {
                 Some((mut head, _, made)) => {
                     if s.chunked { head.extend_from_slice(b"transfer-encoding: chunked\r\n"); }
-                    ([head, b"\r\n".to_vec()].concat(), made + usize::from(s.chunked), s.taker.take())
+                    head.extend_from_slice(b"\r\n");
+                    (head, made + usize::from(s.chunked), s.taker.take())
                 }
                 // A line HTTP/1 refuses, for the answer nginx gives with 400.
                 None => (b"-\r\n\r\n".to_vec(), 0, None),
@@ -775,14 +793,19 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
             let _ = stream.shutdown().await;
             return;
         }
-        if !c.out.is_empty() && !write_all(&mut stream, &std::mem::take(&mut c.out), None).await { return }
+        let out = std::mem::take(&mut c.out);
+        if !out.is_empty() && !write_all(&mut stream, &out, None).await { return }
+        recycle(out);
         // After GOAWAY, the connection closes once its streams are answered.
         if c.goaway && c.streams.is_empty() { return crate::http::close(&mut stream, lingers).await }
         tokio::select! {
             n = stream.read_buf(&mut buf) => if n.unwrap_or(0) == 0 { return },
-            Some((sid, number, told)) = rx.recv() => if c.streams.get(&sid).is_some_and(|s| s.exchange == number) {
-                match told { Told::Reading(r) => c.reading(sid, r), Told::Answer(part) => c.answer(sid, part) }
-            },
+            Some(told) = rx.recv() => {
+                c.out = buffer();
+                c.told(told);
+                // What other streams have by now goes in the same write, up to the size of a TLS record.
+                while c.out.len() < 16384 && let Ok(told) = rx.try_recv() { c.told(told); }
+            }
             () = crate::http::SHUTDOWN.notified() => {}
         }
     }
@@ -1114,14 +1137,14 @@ impl Reply {
                 // An answer without a length, or with trailers, comes chunked.
                 const CHUNKED: &[u8] = b"\r\ntransfer-encoding: chunked";
                 let chunked = self.buf[..end].windows(CHUNKED.len()).any(|w| w.eq_ignore_ascii_case(CHUNKED));
-                let length = headers.iter().find(|h| h.0.eq_ignore_ascii_case(b"content-length")).and_then(|h| std::str::from_utf8(&h.1).ok()?.parse().ok());
+                let length = headers.iter().find(|h| h.0.eq_ignore_ascii_case(b"content-length")).and_then(|h| std::str::from_utf8(h.1).ok()?.parse().ok());
                 self.comes = Some(match length {
                     _ if self.bodiless || [204, 304].contains(&status) => Comes::Nothing,
                     _ if chunked => Comes::Body(Body::Chunked(0, false)),
                     Some(n) => Comes::Body(Body::Length(n)),
                     None => Comes::Unframed,
                 });
-                part.head = Some((status, headers, chunked));
+                part.head = Some((header_block(status, &headers), chunked));
                 self.buf.drain(..end + 4);
             }
         }
@@ -1151,38 +1174,61 @@ impl Reply {
 /// Its body is passed as it comes, while the answer is read. What is there of the
 /// answer is told at once, and no more is read while too much of what was told is
 /// not sent. When the stream goes away before the answer has ended, so does all of it.
+/// It is all one task: an answer that does not wait for anything comes and is told the
+/// first time that runs.
 async fn exchange(config: Arc<Config>, request: Vec<u8>, body: Option<UnboundedReceiver<Vec<u8>>>, (listen, local, peer, ssl): Addrs, origin: Origin, tell: impl Fn(Part), mut sent: watch::Receiver<usize>) {
-    let ((ours, end), (_reads, reader)) = (tokio::io::duplex(65536), watch::channel(()));
+    let ((ours, end), (reads, reader)) = (tokio::io::duplex(65536), watch::channel(()));
     let theirs = Stream::Pipe(Pipe { end, reader: Some(Box::new(reader)) });
-    tokio::task::spawn_local(async move { crate::http::connection(&config, theirs, (listen, local, peer, ssl), Busy::new(), Some(Box::new(origin))).await });
+    let connection = Box::pin(crate::http::connection(&config, theirs, (listen, local, peer, ssl), Busy::new(), Some(Box::new(origin))));
     let (mut reply, mut part, mut told) = (Reply { buf: buffer(), bodiless: request.starts_with(b"HEAD "), comes: None }, Part::default(), 0);
     let (mut ours, mut to) = tokio::io::split(ours);
-    tokio::task::spawn_local(async move {
+    let passes = async move {
         let _ = to.write_all(&request).await;
         let mut body = body;
         while let Some(part) = match body.as_mut() { Some(b) => b.recv().await, None => None } {
             if to.write_all(&part).await.is_err() { return }
         }
         let _ = to.shutdown().await;
-    });
-    while part.ended.is_none() {
-        let (room, some) = ((*sent.borrow() + WAITING).saturating_sub(told + part.data.len()), part != Part::default());
-        reply.buf.reserve(8192);
-        let mut piece = (&mut ours).take(room as u64);
-        tokio::select! {
-            biased;
-            n = piece.read_buf(&mut reply.buf), if room > 0 => reply.take(&mut part, n.unwrap_or(0) == 0),
-            () = std::future::ready(()), if some => {
-                told += part.data.len();
-                tell(std::mem::take(&mut part));
+    };
+    let mut tell = Telling { tell, ended: false };
+    let reads = async move {
+        let _reads = reads;
+        while part.ended.is_none() {
+            let (room, some) = ((*sent.borrow() + WAITING).saturating_sub(told + part.data.len()), part != Part::default());
+            reply.buf.reserve(8192);
+            let mut piece = (&mut ours).take(room as u64);
+            tokio::select! {
+                biased;
+                n = piece.read_buf(&mut reply.buf), if room > 0 => reply.take(&mut part, n.unwrap_or(0) == 0),
+                () = std::future::ready(()), if some => {
+                    told += part.data.len();
+                    tell.tell(std::mem::take(&mut part));
+                }
+                gone = sent.changed() => if gone.is_err() { return },
             }
-            gone = sent.changed() => if gone.is_err() { return },
         }
+        tell.tell(part);
+        // The connection may have more to do after its answer, which it does as if it were still read.
+        while ours.read_buf(&mut reply.buf).await.is_ok_and(|n| n > 0) { reply.buf.clear(); }
+        recycle(reply.buf);
+    };
+    tokio::join!(passes, connection, reads);
+}
+
+/// What tells of a stream's answer, and that it was cut off when the exchange goes before it has ended.
+struct Telling<F: Fn(Part)> { tell: F, ended: bool }
+
+impl<F: Fn(Part)> Telling<F> {
+    fn tell(&mut self, part: Part) {
+        self.ended = part.ended.is_some();
+        (self.tell)(part);
     }
-    tell(part);
-    // The connection may have more to do after its answer, which it does as if it were still read.
-    while ours.read_buf(&mut reply.buf).await.is_ok_and(|n| n > 0) { reply.buf.clear(); }
-    recycle(reply.buf);
+}
+
+impl<F: Fn(Part)> Drop for Telling<F> {
+    fn drop(&mut self) {
+        if !self.ended { (self.tell)(Part { ended: Some(Ended::Cut), ..Part::default() }); }
+    }
 }
 
 #[cfg(test)]
@@ -1191,6 +1237,24 @@ mod tests {
     use crate::http::tests::{CHUNKED, DELIMITED, GZ, LENGTH, Pieces, after_head, files, letters, log_path, logged, member, passing, pieces_after, plays, sends, served_by, serves_files, serving_on, with_length};
     use crate::stream::within;
 
+    /// A string written Huffman encoded or not, and one decoded.
+    fn encoded(s: &[u8], lower: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_string(&mut out, s, lower);
+        out
+    }
+
+    fn decoded(s: &[u8]) -> Option<Vec<u8>> {
+        let mut out = b"before".to_vec();
+        unhuffman(s, &mut out).then(|| out.split_off(6))
+    }
+
+    /// The header block of an answer, after an update of the table's size or not.
+    fn header_block(status: u16, headers: &[(Vec<u8>, Vec<u8>)], table_update: bool) -> Vec<u8> {
+        let headers: Vec<_> = headers.iter().map(|(n, v)| (&n[..], &v[..])).collect();
+        [if table_update { &[0x20][..] } else { &[] }, &super::header_block(status, &headers)].concat()
+    }
+
     /// As upstream() does, on a new connection.
     async fn upstream(up: Stream, pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot) {
         super::upstream(Conn::new(up, Instant::now()), pipe, scheme, head_size, slot).await
@@ -1198,22 +1262,31 @@ mod tests {
 
     #[test]
     fn huffman_codes() {
-        assert_eq!(huffman(b"www.example.com", false).unwrap(), [0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]);
-        assert_eq!(huffman(b"{{{{{", false), None);
-        assert_eq!(huffman(b"X-Sent-Foo", true), huffman(b"x-sent-foo", false));
-        assert_eq!(unhuffman(&[0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]).unwrap(), b"www.example.com");
+        assert_eq!(encoded(b"www.example.com", false), [0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]);
+        assert_eq!(encoded(b"{{{{{", false), b"\x05{{{{{");
+        assert_eq!(encoded(b"X-Sent-Foo", true), encoded(b"x-sent-foo", false));
+        assert_eq!(encoded(b"{{{{X", true), b"\x05{{{{x");
+        // Every octet, between others.
+        for c in 0..=255 {
+            let s = [&[b'0'; 80][..], &[c], b"a~e", &[c]].concat();
+            let coded = encoded(&s, false);
+            let length = coded.len() - 1;
+            assert_eq!(coded[0], 0x80 | length as u8);
+            assert_eq!(decoded(&coded[1..]).unwrap(), s);
+        }
+        assert_eq!(decoded(&[0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]).unwrap(), b"www.example.com");
         // A whole octet of padding, which nginx takes; EOS, which it does not; padding that is not ones.
-        assert_eq!(unhuffman(&[0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xff]).unwrap(), b"localhost");
-        assert_eq!(unhuffman(&[0xff, 0xff, 0xff, 0xff]), None);
-        assert_eq!(unhuffman(&[0x00]), None);
+        assert_eq!(decoded(&[0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xff]).unwrap(), b"localhost");
+        assert_eq!(decoded(&[0xff, 0xff, 0xff, 0xff]), None);
+        assert_eq!(decoded(&[0x00]), None);
         // Every octet, and all of them.
         let coded = |octets: &[u8]| {
             let bits: String = octets.iter().map(|&c| { let (code, len) = HUFFMAN[usize::from(c)]; format!("{code:00$b}", usize::from(len)) }).collect();
             bits.as_bytes().chunks(8).map(|b| u8::from_str_radix(&format!("{:1<8}", std::str::from_utf8(b).unwrap()), 2).unwrap()).collect::<Vec<_>>()
         };
-        for c in 0..=255 { assert_eq!(unhuffman(&coded(&[c])), Some(vec![c])); }
+        for c in 0..=255 { assert_eq!(decoded(&coded(&[c])), Some(vec![c])); }
         let all: Vec<u8> = (0..=255).chain((0..=255).rev()).collect();
-        assert_eq!(unhuffman(&coded(&all)), Some(all));
+        assert_eq!(decoded(&coded(&all)), Some(all));
     }
 
     #[test]
@@ -1233,8 +1306,8 @@ mod tests {
         let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
         let fields = t.decode(&[0x82, 0x86, 0x84, 0x41, 0x03, b'a', b'.', b'b', 0x40, 0x01, b'x', 0x01, b'y'], 13, (4, 8192)).unwrap();
         assert_eq!(fields[3], (b":authority".to_vec(), b"a.b".to_vec()));
-        assert_eq!(t.field(62), Some((b"x".to_vec(), b"y".to_vec())));
-        assert_eq!(t.field(63), Some((b":authority".to_vec(), b"a.b".to_vec())));
+        assert_eq!(t.field(62), Some((&b"x"[..], &b"y"[..])));
+        assert_eq!(t.field(63), Some((&b":authority"[..], &b"a.b"[..])));
         assert_eq!(t.decode(&[0x80], 1, (4, 8192)), Err(COMPRESSION_ERROR));
         assert_eq!(t.decode(&[0xc2], 1, (4, 8192)), Err(COMPRESSION_ERROR));
         assert_eq!(t.decode(&[0x40, 0x00, 0x00], 3, (4, 8192)), Err(PROTOCOL_ERROR));
@@ -1250,20 +1323,20 @@ mod tests {
 
     #[test]
     fn requests() {
-        let f = |list: &[(&str, &str)]| list.iter().map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec())).collect::<Vec<_>>();
+        let request = |list: &[(&str, &str)], end| request(list.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())), end);
         let base = [(":method", "GET"), (":scheme", "http"), (":path", "/a?b"), (":authority", "h")];
-        let (head, length, made) = request(&f(&[&base[..], &[("cookie", "a=b"), ("x-a", "1"), ("cookie", "c=d")]].concat()), true).unwrap();
+        let (head, length, made) = request(&[&base[..], &[("cookie", "a=b"), ("x-a", "1"), ("cookie", "c=d")]].concat(), true).unwrap();
         assert_eq!((String::from_utf8(head).unwrap().as_str(), length, made), ("GET /a?b HTTP/2.0\r\nx-a: 1\r\ncookie: a=b; c=d\r\nhost: h\r\n", false, 2));
-        assert_eq!(request(&f(&[&base[..], &[("host", "h")]].concat()), true).unwrap().2, 0);
-        assert!(request(&f(&[&base[..], &[("host", "h"), ("content-length", "1")]].concat()), false).unwrap().1);
-        assert!(request(&f(&[&base[..], &[("content-length", "1")]].concat()), true).is_none());
-        assert!(request(&f(&[&base[..], &[("host", "other")]].concat()), true).is_none());
-        assert!(request(&f(&[&base[..], &[("X-A", "1")]].concat()), true).is_none());
-        assert!(request(&f(&[&base[..], &[("x-a", "1\n")]].concat()), true).is_none());
-        assert!(request(&f(&[&base[..], &[(":path", "/")]].concat()), true).is_none());
-        assert!(request(&f(&[&base[..], &[(":other", "/")]].concat()), true).is_none());
-        assert!(request(&f(&base[..3]), true).is_none());
-        assert!(request(&f(&[base[0], (":scheme", "1x"), base[2], base[3]]), true).is_none());
+        assert_eq!(request(&[&base[..], &[("host", "h")]].concat(), true).unwrap().2, 0);
+        assert!(request(&[&base[..], &[("host", "h"), ("content-length", "1")]].concat(), false).unwrap().1);
+        assert!(request(&[&base[..], &[("content-length", "1")]].concat(), true).is_none());
+        assert!(request(&[&base[..], &[("host", "other")]].concat(), true).is_none());
+        assert!(request(&[&base[..], &[("X-A", "1")]].concat(), true).is_none());
+        assert!(request(&[&base[..], &[("x-a", "1\n")]].concat(), true).is_none());
+        assert!(request(&[&base[..], &[(":path", "/")]].concat(), true).is_none());
+        assert!(request(&[&base[..], &[(":other", "/")]].concat(), true).is_none());
+        assert!(request(&base[..3], true).is_none());
+        assert!(request(&[base[0], (":scheme", "1x"), base[2], base[3]], true).is_none());
     }
 
     #[test]
@@ -1272,7 +1345,7 @@ mod tests {
         assert_eq!((status, headers.len()), (301, 3));
         assert!(answer_head(b"HTTP/1.1").is_none());
         assert!(answer_head(b"HTTP/1.1 200 OK\r\nbroken").is_none());
-        let block = header_block(status, &headers, true);
+        let block = [&[0x20], &super::header_block(status, &headers)[..]].concat();
         assert_eq!(block[..6], [0x20, 0x48, 0x03, b'3', b'0', b'1']);
         let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
         let fields = t.decode(&block, block.len(), (4, 8192)).unwrap();
@@ -1908,8 +1981,8 @@ mod tests {
             let early = if matches!(&ended, Some(Ended::Whole(_))) && !answer.contains("101") { ended } else { open };
             if !bytes.is_empty() { assert_eq!(told(&[bytes], bodiless, false).ended, early, "{answer}"); }
         }
-        assert_eq!(told(&[length.as_bytes()], true, false).head, Some((200, vec![(b"Content-Length".to_vec(), b"5".to_vec())], false)));
-        assert_eq!(told(&[chunks.as_bytes()], false, false).head, Some((200, vec![(b"Content-Length".to_vec(), b"5".to_vec())], true)));
+        assert_eq!(told(&[length.as_bytes()], true, false).head, Some((header_block(200, &[(b"Content-Length".to_vec(), b"5".to_vec())], false), false)));
+        assert_eq!(told(&[chunks.as_bytes()], false, false).head, Some((header_block(200, &[(b"Content-Length".to_vec(), b"5".to_vec())], false), true)));
     }
 
     #[test]
@@ -1920,7 +1993,7 @@ mod tests {
         let start = |send: i64| {
             let (mut c, (taken, sent)) = (connection(), watch::channel(0));
             c.streams.insert(1, Open { send, ended: true, taken: Some(taken), ..Open::default() });
-            c.answer(1, Part { head: Some((200, Vec::new(), false)), data: b"abc".to_vec(), ended: None });
+            c.answer(1, Part { head: Some((header_block(200, &[], false), false)), data: b"abc".to_vec(), ended: None });
             c.send_data();
             (c, sent)
         };
@@ -2112,6 +2185,34 @@ mod tests {
             let all = got(&after_head(head, parts, 200), closes, directives, "GET");
             assert!(texts(&all) == want && all[0].0 < 150 && all[1].0 >= 180, "{all:?}");
         }
+    }
+
+    #[test]
+    fn exchanges_that_go_cut_their_answers_off() {
+        let told = std::cell::RefCell::new(Vec::new());
+        let telling = || Telling { tell: |part: Part| told.borrow_mut().push(part.ended), ended: false };
+        telling().tell(Part { ended: Some(Ended::Whole(Vec::new())), ..Part::default() });
+        telling().tell(Part { data: b"a".to_vec(), ..Part::default() });
+        assert_eq!(told.take(), [Some(Ended::Whole(Vec::new())), None, Some(Ended::Cut)]);
+    }
+
+    #[test]
+    fn answers_of_streams_follow_one_another() {
+        let mut c = connection();
+        let opened = |exchange| Open { send: 100, ended: true, exchange, ..Open::default() };
+        c.streams.extend([(1, opened(0)), (3, opened(1)), (5, opened(0))]);
+        let part = |data: &[u8], ended| Told::Answer(Part { head: Some((header_block(200, &[], false), false)), data: data.to_vec(), ended });
+        let whole = || Some(Ended::Whole(Vec::new()));
+        // Each as it comes, whatever else waits; not that of an exchange of before, nor of a stream that has gone.
+        c.told((5, 0, part(b"e", whole())));
+        c.told((3, 0, part(b"old", whole())));
+        c.told((1, 0, part(&[b'x'; 150], whole())));
+        c.told((7, 0, part(b"gone", whole())));
+        c.told((3, 1, part(b"c", None)));
+        let sent: Vec<_> = frames_in(&c.out).iter().map(|f| (f.0, f.1, f.2, f.3.len())).collect();
+        let head = sent[0].3;
+        assert_eq!(sent, [(HEADERS, END_HEADERS, 5, head), (DATA, END_STREAM, 5, 1), (HEADERS, END_HEADERS, 1, head), (DATA, 0, 1, 100), (HEADERS, END_HEADERS, 3, head), (DATA, 0, 3, 1)]);
+        assert_eq!(c.streams.keys().collect::<Vec<_>>(), [&1, &3]);
     }
 
     #[test]
@@ -2440,7 +2541,7 @@ mod tests {
             let mut c = connection();
             c.streams.insert(1, Open { send: 65535, ended: true, ..Open::default() });
             let (chunked, trailers) = (trailers.is_some(), trailers.unwrap_or_default());
-            c.answer(1, Part { head: Some((200, Vec::new(), chunked)), data: body.to_vec(), ended: Some(Ended::Whole(trailers)) });
+            c.answer(1, Part { head: Some((header_block(200, &[], false), chunked)), data: body.to_vec(), ended: Some(Ended::Whole(trailers)) });
             c.send_data();
             assert_eq!((sent(&c.out), c.streams.is_empty()), (want, true), "{body:?}");
         }
@@ -2550,7 +2651,7 @@ mod tests {
         c.reading(1, Reading::Discarded);
         assert_eq!(c.data(0, 1, &[0; 7]), Ok(()));
         assert!(c.out.is_empty());
-        c.answer(1, Part { head: Some((204, Vec::new(), false)), data: Vec::new(), ended: Some(Ended::Whole(Vec::new())) });
+        c.answer(1, Part { head: Some((header_block(204, &[], false), false)), data: Vec::new(), ended: Some(Ended::Whole(Vec::new())) });
         c.send_data();
         assert!(c.out.ends_with(&[0, 0, 4, RST_STREAM, 0, 0, 0, 0, 1, 0, 0, 0, 0]) && c.streams.is_empty());
     }
@@ -2576,7 +2677,7 @@ mod tests {
         let mut taker = s.taker.take().unwrap();
         let parts: Vec<_> = std::iter::from_fn(|| taker.try_recv().ok()).collect();
         assert_eq!((parts.concat(), s.body.is_none(), s.chunked, s.send), (b"1\r\na\r\n1\r\nb\r\n0\r\n\r\n".to_vec(), true, true, 65535 - 65525 + 5));
-        c.answer(1, Part { head: Some((200, vec![(b"x".to_vec(), vec![b'y'; 20000])], false)), data: vec![b'z'; 20], ended: Some(Ended::Whole(Vec::new())) });
+        c.answer(1, Part { head: Some((header_block(200, &[(b"x".to_vec(), vec![b'y'; 20000])], false), false)), data: vec![b'z'; 20], ended: Some(Ended::Whole(Vec::new())) });
         c.send_data();
         assert_eq!(c.streams[&1].sent, 15);
         assert!(c.window_update(1, 10).is_ok());
