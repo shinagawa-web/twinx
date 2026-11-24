@@ -639,6 +639,13 @@ impl Connection {
         s.end = part.ended;
     }
 
+    /// Takes what an exchange tells of a stream, unless it is not the one whose answer
+    /// the stream gets, and sends what the windows let of it.
+    fn told(&mut self, (sid, number, told): (u32, u32, Told)) {
+        if self.streams.get(&sid).is_none_or(|s| s.exchange != number) { return }
+        match told { Told::Reading(r) => self.reading(sid, r), Told::Answer(part) => { self.answer(sid, part); self.send(sid); } }
+    }
+
     /// Sends what the windows let of the bodies of answers, in DATA frames no larger
     /// than the client takes, and forgets the streams answered whole. The last DATA
     /// frame ends the stream of one that is whole, an empty one when that shows only
@@ -647,37 +654,40 @@ impl Connection {
         let waits = |s: &Open| s.answer.as_ref().is_some_and(|body| s.sent < body.len() || s.end.is_some());
         let mut order: Vec<_> = self.streams.iter().filter(|(_, s)| waits(s)).map(|(&sid, _)| (self.rank(sid), sid)).collect();
         order.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        for (_, sid) in order {
-            let Some(s) = self.streams.get_mut(&sid) else { continue };
-            let Some(body) = &mut s.answer else { continue };
-            while s.sent < body.len() {
-                let n = (body.len() - s.sent).min(self.frame_size).min(s.send.min(self.send).max(0) as usize);
-                if n == 0 { break }
-                s.closed = s.sent + n == body.len() && s.end == Some(Ended::Whole(Vec::new()));
-                frame(&mut self.out, DATA, if s.closed { END_STREAM } else { 0 }, sid, &body[s.sent..s.sent + n]);
-                (s.sent, s.send, self.send, s.untold) = (s.sent + n, s.send - n as i64, self.send - n as i64, s.untold + n);
-            }
-            // The exchange waits for that only when, for all it knows, too much waits.
-            let held = s.untold > 0 && s.untold + body.len() - s.sent >= WAITING;
-            if let Some(taken) = s.taken.as_ref().filter(|_| held) { taken.send_modify(|t| *t += std::mem::take(&mut s.untold)); }
-            if s.sent < body.len() { continue }
-            // What has been sent is not kept.
-            (*body, s.sent) = (Vec::new(), 0);
-            match s.end.take() {
-                Some(Ended::Cut) => { self.rst(sid, INTERNAL_ERROR); continue }
-                Some(Ended::Whole(trailers)) if !s.closed => {
-                    let mut block = Vec::new();
-                    literals(&mut block, trailers.iter());
-                    if block.is_empty() { frame(&mut self.out, DATA, END_STREAM, sid, &[]); } else { header_frames(&mut self.out, sid, &block, self.frame_size, true); }
-                    s.closed = true;
-                }
-                _ => {}
-            }
-            if !s.closed { continue }
-            // A stream answered whole before its request ended is reset without an error, as nginx does.
-            if !s.ended { frame(&mut self.out, RST_STREAM, 0, sid, &NO_ERROR.to_be_bytes()); }
-            self.streams.remove(&sid);
+        order.into_iter().for_each(|(_, sid)| self.send(sid));
+    }
+
+    /// Sends what the windows let of the body of a stream's answer.
+    fn send(&mut self, sid: u32) {
+        let Some(s) = self.streams.get_mut(&sid) else { return };
+        let Some(body) = &mut s.answer else { return };
+        while s.sent < body.len() {
+            let n = (body.len() - s.sent).min(self.frame_size).min(s.send.min(self.send).max(0) as usize);
+            if n == 0 { break }
+            s.closed = s.sent + n == body.len() && s.end == Some(Ended::Whole(Vec::new()));
+            frame(&mut self.out, DATA, if s.closed { END_STREAM } else { 0 }, sid, &body[s.sent..s.sent + n]);
+            (s.sent, s.send, self.send, s.untold) = (s.sent + n, s.send - n as i64, self.send - n as i64, s.untold + n);
         }
+        // The exchange waits for that only when, for all it knows, too much waits.
+        let held = s.untold > 0 && s.untold + body.len() - s.sent >= WAITING;
+        if let Some(taken) = s.taken.as_ref().filter(|_| held) { taken.send_modify(|t| *t += std::mem::take(&mut s.untold)); }
+        if s.sent < body.len() { return }
+        // What has been sent is not kept.
+        (*body, s.sent) = (Vec::new(), 0);
+        match s.end.take() {
+            Some(Ended::Cut) => return self.rst(sid, INTERNAL_ERROR),
+            Some(Ended::Whole(trailers)) if !s.closed => {
+                let mut block = Vec::new();
+                literals(&mut block, trailers.iter());
+                if block.is_empty() { frame(&mut self.out, DATA, END_STREAM, sid, &[]); } else { header_frames(&mut self.out, sid, &block, self.frame_size, true); }
+                s.closed = true;
+            }
+            _ => {}
+        }
+        if !s.closed { return }
+        // A stream answered whole before its request ended is reset without an error, as nginx does.
+        if !s.ended { frame(&mut self.out, RST_STREAM, 0, sid, &NO_ERROR.to_be_bytes()); }
+        self.streams.remove(&sid);
     }
 }
 
@@ -738,9 +748,11 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
         if c.goaway && c.streams.is_empty() { return crate::http::close(&mut stream, lingers).await }
         tokio::select! {
             n = stream.read_buf(&mut buf) => if n.unwrap_or(0) == 0 { return },
-            Some((sid, number, told)) = rx.recv() => if c.streams.get(&sid).is_some_and(|s| s.exchange == number) {
-                match told { Told::Reading(r) => c.reading(sid, r), Told::Answer(part) => c.answer(sid, part) }
-            },
+            Some(told) = rx.recv() => {
+                c.told(told);
+                // What other streams have by now goes in the same write, up to the size of a TLS record.
+                while c.out.len() < 16384 && let Ok(told) = rx.try_recv() { c.told(told); }
+            }
             () = crate::http::SHUTDOWN.notified() => {}
         }
     }
@@ -1729,6 +1741,25 @@ mod tests {
             let all = got(&after_head(head, parts, 200), closes, directives, "GET");
             assert!(texts(&all) == want && all[0].0 < 150 && all[1].0 >= 180, "{all:?}");
         }
+    }
+
+    #[test]
+    fn answers_of_streams_follow_one_another() {
+        let mut c = connection();
+        let opened = |exchange| Open { send: 100, ended: true, exchange, ..Open::default() };
+        c.streams.extend([(1, opened(0)), (3, opened(1)), (5, opened(0))]);
+        let part = |data: &[u8], ended| Told::Answer(Part { head: Some((200, Vec::new(), false)), data: data.to_vec(), ended });
+        let whole = || Some(Ended::Whole(Vec::new()));
+        // Each as it comes, whatever else waits; not that of an exchange of before, nor of a stream that has gone.
+        c.told((5, 0, part(b"e", whole())));
+        c.told((3, 0, part(b"old", whole())));
+        c.told((1, 0, part(&[b'x'; 150], whole())));
+        c.told((7, 0, part(b"gone", whole())));
+        c.told((3, 1, part(b"c", None)));
+        let sent: Vec<_> = frames_in(&c.out).iter().map(|f| (f.0, f.1, f.2, f.3.len())).collect();
+        let head = sent[0].3;
+        assert_eq!(sent, [(HEADERS, END_HEADERS, 5, head), (DATA, END_STREAM, 5, 1), (HEADERS, END_HEADERS, 1, head), (DATA, 0, 1, 100), (HEADERS, END_HEADERS, 3, head), (DATA, 0, 3, 1)]);
+        assert_eq!(c.streams.keys().collect::<Vec<_>>(), [&1, &3]);
     }
 
     #[test]
