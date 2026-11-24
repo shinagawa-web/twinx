@@ -3249,6 +3249,33 @@ pub(crate) mod tests {
         COUNTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// What a test's server tells. It takes no more connections once this is dropped.
+    pub(crate) struct Told<T> { told: Arc<Mutex<T>>, addr: SocketAddr, over: Arc<AtomicBool> }
+
+    impl<T> std::ops::Deref for Told<T> {
+        type Target = Mutex<T>;
+        fn deref(&self) -> &Mutex<T> { &self.told }
+    }
+
+    impl<T> Drop for Told<T> {
+        fn drop(&mut self) {
+            self.over.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.addr);
+        }
+    }
+
+    /// A server that does so with each connection, counted from 0, and what it tells.
+    pub(crate) fn listening<T: Default + Send + 'static>(mut each: impl FnMut(usize, TcpStream, &Arc<Mutex<T>>) + Send + 'static) -> (SocketAddr, Told<T>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, told, over) = (listener.local_addr().unwrap(), Arc::<Mutex<T>>::default(), Arc::<AtomicBool>::default());
+        let (all, ended) = (told.clone(), over.clone());
+        thread::spawn(move || for (i, s) in listener.incoming().enumerate() {
+            if ended.load(Ordering::SeqCst) { return }
+            each(i, s.unwrap(), &all);
+        });
+        (addr, Told { told, addr, over })
+    }
+
     #[test]
     fn listens_with_the_backlog() {
         let l = listen("127.0.0.1:0".parse().unwrap(), 511).unwrap();
@@ -3772,14 +3799,9 @@ pub(crate) mod tests {
     #[test]
     fn intercepts_errors_of_proxied_servers() {
         let _busy = serving_on();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            for s in listener.incoming() {
-                let mut s = s.unwrap();
-                let _ = s.read(&mut [0u8; 1024]).unwrap();
-                s.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: a\r\nX-A: 1\r\nWWW-Authenticate: b\r\n\r\nupstream").unwrap();
-            }
+        let (addr, _told) = listening(|_, mut s, _: &Arc<Mutex<()>>| {
+            let _ = s.read(&mut [0u8; 1024]).unwrap();
+            s.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: a\r\nX-A: 1\r\nWWW-Authenticate: b\r\n\r\nupstream").unwrap();
         });
         let text = format!("http {{ server {{ error_page 401 /e; location /on {{ proxy_pass http://{addr}; proxy_intercept_errors on; }} \
                             location /off {{ proxy_pass http://{addr}; }} location /e {{ return 200 e; }} }} }}");
@@ -4132,18 +4154,13 @@ pub(crate) mod tests {
 
     /// A server that sends the pieces in answer to each request, and closes the connection
     /// then or waits for the next one; and how many connections came, how many of
-    /// those the other side closed, and how many answers all of which it took. It ends
-    /// once that count is dropped.
-    pub(crate) fn plays(pieces: &Pieces, closes: bool) -> (SocketAddr, Arc<Mutex<[usize; 3]>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let (addr, count) = (listener.local_addr().unwrap(), Arc::new(Mutex::new([0; 3])));
-        let (counts, pieces) = (count.clone(), pieces.clone());
-        listener.set_nonblocking(true).unwrap();
-        thread::spawn(move || while Arc::strong_count(&counts) > 1 {
-            let Ok((mut s, _)) = listener.accept() else { thread::sleep(Duration::from_millis(1)); continue };
+    /// those the other side closed, and how many answers all of which it took.
+    pub(crate) fn plays(pieces: &Pieces, closes: bool) -> (SocketAddr, Told<[usize; 3]>) {
+        let pieces = pieces.clone();
+        listening(move |_, mut s, counts: &Arc<Mutex<[usize; 3]>>| {
             counts.lock().unwrap()[0] += 1;
             let (counts, pieces) = (counts.clone(), pieces.clone());
-            s.set_nonblocking(false).and_then(|()| s.set_nodelay(true)).unwrap();
+            s.set_nodelay(true).unwrap();
             thread::spawn(move || {
                 let mut got = Vec::new();
                 loop {
@@ -4163,8 +4180,7 @@ pub(crate) mod tests {
                     if closes { return }
                 }
             });
-        });
-        (addr, count)
+        })
     }
 
     /// What tests of answers sent as they come run under: nothing is shutting down.
@@ -5199,30 +5215,21 @@ pub(crate) mod tests {
     }
 
     /// A server that reads a request, sends the answer and then nothing until the
-    /// connection is closed, or resets it; and how many connections came. It ends once
-    /// that count is dropped.
-    fn failing(answer: &str, resets: bool) -> (SocketAddr, Arc<Mutex<usize>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
-        let (all, answer) = (came.clone(), answer.to_string());
-        listener.set_nonblocking(true).unwrap();
-        thread::spawn(move || {
-            while Arc::strong_count(&all) > 1 {
-                let Ok((mut s, _)) = listener.accept() else { thread::sleep(Duration::from_millis(1)); continue };
-                *all.lock().unwrap() += 1;
-                s.set_nonblocking(false).unwrap();
-                assert!(s.read(&mut [0u8; 1024]).unwrap() > 0);
-                s.write_all(answer.as_bytes()).unwrap();
-                if resets {
-                    // After what was sent has come.
-                    thread::sleep(Duration::from_millis(50));
-                    socket2::SockRef::from(&s).set_linger(Some(Duration::ZERO)).unwrap();
-                } else {
-                    let _ = s.read(&mut [0u8; 1]);
-                }
+    /// connection is closed, or resets it; and how many connections came.
+    fn failing(answer: &str, resets: bool) -> (SocketAddr, Told<usize>) {
+        let answer = answer.to_string();
+        listening(move |_, mut s, came: &Arc<Mutex<usize>>| {
+            *came.lock().unwrap() += 1;
+            assert!(s.read(&mut [0u8; 1024]).unwrap() > 0);
+            s.write_all(answer.as_bytes()).unwrap();
+            if resets {
+                // After what was sent has come.
+                thread::sleep(Duration::from_millis(50));
+                socket2::SockRef::from(&s).set_linger(Some(Duration::ZERO)).unwrap();
+            } else {
+                let _ = s.read(&mut [0u8; 1]);
             }
-        });
-        (addr, came)
+        })
     }
 
     /// A frame of HTTP/2.
@@ -5232,25 +5239,19 @@ pub(crate) mod tests {
 
     /// A server of HTTP/2 that sends the pieces, one after another, when a request has
     /// come, and then nothing until the connection is closed, or closes it; and how many connections came.
-    pub(crate) fn sends(pieces: &[Vec<u8>], closes: bool) -> (SocketAddr, Arc<Mutex<usize>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
-        let (all, pieces) = (came.clone(), pieces.to_vec());
-        thread::spawn(move || {
-            for s in listener.incoming() {
-                *all.lock().unwrap() += 1;
-                let mut s = s.unwrap();
-                // The preface, two frames, and the HEADERS.
-                let mut got = Vec::new();
-                while got.len() < 24 + 27 + 13 + 9 { let mut part = [0; 1024]; let n = s.read(&mut part).unwrap(); assert!(n > 0); got.extend_from_slice(&part[..n]); }
-                for (i, piece) in pieces.iter().enumerate() {
-                    if i > 0 { thread::sleep(Duration::from_millis(50)); }
-                    if s.write_all(piece).is_err() { break }
-                }
-                if !closes { while s.read(&mut [0; 1024]).is_ok_and(|n| n > 0) {} }
+    pub(crate) fn sends(pieces: &[Vec<u8>], closes: bool) -> (SocketAddr, Told<usize>) {
+        let pieces = pieces.to_vec();
+        listening(move |_, mut s, came: &Arc<Mutex<usize>>| {
+            *came.lock().unwrap() += 1;
+            // The preface, two frames, and the HEADERS.
+            let mut got = Vec::new();
+            while got.len() < 24 + 27 + 13 + 9 { let mut part = [0; 1024]; let n = s.read(&mut part).unwrap(); assert!(n > 0); got.extend_from_slice(&part[..n]); }
+            for (i, piece) in pieces.iter().enumerate() {
+                if i > 0 { thread::sleep(Duration::from_millis(50)); }
+                if s.write_all(piece).is_err() { break }
             }
-        });
-        (addr, came)
+            if !closes { while s.read(&mut [0; 1024]).is_ok_and(|n| n > 0) {} }
+        })
     }
 
     /// What received() gives for a request to a location with the directives, passed over
@@ -5460,7 +5461,7 @@ pub(crate) mod tests {
                 s.write_all(answer.as_bytes()).unwrap();
                 if !close { open.push(s); }
             }
-            thread::sleep(Duration::from_secs(5));
+            for mut s in open { let _ = s.read(&mut [0u8; 1]); }
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         for (method, answer, _, kept) in answers {
@@ -5482,36 +5483,30 @@ pub(crate) mod tests {
     /// A server that answers each request of a connection with the header lines and
     /// its request line as the body, and leaves the connection open; and the requests
     /// that came, each with the number of its connection.
-    fn answering(lines: &'static str) -> (SocketAddr, Arc<Mutex<Vec<(usize, String)>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())));
-        let all = came.clone();
-        thread::spawn(move || {
-            for (i, s) in listener.incoming().enumerate() {
-                let (mut s, came) = (s.unwrap(), all.clone());
-                thread::spawn(move || {
-                    let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
-                    loop {
-                        let whole = head_end(&buf).filter(|end| {
-                            let head = String::from_utf8_lossy(&buf[..*end]);
-                            let length = head.split_once("Content-Length: ").map_or(0, |(_, l)| l.lines().next().unwrap().parse().unwrap());
-                            buf.len() - end >= length
-                        });
-                        if whole.is_none() {
-                            let Ok(n @ 1..) = s.read(&mut chunk) else { return };
-                            buf.extend_from_slice(&chunk[..n]);
-                            continue;
-                        }
-                        // Whatever came with the request is taken for a part of it.
-                        let req = String::from_utf8(std::mem::take(&mut buf)).unwrap();
-                        let line = req.lines().next().unwrap().to_string();
-                        came.lock().unwrap().push((i, req));
-                        s.write_all(format!("HTTP/1.1 200 OK\r\n{lines}Content-Length: {}\r\n\r\n{line}", line.len()).as_bytes()).unwrap();
+    fn answering(lines: &'static str) -> (SocketAddr, Told<Vec<(usize, String)>>) {
+        listening(move |i, mut s, came: &Arc<Mutex<Vec<(usize, String)>>>| {
+            let came = came.clone();
+            thread::spawn(move || {
+                let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
+                loop {
+                    let whole = head_end(&buf).filter(|end| {
+                        let head = String::from_utf8_lossy(&buf[..*end]);
+                        let length = head.split_once("Content-Length: ").map_or(0, |(_, l)| l.lines().next().unwrap().parse().unwrap());
+                        buf.len() - end >= length
+                    });
+                    if whole.is_none() {
+                        let Ok(n @ 1..) = s.read(&mut chunk) else { return };
+                        buf.extend_from_slice(&chunk[..n]);
+                        continue;
                     }
-                });
-            }
-        });
-        (addr, came)
+                    // Whatever came with the request is taken for a part of it.
+                    let req = String::from_utf8(std::mem::take(&mut buf)).unwrap();
+                    let line = req.lines().next().unwrap().to_string();
+                    came.lock().unwrap().push((i, req));
+                    s.write_all(format!("HTTP/1.1 200 OK\r\n{lines}Content-Length: {}\r\n\r\n{line}", line.len()).as_bytes()).unwrap();
+                }
+            });
+        })
     }
 
     /// The bodies that answer the requests, which are sent one after another to the
@@ -5560,7 +5555,7 @@ pub(crate) mod tests {
     #[test]
     fn proxy_pass_header_passes_what_is_hidden() {
         let _busy = serving_on();
-        let (addr, _) = answering("Date: then\r\nX-Pad: pad\r\nX-Accel-A: a\r\n");
+        let (addr, _came) = answering("Date: then\r\nX-Pad: pad\r\nX-Accel-A: a\r\n");
         let text = format!("http {{ proxy_hide_header X-A; server {{ location /a {{ proxy_pass http://{addr}; }} location /b {{ proxy_pass http://{addr}; proxy_pass_header Date; proxy_pass_header Server; proxy_pass_header X-Pad; }} }} }}");
         let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let (a, b) = (exchanged(&config.servers[0], "/a"), exchanged(&config.servers[0], "/b"));
@@ -5610,27 +5605,21 @@ pub(crate) mod tests {
 
     /// A server that reads a request, sends the answer, if any, and closes the
     /// connection; and how many connections came.
-    fn closing(answer: &'static str) -> (SocketAddr, Arc<Mutex<usize>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
-        let all = came.clone();
-        thread::spawn(move || {
-            for s in listener.incoming() {
-                *all.lock().unwrap() += 1;
-                let (mut s, mut req, mut chunk) = (s.unwrap(), String::new(), [0u8; 1024]);
-                // The body, if any, is one byte, or ends with the last chunk.
-                let whole = |req: &str| req.split_once("\r\n\r\n").is_some_and(|(head, body)| {
-                    if head.contains("chunked") { body.ends_with("0\r\n\r\n") } else { !head.contains("Content-Length") || !body.is_empty() }
-                });
-                while !whole(&req) {
-                    let n = s.read(&mut chunk).unwrap();
-                    assert!(n > 0, "{req}");
-                    req += std::str::from_utf8(&chunk[..n]).unwrap();
-                }
-                s.write_all(answer.as_bytes()).unwrap();
+    fn closing(answer: &'static str) -> (SocketAddr, Told<usize>) {
+        listening(move |_, mut s, came: &Arc<Mutex<usize>>| {
+            *came.lock().unwrap() += 1;
+            let (mut req, mut chunk) = (String::new(), [0u8; 1024]);
+            // The body, if any, is one byte, or ends with the last chunk.
+            let whole = |req: &str| req.split_once("\r\n\r\n").is_some_and(|(head, body)| {
+                if head.contains("chunked") { body.ends_with("0\r\n\r\n") } else { !head.contains("Content-Length") || !body.is_empty() }
+            });
+            while !whole(&req) {
+                let n = s.read(&mut chunk).unwrap();
+                assert!(n > 0, "{req}");
+                req += std::str::from_utf8(&chunk[..n]).unwrap();
             }
-        });
-        (addr, came)
+            s.write_all(answer.as_bytes()).unwrap();
+        })
     }
 
     /// The status of the answer to a request passed to an upstream of the two
@@ -5678,7 +5667,7 @@ pub(crate) mod tests {
             (hints("A: b\0\r\n"), invalid, 200), (hints("A: b\r\n").replacen("1.1", "1.0", 1), invalid, 200),
             (hints("A: b\r\n").replace("OK\r\n", "OK\r\nHTTP/1.1 301 x\r\n").replace(" OK", ""), "", 200),
         ] {
-            let ((a, _), before) = (closing(first.clone().leak()), *again.lock().unwrap());
+            let ((a, _sent), before) = (closing(first.clone().leak()), *again.lock().unwrap());
             assert_eq!((passed_to([a, b], directives, "GET / HTTP/1.0\n\n", None), *again.lock().unwrap() - before), (want, !directives.is_empty() as usize), "{first:?} {directives}");
         }
         // Nothing was sent to a server that refuses the connection: its port is bound, but nothing listens.
@@ -5701,30 +5690,24 @@ pub(crate) mod tests {
     /// A server whose connections answer so many requests each, those that are not
     /// listed any number, read the next one and close without answering it; and how
     /// many requests came.
-    fn dropping(answers: &'static [usize]) -> (SocketAddr, Arc<Mutex<usize>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
-        let all = came.clone();
-        thread::spawn(move || {
-            for (i, s) in listener.incoming().enumerate() {
-                let (mut s, came, mut left) = (s.unwrap(), all.clone(), answers.get(i).copied());
-                thread::spawn(move || {
-                    let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
-                    loop {
-                        while head_end(&buf).is_none() {
-                            let Ok(n @ 1..) = s.read(&mut chunk) else { return };
-                            buf.extend_from_slice(&chunk[..n]);
-                        }
-                        buf.clear();
-                        *came.lock().unwrap() += 1;
-                        if left == Some(0) { return }
-                        left = left.map(|n| n - 1);
-                        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+    fn dropping(answers: &'static [usize]) -> (SocketAddr, Told<usize>) {
+        listening(move |i, mut s, came: &Arc<Mutex<usize>>| {
+            let (came, mut left) = (came.clone(), answers.get(i).copied());
+            thread::spawn(move || {
+                let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
+                loop {
+                    while head_end(&buf).is_none() {
+                        let Ok(n @ 1..) = s.read(&mut chunk) else { return };
+                        buf.extend_from_slice(&chunk[..n]);
                     }
-                });
-            }
-        });
-        (addr, came)
+                    buf.clear();
+                    *came.lock().unwrap() += 1;
+                    if left == Some(0) { return }
+                    left = left.map(|n| n - 1);
+                    s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+                }
+            });
+        })
     }
 
     /// The answer of a server to a request without a body.
@@ -5788,22 +5771,15 @@ pub(crate) mod tests {
 
     /// A server that sends the answers to a connection's requests in turn, and then
     /// nothing until the connection is closed; and how many connections came.
-    fn silent(answers: &'static [&str]) -> (SocketAddr, Arc<Mutex<usize>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
-        let all = came.clone();
-        thread::spawn(move || {
-            for s in listener.incoming() {
-                *all.lock().unwrap() += 1;
-                let mut s = s.unwrap();
-                for answer in answers {
-                    if request_line(&mut s).is_none() { break }
-                    s.write_all(answer.as_bytes()).unwrap();
-                }
-                let _ = s.read_to_end(&mut Vec::new());
+    fn silent(answers: &'static [&str]) -> (SocketAddr, Told<usize>) {
+        listening(move |_, mut s, came: &Arc<Mutex<usize>>| {
+            *came.lock().unwrap() += 1;
+            for answer in answers {
+                if request_line(&mut s).is_none() { break }
+                s.write_all(answer.as_bytes()).unwrap();
             }
-        });
-        (addr, came)
+            let _ = s.read_to_end(&mut Vec::new());
+        })
     }
 
     /// A configuration whose server passes requests to an upstream of the servers,
@@ -5858,7 +5834,8 @@ pub(crate) mod tests {
             for task in all { task.await.unwrap(); }
         });
         // error_page takes the 504.
-        let http = format!("server {{ proxy_read_timeout 1s; location / {{ proxy_pass http://{}; error_page 504 = /e; }} location = /e {{ return 403; }} }}", silent(NEVER).0);
+        let (addr, _came) = silent(NEVER);
+        let http = format!("server {{ proxy_read_timeout 1s; location / {{ proxy_pass http://{addr}; error_page 504 = /e; }} location = /e {{ return 403; }} }}");
         let got = block_on(received(&http, "GET / HTTP/1.0\r\n\r\n"));
         assert!(got.starts_with(b"HTTP/1.1 403 "), "{got:?}");
         // A body passed as it comes is passed once.
@@ -5870,7 +5847,7 @@ pub(crate) mod tests {
         let (a, came) = silent(&[OK]);
         let config = passing_to(&[a], "");
         // A server that timed out has failed: the other one gets the requests for a while.
-        let ((b, sent), (c, _)) = (silent(NEVER), silent(&[OK, OK]));
+        let ((b, sent), (c, _came)) = (silent(NEVER), silent(&[OK, OK]));
         let two = passing_to(&[b, c], off);
         block_on(async {
             for want in [200, 504] {
@@ -5953,49 +5930,43 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     /// A server that does what act says with each request of a connection (both
     /// counted from 0), over TLS of the version once a handshake begins; and the
     /// requests that came, each with the number of its connection.
-    fn securing(version: &'static rustls::SupportedProtocolVersion, act: fn(usize, usize) -> Act) -> (SocketAddr, Arc<Mutex<Vec<(usize, String)>>>) {
+    fn securing(version: &'static rustls::SupportedProtocolVersion, act: fn(usize, usize) -> Act) -> (SocketAddr, Told<Vec<(usize, String)>>) {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
         let key = PrivateKeyDer::from_pem_slice(KEY.as_bytes()).unwrap();
         let chain = vec![CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap()];
         let config = Arc::new(rustls::ServerConfig::builder_with_protocol_versions(&[version]).with_no_client_auth().with_single_cert(chain, key).unwrap());
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())));
-        let all = came.clone();
-        thread::spawn(move || {
-            for (i, s) in listener.incoming().enumerate() {
-                let (mut s, came, config, mut tls) = (s.unwrap(), all.clone(), config.clone(), None);
-                thread::spawn(move || {
-                    let mut first = [0];
-                    for n in 0.. {
-                        if s.peek(&mut first).ok() != Some(1) { return }
-                        let act = act(i, n);
-                        if act == Act::Close {
-                            came.lock().unwrap().push((i, "closed".to_string()));
-                            let _ = s.read(&mut [0u8; 4096]);
-                            return;
-                        }
-                        // A handshake record begins with 22.
-                        if tls.is_none() && first[0] == 22 { tls = Some(rustls::ServerConnection::new(config.clone()).unwrap()); }
-                        let Some(tls) = &mut tls else {
-                            let Some(line) = request_line(&mut s) else { return };
-                            let answer = echo(&line, act);
-                            came.lock().unwrap().push((i, line));
-                            s.write_all(answer.as_bytes()).unwrap();
-                            continue;
-                        };
-                        let Some(line) = request_line(&mut rustls::Stream::new(tls, &mut s)) else { return };
-                        // What is written at once comes at once: the answer is one record.
-                        let answer = if let Act::End(answer) = act { answer.to_string() } else { echo(&line, act) };
-                        tls.writer().write_all(answer.as_bytes()).unwrap();
-                        if act == Act::Notify { tls.send_close_notify(); }
-                        came.lock().unwrap().push((i, line));
-                        while tls.wants_write() { tls.write_tls(&mut s).unwrap(); }
-                        if matches!(act, Act::End(_)) { return }
+        listening(move |i, mut s, came: &Arc<Mutex<Vec<(usize, String)>>>| {
+            let (came, config, mut tls) = (came.clone(), config.clone(), None);
+            thread::spawn(move || {
+                let mut first = [0];
+                for n in 0.. {
+                    if s.peek(&mut first).ok() != Some(1) { return }
+                    let act = act(i, n);
+                    if act == Act::Close {
+                        came.lock().unwrap().push((i, "closed".to_string()));
+                        let _ = s.read(&mut [0u8; 4096]);
+                        return;
                     }
-                });
-            }
-        });
-        (addr, came)
+                    // A handshake record begins with 22.
+                    if tls.is_none() && first[0] == 22 { tls = Some(rustls::ServerConnection::new(config.clone()).unwrap()); }
+                    let Some(tls) = &mut tls else {
+                        let Some(line) = request_line(&mut s) else { return };
+                        let answer = echo(&line, act);
+                        came.lock().unwrap().push((i, line));
+                        s.write_all(answer.as_bytes()).unwrap();
+                        continue;
+                    };
+                    let Some(line) = request_line(&mut rustls::Stream::new(tls, &mut s)) else { return };
+                    // What is written at once comes at once: the answer is one record.
+                    let answer = if let Act::End(answer) = act { answer.to_string() } else { echo(&line, act) };
+                    tls.writer().write_all(answer.as_bytes()).unwrap();
+                    if act == Act::Notify { tls.send_close_notify(); }
+                    came.lock().unwrap().push((i, line));
+                    while tls.wants_write() { tls.write_tls(&mut s).unwrap(); }
+                    if matches!(act, Act::End(_)) { return }
+                }
+            });
+        })
     }
 
     /// The answers to the requests, which are sent one after another, each its body
@@ -6035,7 +6006,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         // The case of a connection to the server: each request has one.
         let act = |i, _| Act::End(CASES.iter().flat_map(|c| vec![c.0; 1 + c.2 as usize]).cycle().nth(i).unwrap());
         for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
-            let (addr, _) = securing(version, act);
+            let (addr, _came) = securing(version, act);
             for directives in ["", OFF] {
                 for (_, body, stays, log) in CASES {
                     let path = log_path("tls-end");
@@ -6115,7 +6086,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                 let _ = s.read(&mut [0u8; 1024]).unwrap();
                 s.write_all(answer).unwrap();
                 // The connection stays open: Content-Length says where the body ends.
-                thread::spawn(move || { thread::sleep(Duration::from_secs(5)); drop(s) });
+                thread::spawn(move || s.read(&mut [0u8; 1]));
             }
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
@@ -6148,7 +6119,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             let _ = s.read(&mut buf).unwrap();
             // The body never ends: it is not read.
             s.write_all(b"HTTP/1.1 200 OK\r\nX-Accel-Redirect: /b?c=1\r\nX-Accel-Limit-Rate: 13000\r\n\r\nxy").unwrap();
-            thread::sleep(Duration::from_secs(5));
+            let _ = s.read(&mut buf);
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
         let p = Proxy { host: "h".into(), ssl: false, upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
@@ -6952,22 +6923,18 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     fn request_uri_is_that_of_the_request_line_after_redirects() {
         let _busy = serving_on();
         // A server that answers with the request line it got, or redirects to /out.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            for s in listener.incoming() {
-                let (mut s, mut req, mut chunk) = (s.unwrap(), Vec::new(), [0u8; 1024]);
-                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let n = s.read(&mut chunk).unwrap();
-                    assert!(n > 0);
-                    req.extend_from_slice(&chunk[..n]);
-                }
-                let req = String::from_utf8(req).unwrap();
-                let to = if req.contains(" /xa") { "X-Accel-Redirect: /out?x=1\r\n" } else { "" };
-                let of = req.split("\r\n").find_map(|l| l.strip_prefix("X-Of: ")).unwrap_or_default();
-                let line = req.split(" HTTP/").next().unwrap();
-                s.write_all(format!("HTTP/1.1 200 OK\r\n{to}\r\n{line}|{of}").as_bytes()).unwrap();
+        let (addr, _told) = listening(|_, mut s, _: &Arc<Mutex<()>>| {
+            let (mut req, mut chunk) = (Vec::new(), [0u8; 1024]);
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                req.extend_from_slice(&chunk[..n]);
             }
+            let req = String::from_utf8(req).unwrap();
+            let to = if req.contains(" /xa") { "X-Accel-Redirect: /out?x=1\r\n" } else { "" };
+            let of = req.split("\r\n").find_map(|l| l.strip_prefix("X-Of: ")).unwrap_or_default();
+            let line = req.split(" HTTP/").next().unwrap();
+            s.write_all(format!("HTTP/1.1 200 OK\r\n{to}\r\n{line}|{of}").as_bytes()).unwrap();
         });
         let dir = files("request-uri");
         std::fs::create_dir_all(dir.join("i")).unwrap();

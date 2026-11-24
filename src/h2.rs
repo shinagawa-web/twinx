@@ -1252,7 +1252,7 @@ impl<F: Fn(Part)> Drop for Telling<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::tests::{CHUNKED, DELIMITED, GZ, LENGTH, Pieces, after_head, files, letters, log_path, logged, member, passing, pieces_after, plays, sends, served_by, serves_files, serving_on, with_length};
+    use crate::http::tests::{CHUNKED, DELIMITED, GZ, LENGTH, Pieces, after_head, files, letters, listening, log_path, logged, member, passing, pieces_after, plays, sends, served_by, serves_files, serving_on, with_length};
     use crate::stream::within;
 
     /// A string written Huffman encoded or not, and one decoded.
@@ -1692,13 +1692,11 @@ mod tests {
     fn kept(plays: Plays, method: &str, (upstream, location): (&str, &str)) -> (Vec<u16>, Vec<usize>) {
         use std::io::{Read, Write};
         use std::sync::{Mutex, atomic::{AtomicUsize, Ordering::SeqCst}};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (came, sent, answered): (Arc<Mutex<Vec<usize>>>, Arc<AtomicUsize>, Arc<AtomicUsize>) = Default::default();
-        let (all, plays_on, seen) = (came.clone(), sent.clone(), answered.clone());
-        std::thread::spawn(move || for (i, s) in listener.incoming().enumerate() {
-            all.lock().unwrap().push(0);
-            let (mut s, came, sent, answered) = (s.unwrap(), all.clone(), plays_on.clone(), seen.clone());
+        let (sent, answered): (Arc<AtomicUsize>, Arc<AtomicUsize>) = Default::default();
+        let (plays_on, seen) = (sent.clone(), answered.clone());
+        let (addr, came) = listening(move |i, mut s, came: &Arc<Mutex<Vec<usize>>>| {
+            came.lock().unwrap().push(0);
+            let (came, sent, answered) = (came.clone(), plays_on.clone(), seen.clone());
             s.set_nodelay(true).unwrap();
             std::thread::spawn(move || {
                 if s.read_exact(&mut [0; 24]).is_err() { return }
@@ -2356,7 +2354,7 @@ mod tests {
         literals(&mut block, [(b"x-t".to_vec(), b"1".to_vec())].iter());
         let trailer = framed(HEADERS, END_HEADERS | END_STREAM, 1, &block);
         for (last, want) in [(vec![framed(DATA, 0, 1, b"cd"), trailer], vec![OK4, "ab", "cd", "x-t: 1;|"]), (vec![framed(DATA, END_STREAM, 1, b"cd")], vec![OK4, "ab", "cd|"])] {
-            let (addr, _) = sends(&[[&head[..], &framed(DATA, 0, 1, b"ab")].concat(), last.concat()], false);
+            let (addr, _came) = sends(&[[&head[..], &framed(DATA, 0, 1, b"ab")].concat(), last.concat()], false);
             crate::stream::block_on(async {
                 let mut c = Client::new(&passing(addr, "proxy_http_version 2; proxy_pass_trailers on;"), 1 << 20).await;
                 c.get(1, "GET").await;
