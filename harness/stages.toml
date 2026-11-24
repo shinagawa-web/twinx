@@ -89,3 +89,22 @@ files = [
   "proxy_h2_request_buffering.t", "proxy_h2_set_body.t", "proxy_h2_ssl.t",
   "proxy_h2_trailers.t", "worker_shutdown_timeout_h2.t",
 ]
+
+# Stage 5: caching (proxy_cache), and connections to servers kept for other
+# requests. Files that need, besides the modules and test client features of
+# stages 1 to 4, only cache and upstream_keepalive; files that also need fastcgi,
+# grpc, HTTP/3, ssi or other modules wait for their stages.
+[stage5]
+files = [
+  "h2_proxy_cache.t", "h2_ssl_proxy_cache.t", "not_modified_finalize.t",
+  "not_modified_proxy.t", "proxy_cache.t", "proxy_cache_bypass.t",
+  "proxy_cache_chunked.t", "proxy_cache_control.t", "proxy_cache_convert_head.t",
+  "proxy_cache_error.t", "proxy_cache_lock.t", "proxy_cache_lock_age.t",
+  "proxy_cache_manager.t", "proxy_cache_max_range_offset.t", "proxy_cache_min_free.t",
+  "proxy_cache_path.t", "proxy_cache_range.t", "proxy_cache_revalidate.t",
+  "proxy_cache_valid.t", "proxy_cache_variables.t", "proxy_cache_vary.t",
+  "proxy_force_ranges.t", "proxy_h2_cache.t", "proxy_limit_rate.t",
+  "proxy_merge_headers.t", "proxy_non_idempotent.t",
+  "proxy_request_buffering_keepalive.t", "proxy_ssl_keepalive.t", "range_clearing.t",
+  "upstream_keepalive.t",
+]
