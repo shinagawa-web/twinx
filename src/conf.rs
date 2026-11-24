@@ -181,6 +181,14 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("if_modified_since", HSL, 1, 1, false),
 ];
 
+/// The directives that may be given more than once at a level; those that have rules of
+/// their own for it are checked where they are read.
+const REPEATED: &[&str] = &[
+    "error_log", "index", "server", "upstream", "listen", "server_name", "location", "return", "break", "set", "if", "rewrite", "log_format", "access_log", "add_header", "add_trailer", "keepalive_disable", "error_page",
+    "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_next_upstream",
+    "proxy_cookie_domain", "proxy_cookie_path", "proxy_redirect", "proxy_cookie_flags", "gzip_types",
+];
+
 const COMBINED: &str =
     "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\"";
 
@@ -688,10 +696,11 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), implicit: Implicit::default(), temp_paths: Vec::new(), location: String::new() };
     let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
-    let inheritable = main.iter().rev().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
+    let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
     crate::tls::new_configuration(inheritable);
-    for d in main {
+    for (i, d) in main.iter().enumerate() {
         b.check(d, MAIN)?;
+        once(&main[..i], d)?;
         match d.name.as_str() {
             "pid" => config.pid = b.path(&d.args[0]),
             "worker_rlimit_nofile" => config.rlimit_nofile = Some(d.args[0].parse().map_err(|_| format!("invalid number in {}", d.at))?),
@@ -765,7 +774,8 @@ impl Builder<'_> {
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let block = d.block.as_deref().unwrap_or_default();
-            block.iter().try_for_each(|s| self.check(s, UPS))?;
+            if self.upstreams.keys().any(|u| u.eq_ignore_ascii_case(&d.args[0])) { return Err(format!("duplicate upstream \"{}\" in {}", d.args[0], d.at)); }
+            block.iter().enumerate().try_for_each(|(i, s)| self.check(s, UPS).and_then(|()| once(&block[..i], s)))?;
             let peers = block.iter().filter(|s| s.name == "server").map(|s| peer(&s.args).map_err(|e| format!("{e} in {}", s.at)));
             let mut upstream = Upstream::new(peers.collect::<Result<_, _>>()?);
             upstream.keepalive = upstream_keepalive(block)?;
@@ -793,16 +803,23 @@ impl Builder<'_> {
         if default("client_body_temp_path") { self.temp_path("client_body_temp", &[], None)?; }
         servers.iter().flat_map(|s| [&s.level].into_iter().chain(s.locations.iter().map(|l| &l.level))).try_for_each(check_proxy_buffers)?;
         if default("proxy_temp_path") { self.temp_path("proxy_temp", &[1, 2], None)?; }
+        block.iter().filter(|d| d.name == "server").try_for_each(|d| same_locations(d.block.as_deref().unwrap_or_default()))?;
         Ok(servers)
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
         let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), http2: Vec::new() };
         self.level(block, SRV, &mut s.level)?;
+        let mut listens = Vec::new();
         for d in block {
             match d.name.as_str() {
                 "listen" => {
                     let addrs = listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
+                    let quic = d.args[1..].iter().any(|a| a == "quic");
+                    for a in &addrs {
+                        if listens.contains(&(*a, quic)) { return Err(format!("a duplicate listen {a} in {}", d.at)); }
+                        listens.push((*a, quic));
+                    }
                     if d.args[1..].iter().any(|a| a == "ssl") { s.ssl.extend(&addrs); }
                     if d.args[1..].iter().any(|a| a == "http2") { s.http2.extend(&addrs); }
                     if d.args[1..].iter().any(|a| a == "default_server" || a == "default") { s.defaults.extend(&addrs); }
@@ -868,9 +885,8 @@ impl Builder<'_> {
         let (mut ifs, mut limit, mut own_tls) = (Vec::new(), None, false);
         for (i, d) in block.iter().enumerate() {
             self.check(d, ctx)?;
+            once(&block[..i], d)?;
             let at = |e: String| format!("{e} in {}", d.at);
-            const ONCE: &[&str] = &["proxy_buffer_size", "proxy_buffers", "proxy_busy_buffers_size", "proxy_temp_file_write_size", "proxy_max_temp_file_size", "proxy_temp_path"];
-            if ONCE.contains(&d.name.as_str()) && block[..i].iter().any(|b| b.name == d.name) { return Err(at(format!("\"{}\" directive is duplicate", d.name))); }
             let invalid = || at(format!("\"{}\" directive invalid value", d.name));
             match d.name.as_str() {
                 "return" => level.rewrite.push(ret(&d.args).map(|(code, text)| Step::Return(code, text)).map_err(at)?),
@@ -909,6 +925,7 @@ impl Builder<'_> {
                 "server_name_in_redirect" => level.server_name_in_redirect = flag(d).map_err(at)?,
                 "port_in_redirect" => level.port_in_redirect = flag(d).map_err(at)?,
                 "log_format" => {
+                    if self.formats.contains_key(&d.args[0]) { return Err(at(format!("duplicate \"log_format\" name \"{}\"", d.args[0]))); }
                     let escape = d.args[1].strip_prefix("escape=").map(|e| log_escape(e).map_err(at)).transpose()?;
                     let line = Template::parse(&d.args[1 + escape.is_some() as usize..].concat()).map_err(at)?;
                     self.formats.insert(d.args[0].clone(), Arc::new(Format { line, escape: escape.unwrap_or(Escape::Default) }));
@@ -1195,6 +1212,32 @@ impl Builder<'_> {
     }
 }
 
+/// Refuses a directive that was given before at its level, as most of nginx's do; root and
+/// alias are one.
+fn once(before: &[Directive], d: &Directive) -> Result<(), String> {
+    // Nothing goes after "off" of these.
+    let off = (d.name == "proxy_redirect" || d.name.starts_with("proxy_cookie_")) && before.iter().any(|b| b.name == d.name && b.args == ["off"]);
+    if !off && REPEATED.contains(&d.name.as_str()) { return Ok(()) }
+    let other = match d.name.as_str() { "root" => "alias", "alias" => "root", _ => "" };
+    let Some(b) = before.iter().find(|b| b.name == d.name || b.name == other) else { return Ok(()) };
+    let earlier = if b.name == other { format!(", \"{other}\" directive was specified earlier") } else { String::new() };
+    Err(format!("\"{}\" directive is duplicate{earlier} in {}", d.name, d.at))
+}
+
+/// Refuses two locations of a block for the same URI, or the same prefix, as
+/// ngx_http_join_exact_locations() does. Named ones and regular expressions may be the same.
+fn same_locations(block: &[Directive]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for d in block.iter().filter(|d| d.name == "location") {
+        let key = match &d.args[..] {
+            [p] if !p.starts_with(['@', '~']) => (false, p),
+            [m, p] if m == "=" || m == "^~" => (m == "=", p), _ => continue,
+        };
+        if !seen.insert(key) { return Err(format!("duplicate location \"{}\" in {}", key.1, d.at)); }
+    }
+    block.iter().filter(|d| d.name == "location").try_for_each(|d| same_locations(d.block.as_deref().unwrap_or_default()))
+}
+
 /// The name and port of host[:port], the default port when it has none; an
 /// IPv6 address is written in brackets, which are left out.
 pub fn host_port(host: &str, default: u16) -> Option<(&str, u16)> {
@@ -1335,10 +1378,9 @@ fn peer(args: &[String]) -> Result<Peer, String> {
 /// keepalive_timeout in an upstream block; None when it keeps no connection.
 fn upstream_keepalive(block: &[Directive]) -> Result<Option<Keepalive>, String> {
     let mut k = Keepalive::default();
-    for (i, d) in block.iter().enumerate().filter(|(_, d)| d.name.starts_with("keepalive")) {
+    for d in block.iter().filter(|d| d.name.starts_with("keepalive")) {
         let at = |e: String| format!("{e} in {}", d.at);
         let directive = |e: &str| at(format!("\"{}\" directive {e}", d.name));
-        if block[..i].iter().any(|b| b.name == d.name) { return Err(directive("is duplicate")); }
         let time = || millis(&d.args[0]).map_err(|e| directive(&e));
         match d.name.as_str() {
             "keepalive" => {
@@ -1960,6 +2002,45 @@ mod tests {
         for http in ["client_body_temp_path /a 1 2; proxy_temp_path /a 1 2; server { }", "client_body_temp_path /a/ 1; proxy_temp_path /a 2;", "client_body_temp_path proxy_temp 1 2; server { }", "proxy_temp_path client_body_temp 1;"] {
             assert!(build_text(&format!("http {{ {http} }}")).is_ok(), "{http}");
         }
+    }
+
+    #[test]
+    fn directives_given_twice() {
+        let again = |d: &str| format!("\"{d}\" directive is duplicate in t.conf:2");
+        for (conf, want) in [
+            ("daemon on;\ndaemon on;", again("daemon")),
+            ("events { }\nevents { }", again("events")),
+            ("http { }\nhttp { }", again("http")),
+            ("http { gzip on;\ngzip off; }", again("gzip")),
+            // Before its value is looked at.
+            ("http { server { http2 on;\nhttp2 x; } }", again("http2")),
+            ("ssl_object_cache_inheritable on;\nssl_object_cache_inheritable x;", again("ssl_object_cache_inheritable")),
+            ("http { proxy_cookie_path off;\nproxy_cookie_path x; }", again("proxy_cookie_path")),
+            ("http { proxy_redirect off;\nproxy_redirect default; }", again("proxy_redirect")),
+            ("http { server { location / { proxy_pass http://127.0.0.1:1;\nproxy_pass http://$host; } } }", again("proxy_pass")),
+            ("http { server { location / { limit_except GET { }\nlimit_except PUT { } } } }", again("limit_except")),
+            ("http { server { location / { if ($uri) { root /a;\nroot /b; } } } }", again("root")),
+            ("http { server { location / { root /a;\nalias /b; } } }", "\"alias\" directive is duplicate, \"root\" directive was specified earlier in t.conf:2".into()),
+            ("http { server { location / { alias /a;\nroot /b; } } }", "\"root\" directive is duplicate, \"alias\" directive was specified earlier in t.conf:2".into()),
+            ("http { upstream u { server 127.0.0.1:1; keepalive 1;\nkeepalive 1; } }", again("keepalive")),
+            ("http { upstream u { server 127.0.0.1:1; }\nupstream U { server 127.0.0.1:1; } }", "duplicate upstream \"U\" in t.conf:2".into()),
+            ("http { log_format a x;\nlog_format a y; }", "duplicate \"log_format\" name \"a\" in t.conf:2".into()),
+            ("http { log_format combined x; }", "duplicate \"log_format\" name \"combined\" in t.conf:1".into()),
+            ("http { server { listen 8080;\nlisten 0.0.0.0:8080 ssl; } }", "a duplicate listen 0.0.0.0:8080 in t.conf:2".into()),
+            ("http { server { location /a { }\nlocation ^~ /a { } } }", "duplicate location \"/a\" in t.conf:2".into()),
+            ("http { server { location / { location = /a { }\nlocation = /a { } } } }", "duplicate location \"/a\" in t.conf:2".into()),
+        ] {
+            assert_eq!(build_text(conf).err(), Some(want), "{conf}");
+        }
+        for conf in [
+            // One at each level, and what may be given more than once.
+            "http { gzip on; root /a; server { gzip on; root /a; location / { gzip on; root /a; if ($uri) { gzip on; root /a; } if ($uri) { gzip on; } } } server { gzip on; } }",
+            "http { index a; index a; server { listen 8080; listen 8081; listen 8080 quic; location / { } location = / { } location ~ a { } location ~ a { } location @a { } location @a { } } }",
+            "http { server { listen 8080; location /a { location /a { } } } server { listen 8080; location /a { } } }",
+        ] {
+            assert!(build_text(conf).is_ok(), "{conf}");
+        }
+        assert!(REPEATED.iter().all(|r| DIRECTIVES.iter().any(|d| d.0 == *r)));
     }
 
     #[test]
