@@ -27,7 +27,7 @@ pub struct Shared {
     pub unparsed: std::sync::OnceLock<String>,
     /// The trailers of a proxied server's answer that proxy_pass_trailers passes.
     pub trailers: std::sync::Mutex<Vec<(String, String)>>,
-    /// How the cache answered the request: MISS, HIT, EXPIRED, STALE ($upstream_cache_status).
+    /// How the cache answered the request: MISS, HIT, EXPIRED, STALE, REVALIDATED ($upstream_cache_status).
     pub cache_status: std::sync::Mutex<Option<&'static str>>,
     /// Whether the request updates the cache in the background (proxy_cache_background_update).
     pub updater: bool,

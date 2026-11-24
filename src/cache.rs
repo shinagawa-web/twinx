@@ -21,6 +21,15 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// The conditions it is revalidated with (proxy_cache_revalidate): If-Modified-Since its
+    /// Last-Modified and If-None-Match its ETag, which only a 200 or a 206 keeps.
+    pub fn conditions(&self) -> Vec<(&'static str, String)> {
+        if !matches!(self.status, 200 | 206) { return Vec::new(); }
+        let header = |name: &str| self.headers.iter().rev().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
+        let modified = header("last-modified").and_then(|v| crate::expires::http_time(&v)).map(|t| ("If-Modified-Since", crate::expires::http_date(t)));
+        modified.into_iter().chain(header("etag").map(|e| ("If-None-Match", e))).collect()
+    }
+
     /// Whether it may still be given while it is being updated (c->stale_updating).
     pub fn updating(&self) -> bool {
         self.until.saturating_add(self.updating) >= crate::clock::seconds()
@@ -108,6 +117,12 @@ impl Zone {
         let n = uses.entry(key.to_string()).or_default();
         *n += 1;
         *n
+    }
+
+    /// Makes what is kept for a key valid again, until then and given while it is updated
+    /// for so long after (a 304 of proxy_cache_revalidate).
+    pub fn renew(&self, key: &str, (until, updating): (i64, i64)) {
+        if let Some(e) = self.entries.lock().unwrap().get_mut(key) { (e.until, e.updating) = (until, updating); }
     }
 
     /// Keeps an answer for a key, valid until then, and given while it is updated for so long after.
@@ -234,6 +249,22 @@ mod tests {
         assert_eq!(said(&[("Set-Cookie", "a"), ("Cache-Control", "max-age=60")]), None);
         let ignored = ["set-cookie".to_string(), "cache-control".to_string()];
         assert_eq!(super::said(&h(&[("Set-Cookie", "a"), ("Cache-Control", "no-cache")]), &ignored, 1000), Some((None, 0)));
+    }
+
+    #[test]
+    fn conditions_of_what_is_kept() {
+        let entry = |status, headers: &[(&str, &str)]| Entry { status, ctype: None, headers: h(headers), body: Vec::new(), until: 0, updating: 0 };
+        let both = [("Last-Modified", "Mon, 02 Mar 2015 17:20:58 GMT"), ("ETag", "\"x\"")];
+        assert_eq!(entry(200, &both).conditions(), [("If-Modified-Since", "Mon, 02 Mar 2015 17:20:58 GMT".to_string()), ("If-None-Match", "\"x\"".to_string())]);
+        assert_eq!(entry(206, &both[1..]).conditions(), [("If-None-Match", "\"x\"".to_string())]);
+        assert!(entry(201, &both).conditions().is_empty());
+        assert!(entry(200, &[("Last-Modified", "never")]).conditions().is_empty());
+        let z = Zone::default();
+        z.put("k".into(), (200, None, Vec::new(), Vec::new()), (0, 0));
+        assert!(z.get("k").is_none());
+        z.renew("k", (crate::clock::seconds() + 60, 0));
+        z.renew("other", (0, 0));
+        assert!(z.get("k").is_some() && z.stale("other").is_none());
     }
 
     #[test]
