@@ -673,8 +673,9 @@ struct Builder<'a> {
     logs: HashMap<PathBuf, Arc<File>>,
     upstreams: HashMap<String, Arc<Upstream>>,
     implicit: Implicit,
-    /// The directories of temporary files of all levels.
-    temp_paths: Vec<PathBuf>,
+    /// The directories of temporary files of all levels, with their levels of subdirectories
+    /// and where the directives are, the defaults having none.
+    temp_paths: Vec<(PathBuf, Vec<usize>, Option<String>)>,
     /// The name of the location whose directives are being read, which
     /// "proxy_redirect default" puts in place of the proxy_pass URL.
     location: String,
@@ -709,7 +710,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
             _ => {}
         }
     }
-    config.temp_paths = b.temp_paths;
+    config.temp_paths = b.temp_paths.into_iter().map(|t| t.0).collect();
     Ok(config)
 }
 
@@ -731,9 +732,19 @@ impl Builder<'_> {
 
     /// Takes note of a directory of temporary files, as ngx_add_path() does. The name of one
     /// that is not relative to the prefix keeps the "/" it ends with.
-    fn temp_path(&mut self, p: &str) {
+    fn temp_path(&mut self, p: &str, levels: &[usize], at: Option<&str>) -> Result<(), String> {
         let path = self.path(if p.starts_with('/') { p } else { p.strip_suffix('/').unwrap_or(p) });
-        if self.temp_paths.iter().all(|t| t.as_os_str() != path.as_os_str()) { self.temp_paths.push(path); }
+        let Some((_, other, first)) = self.temp_paths.iter().find(|t| t.0.as_os_str() == path.as_os_str()) else {
+            self.temp_paths.push((path, levels.to_vec(), at.map(str::to_string)));
+            return Ok(())
+        };
+        if other == levels { return Ok(()) }
+        let (name, first) = (path.to_string_lossy(), first.as_deref().unwrap_or_default());
+        let name = name.strip_suffix('/').unwrap_or(&name);
+        Err(match at {
+            Some(at) => format!("the same path name \"{name}\" in {first} has the different levels than in {at}"),
+            None => format!("the path name \"{name}\" in {first} has the same name as default path, but the different levels, you need to define default path in http section"),
+        })
     }
 
     /// Opens (creating it) a log file to append to; one handle per path.
@@ -776,13 +787,12 @@ impl Builder<'_> {
         let servers: Vec<Server> = servers.map(|d| self.server(d.block.as_deref().unwrap_or_default(), &level)).collect::<Result<_, _>>()?;
         // nginx merges the levels of the proxy module once all of the block is read. Those of
         // if and limit_except, where none of these directives may be, are as the one around them.
-        servers.iter().flat_map(|s| [&s.level].into_iter().chain(s.locations.iter().map(|l| &l.level))).try_for_each(check_proxy_buffers)?;
         // The default directories are those of servers without directives of their own or inherited.
         let given = |block: &[Directive], name| block.iter().any(|d| d.name == name);
-        for (name, default) in [("client_body_temp_path", "client_body_temp"), ("proxy_temp_path", "proxy_temp")] {
-            let without = block.iter().any(|d| d.name == "server" && !given(d.block.as_deref().unwrap_or_default(), name));
-            if without && !given(block, name) { self.temp_path(default); }
-        }
+        let default = |name| !given(block, name) && block.iter().any(|d| d.name == "server" && !given(d.block.as_deref().unwrap_or_default(), name));
+        if default("client_body_temp_path") { self.temp_path("client_body_temp", &[], None)?; }
+        servers.iter().flat_map(|s| [&s.level].into_iter().chain(s.locations.iter().map(|l| &l.level))).try_for_each(check_proxy_buffers)?;
+        if default("proxy_temp_path") { self.temp_path("proxy_temp", &[1, 2], None)?; }
         Ok(servers)
     }
 
@@ -1011,7 +1021,7 @@ impl Builder<'_> {
                 "proxy_temp_path" => {
                     level.proxy_temp_path = self.path(&d.args[0]);
                     level.proxy_temp_levels = temp_levels(&d.args[1..]).ok_or_else(invalid)?;
-                    self.temp_path(&d.args[0]);
+                    self.temp_path(&d.args[0], &level.proxy_temp_levels, Some(&d.at))?;
                 }
                 "proxy_bind" => level.proxy_bind = proxy_bind(&d.args).map_err(at)?,
                 "proxy_buffers" => match (scaled(&d.args[0], &[("", 1)]), size(&d.args[1])) {
@@ -1025,7 +1035,7 @@ impl Builder<'_> {
                 "client_body_temp_path" => {
                     level.body_temp_path = self.path(&d.args[0]);
                     level.body_temp_levels = temp_levels(&d.args[1..]).ok_or_else(|| at("invalid value".into()))?;
-                    self.temp_path(&d.args[0]);
+                    self.temp_path(&d.args[0], &level.body_temp_levels, Some(&d.at))?;
                 }
                 "default_type" => level.default_type = d.args[0].clone(),
                 "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
@@ -1926,6 +1936,29 @@ mod tests {
             let paths = build_text(&format!("http {{ {http} }}")).unwrap().temp_paths;
             let want: Vec<_> = want.iter().map(|p| dir.join(p).into_os_string()).collect();
             assert_eq!(paths.into_iter().map(PathBuf::into_os_string).collect::<Vec<_>>(), want, "{http}");
+        }
+    }
+
+    #[test]
+    fn levels_of_temporary_files() {
+        let prefix = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
+        let default = |name: &str, line: usize| format!("the path name \"{}\" in t.conf:{line} has the same name as default path, but the different levels, you need to define default path in http section", prefix.join(name).display());
+        let same = |name: &str, first: usize, second: usize| format!("the same path name \"{}\" in t.conf:{first} has the different levels than in t.conf:{second}", prefix.join(name).display());
+        for (http, want) in [
+            ("client_body_temp_path /a;\nproxy_temp_path /a 1;", same("/a", 1, 2)),
+            ("client_body_temp_path /a/ 1;\nproxy_temp_path /a/;", same("/a", 1, 2)),
+            ("client_body_temp_path a/ 1;\nproxy_temp_path a 2;", same("a", 1, 2)),
+            ("server { client_body_temp_path /a 1;\n}\nserver { location / { client_body_temp_path /a 1 1; } }", same("/a", 1, 3)),
+            ("client_body_temp_path proxy_temp;\nserver { }", default("proxy_temp", 1)),
+            ("\nproxy_temp_path client_body_temp 1; server { }", default("client_body_temp", 2)),
+            // It comes before the check of the buffers, the one of the other directory after it.
+            ("server { proxy_buffers 1 4k; }\nserver { proxy_temp_path client_body_temp 1; }", default("client_body_temp", 2)),
+            ("server { proxy_buffers 1 4k; }\nserver { client_body_temp_path proxy_temp; }", "there must be at least 2 \"proxy_buffers\"".into()),
+        ] {
+            assert_eq!(build_text(&format!("http {{ {http} }}")).err(), Some(want), "{http}");
+        }
+        for http in ["client_body_temp_path /a 1 2; proxy_temp_path /a 1 2; server { }", "client_body_temp_path /a/ 1; proxy_temp_path /a 2;", "client_body_temp_path proxy_temp 1 2; server { }", "proxy_temp_path client_body_temp 1;"] {
+            assert!(build_text(&format!("http {{ {http} }}")).is_ok(), "{http}");
         }
     }
 
