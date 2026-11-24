@@ -129,10 +129,21 @@ static HUFFMAN: [(u32, u8); 256] = [
     (0x7ffffeb, 27), (0xffffffe, 28), (0x7ffffec, 27), (0x7ffffed, 27), (0x7ffffee, 27), (0x7ffffef, 27), (0x7fffff0, 27), (0x3ffffee, 26),
 ];
 
-/// The octet of each Huffman code, by its length and the code.
-fn symbols() -> &'static HashMap<(u8, u32), u8> {
-    static SYMBOLS: OnceLock<HashMap<(u8, u32), u8>> = OnceLock::new();
-    SYMBOLS.get_or_init(|| HUFFMAN.iter().enumerate().map(|(c, &(code, len))| ((len, code), c as u8)).collect())
+/// The octets in the order of their Huffman codes, which is that of their lengths; and
+/// of each length the first code, how many there are, and how many octets come before.
+/// The codes of a length follow one another.
+fn symbols() -> &'static ([u8; 256], [(u32, u32, u32); 31]) {
+    static SYMBOLS: OnceLock<([u8; 256], [(u32, u32, u32); 31])> = OnceLock::new();
+    SYMBOLS.get_or_init(|| {
+        let (mut octets, mut lengths) = (std::array::from_fn(|c| c as u8), [(0, 0, 0); 31]);
+        octets.sort_by_key(|&c| { let (code, len) = HUFFMAN[usize::from(c)]; (len, code) });
+        for (i, &c) in octets.iter().enumerate() {
+            let (code, len) = HUFFMAN[usize::from(c)];
+            let of = &mut lengths[usize::from(len)];
+            *of = if of.1 == 0 { (code, 1, i as u32) } else { (of.0, of.1 + 1, of.2) };
+        }
+        (octets, lengths)
+    })
 }
 
 /// A string Huffman encoded, as nginx does it: only when that is shorter.
@@ -150,12 +161,20 @@ fn huffman(src: &[u8], lower: bool) -> Option<Vec<u8>> {
 /// A Huffman encoded string decoded, as nginx decodes it: what is left after
 /// the last octet is padding of ones, of whatever length, but not the code of EOS.
 fn unhuffman(src: &[u8]) -> Option<Vec<u8>> {
-    let (mut out, mut code, mut len) = (Vec::with_capacity(src.len() * 8 / 5), 0u32, 0u8);
-    for bit in src.iter().flat_map(|b| (0..8).rev().map(move |i| u32::from(b >> i & 1))) {
-        (code, len) = (code << 1 | bit, len + 1);
-        if let Some(&c) = symbols().get(&(len, code)) { out.push(c); (code, len) = (0, 0); } else if len == 30 { return None }
+    let (octets, lengths) = symbols();
+    let (mut out, mut acc, mut bits, mut rest) = (Vec::with_capacity(src.len() * 8 / 5), 0u64, 0, src.iter());
+    loop {
+        while bits <= 56 { let Some(&b) = rest.next() else { break }; (acc, bits) = (acc << 8 | u64::from(b), bits + 8); }
+        // The shortest code has 5 bits, the longest 30.
+        let found = (5..=bits.min(30)).find_map(|len| {
+            let ((first, count, before), code) = (lengths[len], (acc >> (bits - len)) as u32 & ((1 << len) - 1));
+            (code.wrapping_sub(first) < count).then(|| (octets[(before + code - first) as usize], len))
+        });
+        match found {
+            Some((c, len)) => { out.push(c); bits -= len; }
+            None => return (bits < 30 && acc & ((1 << bits) - 1) == (1 << bits) - 1).then_some(out),
+        }
     }
-    (code == (1 << len) - 1).then_some(out)
 }
 
 /// An integer of a header block with a prefix of so many bits (RFC 7541, 5.1),
@@ -1083,6 +1102,14 @@ mod tests {
         assert_eq!(unhuffman(&[0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xff]).unwrap(), b"localhost");
         assert_eq!(unhuffman(&[0xff, 0xff, 0xff, 0xff]), None);
         assert_eq!(unhuffman(&[0x00]), None);
+        // Every octet, and all of them.
+        let coded = |octets: &[u8]| {
+            let bits: String = octets.iter().map(|&c| { let (code, len) = HUFFMAN[usize::from(c)]; format!("{code:00$b}", usize::from(len)) }).collect();
+            bits.as_bytes().chunks(8).map(|b| u8::from_str_radix(&format!("{:1<8}", std::str::from_utf8(b).unwrap()), 2).unwrap()).collect::<Vec<_>>()
+        };
+        for c in 0..=255 { assert_eq!(unhuffman(&coded(&[c])), Some(vec![c])); }
+        let all: Vec<u8> = (0..=255).chain((0..=255).rev()).collect();
+        assert_eq!(unhuffman(&coded(&all)), Some(all));
     }
 
     #[test]
