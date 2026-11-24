@@ -3193,7 +3193,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_future_of_a_connection_is_small() {
-        let config = crate::conf::build(&crate::config::parse("http { server { } }", std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", "http { server { } }"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         block_on(async {
             let Stream::Tcp(stream) = pair().await.0 else { unreachable!() };
             let addr = "127.0.0.1:80".parse().unwrap();
@@ -3272,7 +3272,7 @@ pub(crate) mod tests {
         // A byte that is not UTF-8 is sent as it is, and UTF-8 text too.
         let byte = crate::vars::text(b"/\xff");
         let text = format!("http {{ server {{ keepalive_timeout 5 9; location / {{ add_header X \"\u{e9}\"; return 302 {byte}; }} location /a {{ return 200 ok; }} }} }}");
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let got = exchanged_bytes(&config.servers[0], "/");
         let has = |part: &[u8]| got.windows(part.len()).any(|w| w == part);
         assert!(has(b"HTTP/1.1 302 Moved Temporarily\r\nServer: ") && has(b":8080/\xff\r\n") && has("X: \u{e9}\r\n\r\n".as_bytes()), "{}", String::from_utf8_lossy(&got));
@@ -3297,7 +3297,7 @@ pub(crate) mod tests {
     /// The same for the http block's directives, with the server.
     pub(crate) async fn served_by(directives: &str) -> (tokio::net::TcpStream, JoinHandle<()>) {
         let text = format!("http {{ {directives} }}");
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let (Stream::Tcp(stream), client) = pair().await else { unreachable!() };
         let addr = "127.0.0.1:80".parse().unwrap();
         (client, tokio::task::spawn_local(serving(Arc::new(config), stream, false, (addr, addr, (addr, 0)), Busy::new())))
@@ -3462,7 +3462,7 @@ pub(crate) mod tests {
         let open = vec![(TcpListener::bind("127.0.0.1:0").unwrap(), "0.0.0.0:0".parse::<SocketAddr>().unwrap())];
         let addr = open[0].0.local_addr().unwrap();
         let text = format!("http {{ server {{ listen {addr}; }} }}");
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         // The address is taken already, so a socket of its own could not be bound.
         assert!(bind(&config, &[]).unwrap_err().starts_with(&format!("bind() to {addr} failed")));
         let open = vec![(open.into_iter().next().unwrap().0, addr)];
@@ -3474,7 +3474,7 @@ pub(crate) mod tests {
         let (a, b) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
         let (a, b) = ((a.local_addr().unwrap(), a), (b.local_addr().unwrap(), b));
         let text = format!("http {{ server {{ listen {}; listen {}; server_name one; }} server {{ listen {}; listen {} default_server; server_name two; }} }}", a.0, b.0, a.0, b.0);
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let open = vec![(a.1, a.0), (b.1, b.0)];
         assert_eq!(bind(&config, &open).unwrap().iter().map(|l| l.1).collect::<Vec<_>>(), [a.0, b.0]);
         assert_eq!((default_server(&config, a.0).name.as_str(), default_server(&config, b.0).name.as_str()), ("one", "two"));
@@ -3487,7 +3487,7 @@ pub(crate) mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let text = format!("http {{ server {{ listen {addr}; location / {{ return 200 done; }} }} }}");
-        let config = Arc::new(crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
         let mut client = TcpStream::connect(addr).unwrap();
         let writer = thread::spawn(move || {
             // The connection was accepted before its request came: shutting down waits for it.
@@ -3509,7 +3509,7 @@ pub(crate) mod tests {
         // worker_shutdown_timeout: a request that does not come is not waited for longer.
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("http {{ server {{ listen {addr}; }} }}"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", format!("http {{ server {{ listen {addr}; }} }}")), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
         let _idle = TcpStream::connect(addr).unwrap();
         block_on(async {
             let accepting = accept(config, &[(l, addr)]).unwrap();
@@ -3700,7 +3700,7 @@ pub(crate) mod tests {
         });
         let text = format!("http {{ server {{ error_page 401 /e; location /on {{ proxy_pass http://{addr}; proxy_intercept_errors on; }} \
                             location /off {{ proxy_pass http://{addr}; }} location /e {{ return 200 e; }} }} }}");
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let answer = |target: &str| exchanged(s, target);
         let on = answer("/on");
@@ -3749,14 +3749,14 @@ pub(crate) mod tests {
     #[test]
     fn server_tokens() {
         let text = "http { server { location /a { return 404; } location /b { server_tokens off; return 404; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let get = |target: &str| exchanged(s, target);
         let a = get("/a");
         assert!(a.contains(&format!("Server: {NAME}\r\n")) && a.contains(&format!("<center>{NAME}</center>")), "{a}");
         let b = get("/b");
         assert!(b.contains("Server: twinx\r\n") && b.contains("<center>twinx</center>"), "{b}");
-        let refused = crate::conf::build(&crate::config::parse("http { server_tokens x; }", std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        let refused = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", "http { server_tokens x; }"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused, "invalid value \"x\" in \"server_tokens\" directive, it must be \"on\", \"off\" or \"build\" in t:1");
     }
 
@@ -3765,7 +3765,7 @@ pub(crate) mod tests {
         let text = "http { server { location /a { error_page 405 /n; return 405; } location /b { error_page 302 /t; return 302 x; } \
                     location /c { error_page 302 /r; return 302 x; } location /d { error_page 405 = /n; return 405; } \
                     location /n { return 204; } location /t { return 200 t; } location /r { return 302 y; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let get = |target: &str| exchanged(s, target);
         // The answer takes the error's status, unless it is a page of its own, or "=" is given.
@@ -3990,7 +3990,7 @@ pub(crate) mod tests {
             let servers = [failing(&answer, false), failing(&answer, false)];
             let text = format!("http {{ upstream u {{ server {}; server {}; keepalive 2; }} server {{ proxy_read_timeout 1s; proxy_next_upstream error timeout invalid_header http_502 non_idempotent; \
                                 location / {{ proxy_pass http://u; {rate} }} }} }}", servers[0].0, servers[1].0);
-            let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+            let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
             // Each request goes to one of them, in turn, on a connection of its own.
             for want in [[1, 0], [1, 1], [2, 1], [2, 2]] {
                 assert_eq!(exchanged(&config.servers[0], "/"), "", "{answer} {rate}");
@@ -4807,7 +4807,7 @@ pub(crate) mod tests {
         let errors = log_path("numbers");
         let (addr, _count) = plays(&vec![], true);
         let text = format!("http {{ error_log {}; server {{ location / {{ proxy_pass http://{addr}; }} }} }}", errors.display());
-        let config = Arc::new(crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
         block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let to = listener.local_addr().unwrap();
@@ -5437,7 +5437,7 @@ pub(crate) mod tests {
     fn proxied(settings: &str, lines: &'static str, requests: &[(&str, &str)]) -> (Vec<String>, Vec<(usize, String)>) {
         let (addr, came) = answering(lines);
         let text = format!("http {{ upstream u {{ server {addr}; {settings} }} server {{ location /a {{ proxy_pass http://u; }} location /b {{ proxy_pass http://u; }} location /c {{ proxy_pass http://u; proxy_limit_rate 1m; }} }} }}");
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let bodies = block_on(async {
             let mut bodies = Vec::new();
             for (head, body) in requests {
@@ -5479,7 +5479,7 @@ pub(crate) mod tests {
         let _busy = serving_on();
         let (addr, _) = answering("Date: then\r\nX-Pad: pad\r\nX-Accel-A: a\r\n");
         let text = format!("http {{ proxy_hide_header X-A; server {{ location /a {{ proxy_pass http://{addr}; }} location /b {{ proxy_pass http://{addr}; proxy_pass_header Date; proxy_pass_header Server; proxy_pass_header X-Pad; }} }} }}");
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let (a, b) = (exchanged(&config.servers[0], "/a"), exchanged(&config.servers[0], "/b"));
         assert!(a.contains(&format!("Server: {NAME}\r\n")) && a.contains("Date: ") && !a.contains("then") && !a.contains("X-Pad") && !a.contains("X-Accel"), "{a}");
         // The server sent no Server: there is none.
@@ -5500,7 +5500,7 @@ pub(crate) mod tests {
         // A body that is shorter than its length.
         let (addr, came) = closing("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab");
         let text = format!("http {{ upstream u {{ server {addr}; keepalive 2; }} server {{ location / {{ proxy_pass http://u; proxy_limit_rate 1m; }} }} }}");
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         block_on(async {
             for connections in 1..3 {
                 let mut resp = answered(&config.servers[0], "GET / HTTP/1.0\n\n").await;
@@ -5556,7 +5556,7 @@ pub(crate) mod tests {
     fn passed_to(servers: [SocketAddr; 2], directives: &str, head: &str, rest: Option<Unread>) -> u16 {
         let [first, second] = servers;
         let text = format!("http {{ upstream u {{ server {first}; server {second}; }} proxy_read_timeout 1s; server {{ location / {{ proxy_pass http://u; {directives} }} }} }}");
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         block_on(async {
             let (mut client, mut out) = pair().await;
             if let Some(u) = &rest { out.write_all(if u.chunked.is_some() { b"1\r\nc\r\n0\r\n\r\n" } else { b"c" }).await.unwrap(); }
@@ -5679,7 +5679,7 @@ pub(crate) mod tests {
             let servers: Vec<_> = answers.iter().map(|a| dropping(a)).collect();
             let list: String = servers.iter().map(|s| format!("server {}; ", s.0)).collect();
             let text = format!("http {{ upstream u {{ {list}keepalive 2; }} proxy_read_timeout 1s; server {{ location / {{ proxy_pass http://u; {directives} }} }} }}");
-            let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+            let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
             let server = &config.servers[0];
             let resp = block_on(async {
                 let get = || answered(server, "GET / HTTP/1.0\n\n");
@@ -5729,7 +5729,7 @@ pub(crate) mod tests {
         let list: String = servers.iter().map(|s| format!("server {s}; ")).collect();
         let text = format!("http {{ upstream u {{ {list}keepalive 2; }} proxy_connect_timeout 1s; proxy_read_timeout 1s; \
                             server {{ location / {{ proxy_pass http://u; {directives} }} }} }}");
-        crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap()
+        crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap()
     }
 
     #[test]
@@ -5920,7 +5920,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     /// /p, which does not, to an upstream with the settings and the server.
     fn secured(settings: &str, addr: SocketAddr, requests: &[&str]) -> Vec<(String, String)> {
         let text = format!("http {{ upstream u {{ server {addr}; {settings} }} server {{ location /s {{ proxy_pass https://u; }} location /p {{ proxy_pass http://u; }} }} }}");
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         block_on(async {
             let mut answers = Vec::new();
             for target in requests {
@@ -6260,7 +6260,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                     location /d { proxy_pass http://127.0.0.1:1; proxy_pass_request_body off; } \
                     location /e { proxy_pass http://127.0.0.1:1; proxy_request_buffering on; } \
                     location /f { } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let got: Vec<_> = config.servers[0].locations.iter().map(|l| (unbuffered(&l.level, false), unbuffered(&l.level, true))).collect();
         assert_eq!(got, [(true, true), (true, false), (false, false), (false, false), (false, false), (false, false)]);
     }
@@ -6341,7 +6341,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                     server { listen 127.0.0.1:8080; server_name *.b.c; } server { listen 127.0.0.1:8080; server_name *.x.b.c .d.e; } \
                     server { listen 127.0.0.1:8080; server_name f.*; server_name f.g.*; } \
                     server { listen 127.0.0.1:8080; server_name \"~^(?P<n1>[a-z]+)\\Q.h\\E$\"; } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let listen = "127.0.0.1:8080".parse().unwrap();
         let name = |host: Option<&str>| server(&config, listen, host).0.name.clone();
         let cases = [(Some("zz"), "a"), (None, ""), (Some("y.b.c"), "*.b.c"), (Some("y.x.b.c"), "*.x.b.c"), (Some("d.e"), "*.x.b.c"), (Some("y.d.e"), "*.x.b.c"),
@@ -6358,7 +6358,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let text = "http { server { listen 127.0.0.1:8080; server_name a; location /p/ { proxy_pass http://127.0.0.1:8081; } \
                     location /q { } location /q/ { proxy_pass http://127.0.0.1:8081; } } \
                     server { listen 127.0.0.1:8080; server_name b; } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let listen = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(server(&config, listen, Some("b")).0.name, "b");
         assert_eq!(server(&config, listen, Some("c")).0.name, "a");
@@ -6375,7 +6375,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/f.txt"), "F").unwrap();
         let text = format!("http {{ server {{ location ~ ^/c/(\\w+)$ {{ return 200 $1; }} location ~ ^/a/(.+)$ {{ alias {}/sub/$1; }} }} }}", dir.display());
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &dir).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &dir).unwrap();
         let s = &config.servers[0];
         let body = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
@@ -6391,7 +6391,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     fn limit_except_and_proxy_pass_in_if() {
         let text = "http { server { location /lg { limit_except GET { proxy_pass http://127.0.0.1:1; } } \
                     location /i { set $t 1; if ($t) { proxy_pass http://127.0.0.1:1; } if ($t) { } } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let status = |line: &str| {
             let (_, r) = request(&format!("{line} HTTP/1.0\n\n"));
@@ -6409,7 +6409,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     fn rewrites_redirect_with_the_arguments() {
         let text = "http { server { location /a { rewrite ^ http://e/$arg_x; } location /b { rewrite ^ http://e/?y=1; } \
                     location /c { rewrite ^/c http://e/? permanent; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
@@ -6431,7 +6431,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let text = "http { server { location /a { rewrite ^/a(.*) /b$1?c=$1; rewrite ^/b /c; return 200 $uri:$args; } \
                     location /l { rewrite ^ /n last; return 403; } location /n { return 200 n$uri; } \
                     location /k { break; return 403; } location /r { rewrite ^/r(.*) http://e$1?$1 redirect; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let get = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
@@ -6453,7 +6453,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     #[test]
     fn rewrites_with_break_and_named_locations() {
         let text = "http { server { location /a { rewrite ^/a(.*) /b break; return 403; } location @n { return 200 n$uri; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         assert!(location(s, "@n").0.is_empty());
         let (_, r) = request("GET /a?x=1 HTTP/1.0\n\n");
@@ -6466,7 +6466,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     #[test]
     fn sets_limit_rate() {
         let text = "http { server { set $limit_rate 1k; location /a { set $limit_rate $arg_l; return 200 $limit_rate; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let rate = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
@@ -6482,7 +6482,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     #[test]
     fn set_and_if() {
         let text = "http { server { set $s srv; if ($s) { set $t x; } location / { if ($arg_a) { set $v \"[$arg_a]\"; add_header X-If $s; } set $w $v$t; return 200 $v$w; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
@@ -6495,14 +6495,14 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(answer("/"), ("x".to_string(), 0));
         // return in an if of the server answers at once.
         let text = "http { server { if ($arg_r) { return 200 r; } location / { return 200 l; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let body = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
             String::from_utf8(block_on(super::answer(s, &r, Ok(()), location(s, &r.uri), None)).0.body).unwrap()
         };
         assert_eq!((body("/?r=1"), body("/")), ("r".to_string(), "l".to_string()));
-        let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        let refused = |text: &str| crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { server { set $uri x; } }"), "the duplicate \"uri\" variable in t:1");
         assert_eq!(refused("http { server { if $a { } } }"), "invalid condition \"$a\" in t:1");
         assert_eq!(refused("http { server { if ($arg_a <> b) { } } }"), "invalid condition \"($arg_a\" in t:1");
@@ -6519,7 +6519,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                             location /re {{ if ($arg_c ~* ^F(o+)) {{ return 200 $1; }} }} \
                             location /f {{ if (!-f {d}/$arg_c) {{ return 204; }} }} location /x {{ if (-x {d}/$arg_c) {{ return 204; }} }} \
                             location /e {{ if (-e {d}/$arg_c) {{ return 204; }} }} location /d {{ if (-d {d}/$arg_c) {{ return 204; }} }} }} }}", d = dir.display());
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let get = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
@@ -6539,7 +6539,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     fn rewrites_cookies() {
         let text = "http { server { proxy_cookie_domain .a.org b.org; proxy_cookie_domain ~^(.+)\\.com$ $1.net; proxy_cookie_path /p/ /$server_name/; proxy_cookie_path ~*^/R/(.*) /$1; \
                     location /off/ { proxy_cookie_domain off; proxy_cookie_path off; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let (on, off) = (&config.servers[0].level, &config.servers[0].locations[0].level);
         let (_, r) = request("GET / HTTP/1.0\n\n");
         let rw = |cookie: &str, level: &Level| rewrite_cookie(&r, cookie, level);
@@ -6551,7 +6551,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(rw("v=1; Path=/q/; Domain=c.org; Max-Age=1", on), None);
         assert_eq!(rw("v; Path=/p/", on), None);
         assert_eq!(rw("v=1; Path=/p/", off), None);
-        let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        let refused = |text: &str| crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { proxy_cookie_path off; proxy_cookie_path /a /b; }"), "\"proxy_cookie_path\" directive is duplicate in t:1");
         assert_eq!(refused("http { proxy_cookie_path on; }"), "invalid parameter \"on\" in t:1");
     }
@@ -6627,7 +6627,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let text = "http { server { location /d/ { proxy_pass http://127.0.0.1:1/u/; } location /n/ { proxy_pass http://127.0.0.1:1; \
                     proxy_redirect http://a/$server_name/ /x/; proxy_redirect ~*^(.+)/RE/ $1/y/; location /n/i/ { proxy_pass http://127.0.0.1:2; } } \
                     location /o/ { proxy_pass http://127.0.0.1:1; proxy_redirect off; location /o/i/ { } } location /p/ { proxy_pass http://127.0.0.1:1; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let level = |i: usize| &config.servers[0].locations[i].level;
         let (_, r) = request("GET / HTTP/1.0\n\n");
         let rw = |i: usize, name: &str, value: &str| {
@@ -6647,7 +6647,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(rw(1, "Refresh", "7"), (false, "7".into()));
         assert_eq!(rw(3, "Location", "http://127.0.0.1:1/a"), (false, "http://127.0.0.1:1/a".into()));
         assert_eq!(level(4).proxy_redirect.as_ref().map(Vec::len), None);
-        let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        let refused = |text: &str| crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { server { location / { proxy_redirect default; } } }"), "\"proxy_redirect default\" should be placed after the \"proxy_pass\" directive in t:1");
         assert_eq!(refused("http { server { location / { proxy_pass http://$host; proxy_redirect default; } } }"), "\"proxy_redirect default\" cannot be used with \"proxy_pass\" directive with variables in t:1");
         assert_eq!(refused("http { proxy_redirect off; proxy_redirect /a /b; }"), "\"proxy_redirect\" directive is duplicate in t:1");
@@ -6658,7 +6658,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     fn sets_cookie_flags() {
         let text = "http { server { proxy_cookie_flags a secure SameSite=Lax samesite=strict; proxy_cookie_flags ~^B nosecure nosamesite $arg_f; \
                     proxy_cookie_flags c; location /off/ { proxy_cookie_flags off; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let (on, off) = (&config.servers[0].level, &config.servers[0].locations[0].level);
         let (_, r) = request("GET /?f=httponly HTTP/1.0\n\n");
         let rw = |cookie: &str, level: &Level| rewrite_cookie(&r, cookie, level);
@@ -6669,7 +6669,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(rw("c=1;Secure", on), None);
         assert_eq!(rw("d=1;Secure", on), None);
         assert_eq!(rw("a=1", off), None);
-        let refused = |text: &str| crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
+        let refused = |text: &str| crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap_err();
         assert_eq!(refused("http { proxy_cookie_flags a secure; proxy_cookie_flags off; }"), "\"proxy_cookie_flags\" directive is duplicate in t:1");
         assert_eq!(refused("http { proxy_cookie_flags off; proxy_cookie_flags a secure; }"), "\"proxy_cookie_flags\" directive is duplicate in t:1");
         assert_eq!(refused("http { proxy_cookie_flags a sure; }"), "invalid parameter \"sure\" in t:1");
@@ -6736,7 +6736,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         std::fs::create_dir_all(dir.join("a/empty")).unwrap();
         std::fs::write(dir.join("a/index.html"), "hi").unwrap();
         let text = format!("http {{ server {{ root {}; location /a/ {{ }} location = /a/index.html {{ return 200 i$uri; }} }} }}", dir.display());
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let status = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
@@ -6757,7 +6757,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let text = format!("http {{ server {{ root {d}; error_log {d}/e.log; location /m/ {{ index one.html two.html; }} \
                             location /abs/ {{ index /m/$server_name; }} location /q/ {{ log_not_found off; }} \
                             location /c/ {{ error_log {d}/c.log crit; }} }} }}", d = dir.display());
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
@@ -6789,7 +6789,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
              location /n/ {{ alias {0}/; try_files $uri =404; }} }} }}",
             dir.display()
         );
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
@@ -6866,7 +6866,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             location /rn/ {{ rewrite ^/rn(.*)$ /tn$1 last; }} location /bx/ {{ rewrite ^/bx(.*)$ /b$1 break; proxy_pass http://{addr}; }} \
             location /ta {{ try_files /none /px/t?$args; }} location /q/ {{ rewrite ^/q/(.*)$ /r/$1 last; }} location /p/ {{ rewrite ^/p/(.*)$ /r/+$1 last; }} \
             location /r/ {{ rewrite ^/r/(.*)$ /out?z=$1 last; }} }} }}", dir.display());
-        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         for (target, body) in [
             ("/rw", "/rw /out x=1"), ("/rw?q=2", "/rw?q=2 /out x=1&q=2"), ("/two?q=2", "/two?q=2 /out "), ("/break?q=2", "/break?q=2 /out q=2"),
             ("/ep?q=2", "/ep?q=2 /out "), ("/tf?q=2", "/tf?q=2 /out "), ("/i/?q=2", "/i/?q=2 /i/index.html q=2"), ("/xa?q=2", "/xa?q=2 /out x=1"), ("/if", "if"),
@@ -6888,7 +6888,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     #[test]
     fn post_action_answers_in_the_background() {
         let text = "http { server { location / { post_action @n; } location @n { return 204; } location /u { post_action /x?a; } } }";
-        let config = crate::conf::build(&crate::config::parse(text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let s = &config.servers[0];
         for target in ["/", "/u"] {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
@@ -7061,7 +7061,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     /// The server of the files in a directory, a request of it, and its answer, of whose file nothing is read yet.
     fn unread(dir: &std::path::Path, head: &str) -> (Config, Request, Response) {
-        let config = crate::conf::build(&crate::config::parse(&format!("http {{ {} }}", serves_files(dir, "")), std::path::Path::new("t")).unwrap(), dir).unwrap();
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", format!("http {{ {} }}", serves_files(dir, ""))), std::path::Path::new("t")).unwrap(), dir).unwrap();
         let (_, r) = request(head);
         let resp = block_on(answered(&config.servers[0], head));
         (config, r, resp)

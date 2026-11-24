@@ -741,6 +741,11 @@ pub struct Server {
     pub http2: Vec<SocketAddr>,
 }
 
+/// The parameters of listen that are words of their own, and those that are
+/// "name=value" (all of which set options of the socket); any other is refused.
+const LISTEN_WORDS: &[&str] = &["default_server", "default", "ssl", "http2", "quic", "proxy_protocol", "deferred", "bind", "reuseport", "multipath"];
+const LISTEN_VALUES: &[&str] = &["setfib", "fastopen", "backlog", "rcvbuf", "sndbuf", "accept_filter", "ipv6only", "so_keepalive"];
+
 /// The backlog nginx listens with on Linux when "listen" does not set one
 /// (NGX_LISTEN_BACKLOG).
 pub const LISTEN_BACKLOG: i32 = 511;
@@ -778,13 +783,18 @@ struct Builder<'a> {
     /// The name of the location whose directives are being read, which
     /// "proxy_redirect default" puts in place of the proxy_pass URL.
     location: String,
+    /// Whether that location is a regular expression or named, where proxy_pass may not have a URI.
+    location_no_uri: bool,
+    /// The addresses servers listen on, with whether one is the default server of
+    /// it and whether one gave options of its socket.
+    listens: HashMap<(SocketAddr, bool), (bool, bool)>,
 }
 
 /// Interprets the main block. Errors are nginx's messages, with the place.
 pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
-    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), zones: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new() };
+    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), zones: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new(), location_no_uri: false, listens: HashMap::new() };
     let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
@@ -816,6 +826,8 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
             _ => {}
         }
     }
+    // Checked once all of the file is read, as ngx_event_init_conf() does.
+    if !main.iter().any(|d| d.name == "events") { return Err("no \"events\" section in configuration".into()); }
     config.temp_paths = b.temp_paths.into_iter().map(|t| t.0).collect();
     Ok(config)
 }
@@ -880,7 +892,10 @@ impl Builder<'_> {
             if self.upstreams.keys().any(|u| u.eq_ignore_ascii_case(&d.args[0])) { return Err(format!("duplicate upstream \"{}\" in {}", d.args[0], d.at)); }
             block.iter().enumerate().try_for_each(|(i, s)| self.check(s, UPS).and_then(|()| once(&block[..i], s)))?;
             let peers = block.iter().filter(|s| s.name == "server").map(|s| peer(&s.args).map_err(|e| format!("{e} in {}", s.at)));
-            let mut upstream = Upstream::new(peers.collect::<Result<_, _>>()?);
+            let peers: Vec<Peer> = peers.collect::<Result<_, _>>()?;
+            if peers.is_empty() { return Err(format!("no servers are inside upstream in {}", d.at)); }
+            if peers.iter().all(|p| p.backup) { return Err(format!("no servers in upstream \"{}\" in {}", d.args[0], d.at)); }
+            let mut upstream = Upstream::new(peers);
             upstream.keepalive = upstream_keepalive(block)?;
             self.upstreams.insert(d.args[0].clone(), Arc::new(upstream));
         }
@@ -925,13 +940,22 @@ impl Builder<'_> {
                 "listen" => {
                     let addrs = listen_ports(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
                     let quic = d.args[1..].iter().any(|a| a == "quic");
+                    let valued = |a: &String| a.split_once('=').is_some_and(|(name, _)| LISTEN_VALUES.contains(&name));
+                    if let Some(a) = d.args[1..].iter().find(|a| !LISTEN_WORDS.contains(&a.as_str()) && !valued(a)) { return Err(format!("invalid parameter \"{a}\" in {}", d.at)); }
+                    // Options of the socket, which only one server of an address may give, as only one may be its default server.
+                    let options = d.args[1..].iter().any(|a| valued(a) || ["deferred", "bind", "reuseport"].contains(&a.as_str()));
+                    let default = d.args[1..].iter().any(|a| a == "default_server" || a == "default");
                     for a in &addrs {
                         if listens.contains(&(*a, quic)) { return Err(format!("a duplicate listen {a} in {}", d.at)); }
                         listens.push((*a, quic));
+                        let given = self.listens.entry((*a, quic)).or_default();
+                        if options && given.1 { return Err(format!("duplicate listen options for {a} in {}", d.at)); }
+                        if default && given.0 { return Err(format!("a duplicate default server for {a} in {}", d.at)); }
+                        *given = (given.0 || default, given.1 || options);
                     }
                     if d.args[1..].iter().any(|a| a == "ssl") { s.ssl.extend(&addrs); }
                     if d.args[1..].iter().any(|a| a == "http2") { s.http2.extend(&addrs); }
-                    if d.args[1..].iter().any(|a| a == "default_server" || a == "default") { s.defaults.extend(&addrs); }
+                    if default { s.defaults.extend(&addrs); }
                     for a in d.args[1..].iter().filter_map(|a| a.strip_prefix("backlog=")) {
                         let n = a.parse::<i32>().ok().filter(|n| *n != 0).ok_or_else(|| format!("invalid backlog \"{a}\" in {}", d.at))?;
                         s.backlogs.extend(addrs.iter().map(|addr| (*addr, n)));
@@ -955,21 +979,26 @@ impl Builder<'_> {
         let named = files.iter().any(|(cert, key)| [cert, key].iter().any(|p| p.to_string_lossy().contains('$')));
         s.tls = (!files.is_empty()).then(|| crate::tls::server((&files, l.ssl_password_file.as_deref()), named.then(|| l.ssl_certificate_cache.clone()), &trust, options)).transpose()?;
         let level = s.level.clone();
-        self.locations(block, &level, &mut s.locations)?;
+        self.locations(block, None, &level, &mut s.locations)?;
         Ok(s)
     }
 
-    fn locations(&mut self, block: &[Directive], parent: &Level, out: &mut Vec<Location>) -> Result<(), String> {
+    /// The locations of a block, and of the location it is in, if any, with its kind and name.
+    fn locations(&mut self, block: &[Directive], around: Option<(Kind, &str)>, parent: &Level, out: &mut Vec<Location>) -> Result<(), String> {
         for d in block.iter().filter(|d| d.name == "location") {
             let mut level = Level { proxy: None, try_files: None, script: Vec::new(), limit_except: None, ..parent.clone() };
             let inner = d.block.as_deref().unwrap_or_default();
             let (kind, path) = location(&d.args).map_err(|e| format!("{e} in {}", d.at))?;
+            nested(&kind, &path, around).map_err(|e| format!("{e} in {}", d.at))?;
             self.location = d.args.last().cloned().unwrap_or_default();
+            self.location_no_uri = matches!(kind, Match::Regex(_) | Match::Named);
             self.level(inner, LOC, &mut level)?;
             let auto_redirect = level.proxy.is_some() && path.ends_with('/') && !matches!(kind, Match::Regex(_));
             if inner.iter().any(|d| d.name == "alias") { level.alias_len = (!matches!(kind, Match::Regex(_))).then_some(path.len()); }
+            let name = path.clone();
+            let around = match &kind { Match::Exact => Kind::Exact, Match::Named => Kind::Named, Match::Regex(_) => Kind::Regex, _ => Kind::Prefix };
             out.push(Location { kind, path, level: level.clone(), auto_redirect });
-            self.locations(inner, &level, out)?;
+            self.locations(inner, Some((around, &name)), &level, out)?;
         }
         Ok(())
     }
@@ -1045,7 +1074,13 @@ impl Builder<'_> {
                 "add_header" => headers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
                 "add_trailer" => trailers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
                 "error_page" => pages.get_or_insert_default().push(error_page(&d.args).map_err(at)?),
-                "proxy_pass" => (level.proxy, own_proxy) = (Some(Arc::new(self.proxy(&d.args[0]).map_err(at)?)), true),
+                "proxy_pass" => {
+                    let proxy = self.proxy(&d.args[0]).map_err(at)?;
+                    if proxy.uri.is_some() && (self.location_no_uri || ctx == LIF || ctx == LMT) {
+                        return Err(at("\"proxy_pass\" cannot have URI part in location given by regular expression, or inside named location, or inside \"if\" statement, or inside \"limit_except\" block".into()));
+                    }
+                    (level.proxy, own_proxy) = (Some(Arc::new(proxy)), true);
+                }
                 "limit_except" => {
                     const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "DELETE", "MKCOL", "COPY", "MOVE", "OPTIONS", "PROPFIND", "PROPPATCH", "LOCK", "UNLOCK", "PATCH"];
                     if let Some(m) = d.args.iter().find(|m| !METHODS.contains(&m.as_str())) { return Err(at(format!("invalid method \"{m}\""))); }
@@ -1347,6 +1382,7 @@ impl Builder<'_> {
             return Ok(Proxy { host: String::new(), ssl: false, upstream: Arc::new(Upstream::new(Vec::new())), uri: None, url: Some(template), groups: self.upstreams.clone(), implicit: self.implicit.clone() });
         }
         let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
+        if host_port(host, 80).is_some_and(|(_, port)| port == 0) { return Err(format!("invalid port in upstream \"{rest}\"")); }
         // Any other host is an implicit upstream of all its addresses, one for each host and port.
         let implicit = || {
             let (name, port) = host_port(host, if ssl { 443 } else { 80 }).ok_or(())?;
@@ -1374,6 +1410,22 @@ fn once(before: &[Directive], d: &Directive) -> Result<(), String> {
     let Some(b) = before.iter().find(|b| b.name == d.name || b.name == other) else { return Ok(()) };
     let earlier = if b.name == other { format!(", \"{other}\" directive was specified earlier") } else { String::new() };
     Err(format!("\"{}\" directive is duplicate{earlier} in {}", d.name, d.at))
+}
+
+/// What a location is, for the locations inside it.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind { Prefix, Exact, Named, Regex }
+
+/// Refuses a location inside another where nginx's ngx_http_core_location() does: inside an exact
+/// or a named one, a named one inside any, and one that is not a regular expression and does not
+/// begin with the name of the location around it.
+fn nested(kind: &Match, path: &str, around: Option<(Kind, &str)>) -> Result<(), String> {
+    let Some((outer, name)) = around else { return Ok(()) };
+    if outer == Kind::Exact { return Err(format!("location \"{path}\" cannot be inside the exact location \"{name}\"")); }
+    if outer == Kind::Named { return Err(format!("location \"{path}\" cannot be inside the named location \"{name}\"")); }
+    if matches!(kind, Match::Named) { return Err(format!("named location \"{path}\" can be on the server level only")); }
+    if !matches!(kind, Match::Regex(_)) && !path.starts_with(name) { return Err(format!("location \"{path}\" is outside location \"{name}\"")); }
+    Ok(())
 }
 
 /// Refuses two locations of a block for the same URI, or the same prefix, as
@@ -1513,6 +1565,7 @@ fn location(args: &[String]) -> Result<(Match, String), String> {
 /// server address [weight=n] [max_fails=n] [fail_timeout=time] [backup] [down] in an upstream block.
 fn peer(args: &[String]) -> Result<Peer, String> {
     let addr = listen(&args[0]).map_err(|_| format!("host not found in upstream \"{}\"", args[0]))?;
+    if addr.port() == 0 { return Err(format!("invalid port in upstream \"{}\"", args[0])); }
     let (mut values, mut backup, mut down) = ([("weight", 1u64), ("max_fails", 1), ("fail_timeout", 10)], false, false);
     for a in &args[1..] {
         if a == "backup" { backup = true; continue; }
@@ -1521,6 +1574,7 @@ fn peer(args: &[String]) -> Result<Peer, String> {
         let (name, value) = a.split_once('=').ok_or_else(invalid)?;
         let slot = values.iter_mut().find(|v| v.0 == name).ok_or_else(invalid)?;
         slot.1 = value.trim_end_matches('s').parse().map_err(|_| invalid())?;
+        if name == "weight" && slot.1 == 0 { return Err(invalid()); }
     }
     let [weight, max_fails, fail_timeout] = values.map(|v| v.1);
     Ok(Peer { addr, weight: weight as i64, max_fails, fail_timeout, backup, down })
@@ -1569,6 +1623,8 @@ fn seconds(s: &str) -> Result<Duration, String> {
 /// What a server_name argument matches: ".name" is both "name" and "*.name".
 /// The named captures of a regular expression become variables.
 fn server_name(n: &str) -> Result<Vec<ServerName>, String> {
+    if n.starts_with('*') && (n.len() < 3 || !n[1..].starts_with('.')) || n == "." { return Err(format!("server name \"{n}\" is invalid")); }
+    if n == "~" { return Err(format!("empty regex in server name \"{n}\"")); }
     let lower = n.to_lowercase();
     if let Some(re) = n.strip_prefix('~') {
         let re = regex::Regex::new(&format!("(?i){}", pcre(re))).map_err(|e| format!("invalid regular expression \"{re}\": {e}"))?;
@@ -1739,7 +1795,8 @@ fn scaled(s: &str, units: &[(&str, u64)]) -> Result<u64, String> {
 }
 
 fn add_header(args: &[String]) -> Result<(String, Template, bool), String> {
-    let always = args.get(2).map(|a| a == "always").unwrap_or(false);
+    if let Some(a) = args.get(2).filter(|a| *a != "always") { return Err(format!("invalid parameter \"{a}\"")); }
+    let always = args.len() > 2;
     Ok((args[0].clone(), Template::parse(&args[1])?, always))
 }
 
@@ -1749,15 +1806,19 @@ fn error_page(args: &[String]) -> Result<ErrorPage, String> {
     let (url, rest) = args.split_last().unwrap();
     let (status, codes) = match rest.split_last() {
         // "=" alone (0) keeps the status of the answer the URI gives.
-        Some((last, codes)) if last.starts_with('=') => (Some(if last.len() == 1 { 0 } else { last[1..].parse::<u16>().unwrap_or(302) }), codes),
+        Some((last, codes)) if last.starts_with('=') => {
+            let status = if last.len() == 1 { 0 } else { last[1..].parse::<u16>().map_err(|_| format!("invalid value \"{last}\""))? };
+            (Some(status), codes)
+        }
         _ => (None, rest),
     };
-    let codes = codes.iter().map(|c| c.parse::<u16>().ok().filter(|c| (300..=599).contains(c)).ok_or_else(|| format!("value \"{c}\" must be between 300 and 599")));
+    let codes = codes.iter().map(|c| c.parse::<u16>().ok().filter(|c| (300..=599).contains(c) && *c != 499).ok_or_else(|| format!("value \"{c}\" must be between 300 and 599")));
     let codes = codes.collect::<Result<Vec<u16>, String>>()?;
     Ok(ErrorPage { codes, status, url: Template::parse(url)? })
 }
 
 fn rewrite(args: &[String]) -> Result<Rewrite, String> {
+    if args[1].is_empty() { return Err("empty replacement".into()); }
     let regex = regex::Regex::new(&args[0]).map_err(|e| format!("invalid regular expression \"{}\": {e}", args[0]))?;
     let flag = args.get(2).map_or("", |f| f.as_str());
     if !["", "last", "break", "redirect", "permanent"].contains(&flag) { return Err(format!("invalid parameter \"{flag}\"")); }
@@ -1781,7 +1842,10 @@ fn ret(args: &[String]) -> Result<(u16, Template), String> {
 /// The addresses of a listen directive: a port range, port-port, stands for every port in it.
 fn listen_ports(arg: &str) -> Result<Vec<SocketAddr>, String> {
     let at = arg.rfind([':', ']']).map_or(0, |i| i + 1);
-    let Some((from, to)) = arg[at..].split_once('-').filter(|_| arg[at..].bytes().all(|b| b.is_ascii_digit() || b == b'-')) else { return listen(arg).map(|a| vec![a]) };
+    let Some((from, to)) = arg[at..].split_once('-').filter(|_| arg[at..].bytes().all(|b| b.is_ascii_digit() || b == b'-')) else {
+        let addr = listen(arg)?;
+        return if addr.port() == 0 { Err(format!("invalid port in \"{arg}\" of the \"listen\" directive")) } else { Ok(vec![addr]) };
+    };
     let port = |p: &str| p.parse::<u16>().ok().filter(|p| *p > 0);
     let (from, to) = port(from).zip(port(to)).ok_or_else(|| format!("invalid port in \"{arg}\" of the \"listen\" directive"))?;
     let host = arg[..at].strip_suffix(':').unwrap_or(&arg[..at]);
@@ -1807,7 +1871,9 @@ mod tests {
     fn build_text(text: &str) -> Result<Config, String> {
         let dir = std::env::temp_dir().join(format!("twinx-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        build(&parse(text, Path::new("t.conf")).unwrap(), &dir)
+        // Every configuration has an events block; the tests leave it out.
+        let events = if text.contains("events") { "" } else { "events { } " };
+        build(&parse(&format!("{events}{text}"), Path::new("t.conf")).unwrap(), &dir)
     }
 
     #[test]
@@ -2483,6 +2549,45 @@ mod tests {
     fn listen_forms() {
         assert_eq!(listen("8080").unwrap(), "0.0.0.0:8080".parse().unwrap());
         assert_eq!(listen("127.0.0.1").unwrap(), "127.0.0.1:80".parse().unwrap());
+    }
+
+    #[test]
+    fn refuses_what_nginx_refuses() {
+        let http = |conf: &str| build_text(&format!("http {{ {conf} server {{ listen 127.0.0.1:8080; }} }}")).err();
+        let server = |conf: &str| build_text(&format!("http {{ server {{ listen 127.0.0.1:8080; {conf} }} }}")).err();
+        let refused = |e: Option<String>, want: &str| assert_eq!(e.as_deref(), Some(format!("{want} in t.conf:1").as_str()));
+        let dir = std::env::temp_dir();
+        assert_eq!(build(&parse("http { }", Path::new("t.conf")).unwrap(), &dir).unwrap_err(), "no \"events\" section in configuration");
+        refused(http("upstream u { }"), "no servers are inside upstream");
+        refused(http("upstream u { server 127.0.0.1:8081 backup; }"), "no servers in upstream \"u\"");
+        refused(http("upstream u { server 127.0.0.1:8081 weight=0; }"), "invalid parameter \"weight=0\"");
+        refused(http("upstream u { server 127.0.0.1:0; }"), "invalid port in upstream \"127.0.0.1:0\"");
+        refused(http("error_page 404 =x /a;"), "invalid value \"=x\"");
+        refused(http("error_page 499 /a;"), "value \"499\" must be between 300 and 599");
+        refused(http("server { listen 127.0.0.1:8080 default_server; } server { listen 127.0.0.1:8080 default; }"), "a duplicate default server for 127.0.0.1:8080");
+        refused(http("server { listen 127.0.0.1:8080 backlog=10; } server { listen 127.0.0.1:8080 reuseport; }"), "duplicate listen options for 127.0.0.1:8080");
+        refused(http("server { listen 127.0.0.1:0; }"), "invalid port in \"127.0.0.1:0\" of the \"listen\" directive");
+        refused(http("server { listen 127.0.0.1:8080 nosuch; }"), "invalid parameter \"nosuch\"");
+        refused(http("server { listen 127.0.0.1:8080 backlog; }"), "invalid parameter \"backlog\"");
+        refused(http("keepalive_timeout 30s1m;"), "\"keepalive_timeout\" directive invalid value");
+        refused(http("add_header X-A b c;"), "invalid parameter \"c\"");
+        refused(server("server_name ~;"), "empty regex in server name \"~\"");
+        refused(server("server_name *a;"), "server name \"*a\" is invalid");
+        refused(server("location /a { location /b { } }"), "location \"/b\" is outside location \"/a\"");
+        refused(server("location = /a { location /a/b { } }"), "location \"/a/b\" cannot be inside the exact location \"/a\"");
+        refused(server("location @a { location /b { } }"), "location \"/b\" cannot be inside the named location \"@a\"");
+        refused(server("location /a { location @b { } }"), "named location \"@b\" can be on the server level only");
+        refused(server("rewrite ^ \"\";"), "empty replacement");
+        refused(server("location / { proxy_pass http://127.0.0.1:0; }"), "invalid port in upstream \"127.0.0.1:0\"");
+        let uri = "\"proxy_pass\" cannot have URI part in location given by regular expression, or inside named location, or inside \"if\" statement, or inside \"limit_except\" block";
+        refused(server("location / { limit_except GET { proxy_pass http://127.0.0.1:8081/a; } }"), uri);
+        refused(server("location / { if ($uri) { proxy_pass http://127.0.0.1:8081/a; } }"), uri);
+        refused(server("location ~ /a { proxy_pass http://127.0.0.1:8081/; }"), uri);
+        // What it takes: the same location, error_page and name twice, a down server,
+        // a regular expression in any location, options for one server of an address.
+        assert!(http("upstream u { server 127.0.0.1:8081 down; } error_page 404 /a; error_page 404 /b;").is_none());
+        assert!(server("server_name a a *.b c.*; location ~ ^/a { location ~ y { } location ^/a/x { } } location ~ ^/a { } location @a { } location @a { proxy_pass http://127.0.0.1:8081; } location /b { location /bc { } } location /p { proxy_pass http://127.0.0.1:8081/p; }").is_none());
+        assert!(http("server { listen 127.0.0.1:8080 default_server backlog=10 ssl http2 deferred; } server { listen 127.0.0.1:8080; }").is_none());
     }
 
     #[test]
