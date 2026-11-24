@@ -159,6 +159,9 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_cache", HSL, 1, 1, false),
     ("proxy_cache_valid", HSL, 1, usize::MAX, false),
     ("proxy_cache_lock", HSL, 1, 1, false),
+    ("proxy_cache_min_uses", HSL, 1, 1, false),
+    ("proxy_cache_use_stale", HSL, 1, usize::MAX, false),
+    ("proxy_no_cache", HSL, 1, usize::MAX, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
     ("proxy_http_version", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
@@ -182,6 +185,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("tcp_nodelay", HSL, 1, 1, false),
     ("gzip_http_version", HSL, 1, 1, false),
     ("gzip_types", HSL, 1, usize::MAX, false),
+    ("gzip_min_length", HSL, 1, 1, false),
     ("limit_rate", HSL | LIF, 1, 1, false),
     ("proxy_limit_rate", HSL, 1, 1, false),
     ("limit_rate_after", HSL | LIF, 1, 1, false),
@@ -194,6 +198,7 @@ const REPEATED: &[&str] = &[
     "error_log", "index", "server", "upstream", "listen", "server_name", "location", "return", "break", "set", "if", "rewrite", "log_format", "access_log", "add_header", "add_trailer", "keepalive_disable", "error_page",
     "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_next_upstream",
     "proxy_cookie_domain", "proxy_cookie_path", "proxy_redirect", "proxy_cookie_flags", "gzip_types", "proxy_cache_path", "proxy_cache_valid",
+    "proxy_no_cache",
 ];
 
 const COMBINED: &str =
@@ -452,6 +457,13 @@ pub struct Level {
     pub proxy_cache_lock: bool,
     /// proxy_cache_valid: for how long answers of each status (None: any) are valid.
     pub proxy_cache_valid: Vec<(Option<u16>, Duration)>,
+    /// proxy_cache_min_uses: how many requests ask for a key before its answer is cached.
+    pub proxy_cache_min_uses: u64,
+    /// proxy_cache_use_stale: when an answer no longer valid is given rather than the
+    /// server's ("error", "timeout", "http_500", ...).
+    pub proxy_cache_use_stale: Vec<String>,
+    /// proxy_no_cache: the answer is not cached when one of these is neither empty nor "0".
+    pub proxy_no_cache: Vec<Template>,
     /// proxy_buffers: the number and the size of the buffers the body is read into.
     pub proxy_buffers: (usize, usize),
     /// proxy_busy_buffers_size: how much of those is written at once, twice the size of
@@ -479,6 +491,8 @@ pub struct Level {
     pub gzip_types: Vec<String>,
     pub gunzip: bool,
     pub gzip_vary: bool,
+    /// gzip_min_length: the shortest answer, by its length, that is compressed.
+    pub gzip_min_length: u64,
     /// gzip_http_version 1.1 (the default): HTTP/1.0 requests are not given gzip.
     pub gzip_http_11: bool,
     /// resolver: what looks up the names of proxy_pass URLs with variables,
@@ -806,7 +820,7 @@ impl Builder<'_> {
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let (temp, proxy_temp) = (self.path("client_body_temp"), self.path("proxy_temp"));
         // Without root, files come from html under the prefix, as nginx's default root is.
-        let mut level = Level { error_log: self.errors.clone(), root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
+        let mut level = Level { error_log: self.errors.clone(), root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, gzip_min_length: 20, proxy_cache_min_uses: 1, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, lingering_close: Some(false),
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), sendfile_max_chunk: 2 << 20, tcp_nodelay: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -1078,6 +1092,16 @@ impl Builder<'_> {
                     level.proxy_cache_valid = valid.collect::<Result<Vec<_>, _>>()?.concat();
                 }
                 "proxy_cache_lock" => level.proxy_cache_lock = flag(d).map_err(at)?,
+                "proxy_cache_min_uses" => level.proxy_cache_min_uses = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
+                "proxy_cache_use_stale" => {
+                    const VALUES: &[&str] = &["error", "timeout", "invalid_header", "updating", "http_500", "http_502", "http_503", "http_504", "http_403", "http_404", "http_429", "off"];
+                    if let Some(a) = d.args.iter().find(|a| !VALUES.contains(&a.as_str())) { return Err(at(format!("invalid value \"{a}\""))); }
+                    level.proxy_cache_use_stale = if d.args.iter().any(|a| a == "off") { Vec::new() } else { d.args.clone() };
+                }
+                "proxy_no_cache" => {
+                    let all = block.iter().filter(|v| v.name == "proxy_no_cache").flat_map(|v| v.args.iter().map(move |a| Template::parse(a).map_err(|e| format!("{e} in {}", v.at))));
+                    level.proxy_no_cache = all.collect::<Result<_, _>>()?;
+                }
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
                 "proxy_http_version" => {
                     let version = ["1.0", "1.1", "2"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\"", d.args[0])))?;
@@ -1140,6 +1164,7 @@ impl Builder<'_> {
                 }
                 "gzip_types" => level.gzip_types = d.args.iter().map(|t| t.to_ascii_lowercase()).collect(),
                 "gzip_vary" => level.gzip_vary = flag(d).map_err(at)?,
+                "gzip_min_length" => level.gzip_min_length = size(&d.args[0]).map_err(at)?,
                 "sendfile" => level.sendfile = flag(d).map_err(at)?,
                 "sendfile_max_chunk" => level.sendfile_max_chunk = size(&d.args[0]).map_err(|_| invalid())?,
                 "tcp_nopush" => level.tcp_nopush = flag(d).map_err(at)?,

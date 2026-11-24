@@ -27,6 +27,8 @@ pub struct Shared {
     pub unparsed: std::sync::OnceLock<String>,
     /// The trailers of a proxied server's answer that proxy_pass_trailers passes.
     pub trailers: std::sync::Mutex<Vec<(String, String)>>,
+    /// How the cache answered the request: MISS, HIT, EXPIRED, STALE ($upstream_cache_status).
+    pub cache_status: std::sync::Mutex<Option<&'static str>>,
 }
 
 /// What a request carries, as the variables see it.
@@ -208,6 +210,7 @@ pub enum Var {
     IsRequestPort,
     UpstreamAddr,
     UpstreamStatus,
+    UpstreamCacheStatus,
     /// $upstream_connect_time (0), $upstream_header_time (1), $upstream_response_time (2).
     UpstreamTime(usize),
     UpstreamBytes(usize),
@@ -261,7 +264,7 @@ impl Var {
             ("server_addr", Var::ServerAddr), ("server_port", Var::ServerPort), ("remote_user", Var::RemoteUser), ("request", Var::Request), ("host", Var::Host),
             ("request_uri", Var::RequestUri), ("args", Var::Args), ("request_body", Var::RequestBody), ("request_body_file", Var::RequestBodyFile),
             ("connection_requests", Var::ConnectionRequests), ("connection_time", Var::ConnectionTime),
-            ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("upstream_status", Var::UpstreamStatus), ("pid", Var::Pid),
+            ("request_port", Var::RequestPort), ("is_request_port", Var::IsRequestPort), ("upstream_addr", Var::UpstreamAddr), ("upstream_status", Var::UpstreamStatus), ("upstream_cache_status", Var::UpstreamCacheStatus), ("pid", Var::Pid),
             ("upstream_connect_time", Var::UpstreamTime(0)), ("upstream_header_time", Var::UpstreamTime(1)), ("upstream_response_time", Var::UpstreamTime(2)),
             ("upstream_response_length", Var::UpstreamBytes(0)), ("upstream_bytes_received", Var::UpstreamBytes(1)), ("upstream_bytes_sent", Var::UpstreamBytes(2)),
             ("proxy_host", Var::ProxyHost), ("proxy_port", Var::ProxyPort), ("proxy_add_x_forwarded_for", Var::ProxyAddXForwardedFor),
@@ -336,6 +339,7 @@ impl Var {
             Var::User(name) => r.shared.vars.lock().unwrap().iter().find(|v| v.0 == *name)?.1.clone(),
             Var::UpstreamAddr => s.upstream_addr.clone().or_else(|| r.upstream_addr.clone())?,
             Var::UpstreamStatus => s.upstream_status.clone().or_else(|| r.upstream_status.clone())?,
+            Var::UpstreamCacheStatus => r.shared.cache_status.lock().unwrap().map(str::to_string)?,
             Var::UpstreamBytes(i) => s.upstream_bytes.as_ref()?.iter().map(|b| b[*i].to_string()).collect::<Vec<_>>().join(", "),
             Var::UpstreamTime(i) => {
                 let time = |t: &[Option<u128>; 3]| t[*i].map_or("-".to_string(), |ms| format!("{}.{:03}", ms / 1000, ms % 1000));
