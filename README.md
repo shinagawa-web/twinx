@@ -26,7 +26,7 @@ Each stage is a list of nginx-tests files (`harness/stages.toml`). A stage is do
 | 2 | What stage 1 left, and gzip | done at v0.2.0 (2026-11-22): the stage 1 files that did not pass at v0.1.0, those that also need the gzip, gunzip or gzip_static modules, and twinx's own tests |
 | 3 | TLS | done at v0.3.0 (2026-11-23): those that also need only http_ssl and the test client's TLS features (40; HTTP/2, HTTP/3, stream and mail wait) |
 | 4 | HTTP/2 | done at v0.4.0 (2026-11-24): those that also need only http_v2 (33; grpc, HTTP/3, caching and other modules wait) |
-| 5 | Caching (proxy_cache), and kept connections to servers | those that also need only cache and upstream_keepalive (30; fastcgi, grpc, HTTP/3 and other modules wait) |
+| 5 | Caching (proxy_cache), and kept connections to servers | those that also need only cache and upstream_keepalive (30; fastcgi, grpc, HTTP/3 and other modules wait), and twinx's own tests of behaviour nginx-tests does not check (29) |
 
 ## The automated loop
 
