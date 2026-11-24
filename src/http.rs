@@ -1284,13 +1284,15 @@ fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
 /// Several ranges (multipart), which no test needs, are not done yet.
 fn range(r: &Request, level: &Level, resp: &mut Response) {
     let ok = resp.status == 200 && resp.ranges && resp.cut.is_none() && !resp.unknown_length && !http09(r.line.as_bytes());
+    // max_ranges 0: none, and no Accept-Ranges either.
+    if ok && level.max_ranges == Some(0) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges")); return; }
     let Some(spec) = header(r, "range").filter(|v| ok && v.len() > 6 && v[..6].eq_ignore_ascii_case("bytes=")).map(|v| v[6..].trim()) else { return };
     let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     let same = |v: &str| if v.len() >= 2 && v.ends_with('"') { sent("etag").as_deref() == Some(v) } else { sent("last-modified").and_then(|t| expires::http_time(&t)).is_some_and(|t| expires::http_time(v) == Some(t)) };
     if !header(r, "if-range").is_none_or(same) { return; }
     let len = resp.len() as u64;
     let ranges = match byte_ranges(spec, len) {
-        Ok(Some(ranges)) if !(resp.single_range && ranges.len() > 1) => ranges,
+        Ok(Some(ranges)) if !(resp.single_range && ranges.len() > 1) && level.max_ranges.is_none_or(|max| ranges.len() <= max) => ranges,
         Ok(_) => return,
         Err(()) => { *resp = Response { headers: vec![("Content-Range".into(), format!("bytes */{len}"))], ..special(416) }; return }
     };
@@ -2377,6 +2379,14 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         (resp.ranges, resp.single_range) = (true, true);
         if resp.cut.is_none() { zone.put((&main, &key), (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid, (vary.unwrap_or_default(), &r.headers)); }
     }
+    // proxy_force_ranges: one range of any other answer is given too, whatever its Accept-Ranges
+    // says, read whole for it.
+    if level.proxy_force_ranges && !resp.ranges {
+        resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
+        if resp.status == 200 { resp.headers.push(("Accept-Ranges".to_string(), "bytes".to_string())); }
+        if resp.status == 200 && header(r, "range").is_some() { finish(&mut resp, (level, r)).await; }
+        (resp.ranges, resp.single_range) = (true, true);
+    }
     resp
 }
 
@@ -3137,6 +3147,19 @@ pub(crate) mod tests {
             let size = size_of_val(&future);
             assert!(size < 4096, "{size} bytes");
         });
+    }
+
+    #[test]
+    fn max_ranges_limits_ranges() {
+        let ranged = |max, h: &str| {
+            let mut resp = Response { status: 200, body: b"0123456789".to_vec(), ranges: true, headers: vec![("Accept-Ranges".into(), "bytes".into())], ..Response::default() };
+            range(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, &Level { max_ranges: max, ..Level::default() }, &mut resp);
+            (resp.status, resp.headers.len())
+        };
+        assert_eq!(ranged(Some(0), "Range: bytes=1-2"), (200, 0));
+        assert_eq!(ranged(Some(1), "Range: bytes=1-2,4-5"), (200, 1));
+        assert_eq!(ranged(Some(2), "Range: bytes=1-2,4-5").0, 206);
+        assert_eq!(ranged(None, "Range: bytes=1-2").0, 206);
     }
 
     #[test]

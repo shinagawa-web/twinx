@@ -170,6 +170,8 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_cache_background_update", HSL, 1, 1, false),
     ("proxy_cache_convert_head", HSL, 1, 1, false),
     ("proxy_cache_revalidate", HSL, 1, 1, false),
+    ("proxy_force_ranges", HSL, 1, 1, false),
+    ("max_ranges", HSL, 1, 1, false),
     ("proxy_ignore_headers", HSL, 1, usize::MAX, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
     ("proxy_http_version", HSL, 1, 1, false),
@@ -503,6 +505,11 @@ pub struct Level {
     /// proxy_cache_revalidate: what is kept but no longer valid is asked for with the
     /// conditions of its Last-Modified and ETag, and kept again when the server says 304.
     pub proxy_cache_revalidate: bool,
+    /// proxy_force_ranges: ranges of a proxied answer are given whatever its Accept-Ranges says.
+    pub proxy_force_ranges: bool,
+    /// max_ranges: how many ranges a request may ask for before it is given the whole
+    /// answer; 0 gives no ranges at all (none: no limit).
+    pub max_ranges: Option<usize>,
     /// proxy_ignore_headers: the headers of proxied answers that are not acted on, lowercase.
     pub proxy_ignore_headers: Vec<String>,
     /// proxy_buffers: the number and the size of the buffers the body is read into.
@@ -1153,6 +1160,8 @@ impl Builder<'_> {
                 "proxy_cache_background_update" => level.proxy_cache_background_update = flag(d).map_err(at)?,
                 "proxy_cache_convert_head" => level.proxy_cache_convert_head = flag(d).map_err(at)?,
                 "proxy_cache_revalidate" => level.proxy_cache_revalidate = flag(d).map_err(at)?,
+                "proxy_force_ranges" => level.proxy_force_ranges = flag(d).map_err(at)?,
+                "max_ranges" => level.max_ranges = Some(d.args[0].parse().map_err(|_| at("invalid number".into()))?),
                 // All of those of a level replace those it inherits.
                 "proxy_ignore_headers" => {
                     const VALUES: &[&str] = &["x-accel-redirect", "x-accel-expires", "x-accel-limit-rate", "x-accel-buffering", "x-accel-charset", "expires", "cache-control", "set-cookie", "vary"];
@@ -1826,6 +1835,10 @@ mod tests {
         let c = build_text("http { proxy_cache_convert_head off; server { location / { proxy_cache_convert_head on; } } }").unwrap();
         assert_eq!((c.servers[0].level.proxy_cache_convert_head, c.servers[0].locations[0].level.proxy_cache_convert_head), (false, true));
         assert!(build_text("http { server { } }").unwrap().servers[0].level.proxy_cache_convert_head);
+        let c = build_text("http { proxy_force_ranges on; max_ranges 2; server { location / { max_ranges 0; } } }").unwrap();
+        let (server, location) = (&c.servers[0].level, &c.servers[0].locations[0].level);
+        assert_eq!((server.proxy_force_ranges, server.max_ranges, location.proxy_force_ranges, location.max_ranges), (true, Some(2), true, Some(0)));
+        assert!(build_text("http { max_ranges x; }").is_err());
         let c = build_text("http { proxy_cache_revalidate on; server { location / { proxy_cache_revalidate off; } } }").unwrap();
         assert_eq!((c.servers[0].level.proxy_cache_revalidate, c.servers[0].locations[0].level.proxy_cache_revalidate), (true, false));
         assert!(!build_text("http { server { } }").unwrap().servers[0].level.proxy_cache_revalidate);
