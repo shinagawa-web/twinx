@@ -1,0 +1,86 @@
+name: baseline
+
+# Measures main whenever it changes, as harness/judge.sh does, and saves the
+# results in the cache under the key judge.yml restores, so the judge need not
+# measure the same commit again for every pull request. judge.yml cannot save
+# them itself: runs on pull_request_target may only read the cache, and runs on
+# a push to main may write it. Where the results are missing (this run is still
+# going, failed, or the cache was evicted), the judge measures main itself.
+#
+# Only main's code runs here, and as in the judge only in containers
+# (harness/judge.sh); the results are written on the runner, by the harness.
+
+# No paths-ignore: the key is main's commit, so a push that only changes
+# documents needs results under its own commit too.
+on:
+  push:
+    branches: [main]
+
+# A newer push makes the older commit's results useless: the judge measures
+# pull requests only against main as it is when the judge starts, and main's
+# ruleset wants every branch up to date with main. Cancelling the older run
+# starts the newer one at once instead of after it. A judge run that started
+# on the older commit and did not find its results is measuring it by itself.
+concurrency:
+  group: baseline
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      TWINX_REPO: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Keep main's harness, as the judge does
+        id: base
+        run: |
+          cp -r harness "$RUNNER_TEMP/harness"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "JUDGE_DIR=$RUNNER_TEMP/judge" >> "$GITHUB_ENV"
+
+      # ssl_ktls.t runs only where the kernel's TLS module is loaded, and runners
+      # differ in that; loading it here makes nginx run the file on every runner.
+      - name: Load the kernel's TLS module
+        run: sudo modprobe tls && test -r /proc/net/tls_stat
+
+      # The path list is part of what the cache is found by: it has to be the one in
+      # judge.yml's "Restore main's results", in the same order, here and below.
+      - name: Look for main's results, there already when a run is started again
+        id: baseline-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ runner.temp }}/judge/out/reference.json
+            ${{ runner.temp }}/judge/out/baseline.json
+            ${{ runner.temp }}/judge/out/unit-main.json
+          key: nginx-tests-unit-${{ steps.base.outputs.sha }}
+          lookup-only: true
+
+      - name: Run nginx-tests against nginx and against main
+        if: steps.baseline-cache.outputs.cache-hit != 'true'
+        run: '"$RUNNER_TEMP/harness/judge.sh" baseline'
+
+      # judge.sh baseline goes on when main does not build, and then no subtest passes
+      # on main. Once saved, such results (a failed download is enough) would stand for
+      # every pull request until main changes, and no regression would be seen.
+      - name: Check that main was built
+        if: steps.baseline-cache.outputs.cache-hit != 'true'
+        run: test -x "$JUDGE_DIR/main/target/release/twinx"
+
+      - name: Save main's results
+        if: steps.baseline-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/judge/out/reference.json
+            ${{ runner.temp }}/judge/out/baseline.json
+            ${{ runner.temp }}/judge/out/unit-main.json
+          key: nginx-tests-unit-${{ steps.base.outputs.sha }}
