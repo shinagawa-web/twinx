@@ -1013,6 +1013,8 @@ impl Builder<'_> {
     /// access_log and error_log replace what the level above set as a whole.
     fn level(&mut self, block: &[Directive], ctx: u16, level: &mut Level) -> Result<(), String> {
         let mut logs: Option<Vec<Arc<AccessLog>>> = None;
+        // The rewrite, return and break inherited, the server's: a limit_except block has only those.
+        let inherited = level.rewrite.len();
         let mut errors: Option<Vec<(Arc<File>, usize)>> = None;
         let (mut headers, mut trailers): (Option<Vec<(String, Template, bool)>>, Option<Vec<_>>) = (None, None);
         let mut pages: Option<Vec<ErrorPage>> = None;
@@ -1338,9 +1340,11 @@ impl Builder<'_> {
             let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
             if let Op::If(_, body, to) = &mut script[i] { (*body, *to) = (std::mem::take(&mut inner.script), (ctx != SRV || inner.rewrite.iter().any(|s| matches!(s, Step::Return(..)))).then(|| Arc::new(inner))); }
         }
-        // A limit_except block inherits the location's settings, but not its set and if, which do not run there.
+        // A limit_except block inherits the location's settings, but not its set, if,
+        // rewrite, return and break, which do not run there.
         if let Some((methods, d)) = limit {
             let mut inner = Level { script: Vec::new(), ..level.clone() };
+            inner.rewrite.truncate(inherited);
             self.level(d.block.as_deref().unwrap_or_default(), LMT, &mut inner)?;
             level.limit_except = Some((methods, Arc::new(inner)));
         }
@@ -2630,6 +2634,11 @@ mod tests {
         let redirect = s.locations[0].level.proxy_redirect.as_ref().unwrap();
         assert!(matches!(&redirect[0].pattern, CookiePattern::Text(t) if matches!(&t.0[..], [Part::Text(u)] if u == "https://127.0.0.1/u")));
         assert_eq!(s.locations[1].level.limit_except.as_ref().unwrap().0, ["GET", "HEAD"]);
+        // Only the server's rewrite, return and break go on in a limit_except block.
+        let c = build_text("http { server { break; location / { return 200; limit_except GET { } } } }").unwrap();
+        let level = &c.servers[0].locations[0].level;
+        assert_eq!(level.rewrite.len(), 2);
+        assert!(matches!(level.limit_except.as_ref().unwrap().1.rewrite[..], [Step::Break]));
     }
 
     #[test]

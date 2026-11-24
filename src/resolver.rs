@@ -71,8 +71,12 @@ impl Resolver {
     }
 
     /// The addresses of a name, None when it cannot be resolved within the timeout.
+    /// As in nginx, one dot at its end is left out, and a name with an empty
+    /// label or one longer than 255 bytes is not found, without a query.
     pub async fn resolve(&self, name: &str, timeout: Duration) -> Option<Vec<IpAddr>> {
-        self.lookup(&name.to_ascii_lowercase(), Instant::now() + timeout, 0).await.map(|(addrs, _)| addrs)
+        let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+        if !queried(&name) { return None; }
+        self.lookup(&name, Instant::now() + timeout, 0).await.map(|(addrs, _)| addrs)
     }
 
     async fn lookup(&self, name: &str, deadline: Instant, depth: usize) -> Option<(Vec<IpAddr>, Instant)> {
@@ -143,6 +147,11 @@ async fn tcp(server: &SocketAddr, query: &[u8], deadline: Instant) -> Option<Vec
         Some(answer)
     };
     tokio::time::timeout_at(deadline.into(), exchange).await.ok()?
+}
+
+/// Whether a query can be made for a name: each of its labels has 1 to 255 bytes.
+fn queried(name: &str) -> bool {
+    name.split('.').all(|l| (1..=255).contains(&l.len()))
 }
 
 /// A query for the records of a type of a name, with recursion desired.
@@ -226,6 +235,12 @@ mod tests {
             m.extend_from_slice(rdata);
         }
         m
+    }
+
+    #[test]
+    fn names_queried() {
+        assert!(queried("a.example.com") && queried(&"d".repeat(255)));
+        for name in ["", "a.example.com.", ".a.b", "a..b", &"d".repeat(256)] { assert!(!queried(name), "{name}"); }
     }
 
     #[test]

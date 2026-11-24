@@ -189,6 +189,16 @@ fn lines_end(buf: &[u8], mut at: usize) -> Option<usize> {
     }
 }
 
+/// The status line of a proxied server's answer from its code to the end, without
+/// CR and LF: the code, and the reason as it is, if any.
+fn status_line(answer: &[u8]) -> Box<[u8]> {
+    let line = &answer[..line_end(answer).unwrap_or(answer.len())];
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let after = line.get("HTTP/1.x".len()..).unwrap_or_default();
+    after[after.iter().take_while(|&&b| b == b' ').count()..].into()
+}
+
 /// Where the first line of the buffer ends, after its LF, if that has come.
 fn line_end(buf: &[u8]) -> Option<usize> {
     // SAFETY: memchr() reads the buffer's length from its start, and gives a
@@ -608,7 +618,7 @@ struct Response {
     single_range: bool,
     /// How many Content-Range headers it had before add_header: those of the proxied
     /// server, the last of which nginx keeps as the answer's (r->headers_out.content_range).
-    content_ranges: usize,
+    content_ranges: u32,
     /// Whether a Location that starts with "/" is sent as it is: one a proxied
     /// server sent and proxy_redirect did not rewrite.
     relative: bool,
@@ -624,6 +634,10 @@ struct Response {
     told: Option<Option<usize>>,
     /// Whether it is a proxied answer that is not buffered, which limit_rate does not pace.
     unbuffered: bool,
+    /// The status line of a proxied server's answer from its code on, which is sent as it
+    /// is while the status stays that code (r->headers_out.status_line). Boxed
+    /// twice, a thin pointer, to keep the answer small.
+    status_line: Option<Box<Box<[u8]>>>,
 }
 
 impl Response {
@@ -1066,7 +1080,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
             redirected = to;
             (resp, level, last) = Box::pin(answer(server, &redirected, Ok(()), found, Some(&mut *stream))).await;
-            if !resp.generated && status != 0 { resp.status = status; }
+            if !resp.generated && status != 0 { (resp.status, resp.status_line) = (status, None); }
             // A redirect the new answer makes replaces the Location kept.
             let own = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("location"));
             resp.headers.splice(0..0, kept.into_iter().filter(|h| !own || !h.0.eq_ignore_ascii_case("location")));
@@ -1117,7 +1131,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         sent.upstream_time.iter_mut().filter_map(|t| t.last_mut()).for_each(|t| t[2] = None);
         sent
     };
-    resp.content_ranges = resp.headers.iter().filter(|h| h.0.eq_ignore_ascii_case("content-range")).count();
+    resp.content_ranges = resp.headers.iter().filter(|h| h.0.eq_ignore_ascii_case("content-range")).count() as u32;
     for (name, value, _) in level.add_header.iter().filter(|h| h.2 || added) {
         let value = value.render(r, &at_head(&resp));
         // These replace what the response has, and an empty value removes it.
@@ -1186,9 +1200,13 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown) && !upgraded;
     let mut out = buffer();
     if !silent && !http09(r.line.as_bytes()) {
+        // A proxied server's status line is sent as it is, while the status is its code.
+        match resp.status_line.as_deref().map(|l| &**l).filter(|line| line.starts_with(status.to_string().as_bytes())) {
+            Some(line) => out.extend_from_slice(&[b"HTTP/1.1 ", line, b"\r\n"].concat()),
+            None => out.extend_from_slice(format!("HTTP/1.1 {status} {}\r\n", reason(status)).as_bytes()),
+        }
         let mut add = |parts: &[&str]| parts.iter().for_each(|p| out.extend_from_slice(p.as_bytes()));
         let server = if level.server_tokens { NAME } else { "twinx" };
-        add(&["HTTP/1.1 ", decimal(&mut [0; 20], status.into()), " ", reason(status), "\r\n"]);
         // Those proxy_pass_header passes are the proxied server's, among its other headers, or none.
         let passes = |name: &str| resp.proxied && level.proxy_pass_header.iter().any(|p| p == name);
         if !passes("server") { add(&["Server: ", server, "\r\n"]); }
@@ -1357,7 +1375,7 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
     // The answer's Content-Range, if the proxied server gave one, is replaced where it is
     // for one range, and removed for several.
-    let given = resp.content_ranges.checked_sub(1).and_then(|n| resp.headers.iter().enumerate().filter(|h| h.1.0.eq_ignore_ascii_case("content-range")).nth(n).map(|h| h.0));
+    let given = resp.content_ranges.checked_sub(1).and_then(|n| resp.headers.iter().enumerate().filter(|h| h.1.0.eq_ignore_ascii_case("content-range")).nth(n as usize).map(|h| h.0));
     if let Some(i) = given { resp.headers.remove(i); }
     if let [(start, end)] = ranges[..] {
         resp.headers.insert(given.unwrap_or(resp.headers.len()), ("Content-Range".into(), format!("bytes {start}-{}/{len}", end - 1)));
@@ -2724,7 +2742,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     };
     time[1] = Some(start.elapsed().as_millis());
     let version = head.split(['\r', '\n', ' ']).next().unwrap_or_default();
-    let mut resp = Response { status, proxied: true, ..Response::default() };
+    let mut resp = Response { status, proxied: true, status_line: (!level.proxy_h2).then(|| Box::new(status_line(&answer))), ..Response::default() };
     // Those of the connection, which nginx never passes, and those it hides unless proxy_pass_header passes them.
     const HOP: &[&str] = &["connection", "keep-alive", "transfer-encoding", "content-length"];
     for line in upstream_lines(&head) {
@@ -3624,6 +3642,15 @@ pub(crate) mod tests {
         // Up to the empty line; a line with more CRs is not empty, and one like a status line is ignored.
         assert_eq!(upstream_lines("HTTP/1.1 200\r\nA: b\r\r\nHTTP/1.1 301 x: \0\r\n\r\r\nC\n\r\n").collect::<Vec<_>>(), ["A: b", "", "C"]);
         assert_eq!(upstream_lines("HTTP/1.1 200\nHTTP: b\n\n").collect::<Vec<_>>(), ["HTTP: b"]);
+    }
+
+    #[test]
+    fn status_line_of_a_proxied_answer() {
+        let line = |answer: &[u8]| status_line(answer).to_vec();
+        assert_eq!(line(b"HTTP/1.1 200 Fine\r\nA: b\r\n\r\n"), b"200 Fine");
+        assert_eq!(line(b"HTTP/1.0  404  Two  spaces \n\n"), b"404  Two  spaces ");
+        assert_eq!(line(b"HTTP/1.1 200\r\n\r\n"), b"200");
+        assert_eq!(line(b"HTTP/1.1 200 \xff\r\n\r\n"), b"200 \xff");
     }
 
     #[test]
