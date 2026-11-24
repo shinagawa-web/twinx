@@ -802,7 +802,7 @@ async fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Fo
         };
         if rw.redirect { return redirect(rw.status, format!("{uri}{args}")); }
         let target = format!("{uri}{args}");
-        (to.to_mut().target, to.to_mut().uri) = (target, uri);
+        to.to_mut().redirect(uri, target);
         (changed, moved) = (rw.flag != Flag::Break, true);
         if rw.flag != Flag::Next { break; }
     }
@@ -821,7 +821,7 @@ async fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Fo
 /// NGX_ESCAPE_ARGS does in the arguments and in a redirect
 /// (ngx_http_script_copy_capture_code()).
 fn replacement(rw: &Rewrite, r: &Request) -> (String, Option<String>) {
-    let quoted = r.target.split('?').next().unwrap_or_default().contains(['%', '+']);
+    let quoted = r.request_uri().split('?').next().unwrap_or_default().contains(['%', '+']);
     let (mut uri, mut args) = (String::new(), None::<String>);
     for part in &rw.url.0 {
         let value = match part {
@@ -900,9 +900,9 @@ fn unescape_redirect(url: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// "?" and the arguments of the request, or "" when it has none.
+/// "?" and the arguments of the request, or "" when it has none or they are empty.
 fn args(r: &Request) -> &str {
-    r.target.find('?').map_or("", |i| &r.target[i..])
+    r.target.find('?').map(|i| &r.target[i..]).filter(|a| a.len() > 1).unwrap_or_default()
 }
 
 /// Answers one request; when the connection stays open for the next one, how
@@ -925,8 +925,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             let mut to = Box::new(r.clone());
             (to.upstream_addr, to.upstream_status) = (resp.upstream_addr.take(), resp.upstream_status.take());
             if named.is_none() {
-                to.uri = url.split('?').next().unwrap_or_default().to_string();
-                to.target = url;
+                to.redirect(url.split('?').next().unwrap_or_default().to_string(), url);
                 to.method = if r.method == "HEAD" { "HEAD" } else { "GET" }.to_string();
             }
             // The answer is sent with the error's status ("=code" replaces it, "=" leaves the
@@ -1169,8 +1168,8 @@ async fn post_action(server: &Server, r: &Request, level: &Level, client: Option
     let Some(url) = &level.post_action else { return };
     let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && &l.path == url);
     // A named location answers the request as it is; a URI replaces the request's.
-    let uri = || url.split('?').next().unwrap_or_default().to_string();
-    let to = if named.is_some() { r.clone() } else { Request { uri: uri(), target: url.clone(), ..r.clone() } };
+    let mut to = r.clone();
+    if named.is_none() { to.redirect(url.split('?').next().unwrap_or_default().to_string(), url.clone()); }
     let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
     answer(server, &to, Ok(()), found, client).await;
 }
@@ -1714,8 +1713,7 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
         let (prefix, found, auto) = if let Some(l) = named { (l.path.as_str(), &l.level, false) } else {
             let next = to.to_mut();
             if resp.as_get && next.method != "HEAD" { next.method = "GET".to_string(); }
-            next.uri = target.split('?').next().unwrap_or_default().to_string();
-            next.target = target.clone();
+            next.redirect(target.split('?').next().unwrap_or_default().to_string(), target.clone());
             located(server, &to, &to.uri)
         };
         let proxied = &mut false;
@@ -1937,13 +1935,20 @@ fn gunzip(resp: &mut Response) {
     if let Some(cut) = &mut resp.cut { cut.length = None; }
 }
 
+/// The URI a proxied server is sent when proxy_pass has none: the request line's
+/// as it is, else, once another replaced it, that one escaped and its arguments
+/// (r->valid_unparsed_uri).
+fn passed(r: &Request) -> String {
+    if r.shared.unparsed.get().is_none() { r.target.clone() } else { format!("{}{}", escape_uri(&r.uri), args(r)) }
+}
+
 /// Passes the request to the proxied servers in turn, as proxy_http_version
 /// says (1.1 by default) and, as nginx 1.30 does, with no Connection header of
 /// its own, until one answers with a response head.
 async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: Option<&mut Stream>) -> Response {
     let rest = escape_uri(r.uri.get(prefix.len()..).unwrap_or_default());
     let (host, mut uri, up) = match &p.url {
-        None => (p.host.clone(), p.uri.as_ref().map_or_else(|| r.target.clone(), |u| format!("{u}{rest}{}", args(r))), p.upstream.clone()),
+        None => (p.host.clone(), p.uri.as_ref().map_or_else(|| passed(r), |u| format!("{u}{rest}{}", args(r))), p.upstream.clone()),
         Some(url) => match resolved(&url.render(r, &Sent::default()), p, level, r).await {
             Some(t) => t,
             None => return special(502),
@@ -2212,17 +2217,17 @@ fn cookie_value(r: &Request, rw: &CookieRewrite, value: &str, domain: bool) -> O
 async fn resolved(url: &str, p: &Proxy, level: &Level, r: &Request) -> Option<(String, String, Arc<Upstream>)> {
     let rest = url.strip_prefix("http://")?;
     let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
-    if let Some(up) = p.groups.get(host) { return Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), up.clone())); }
+    if let Some(up) = p.groups.get(host) { return Some((host.to_string(), uri.unwrap_or_else(|| passed(r)), up.clone())); }
     let (name, port) = crate::conf::host_port(host, 80)?;
     // As in nginx, the implicit upstream of a proxy_pass with this host and port comes before the resolver.
     let implicit = p.implicit.lock().unwrap().get(&format!("{}:{port}", name.to_ascii_lowercase())).cloned();
-    if let Some(up) = implicit { return Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), up)); }
+    if let Some(up) = implicit { return Some((host.to_string(), uri.unwrap_or_else(|| passed(r)), up)); }
     let addrs = match name.parse::<IpAddr>() {
         Ok(a) => vec![a],
         Err(_) => level.resolver.as_ref()?.resolve(name, level.resolver_timeout).await?,
     };
     let peers = addrs.into_iter().map(|a| Peer::new(SocketAddr::new(a, port))).collect();
-    Some((host.to_string(), uri.unwrap_or_else(|| r.target.clone()), Arc::new(Upstream::new(peers))))
+    Some((host.to_string(), uri.unwrap_or_else(|| passed(r)), Arc::new(Upstream::new(peers))))
 }
 
 /// Sends a request to one server and reads its whole answer, noting how long
@@ -2716,7 +2721,7 @@ fn dots(path: &str) -> Option<String> {
 /// does: control characters, space, `"#%<>?\^`{|}` and bytes above 0x7e.
 fn escape_uri(s: &str) -> String {
     let plain = |c: u8| c > 0x20 && c < 0x7f && !b"\"#%<>?\\^`{|}".contains(&c);
-    s.bytes().map(|c| if plain(c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
+    crate::vars::bytes(s).into_iter().map(|c| if plain(c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
 }
 
 /// The server that answers on a listening address, and the named captures of
@@ -6319,6 +6324,58 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(request("GET / HTTP/1.0\nIf-Match: a\nif-match: b\n\n").0, Err(400));
         assert_eq!(request("GET / HTTP/1.0\nAuthorization: a\nAuthorization: a\n\n").0, Err(400));
         assert_eq!(request("GET / HTTP/1.0\nCookie: a\nCookie: b\nVia: x\nVia: y\n\n").0, Ok(()));
+    }
+
+    #[test]
+    fn request_uri_is_that_of_the_request_line_after_redirects() {
+        // A server that answers with the request line it got, or redirects to /out.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for s in listener.incoming() {
+                let (mut s, mut req, mut chunk) = (s.unwrap(), Vec::new(), [0u8; 1024]);
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = s.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    req.extend_from_slice(&chunk[..n]);
+                }
+                let req = String::from_utf8(req).unwrap();
+                let to = if req.contains(" /xa") { "X-Accel-Redirect: /out?x=1\r\n" } else { "" };
+                let of = req.split("\r\n").find_map(|l| l.strip_prefix("X-Of: ")).unwrap_or_default();
+                let line = req.split(" HTTP/").next().unwrap();
+                s.write_all(format!("HTTP/1.1 200 OK\r\n{to}\r\n{line}|{of}").as_bytes()).unwrap();
+            }
+        });
+        let dir = files("request-uri");
+        std::fs::create_dir_all(dir.join("i")).unwrap();
+        std::fs::write(dir.join("i/index.html"), "").unwrap();
+        let text = format!("http {{ server {{ root {}; proxy_set_header X-Of $request_uri; location /out {{ return 200 \"$request_uri $uri $args\"; }} \
+            location /rw {{ rewrite ^ /out?x=1 last; }} location /two {{ rewrite ^ /ep?y=2 last; }} location /break {{ rewrite ^ /out; return 200 \"$request_uri $uri $args\"; }} \
+            location /ep {{ error_page 404 = /out; }} location /tf {{ try_files /none /out; }} location /en {{ error_page 404 = @n; }} location /tn {{ try_files /none @n; }} \
+            location @n {{ proxy_pass http://{addr}; }} location = /i/index.html {{ return 200 \"$request_uri $uri $args\"; }} location /xa {{ proxy_pass http://{addr}; }} \
+            location /if {{ rewrite ^ /fi?x=1 last; }} location /fi {{ set $was no; if ($request_uri ~ ^/if) {{ set $was if; }} return 200 $was; }} \
+            location /px/ {{ proxy_pass http://{addr}; }} location /pu/ {{ proxy_pass http://{addr}/base/; }} location /pv/ {{ set $to {addr}; proxy_pass http://$to; }} \
+            location /rx/ {{ rewrite ^/rx(/(.|\\n)*)$ /px$1?x=1 last; }} location /ru/ {{ rewrite ^/ru(.*)$ /pu$1 last; }} location /rv/ {{ rewrite ^/rv(.*)$ /pv$1 last; }} \
+            location /rn/ {{ rewrite ^/rn(.*)$ /tn$1 last; }} location /bx/ {{ rewrite ^/bx(.*)$ /b$1 break; proxy_pass http://{addr}; }} \
+            location /ta {{ try_files /none /px/t?$args; }} location /q/ {{ rewrite ^/q/(.*)$ /r/$1 last; }} location /p/ {{ rewrite ^/p/(.*)$ /r/+$1 last; }} \
+            location /r/ {{ rewrite ^/r/(.*)$ /out?z=$1 last; }} }} }}", dir.display());
+        let config = crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        for (target, body) in [
+            ("/rw", "/rw /out x=1"), ("/rw?q=2", "/rw?q=2 /out x=1&q=2"), ("/two?q=2", "/two?q=2 /out "), ("/break?q=2", "/break?q=2 /out q=2"),
+            ("/ep?q=2", "/ep?q=2 /out "), ("/tf?q=2", "/tf?q=2 /out "), ("/i/?q=2", "/i/?q=2 /i/index.html q=2"), ("/xa?q=2", "/xa?q=2 /out x=1"), ("/if", "if"),
+            // A named location, which leaves the URI, passes the request line's.
+            ("/en/%61?q=2", "GET /en/%61?q=2|/en/%61?q=2"), ("/tn/%61?", "GET /tn/%61?|/tn/%61?"), ("/px/%61?", "GET /px/%61?|/px/%61?"),
+            // A URI that replaced it is passed escaped, without a "?" that nothing follows.
+            ("/rx/a%20b%0D%0AX:%201?q=2", "GET /px/a%20b%0D%0AX:%201?x=1&q=2|/rx/a%20b%0D%0AX:%201?q=2"), ("/ru/a%20b?q=2", "GET /base/a%20b?q=2|/ru/a%20b?q=2"),
+            ("/rv/a%20b", "GET /pv/a%20b|/rv/a%20b"), ("/rn/a%20b", "GET /tn/a%20b|/rn/a%20b"), ("/bx/a%20b?", "GET /b/a%20b|/bx/a%20b?"),
+            ("/ta", "GET /px/t|/ta"), ("/ta?", "GET /px/t|/ta?"), ("/ta?q=2", "GET /px/t?q=2|/ta?q=2"), ("/pu/a?", "GET /base/a|/pu/a?"),
+            // Whether a capture is escaped in the arguments depends on the request line's.
+            ("/q/a%26b?q=2", "/q/a%26b?q=2 /out z=a%26b&q=2"), ("/p/a", "/p/a /out z=+a"),
+        ] {
+            let got = exchanged(&config.servers[0], target);
+            assert_eq!(got.split_once("\r\n\r\n").map(|a| a.1), Some(body), "{target}");
+        }
+        assert_eq!(escape_uri(&crate::vars::text(b"/\xff\xc3\xa9")), "/%FF%C3%A9");
     }
 
     #[test]
