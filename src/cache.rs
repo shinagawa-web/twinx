@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A cached answer: its status, Content-Type, headers and body, until when (in seconds
 /// since the epoch) it is valid, and for how long after that it may be given while it
@@ -82,6 +82,8 @@ pub struct Zone {
     entries: Mutex<HashMap<String, Entry>>,
     /// proxy_cache_lock: what a request that asks the server for a key holds meanwhile.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// When the request that asks the server for each key last began to (proxy_cache_lock_age).
+    since: Mutex<HashMap<String, Instant>>,
     /// How many requests asked for each key (proxy_cache_min_uses).
     uses: Mutex<HashMap<String, u64>>,
 }
@@ -113,11 +115,23 @@ impl Zone {
         self.entries.lock().unwrap().insert(key, Entry { status, ctype, headers, body, until, updating });
     }
 
-    /// Waits, for so long at most, until no other request asks the server for the key, and
-    /// holds that until what it gives is dropped; None when the time ran out.
-    pub async fn lock(&self, key: &str, wait: Duration) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    /// Waits, for so long at most (proxy_cache_lock_timeout), until no other request asks the
+    /// server for the key, and holds that until what it gives is dropped; None when the time ran
+    /// out. Once the request that asks has been at it for so long (proxy_cache_lock_age), this one
+    /// asks in its place without holding anything: Some(None).
+    pub async fn lock(&self, key: &str, wait: Duration, age: Duration) -> Option<Option<tokio::sync::OwnedMutexGuard<()>>> {
         let lock = self.locks.lock().unwrap().entry(key.to_string()).or_default().clone();
-        crate::stream::within(Some(wait), lock.lock_owned()).await
+        let deadline = Instant::now() + wait;
+        let since = || self.since.lock().unwrap().get(key).copied();
+        let begin = || { self.since.lock().unwrap().insert(key.to_string(), Instant::now()); };
+        loop {
+            let asked = since();
+            let aged = asked.map_or(deadline, |t| (t + age).min(deadline));
+            if let Some(held) = crate::stream::until(|| Some(aged), lock.clone().lock_owned()).await { begin(); return Some(Some(held)) }
+            if Instant::now() >= deadline { return None }
+            // Another request that waited may have taken over first: then wait for its age.
+            if since() == asked { begin(); return Some(None) }
+        }
     }
 }
 
@@ -174,12 +188,20 @@ mod tests {
     fn one_request_at_a_time_holds_a_key() {
         let z = Zone::default();
         crate::stream::block_on(async {
-            let held = z.lock("k", LOCK_TIMEOUT).await.unwrap();
+            let (ms, long) = (Duration::from_millis, LOCK_TIMEOUT);
+            let held = z.lock("k", long, long).await.unwrap().unwrap();
             // Another key is not held; the same one is, until the time runs out.
-            assert!(z.lock("other", Duration::from_millis(50)).await.is_some());
-            assert!(z.lock("k", Duration::from_millis(50)).await.is_none());
+            assert!(z.lock("other", ms(50), long).await.unwrap().is_some());
+            assert!(z.lock("k", ms(50), long).await.is_none());
+            // Once the one that holds it has asked for so long, the next asks in its place, and
+            // then the one after that waits for as long again.
+            assert!(z.lock("k", long, ms(100)).await.unwrap().is_none());
+            let start = Instant::now();
+            assert!(z.lock("k", long, ms(100)).await.unwrap().is_none());
+            assert!(start.elapsed() >= ms(90));
+            assert!(z.lock("k", ms(50), ms(100)).await.is_none());
             drop(held);
-            assert!(z.lock("k", Duration::from_millis(50)).await.is_some());
+            assert!(z.lock("k", ms(50), long).await.unwrap().is_some());
         });
     }
 

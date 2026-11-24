@@ -160,6 +160,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_cache_valid", HSL, 1, usize::MAX, false),
     ("proxy_cache_lock", HSL, 1, 1, false),
     ("proxy_cache_lock_timeout", HSL, 1, 1, false),
+    ("proxy_cache_lock_age", HSL, 1, 1, false),
     ("proxy_cache_min_uses", HSL, 1, 1, false),
     ("proxy_cache_use_stale", HSL, 1, usize::MAX, false),
     ("proxy_no_cache", HSL, 1, usize::MAX, false),
@@ -464,6 +465,9 @@ pub struct Level {
     pub proxy_cache_lock: bool,
     /// proxy_cache_lock_timeout: how long a request waits for another that asks for the same key.
     pub proxy_cache_lock_timeout: Duration,
+    /// proxy_cache_lock_age: how long the request that asks the server for a key may take
+    /// before another one asks in its place.
+    pub proxy_cache_lock_age: Duration,
     /// proxy_cache_valid: for how long answers of each status (None: any) are valid.
     pub proxy_cache_valid: Vec<(Option<u16>, Duration)>,
     /// proxy_cache_min_uses: how many requests ask for a key before its answer is cached.
@@ -841,7 +845,7 @@ impl Builder<'_> {
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let (temp, proxy_temp) = (self.path("client_body_temp"), self.path("proxy_temp"));
         // Without root, files come from html under the prefix, as nginx's default root is.
-        let mut level = Level { error_log: self.errors.clone(), root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, gzip_min_length: 20, proxy_cache_min_uses: 1, proxy_cache_lock_timeout: crate::cache::LOCK_TIMEOUT, proxy_cache_convert_head: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
+        let mut level = Level { error_log: self.errors.clone(), root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, gzip_min_length: 20, proxy_cache_min_uses: 1, proxy_cache_lock_timeout: crate::cache::LOCK_TIMEOUT, proxy_cache_lock_age: crate::cache::LOCK_TIMEOUT, proxy_cache_convert_head: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, lingering_close: Some(false),
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), sendfile_max_chunk: 2 << 20, tcp_nodelay: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -1114,6 +1118,7 @@ impl Builder<'_> {
                 }
                 "proxy_cache_lock" => level.proxy_cache_lock = flag(d).map_err(at)?,
                 "proxy_cache_lock_timeout" => level.proxy_cache_lock_timeout = millis(&d.args[0]).map_err(at)?,
+                "proxy_cache_lock_age" => level.proxy_cache_lock_age = millis(&d.args[0]).map_err(at)?,
                 "proxy_cache_min_uses" => level.proxy_cache_min_uses = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
                 "proxy_cache_use_stale" => {
                     const VALUES: &[&str] = &["error", "timeout", "invalid_header", "updating", "http_500", "http_502", "http_503", "http_504", "http_403", "http_404", "http_429", "off"];
@@ -1785,6 +1790,9 @@ mod tests {
         assert_eq!(c.servers[0].locations.iter().map(|l| l.level.proxy_cache_lock_timeout).collect::<Vec<_>>(), [Duration::from_millis(200), Duration::from_secs(2)]);
         assert_eq!(build_text("http { server { listen 127.0.0.1:8080; } }").unwrap().servers[0].level.proxy_cache_lock_timeout, crate::cache::LOCK_TIMEOUT);
         assert!(build_text("http { proxy_cache_lock_timeout x; }").is_err());
+        let c = build_text("http { server { listen 127.0.0.1:8080; proxy_cache_lock_age 100ms; } server { listen 127.0.0.1:8081; } }").unwrap();
+        assert_eq!((c.servers[0].level.proxy_cache_lock_age, c.servers[1].level.proxy_cache_lock_age), (Duration::from_millis(100), crate::cache::LOCK_TIMEOUT));
+        assert!(build_text("http { proxy_cache_lock_age x; }").is_err());
         let c = build_text("http { proxy_cache_bypass $arg_a; proxy_cache_bypass $arg_b $arg_c; proxy_no_cache $arg_d; proxy_cache_key $uri; proxy_cache_min_uses 2; proxy_cache_use_stale error http_404; server { location / { proxy_cache_use_stale off; } } }").unwrap();
         let l = &c.servers[0].level;
         assert_eq!((l.proxy_cache_bypass.len(), l.proxy_no_cache.len(), l.proxy_cache_key.is_some(), l.proxy_cache_min_uses), (3, 1, true, 2));
