@@ -187,6 +187,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("sendfile", HSL | LIF, 1, 1, false),
     ("sendfile_max_chunk", HSL, 1, 1, false),
     ("tcp_nopush", HSL, 1, 1, false),
+    ("postpone_output", HSL, 1, 1, false),
     ("tcp_nodelay", HSL, 1, 1, false),
     ("gzip_http_version", HSL, 1, 1, false),
     ("gzip_types", HSL, 1, usize::MAX, false),
@@ -1158,7 +1159,7 @@ impl Builder<'_> {
                 "resolver" => level.resolver = Some(Arc::new(Resolver::parse(&d.args).map_err(at)?)),
                 "resolver_timeout" => level.resolver_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_connect_timeout" => level.proxy_connect_timeout = millis(&d.args[0]).map_err(at)?,
-                "proxy_read_timeout" => level.proxy_read_timeout = seconds(&d.args[0]).map_err(at)?,
+                "proxy_read_timeout" => level.proxy_read_timeout = millis(&d.args[0]).map_err(at)?,
                 "send_timeout" => level.send_timeout = seconds(&d.args[0]).map_err(at)?,
                 "proxy_intercept_errors" => level.proxy_intercept_errors = flag(d).map_err(at)?,
                 "proxy_pass_request_headers" => level.proxy_pass_request_headers = flag(d).map_err(at)?,
@@ -1194,6 +1195,9 @@ impl Builder<'_> {
                 "sendfile" => level.sendfile = flag(d).map_err(at)?,
                 "sendfile_max_chunk" => level.sendfile_max_chunk = size(&d.args[0]).map_err(|_| invalid())?,
                 "tcp_nopush" => level.tcp_nopush = flag(d).map_err(at)?,
+                // twinx writes what an answer has as soon as it has it, which is what
+                // nginx does with any postpone_output for the answers it sends whole.
+                "postpone_output" => { size(&d.args[0]).map_err(|_| invalid())?; }
                 "tcp_nodelay" => level.tcp_nodelay = flag(d).map_err(at)?,
                 "gzip_http_version" => level.gzip_http_11 = ["1.0", "1.1"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\"", d.args[0])))? == 1,
                 "post_action" => level.post_action = Some(d.args[0].clone()).filter(|a| a != "off"),
@@ -2371,6 +2375,9 @@ mod tests {
         let c = build_text("http { proxy_next_upstream_tries 2; proxy_next_upstream_timeout 3800ms; server { proxy_next_upstream_timeout 2s; } }").unwrap();
         assert_eq!((c.servers[0].level.proxy_next_upstream_tries, c.servers[0].level.proxy_next_upstream_timeout), (2, Duration::from_secs(2)));
         assert_eq!(millis("3800ms"), Ok(Duration::from_millis(3800)));
+        let c = build_text("http { proxy_read_timeout 500ms; server { } server { proxy_read_timeout 2; } }").unwrap();
+        assert_eq!((c.servers[0].level.proxy_read_timeout, c.servers[1].level.proxy_read_timeout), (Duration::from_millis(500), Duration::from_secs(2)));
+        assert!(build_text("http { proxy_read_timeout 5x; }").is_err());
         assert!(build_text("http { proxy_next_upstream_tries x; }").is_err());
         let c = build_text("http { if_modified_since before; server { location / { if_modified_since off; } } }").unwrap();
         assert_eq!((c.servers[0].level.if_modified_since, c.servers[0].locations[0].level.if_modified_since), (Some(true), None));
@@ -2512,6 +2519,14 @@ mod tests {
             assert!(of(text).unwrap_err().starts_with(error), "{text} {:?}", of(text));
         }
         assert!(of("location / { if ($args) { sendfile on; } }").is_ok());
+        assert!(of("postpone_output 0; location / { postpone_output 2k; }").is_ok());
+        for (text, error) in [
+            ("postpone_output x;", "\"postpone_output\" directive invalid value"),
+            ("postpone_output 1; postpone_output 1;", "\"postpone_output\" directive is duplicate"),
+            ("location / { if ($args) { postpone_output 1; } }", "\"postpone_output\" directive is not allowed here"),
+        ] {
+            assert!(of(text).unwrap_err().starts_with(error), "{text} {:?}", of(text));
+        }
     }
 
     #[test]
