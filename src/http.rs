@@ -2136,6 +2136,11 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         None => None,
     };
     if let Some(e) = cache.filter(|_| locked.is_some()).and_then(|z| z.get(&key)) { noted("HIT"); return hit(e) }
+    // Before proxy_cache_min_uses requests asked for the key, and when the range asked for
+    // starts too far (proxy_cache_max_range_offset), the request is passed with its
+    // conditions and ranges, and the answer is not cached.
+    let scarce = cache.is_some() && !bypass && uses < level.proxy_cache_min_uses;
+    let far = cache.is_some() && !bypass && !scarce && !range_cacheable(r, level.proxy_cache_max_range_offset);
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     // proxy_set_body replaces the client's body, whatever proxy_pass_request_body
@@ -2165,7 +2170,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
     // With a cache, the server is asked for the whole answer, whatever the client's conditions and ranges.
     const WHOLE: &[&str] = &["if-modified-since", "if-unmodified-since", "if-none-match", "if-match", "range", "if-range"];
-    let dropped = |n: &str| DROPPED.contains(&n) || level.proxy_cache.is_some() && WHOLE.contains(&n);
+    let dropped = |n: &str| DROPPED.contains(&n) || level.proxy_cache.is_some() && !scarce && !far && WHOLE.contains(&n);
     // proxy_pass_request_headers off passes none of the client's headers.
     let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !dropped(&n.to_ascii_lowercase()) && !is_set(n));
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
@@ -2331,7 +2336,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // An answer whose status proxy_cache_valid names is read whole and kept.
     // Not before proxy_cache_min_uses requests asked for it, nor when proxy_no_cache says so.
     let no_cache = any_set(&level.proxy_no_cache);
-    let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !no_cache;
+    let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !far && !no_cache;
     // X-Accel-Expires, Cache-Control and Expires say for how long, before proxy_cache_valid.
     let now = crate::clock::seconds();
     let said = cache.filter(|_| cacheable).and_then(|_| crate::cache::said(&resp.upstream, &level.proxy_ignore_headers, now));
@@ -2341,6 +2346,19 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         if resp.cut.is_none() { zone.put(key, (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid); }
     }
     resp
+}
+
+/// proxy_cache_max_range_offset, as ngx_http_upstream_cache_check_range() reads a
+/// "bytes=" Range: false when its first range is a suffix ("-n") or starts at the
+/// offset or past it, and for any Range when the offset is 0.
+fn range_cacheable(r: &Request, max: Option<u64>) -> bool {
+    let (Some(max), Some(v)) = (max, header(r, "range")) else { return true };
+    if max == 0 { return false }
+    let Some(spec) = v.get(..6).filter(|p| p.eq_ignore_ascii_case("bytes=")).map(|_| v[6..].trim_start_matches(' ')) else { return true };
+    if spec.starts_with('-') { return false }
+    // What is no number, or too large for one, is no offset.
+    let digits = &spec[..spec.find(|c: char| !c.is_ascii_digit()).unwrap_or(spec.len())];
+    digits.parse::<u64>().ok().filter(|&o| o <= i64::MAX as u64).is_none_or(|o| o < max)
 }
 
 /// proxy_redirect: the first rule that matches the Location, or what follows
@@ -5920,6 +5938,15 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let resp = block_on(proxy(&p, &level, &r, "", None));
         assert_eq!((resp.internal.as_deref(), resp.as_get, r.shared.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
         assert!(resp.upstream_time.unwrap()[0][2].unwrap() < 1000);
+    }
+
+    #[test]
+    fn range_offset() {
+        let ranged = |h: &str, max| range_cacheable(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, max);
+        assert!(ranged("Range: bytes=1-", Some(2)) && ranged("Range: bytes=  1-1,3-", Some(2)) && ranged("Range: bytes=9-", None));
+        assert!(!ranged("Range: bytes=2-", Some(2)) && !ranged("Range: BYTES=-1", Some(2)) && !ranged("Range: bytes=0-0", Some(0)));
+        // No Range, one that is not of bytes, or no offset in it, may be cached.
+        assert!(ranged("Accept: a", Some(0)) && ranged("Range: items=5-", Some(2)) && ranged("Range: bytes=x", Some(2)) && ranged("Range: bytes=99999999999999999999-", Some(2)));
     }
 
     #[test]
