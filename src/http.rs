@@ -2171,6 +2171,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let mut req = format!("{method} {uri} HTTP/1.{}\r\n", level.proxy_http_11 as u8);
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     if !is_set("host") { req += &format!("Host: {host}\r\n"); }
+    // proxy_cache_revalidate: what is kept but no longer valid is asked for on its conditions.
+    let revalidate = stale.is_some() && level.proxy_cache_revalidate && !bypass && !scarce && !far;
+    stale.iter().filter(|_| revalidate).flat_map(|e| e.conditions()).filter(|(n, _)| !is_set(n)).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     // A body passed as it comes: the rest of one with a Content-Length, or chunks.
     let mut unread = r.shared.unread.lock().unwrap();
     let chunked = unread.as_ref().is_some_and(|u| u.chunked.is_some());
@@ -2314,6 +2317,18 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         }
         if !again || tries == 0 { break; }
         answer = None;
+    }
+    // A 304 to them gives what is kept, valid again for as long as the 304 says, else as
+    // proxy_cache_valid says for the status kept.
+    if let (Some(zone), Some(a), Some(e)) = (cache, answer.as_ref().filter(|a| a.status == 304 && !a.generated), stale.as_ref().filter(|_| revalidate)) {
+        noted("REVALIDATED");
+        let now = crate::clock::seconds();
+        let said = crate::cache::said(&a.upstream, &level.proxy_ignore_headers, now).and_then(|(until, updating)| until.map(|u| (u, updating)));
+        let valid = said.or_else(|| crate::cache::validity(&level.proxy_cache_valid, e.status).map(|t| (now.saturating_add(t.as_secs() as i64), 0)));
+        if let Some(valid) = valid { zone.renew(&key, valid); }
+        let mut kept = hit(e.clone());
+        (kept.upstream_addr, kept.upstream_status, kept.upstream_time, kept.upstream_bytes) = (Some(addrs.join(", ")), Some(statuses.join(", ")), Some(times), Some(bytes));
+        return kept;
     }
     // proxy_cache_use_stale: what the cache keeps is given when the server failed so.
     let condition = answer.as_ref().map_or_else(|| failed.to_string(), |a| if a.generated { "timeout".to_string() } else { format!("http_{}", a.status) });

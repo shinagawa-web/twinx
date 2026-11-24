@@ -169,6 +169,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_cache_key", HSL, 1, 1, false),
     ("proxy_cache_background_update", HSL, 1, 1, false),
     ("proxy_cache_convert_head", HSL, 1, 1, false),
+    ("proxy_cache_revalidate", HSL, 1, 1, false),
     ("proxy_ignore_headers", HSL, 1, usize::MAX, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
     ("proxy_http_version", HSL, 1, 1, false),
@@ -499,6 +500,9 @@ pub struct Level {
     pub proxy_cache_background_update: bool,
     /// proxy_cache_convert_head: a HEAD that may be cached asks the server with GET (on by default).
     pub proxy_cache_convert_head: bool,
+    /// proxy_cache_revalidate: what is kept but no longer valid is asked for with the
+    /// conditions of its Last-Modified and ETag, and kept again when the server says 304.
+    pub proxy_cache_revalidate: bool,
     /// proxy_ignore_headers: the headers of proxied answers that are not acted on, lowercase.
     pub proxy_ignore_headers: Vec<String>,
     /// proxy_buffers: the number and the size of the buffers the body is read into.
@@ -1148,6 +1152,7 @@ impl Builder<'_> {
                 "proxy_cache_key" => level.proxy_cache_key = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_cache_background_update" => level.proxy_cache_background_update = flag(d).map_err(at)?,
                 "proxy_cache_convert_head" => level.proxy_cache_convert_head = flag(d).map_err(at)?,
+                "proxy_cache_revalidate" => level.proxy_cache_revalidate = flag(d).map_err(at)?,
                 // All of those of a level replace those it inherits.
                 "proxy_ignore_headers" => {
                     const VALUES: &[&str] = &["x-accel-redirect", "x-accel-expires", "x-accel-limit-rate", "x-accel-buffering", "x-accel-charset", "expires", "cache-control", "set-cookie", "vary"];
@@ -1821,6 +1826,9 @@ mod tests {
         let c = build_text("http { proxy_cache_convert_head off; server { location / { proxy_cache_convert_head on; } } }").unwrap();
         assert_eq!((c.servers[0].level.proxy_cache_convert_head, c.servers[0].locations[0].level.proxy_cache_convert_head), (false, true));
         assert!(build_text("http { server { } }").unwrap().servers[0].level.proxy_cache_convert_head);
+        let c = build_text("http { proxy_cache_revalidate on; server { location / { proxy_cache_revalidate off; } } }").unwrap();
+        assert_eq!((c.servers[0].level.proxy_cache_revalidate, c.servers[0].locations[0].level.proxy_cache_revalidate), (true, false));
+        assert!(!build_text("http { server { } }").unwrap().servers[0].level.proxy_cache_revalidate);
         let c = build_text("http { proxy_cache_background_update on; proxy_ignore_headers Expires Set-Cookie; proxy_ignore_headers X-Accel-Expires; server { location / { proxy_ignore_headers vary; } } }").unwrap();
         let (http, l) = (&c.servers[0].level, &c.servers[0].locations[0].level);
         assert_eq!((http.proxy_cache_background_update, http.proxy_ignore_headers.clone()), (true, vec!["expires".to_string(), "set-cookie".into(), "x-accel-expires".into()]));
