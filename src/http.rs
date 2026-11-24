@@ -547,7 +547,9 @@ fn unbuffered(level: &Level, chunked: bool) -> bool {
 /// module directives or try_files may lead elsewhere. Otherwise its content
 /// handler (static files) discards the body, as nginx's does.
 fn reads_body(level: &Level) -> bool {
-    level.proxy.is_some() || !level.rewrite.is_empty() || !level.script.is_empty() || !level.server_script.is_empty() || level.try_files.is_some() || level.post_action.is_some()
+    // One that returns before anything else discards it.
+    let returns = matches!(level.rewrite.first(), Some(Step::Return(..))) && level.script.is_empty() && level.server_script.is_empty();
+    !returns && (level.proxy.is_some() || !level.rewrite.is_empty() || !level.script.is_empty() || !level.server_script.is_empty() || level.try_files.is_some() || level.post_action.is_some())
 }
 
 fn header<'a>(r: &'a Request, name: &str) -> Option<&'a str> {
@@ -978,8 +980,10 @@ async fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Temp
         (Some((code, text)), _, _) if REDIRECTS.contains(&code) => redirect(code, text.render(r, &Sent::default())),
         (Some((code, text)), _, _) if text.0.is_empty() && code >= 400 => special(code),
         (Some((code, text)), _, _) => {
-            let ctype = Some("text/plain".into());
-            Response { status: code, ctype, body: crate::vars::bytes(&text.value(r, &Sent::default())), ..Response::default() }
+            // As ngx_http_send_response() and the header filter leave them: 204 has no
+            // Content-Type, and 304, without its body, the length of the text.
+            let (ctype, body) = ((code != 204).then(|| "text/plain".into()), crate::vars::bytes(&text.value(r, &Sent::default())));
+            Response { status: code, ctype, told: (code == 304).then_some(Some(body.len())), body, ..Response::default() }
         }
         (None, _, Some(tf)) => try_files(tf, level, r, prefix, client).await,
         (None, Some(p), None) => Box::pin(proxy(p, level, r, prefix, client)).await,

@@ -455,6 +455,8 @@ struct Connection {
     goaway: bool,
     /// keepalive_requests, keepalive_timeout and keepalive_time of the default server of the address.
     keepalive: (u64, Duration, Duration),
+    /// How many more PRIORITY frames it takes: nginx's priority_limit, which each stream raises.
+    priorities: usize,
 }
 
 impl Connection {
@@ -537,7 +539,12 @@ impl Connection {
         match kind {
             DATA => self.data(flags, sid, p),
             HEADERS => self.headers(flags, sid, p),
-            PRIORITY => { self.depend(sid, word(0), u16::from(p[4]) + 1); Ok(()) }
+            PRIORITY => {
+                self.priorities -= 1;
+                if self.priorities == 0 { return Err(ENHANCE_YOUR_CALM) }
+                self.depend(sid, word(0), u16::from(p[4]) + 1);
+                Ok(())
+            }
             SETTINGS => self.settings(flags, sid, p),
             WINDOW_UPDATE => self.window_update(sid, i64::from(word(0) & 0x7fff_ffff)),
             _ => {
@@ -572,6 +579,7 @@ impl Connection {
         // As in nginx, a stream that reaches keepalive_requests or keepalive_time,
         // or any with keepalive_timeout 0, is the last the connection takes.
         self.requests += u64::from(!refused);
+        if !refused { self.priorities += CONCURRENT; }
         let (requests, timeout, time) = self.keepalive;
         if !refused && (timeout.is_zero() || self.requests >= requests || self.started.elapsed() > time) { self.goaway(); }
         self.block = Some((sid, flags, Vec::new(), refused));
@@ -751,7 +759,7 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
     let lingers = level.lingering_close.is_some();
     let send = crate::http::send_timeout(level);
     let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
-    let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive };
+    let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive, priorities: CONCURRENT.max(100) };
     // nginx's settings: the streams at a time, the window of each, the largest frame it takes; and the largest window of the connection.
     frame(&mut c.out, SETTINGS, 0, 0, &[0, 3, 0, 0, 0, CONCURRENT as u8, 0, 4, 0, 1, 0, 0, 0, 5, 0, 0xff, 0xff, 0xff]);
     frame(&mut c.out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
@@ -809,6 +817,8 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
                 while c.out.len() < 16384 && let Ok(told) = rx.try_recv() { c.told(told); }
             }
             () = crate::http::SHUTDOWN.notified() => {}
+            // A connection without streams for keepalive_timeout is closed with GOAWAY, as nginx does.
+            () = tokio::time::sleep(c.keepalive.1), if c.streams.is_empty() && c.block.is_none() && !c.keepalive.1.is_zero() => c.goaway(),
         }
     }
 }
@@ -1135,7 +1145,9 @@ impl Reply {
     fn take(&mut self, part: &mut Part, closed: bool) {
         if self.comes.is_none() {
             if let Some(end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let Some((status, headers)) = answer_head(&self.buf[..end]) else { return part.ended = Some(Ended::Cut) };
+                let Some((status, mut headers)) = answer_head(&self.buf[..end]) else { return part.ended = Some(Ended::Cut) };
+                // nginx's HTTP/2 header filter sends 204 without Content-Type and Content-Length.
+                headers.retain(|h| status != 204 || !h.0.eq_ignore_ascii_case(b"content-type") && !h.0.eq_ignore_ascii_case(b"content-length"));
                 // An answer without a length, or with trailers, comes chunked.
                 const CHUNKED: &[u8] = b"\r\ntransfer-encoding: chunked";
                 let chunked = self.buf[..end].windows(CHUNKED.len()).any(|w| w.eq_ignore_ascii_case(CHUNKED));
@@ -2569,7 +2581,7 @@ mod tests {
 
     fn connection() -> Connection {
         let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
-        Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits: (4, 8192), send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive: (2, Duration::from_secs(75), Duration::from_secs(3600)) }
+        Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits: (4, 8192), send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive: (2, Duration::from_secs(75), Duration::from_secs(3600)), priorities: CONCURRENT.max(100) }
     }
 
     #[test]
@@ -2708,5 +2720,81 @@ mod tests {
         assert_eq!(c.frame(HEADERS, END_HEADERS, 1, &[0x82]), Err(PROTOCOL_ERROR));
         assert_eq!(c.frame(PING, 0, 0, &[]), Err(FRAME_SIZE_ERROR));
         assert_eq!(c.frame(SETTINGS, 0, 0, &[0, 5, 0, 0, 0, 1]), Err(PROTOCOL_ERROR));
+    }
+
+    #[test]
+    fn priority_frames_are_limited() {
+        let priority = framed(PRIORITY, 0, 1, &[0, 0, 0, 0, 16])[9..].to_vec();
+        let mut c = connection();
+        (1..CONCURRENT).for_each(|_| assert_eq!(c.frame(PRIORITY, 0, 1, &priority), Ok(())));
+        assert_eq!(c.frame(PRIORITY, 0, 1, &priority), Err(ENHANCE_YOUR_CALM));
+        // Each stream taken allows as many more as streams at a time.
+        let mut c = connection();
+        assert_eq!(c.frame(HEADERS, END_HEADERS | END_STREAM, 1, &[0x82, 0x86, 0x84, 0x41, 0x01, b'h']), Ok(()));
+        (1..2 * CONCURRENT).for_each(|_| assert_eq!(c.frame(PRIORITY, 0, 3, &priority), Ok(())));
+        assert_eq!(c.frame(PRIORITY, 0, 3, &priority), Err(ENHANCE_YOUR_CALM));
+    }
+
+    /// A request for a path on a stream, which ends it or not.
+    fn asking(sid: u32, method: &str, path: &str, end: bool) -> Vec<u8> {
+        let block = [&[0x86, 0x41, 0x01, b'h', 0x02, method.len() as u8], method.as_bytes(), &[0x04, path.len() as u8], path.as_bytes()].concat();
+        framed(HEADERS, END_HEADERS | if end { END_STREAM } else { 0 }, sid, &block)
+    }
+
+    /// All the fields of a header block.
+    fn all_fields(block: &[u8]) -> String {
+        let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
+        let fields = t.decode(block, block.len(), (4, 8192)).unwrap();
+        fields.iter().filter(|f| f.0 != b"server" && f.0 != b"date").map(|f| format!("{}: {};", String::from_utf8_lossy(&f.0), String::from_utf8_lossy(&f.1))).collect()
+    }
+
+    #[test]
+    fn answers_without_a_body_over_h2() {
+        let _busy = serving_on();
+        crate::stream::block_on(async {
+            let mut c = Client::new("default_type text/plain; server { location /n { return 204; } location /m { return 304 abc; } location /p/ { return 204 abc; } }", 1 << 20).await;
+            for (sid, method, path, want) in [(1, "GET", "/n", ":status: 204;"), (3, "HEAD", "/n", ":status: 204;"), (5, "GET", "/p/", ":status: 204;"), (7, "GET", "/m", ":status: 304;content-type: text/plain;content-length: 3;")] {
+                c.send(&[asking(sid, method, path, true)]).await;
+                let frames = c.next().await;
+                assert_eq!((frames[0].0, frames[0].1 & END_STREAM, all_fields(&frames[0].3)), (HEADERS, END_STREAM, want.to_string()), "{path}");
+            }
+            c.close().await;
+        });
+        // A proxied 204 loses them too.
+        let (addr, _count) = plays(&after_head("HTTP/1.1 204 No Content\r\nContent-Type: text/x\r\nContent-Length: 5\r\nX-A: b\r\n\r\n", &[""], 0), false);
+        crate::stream::block_on(async {
+            let mut c = Client::new(&passing(addr, ""), 1 << 20).await;
+            c.send(&[asking(1, "GET", "/", true)]).await;
+            let frames = c.next().await;
+            assert_eq!(all_fields(&frames[0].3), ":status: 204;x-a: b;");
+            c.close().await;
+        });
+    }
+
+    #[test]
+    fn a_location_that_returns_answers_before_the_body() {
+        let _busy = serving_on();
+        crate::stream::block_on(async {
+            let mut c = Client::new("server { location / { return 200 ok; } }", 1 << 20).await;
+            c.send(&[asking(1, "POST", "/", false)]).await;
+            assert_eq!(texts(&c.all(1).await), [":status: 200;content-length: 2;", "ok|"]);
+            c.close().await;
+        });
+    }
+
+    #[test]
+    fn idle_connections_go_away_after_keepalive_timeout() {
+        let _busy = serving_on();
+        crate::stream::block_on(async {
+            let mut c = Client::new("keepalive_timeout 1; server { location / { return 200 ok; } }", 1 << 20).await;
+            c.get(1, "GET").await;
+            c.all(1).await;
+            let started = Instant::now();
+            within(Some(Duration::from_secs(3)), c.s.read_to_end(&mut c.buf)).await.unwrap().unwrap();
+            let goaway = frames_in(&c.buf).into_iter().find(|f| f.0 == GOAWAY).unwrap();
+            assert_eq!(goaway.3, [1u32.to_be_bytes(), NO_ERROR.to_be_bytes()].concat());
+            assert!(started.elapsed() >= Duration::from_millis(900), "{:?}", started.elapsed());
+            c.close().await;
+        });
     }
 }
