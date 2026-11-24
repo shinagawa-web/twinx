@@ -18,7 +18,18 @@ pub enum Stream {
     Client(Box<tokio_rustls::client::TlsStream<TcpStream>>),
     /// One end of a pipe in memory: a stream of an HTTP/2 connection, which
     /// the other end passes as an HTTP/1 request and its answer.
-    Pipe(tokio::io::DuplexStream),
+    Pipe(Pipe),
+}
+
+/// One end of a pipe in memory, and what tells, if anything does, that what reads the
+/// answer at the other end has gone: the sender is dropped.
+#[derive(Debug)]
+pub struct Pipe { pub end: tokio::io::DuplexStream, pub reader: Option<Box<tokio::sync::watch::Receiver<()>>> }
+
+impl From<tokio::io::DuplexStream> for Pipe {
+    fn from(end: tokio::io::DuplexStream) -> Pipe {
+        Pipe { end, reader: None }
+    }
 }
 
 impl Stream {
@@ -56,14 +67,14 @@ impl Stream {
 
 macro_rules! each {
     ($self:ident, $s:ident => $e:expr) => {
-        match $self.get_mut() { Stream::Tcp($s) => $e, Stream::Server($s) => $e, Stream::Client($s) => $e, Stream::Pipe($s) => $e }
+        match $self.get_mut() { Stream::Tcp($s) => $e, Stream::Server($s) => $e, Stream::Client($s) => $e, Stream::Pipe(Pipe { end: $s, .. }) => $e }
     };
 }
 
 impl AsyncRead for Stream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut ReadBuf) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let read = match this { Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf), Stream::Server(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Client(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Pipe(s) => Pin::new(s).poll_read(cx, buf) };
+        let read = match this { Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf), Stream::Server(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Client(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Pipe(s) => Pin::new(&mut s.end).poll_read(cx, buf) };
         // What TLS answers to what it read, such as the alert refusing a
         // renegotiation, is sent at once, not with the next write.
         let wants = match this { Stream::Tcp(_) | Stream::Pipe(_) => false, Stream::Server(s) => s.get_ref().1.wants_write(), Stream::Client(s) => s.get_ref().1.wants_write() };
@@ -82,7 +93,7 @@ impl AsyncWrite for Stream {
     }
 
     fn is_write_vectored(&self) -> bool {
-        match self { Stream::Tcp(s) => s.is_write_vectored(), Stream::Server(s) => s.is_write_vectored(), Stream::Client(s) => s.is_write_vectored(), Stream::Pipe(s) => s.is_write_vectored() }
+        match self { Stream::Tcp(s) => s.is_write_vectored(), Stream::Server(s) => s.is_write_vectored(), Stream::Client(s) => s.is_write_vectored(), Stream::Pipe(s) => s.end.is_write_vectored() }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
@@ -196,10 +207,21 @@ pub async fn closed(tcp: &TcpStream) {
     }
 }
 
-/// What a future gives, None when the client closes its side of the connection before.
+/// Waits until a client has gone: it has closed its side of the connection, or the
+/// stream of its HTTP/2 connection has ended before its answer.
+pub async fn gone(client: &Stream) {
+    match client {
+        Stream::Pipe(pipe) => match pipe.reader.clone() {
+            Some(mut reader) => Box::pin(async move { while reader.changed().await.is_ok() {} }).await,
+            None => std::future::pending().await,
+        },
+        _ => if let Some(tcp) = client.tcp() { closed(tcp).await },
+    }
+}
+
+/// What a future gives, None when the client goes away before.
 pub async fn unless_closed<F: Future>(client: &Stream, f: F) -> Option<F::Output> {
-    let closed = async { match client.tcp() { Some(tcp) => closed(tcp).await, None => std::future::pending().await } };
-    tokio::select! { biased; out = f => Some(out), () = closed => None }
+    tokio::select! { biased; out = f => Some(out), () = gone(client) => None }
 }
 
 #[cfg(test)]
