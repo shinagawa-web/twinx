@@ -449,11 +449,9 @@ fn dechunk(buf: &[u8], max: u64) -> Result<Option<(Vec<u8>, usize)>, u16> {
 /// invalid.
 fn chunk_line(buf: &[u8], at: usize) -> Result<Option<(String, usize)>, u16> {
     let Some(n) = buf[at..].iter().position(|&c| c == b'\r' || c == b'\n') else { return Ok(None) };
-    match (buf[at + n], buf.get(at + n + 1)) {
-        (b'\r', None) => Ok(None),
-        (b'\r', Some(b'\n')) => Ok(Some((String::from_utf8_lossy(&buf[at..at + n]).to_string(), at + n + 2))),
-        _ => Err(400),
-    }
+    let next = buf.get(at + n + 1).copied();
+    if buf[at + n] == b'\n' || next.is_some_and(|c| c != b'\n') { return Err(400) }
+    Ok(next.map(|_| (String::from_utf8_lossy(&buf[at..at + n]).to_string(), at + n + 2)))
 }
 
 /// The data of a chunked body that has come, and the bytes the whole body took
