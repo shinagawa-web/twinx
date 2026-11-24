@@ -54,13 +54,8 @@ pub fn said(headers: &[(String, String)], ignored: &[String], now: i64) -> Optio
                 if !(valid.is_some() && accel) {
                     if ["no-cache", "no-store", "private"].iter().any(|d| lower.contains(d)) { no_cache = true; continue; }
                     let age = lower.find("s-maxage=").map(|i| i + 9).or_else(|| lower.find("max-age=").map(|i| i + 8));
-                    if let Some(age) = age {
-                        match seconds(&lower[age..]) {
-                            None => continue,
-                            Some(0) => { no_cache = true; continue }
-                            Some(n) => (valid, expired) = (Some(now.saturating_add(n)), false),
-                        }
-                    }
+                    // Other than digits goes no further; "0" caches nothing.
+                    match age.map(|age| seconds(&lower[age..])) { Some(None) => continue, Some(Some(0)) => { no_cache = true; continue } Some(Some(n)) => (valid, expired) = (Some(now.saturating_add(n)), false), None => {} }
                 }
                 if let Some(n) = lower.find("stale-while-revalidate=").and_then(|i| seconds(&lower[i + 23..])) { updating = n; }
             }
