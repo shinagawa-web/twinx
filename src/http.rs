@@ -19,7 +19,7 @@ use crate::vars::{Part, Template};
 use crate::expires;
 use crate::upstream::{Conn, Peer, Upstream};
 use crate::vars::{Request, Sent};
-use crate::stream::{Stream, buffer, read_into, read_until, recycle, within, write_all};
+use crate::stream::{Stream, buffer, read_into, read_until, recycle, unless_closed, within, write_all};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
 
@@ -598,14 +598,27 @@ async fn finish(resp: &mut Response) {
     let Some(mut rest) = resp.rest.take() else { return };
     let (read, ended);
     (resp.body, read, ended, resp.cut) = read_body(&mut rest.conn.stream, &rest.answer[rest.end..], rest.length, rest.chunked, rest.rate, rest.wait, rest.slot.as_ref()).await;
-    if let Some(t) = rest.trailers.filter(|_| resp.cut.is_none()) {
+    if let Some(t) = rest.trailers.as_ref().filter(|_| resp.cut.is_none()) {
         let any = t.take(&mut rest.conn.stream, Some(rest.wait.unwrap_or_default())).await;
         // They come after a body in chunks, if it has no length of the server's.
         resp.unknown_length |= any && rest.length.is_none();
     }
-    if let Some((up, addr, tag)) = rest.home.filter(|_| rest.keep && ended) { up.put(rest.conn, addr, tag); }
+    note(resp, &rest, read);
+    rest.give_back(ended);
+}
+
+/// Notes how long the last proxied server took for its answer, of whose body, with
+/// what makes it chunks, so many bytes were read.
+fn note(resp: &mut Response, rest: &Rest, read: usize) {
     if let Some(t) = resp.upstream_time.as_mut().and_then(|t| t.last_mut()) { t[2] = Some(rest.started.elapsed().as_millis()); }
     if let Some(b) = resp.upstream_bytes.as_mut().and_then(|b| b.last_mut()) { (b[0], b[1]) = (read as u64, (rest.end + read) as u64); }
+}
+
+impl Rest {
+    /// Gives the connection back for other requests, if the answer ended so that it may be.
+    fn give_back(self, ended: bool) {
+        if let Some((up, addr, tag)) = self.home.filter(|_| self.keep && ended) { up.put(self.conn, addr, tag); }
+    }
 }
 
 /// Whether a request is misdirected (421), as nginx finds it: its Host is not
@@ -835,9 +848,10 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         h.1 = format!("http://{host}{port}{}", h.1);
     }
     let gzipped = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && h.1.eq_ignore_ascii_case("gzip"));
+    let streams = streams(r, level, &resp, gzipped);
     if level.gunzip && gzipped {
         resp.vary = true;
-        finish(&mut resp).await;
+        if !streams { finish(&mut resp).await; }
         if !gzip_ok(r, level) { gunzip(&mut resp); }
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
@@ -856,7 +870,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     };
     let copy = |resp: &Response| Response { status: resp.status, ctype: resp.ctype.clone(), headers: resp.headers.clone(), upstream: resp.upstream.clone(), upstream_addr: resp.upstream_addr.clone(), upstream_status: resp.upstream_status.clone(), upstream_time: resp.upstream_time.clone(), upstream_bytes: resp.upstream_bytes.clone(), proxy_host: resp.proxy_host.clone(), ..Response::default() };
     // While the head is made, the last proxied server is still sending ($upstream_response_time).
-    let at_head = |resp: &Response| {
+    let at_head = move |resp: &Response| {
         let mut sent = so_far(copy(resp), Vec::new());
         sent.upstream_time.iter_mut().filter_map(|t| t.last_mut()).for_each(|t| t[2] = None);
         sent
@@ -867,19 +881,23 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         if ["etag", "last-modified"].contains(&name.to_ascii_lowercase().as_str()) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case(name)); }
         if !value.is_empty() { resp.headers.push((name.clone(), value)); }
     }
-    finish(&mut resp).await;
+    if !streams { finish(&mut resp).await; }
     // server_tokens off: the pages twinx generates give its name without the version.
     if resp.generated && !level.server_tokens {
         resp.body = String::from_utf8_lossy(&resp.body).replace(&format!("<hr><center>{NAME}</center>"), "<hr><center>twinx</center>").into_bytes();
     }
-    gzip(r, level, &mut resp);
+    match &resp.rest {
+        // As gzip() would: it is not compressed for this client, but may be for another.
+        Some(rest) => resp.vary |= rest.length.is_none_or(|n| n >= 20) && gzips(level, &resp),
+        None => gzip(r, level, &mut resp),
+    }
     range(r, &mut resp);
     let status = resp.status;
     // 444 closes the connection without an answer; 499 is the status of a client that closed it.
     let silent = [444, 499].contains(&status);
     // An answer cut off has the length it would have whole, and the connection
     // closes after it, so that the client can tell. Without a body to send, it is not one.
-    let cut = resp.cut.is_some() && r.method != "HEAD" && !silent && ![204, 304].contains(&status);
+    let mut cut = resp.cut.is_some() && r.method != "HEAD" && !silent && ![204, 304].contains(&status);
     // Nothing is sent of one whose chunks are malformed: nginx, which finds that
     // before it sends the head it has made, closes the connection too.
     let silent = silent || cut && resp.cut.as_ref().is_some_and(|c| c.malformed);
@@ -887,7 +905,9 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     // closes after it. A HEAD answer has neither.
     // add_trailer makes it chunked too, except for a status that has no body.
     // chunked_transfer_encoding off leaves both unchunked.
-    let length = resp.cut.as_ref().filter(|_| cut).map_or(Some(resp.body.len()), |c| c.length).filter(|_| !resp.unknown_length);
+    // One whose body is still to be read has the length its server gave.
+    let whole = || resp.cut.as_ref().filter(|_| cut).map_or(Some(resp.body.len()), |c| c.length);
+    let length = resp.rest.as_ref().map_or_else(whole, |rest| rest.length).filter(|_| !resp.unknown_length);
     let unknown = length.is_none() && r.method != "HEAD";
     let trailing = level.add_trailer.iter().any(|t| t.2 || added) && r.method != "HEAD" && ![204, 304].contains(&status);
     // An upgraded connection is neither chunked nor kept alive, and has no length.
@@ -916,35 +936,49 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let head_len = out.len();
     let body_len = if r.method == "HEAD" || silent { 0 } else { resp.body.len() };
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
-    // The body is written from where it is, after the head, not copied after it.
-    let mut tail = Vec::new();
     // The trailers are made after the body, each seeing those before it ($sent_trailer_*);
     // those of the proxied server come first.
-    let mut trailers = std::mem::take(&mut *r.shared.trailers.lock().unwrap());
-    trailers.retain(|_| chunked && !cut && resp.proxied);
-    for (name, value, _) in level.add_trailer.iter().filter(|t| chunked && !cut && (t.2 || added)) {
-        let value = value.render(r, &so_far(copy(&resp), trailers.clone()));
-        if !value.is_empty() { trailers.push((name.clone(), value)); }
+    let ending = |resp: &Response, to: &mut Vec<u8>| {
+        let mut trailers = std::mem::take(&mut *r.shared.trailers.lock().unwrap());
+        trailers.retain(|_| resp.proxied);
+        for (name, value, _) in level.add_trailer.iter().filter(|t| t.2 || added) {
+            let value = value.render(r, &so_far(copy(resp), trailers.clone()));
+            if !value.is_empty() { trailers.push((name.clone(), value)); }
+        }
+        to.extend_from_slice(b"0\r\n");
+        trailers.iter().for_each(|(n, v)| to.extend(crate::vars::bytes(&format!("{n}: {v}\r\n"))));
+        to.extend_from_slice(b"\r\n");
+        trailers
+    };
+    let pace = {
+        // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
+        let size = |t: &Template| if t.0.is_empty() { 0 } else { crate::conf::size(&t.value(r, &Sent::default())).unwrap_or(0) };
+        let rate = r.shared.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
+        Pace::new(rate, size(&level.limit_rate_after), r.started, streams)
+    };
+    let (written, mut bytes, mut body, trailers);
+    if let Some(rest) = resp.rest.take() {
+        (written, bytes, trailers) = Box::pin(pass(stream, rest, &mut resp, (&out, chunked), pace, send_timeout(level), ending)).await;
+        // All that was written, whatever makes it chunks too.
+        (body, cut) = (bytes.saturating_sub(head_len), resp.cut.is_some());
+    } else {
+        // The body is written from where it is, after the head, not copied after it.
+        // What came of one cut off is a whole chunk, but there is no last one.
+        let mut tail = Vec::new();
+        if chunked && body_len > 0 { tail.extend_from_slice(b"\r\n"); }
+        trailers = if chunked && !cut { ending(&resp, &mut tail) } else { Vec::new() };
+        // The body sent of an answer cut off has what makes it a chunk.
+        (bytes, body) = (out.len() + body_len + tail.len(), body_len + if cut { out.len() - head_len + tail.len() } else { 0 });
+        written = send(stream, &[&out, &resp.body[..body_len], &tail], &mut { pace }, send_timeout(level)).await;
     }
-    if chunked && cut {
-        // What came is a whole chunk, but there is no last one.
-        if body_len > 0 { tail.extend_from_slice(b"\r\n"); }
-    } else if chunked {
-        tail.extend_from_slice(if body_len > 0 { b"\r\n0\r\n" } else { b"0\r\n" });
-        trailers.iter().for_each(|(n, v)| tail.extend(crate::vars::bytes(&format!("{n}: {v}\r\n"))));
-        tail.extend_from_slice(b"\r\n");
-    }
-    // limit_rate: a rate set $limit_rate or X-Accel-Limit-Rate gave, else the location's.
-    let size = |t: &Template| if t.0.is_empty() { 0 } else { crate::conf::size(&t.value(r, &Sent::default())).unwrap_or(0) };
-    let rate = r.shared.limit_rate.get().unwrap_or_else(|| size(&level.limit_rate));
-    let written = send(stream, &[&out, &resp.body[..body_len], &tail], rate, size(&level.limit_rate_after), r.started, send_timeout(level)).await;
     // What was passed from the proxied server through an upgraded connection counts as sent, as body.
-    let tunneled = match resp.tunnel.take().filter(|_| written) { Some(up) => tunnel(stream, up, ahead, (Some(level.proxy_read_timeout).filter(|t| !t.is_zero()), send_timeout(level))).await, None => 0 };
+    if let Some(up) = resp.tunnel.take().filter(|_| written) {
+        let passed = tunnel(stream, up, ahead, (Some(level.proxy_read_timeout).filter(|t| !t.is_zero()), send_timeout(level))).await;
+        (bytes, body) = (bytes + passed, body + passed);
+    }
     if written && level.post_action.is_some() { Box::pin(post_action(server, r, level, Some(stream))).await; }
     if !level.access_log.is_empty() {
-        // The body sent of an answer cut off has what makes it a chunk.
-        let chunking = if cut { out.len() - head_len + tail.len() } else { 0 };
-        let sent = Sent { bytes: out.len() + body_len + tail.len() + tunneled, body: body_len + chunking + tunneled, ..so_far(resp, trailers) };
+        let sent = Sent { bytes, body, ..so_far(resp, trailers) };
         level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     }
     recycle(out);
@@ -1056,33 +1090,142 @@ fn etag_match(list: &str, etag: Option<&str>, weak: bool) -> bool {
     list.split(',').map(|e| e.trim_matches([' ', '\t'])).any(|e| (if weak { e.strip_prefix("W/").unwrap_or(e) } else { e }) == etag)
 }
 
-/// Writes an answer, paced as ngx_http_write_filter() paces it with a rate:
-/// by the end of each second since the request started (counted in whole
+/// Whether a proxied answer is sent as its body comes, not once all of it has: to a
+/// client of HTTP/1, and neither decompressed nor compressed on its way. The gzip
+/// filter looks at the body's length too, which is not known yet.
+fn streams(r: &Request, level: &Level, resp: &Response, gzipped: bool) -> bool {
+    if resp.rest.is_none() || r.method == "HEAD" || r.line.ends_with("HTTP/2.0") || [204, 304, 444, 499].contains(&resp.status) { return false; }
+    if gzip_ok(r, level) { !gzips(level, resp) } else { !(level.gunzip && gzipped) }
+}
+
+/// Sends a proxied answer as its body comes: the head, with what of the body came with
+/// it or comes first, then each piece as it is read, the next one once it is written,
+/// in a chunk if the body is chunked, and then what ends that. A body cut off has no
+/// last chunk; of one found malformed before anything was sent nothing is. The
+/// connection to the server goes back, or is closed, once the body has ended, before
+/// what is left is written, or when the client closes its connection, a write fails or
+/// worker_shutdown_timeout passes meanwhile. As in nginx, the status is 499 when the
+/// client goes away while the server is waited for before anything was sent; else it stays.
+/// Gives whether all was written that there was, how much was, and the trailers.
+async fn pass<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(stream: &mut Stream, rest: Box<Rest>, resp: &mut Response, head: (&[u8], bool), mut pace: Pace, time: Option<Duration>, ending: E) -> (bool, usize, Vec<(String, String)>) {
+    let (mut rest, mut read, mut trailers) = (Some(rest), 0, Vec::new());
+    let ending = |resp: &Response, to: &mut Vec<u8>| trailers = ending(resp, to);
+    let written = tokio::select! {
+        biased;
+        written = pass_pieces(stream, (&mut rest, &mut read), resp, head, &mut pace, time, ending) => written.unwrap_or_else(|| {
+            if pace.sent == 0 { resp.status = 499; }
+            false
+        }),
+        () = halted() => false,
+    };
+    if let Some(rest) = rest { note(resp, &rest, read); }
+    (written, pace.sent, trailers)
+}
+
+/// Does that, leaving the rest of an answer that has not ended, with how much of it was
+/// read; None when the client closes its connection while the server is waited for.
+async fn pass_pieces(stream: &mut Stream, (rest, read): (&mut Option<Box<Rest>>, &mut usize), resp: &mut Response, (mut head, chunked): (&[u8], bool), pace: &mut Pace, time: Option<Duration>, ending: impl FnOnce(&Response, &mut Vec<u8>)) -> Option<bool> {
+    let (start, mut buf, mut data, mut size, mut tail, mut ending) = (seconds(), Vec::new(), buffer(), Vec::new(), Vec::new(), Some(ending));
+    let (mut body, mut came, mut ended, mut failed, mut malformed) = (Body::new(None, false), Came::More, false, false, false);
+    if let Some(from) = rest {
+        body = Body::new(from.length.map(|n| n as u64), from.chunked);
+        *read = from.answer.len() - from.end;
+        came = body.take(&from.answer[from.end..], &mut data);
+    }
+    while let Some(from) = rest.as_mut() {
+        while came == Came::More && data.is_empty() && !ended {
+            if buf.is_empty() { buf.resize(16384, 0); }
+            let n = unless_closed(stream, read_piece(&mut from.conn.stream, &mut buf, (from.rate, start, *read), from.wait)).await?;
+            let n = n.unwrap_or_else(|| { failed = true; 0 });
+            *read += n;
+            came = body.take(&buf[..n], &mut data);
+            ended = n == 0;
+            if let Some(slot) = from.slot.as_ref().filter(|_| ended && !failed) { (failed, malformed) = ended_over_h2(slot); }
+        }
+        malformed |= came == Came::Malformed;
+        ended |= came != Came::More;
+        if ended {
+            resp.cut = body.cut(failed).then(|| Box::new(Cut { length: from.length, malformed }));
+            if let Some(t) = from.trailers.as_ref().filter(|_| resp.cut.is_none()) { unless_closed(stream, t.take(&mut from.conn.stream, Some(from.wait.unwrap_or_default()))).await?; }
+            note(resp, from, *read);
+            if let Some(rest) = rest.take() { rest.give_back(came == Came::Whole { followed: false }); }
+            // Nothing is sent of what came in one read with what is malformed.
+            if malformed { return Some(true) }
+        }
+        size.clear();
+        tail.clear();
+        if chunked && !data.is_empty() {
+            let _ = write!(size, "{:x}\r\n", data.len());
+            tail.extend_from_slice(b"\r\n");
+        }
+        if let Some(ending) = ending.take_if(|_| chunked && ended && resp.cut.is_none()) { ending(resp, &mut tail); }
+        if !send(stream, &[head, &size, &data, &tail], pace, time).await { return Some(false) }
+        // What follows, small as it may be, does not wait for the client to acknowledge that (tcp_nodelay).
+        if let Some(tcp) = stream.tcp().filter(|_| !head.is_empty() && !ended) { let _ = tcp.set_nodelay(true); }
+        head = &[];
+        data.clear();
+    }
+    recycle(data);
+    Some(true)
+}
+
+/// How the writes of an answer are paced (limit_rate): the rate, what goes before it is
+/// looked at (limit_rate_after), the second the request started in, the bytes written
+/// so far, when the next write may be, and whether the client is watched meanwhile.
+struct Pace { rate: i64, after: i64, start: i64, sent: usize, until: Option<Instant>, watched: bool }
+
+impl Pace {
+    fn new(rate: u64, after: u64, started: Instant, watched: bool) -> Pace {
+        // Without a rate, the clock is not read.
+        let start = if rate == 0 { 0 } else { (now() - started.elapsed()).as_secs() as i64 };
+        Pace { rate: rate as i64, after: after as i64, start, sent: 0, until: None, watched }
+    }
+}
+
+/// The time of day, and in whole seconds.
+fn now() -> Duration {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+}
+
+fn seconds() -> i64 {
+    now().as_secs() as i64
+}
+
+/// Writes an answer or a part of it, paced as ngx_http_write_filter() paces it with a
+/// rate: by the end of each second since the request started (counted in whole
 /// seconds of the clock) up to limit_rate_after bytes and limit_rate bytes for
-/// each second have gone, and after each write the time it is worth at that
-/// rate is waited. Without a rate it is written at once. The answer is the
-/// parts one after another (the head, the body, the end of a chunked body),
-/// written together (writev) without copying them into one buffer. Each
-/// write waits at most the time (send_timeout).
-async fn send<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts: &[&[u8]; N], rate: u64, after: u64, started: Instant, time: Option<Duration>) -> bool {
+/// each second have gone, and after each write the time is waited that what it wrote
+/// after the first limit_rate_after bytes is worth at that rate. Without a rate it is
+/// written at once. What is written is the parts one after another (the head, the body,
+/// the end of a chunked body), written together (writev) without copying them into one
+/// buffer. Each write waits at most the time (send_timeout).
+async fn send<const N: usize>(stream: &mut Stream, parts: &[&[u8]; N], pace: &mut Pace, time: Option<Duration>) -> bool {
     let total: usize = parts.iter().map(|p| p.len()).sum();
-    if rate == 0 { return write_parts(stream, parts, 0, total, time).await; }
-    let clock = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    let start = (clock() - started.elapsed()).as_secs() as i64;
-    let (rate, mut sent) = (rate as i64, 0);
-    while sent < total {
-        let limit = rate * (clock().as_secs() as i64 - start + 1) - (sent as i64 - after as i64);
-        if limit <= 0 { tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await; continue; }
-        let n = (limit as usize).min(total - sent);
-        if !write_parts(stream, parts, sent, sent + n, time).await { return false; }
-        sent += n;
-        if sent < total { tokio::time::sleep(Duration::from_millis(n as u64 * 1000 / rate as u64)).await; }
+    if pace.rate == 0 { return write_parts(stream, parts, 0, total, time, &mut pace.sent).await; }
+    let (mut done, after) = (0, pace.after);
+    let paced = |sent: usize| (sent as i64 - after).max(0);
+    while done < total {
+        let limit = pace.rate * (seconds() - pace.start + 1) - (pace.sent as i64 - after);
+        let until = pace.until.take().or_else(|| (limit <= 0).then(|| Instant::now() + Duration::from_millis((-limit * 1000 / pace.rate + 1) as u64)));
+        if let Some(until) = until {
+            if !pace.watched {
+                tokio::time::sleep_until(until.into()).await;
+            } else if Box::pin(unless_closed(stream, tokio::time::sleep_until(until.into()))).await.is_none() {
+                return false;
+            }
+            continue;
+        }
+        let (n, before) = ((limit as usize).min(total - done), paced(pace.sent));
+        if !write_parts(stream, parts, done, done + n, time, &mut pace.sent).await { return false; }
+        done += n;
+        let delay = (paced(pace.sent) - before) * 1000 / pace.rate;
+        if delay > 0 { pace.until = Some(Instant::now() + Duration::from_millis(delay as u64)); }
     }
     true
 }
 
-/// Writes the bytes from..to of the parts taken one after another.
-async fn write_parts<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts: &[&[u8]; N], from: usize, to: usize, time: Option<Duration>) -> bool {
+/// Writes the bytes from..to of the parts taken one after another, counting them.
+async fn write_parts<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts: &[&[u8]; N], from: usize, to: usize, time: Option<Duration>, count: &mut usize) -> bool {
     let (mut at, mut used, mut bufs) = (0, 0, [std::io::IoSlice::new(&[]); N]);
     for p in parts {
         let (start, end) = (from.max(at), to.min(at + p.len()));
@@ -1092,7 +1235,7 @@ async fn write_parts<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, part
         }
         at += p.len();
     }
-    crate::stream::write_vectored(stream, &mut bufs[..used], time).await
+    crate::stream::write_counted(stream, &mut bufs[..used], time, count).await
 }
 
 /// Whether the location lets the connection serve another request, as
@@ -1304,11 +1447,7 @@ fn recoded(resp: &mut Response) {
 /// gzip_types (text/html always) is compressed for a client that takes gzip,
 /// at gzip_comp_level 1, and sent without a length.
 fn gzip(r: &Request, level: &Level, resp: &mut Response) {
-    if !level.gzip || resp.body.len() < 20 { return; }
-    let ctype = resp.ctype.as_deref().unwrap_or_default().split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
-    let typed = ctype == "text/html" || level.gzip_types.iter().any(|t| t == "*" || *t == ctype);
-    let encoded = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && !h.1.is_empty());
-    if ![200, 403, 404].contains(&resp.status) || encoded || !typed { return; }
+    if resp.body.len() < 20 || !gzips(level, resp) { return; }
     resp.vary = true;
     if !gzip_ok(r, level) { return; }
     recoded(resp);
@@ -1321,6 +1460,15 @@ fn gzip(r: &Request, level: &Level, resp: &mut Response) {
     let mut body = deflate.finish().unwrap_or_default();
     body.extend(crc.sum().to_le_bytes().into_iter().chain((resp.body.len() as u32).to_le_bytes()));
     (resp.body, resp.unknown_length) = (body, true);
+}
+
+/// Whether the gzip filter would compress an answer that is long enough for a client
+/// that takes gzip.
+fn gzips(level: &Level, resp: &Response) -> bool {
+    if !level.gzip || ![200, 403, 404].contains(&resp.status) { return false; }
+    let ctype = resp.ctype.as_deref().unwrap_or_default().split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    let typed = ctype == "text/html" || level.gzip_types.iter().any(|t| t == "*" || *t == ctype);
+    typed && !resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && !h.1.is_empty())
 }
 
 /// gunzip: decompresses a gzip answer for a client that does not take gzip,
@@ -1763,17 +1911,14 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// says whether the connection's end is the body's; the frames that fail an answer
 /// before any of the body are as malformed chunks.
 async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>, slot: Option<&crate::h2::Slot>) -> (Vec<u8>, usize, bool, Option<Box<Cut>>) {
-    let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    let (start, rate, mut chunk, mut failed, mut malformed) = (secs(), rate as i64, vec![0u8; 4096], false, false);
+    let (start, mut chunk, mut failed, mut malformed) = (seconds(), vec![0u8; 4096], false, false);
     let (mut body, mut data, mut read) = (Body::new(length.map(|n| n as u64), chunked), Vec::new(), after.len());
     let mut came = body.take(after, &mut data);
     while came == Came::More {
-        let limit = if rate == 0 { chunk.len() as i64 } else { rate * (secs() - start + 1) - read as i64 };
-        if limit <= 0 { tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await; continue; }
-        let Some(Ok(n)) = within(wait, s.read(&mut chunk[..(limit as usize).min(4096)])).await else { failed = true; break };
+        let Some(n) = read_piece(s, &mut chunk, (rate, start, read), wait).await else { failed = true; break };
         if n == 0 {
-            let end = slot.map(|s| s.lock().unwrap().end);
-            (failed, malformed) = (end.is_some_and(|e| e != crate::h2::End::Whole), end == Some(crate::h2::End::Failed) && data.is_empty());
+            if let Some(slot) = slot { (failed, malformed) = ended_over_h2(slot); }
+            malformed &= data.is_empty();
             break;
         }
         read += n;
@@ -1781,6 +1926,27 @@ async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked:
     }
     let cut = body.cut(failed).then(|| Box::new(Cut { length, malformed: malformed || came == Came::Malformed }));
     (data, read, came == Came::Whole { followed: false }, cut)
+}
+
+/// Reads a piece of a proxied answer's body into the buffer, at the rate from the second
+/// the body started in, with so much of it read before; None when the read fails or
+/// waits longer than the time.
+async fn read_piece(s: &mut Stream, buf: &mut [u8], (rate, start, read): (u64, i64, usize), wait: Option<Duration>) -> Option<usize> {
+    let rate = rate as i64;
+    let limit = loop {
+        let limit = if rate == 0 { buf.len() as i64 } else { rate * (seconds() - start + 1) - read as i64 };
+        if limit > 0 { break limit as usize }
+        tokio::time::sleep(Duration::from_millis((-limit * 1000 / rate + 1) as u64)).await;
+    };
+    let limit = limit.min(buf.len());
+    within(wait, s.read(&mut buf[..limit])).await.and_then(Result::ok)
+}
+
+/// Whether an answer over HTTP/2 whose connection has ended is cut off, and whether a
+/// frame failed it.
+fn ended_over_h2(slot: &crate::h2::Slot) -> (bool, bool) {
+    let end = slot.lock().unwrap().end;
+    (end != crate::h2::End::Whole, end == crate::h2::End::Failed)
 }
 
 /// Whether a proxied server closes the connection after its answer, as nginx
@@ -2703,23 +2869,39 @@ mod tests {
             // Nothing more comes, not even the answer to a second request.
             for (requests, rate) in [request.to_string(), request.repeat(2)].iter().flat_map(|r| RATES.map(|rate| (r, rate))) {
                 let (got, came) = passed_on(&answer, &format!("{directives} {rate}"), requests);
-                assert_eq!((String::from_utf8(got).unwrap(), came), (want.clone(), 1), "{answer} {directives} {rate} {requests}");
+                assert_eq!((joined(&got), came), (want.clone(), 1), "{answer} {directives} {rate} {requests}");
             }
         }
+    }
+
+    /// An answer whose body, if it is in chunks, is in one.
+    fn joined(got: &[u8]) -> String {
+        let text = std::str::from_utf8(got).unwrap();
+        let Some((head, mut rest)) = text.split_once("\r\n\r\n").filter(|(head, _)| head.contains("Transfer-Encoding: chunked")) else { return text.to_string() };
+        let mut data = String::new();
+        while let Some((n, after)) = rest.split_once("\r\n").map(|(size, after)| (usize::from_str_radix(size, 16).unwrap(), after)).filter(|(n, _)| *n > 0) {
+            assert_eq!(&after[n..n + 2], "\r\n", "{text}");
+            data += &after[..n];
+            rest = &after[n + 2..];
+        }
+        let data = if data.is_empty() { data } else { format!("{:x}\r\n{data}\r\n", data.len()) };
+        format!("{head}\r\n\r\n{data}{rest}")
     }
 
     #[test]
     fn whole_answers_stay_so() {
         let (http11, two) = ("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", "GET / HTTP/1.1\r\nHost: a\r\n\r\n".repeat(2));
-        let whole = head("Content-Length: 2\r\n", "close");
+        // Without a length of the server's they are in chunks.
+        let whole = head("Content-Length: 2\r\n", "close") + "ab";
+        let chunked = head("Transfer-Encoding: chunked\r\n", "close") + "2\r\nab\r\n0\r\n\r\n";
         let length = LENGTH.replace("30000", "2");
-        for answer in [
-            format!("{length}ab"), format!("{length}abc"), LENGTH.replace("Content-Length: 30000\r\n", "") + "ab",
-            format!("{CHUNKED}2\r\nab\r\n0\r\n\r\n"), format!("{CHUNKED}2\r\nab\r\n0\r\nX: 1\r\n\r\n"),
+        for (answer, want) in [
+            (format!("{length}ab"), &whole), (format!("{length}abc"), &whole), (LENGTH.replace("Content-Length: 30000\r\n", "") + "ab", &chunked),
+            (format!("{CHUNKED}2\r\nab\r\n0\r\n\r\n"), &chunked), (format!("{CHUNKED}2\r\nab\r\n0\r\nX: 1\r\n\r\n"), &chunked),
         ] {
             for rate in RATES {
                 let (got, _) = passed_on(&answer, rate, http11);
-                assert_eq!(String::from_utf8(got).unwrap(), format!("{whole}ab"), "{answer} {rate}");
+                assert_eq!(String::from_utf8(got).unwrap(), *want, "{answer} {rate}");
             }
         }
         // Requests on one connection are all answered. A page or a head instead of the
@@ -2767,7 +2949,7 @@ mod tests {
         let big = format!("4e20\r\n{}\r\nzz\r\n", "x".repeat(20000));
         let answer = format!("{CHUNKED}{}", MALFORMED[0]);
         let encoded = answer.replacen("\r\n\r\n", "\r\nContent-Encoding: gzip\r\n\r\n", 1);
-        let mut cases: Vec<_> = MALFORMED.into_iter().chain([big.as_str()]).map(|body| (format!("{CHUNKED}{body}"), "", http11)).collect();
+        let mut cases: Vec<_> = MALFORMED.into_iter().map(|body| (format!("{CHUNKED}{body}"), "", http11)).collect();
         cases.extend([
             (answer.clone(), "", http10), (answer.clone(), "add_trailer X 1 always; add_header X 1 always;", http11),
             (answer.clone(), "chunked_transfer_encoding off;", http11), (encoded, "gunzip on;", http11),
@@ -2841,7 +3023,408 @@ mod tests {
         }
         // The status and $body_bytes_sent, with what makes it a chunk.
         let lines = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(lines.lines().map(|l| l.split(' ').skip(8).take(2).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>(), ["200 7", "200 2", "200 2"], "{lines}");
+        assert_eq!(lines.lines().map(|l| l.split(' ').skip(8).take(2).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>(), ["200 7", "200 2", "200 12"], "{lines}");
+    }
+
+    /// What a server sends, each piece so many milliseconds after the one before it.
+    type Pieces = Vec<(u64, Vec<u8>)>;
+
+    /// A server that sends the pieces in answer to each request, and closes the connection
+    /// then or waits for the next one; and how many connections came, and how many of
+    /// those the other side closed. It ends once that count is dropped.
+    fn plays(pieces: &Pieces, closes: bool) -> (SocketAddr, Arc<Mutex<[usize; 2]>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, count) = (listener.local_addr().unwrap(), Arc::new(Mutex::new([0; 2])));
+        let (counts, pieces) = (count.clone(), pieces.clone());
+        listener.set_nonblocking(true).unwrap();
+        thread::spawn(move || while Arc::strong_count(&counts) > 1 {
+            let Ok((mut s, _)) = listener.accept() else { thread::sleep(Duration::from_millis(1)); continue };
+            counts.lock().unwrap()[0] += 1;
+            let (counts, pieces) = (counts.clone(), pieces.clone());
+            s.set_nonblocking(false).and_then(|()| s.set_nodelay(true)).unwrap();
+            thread::spawn(move || {
+                let mut got = Vec::new();
+                loop {
+                    while head_end(&got).is_none() {
+                        let mut part = [0; 1024];
+                        match s.read(&mut part) {
+                            Ok(n @ 1..) => got.extend_from_slice(&part[..n]),
+                            _ => { counts.lock().unwrap()[1] += 1; return }
+                        }
+                    }
+                    got.clear();
+                    for (ms, piece) in &pieces {
+                        thread::sleep(Duration::from_millis(*ms));
+                        if s.write_all(piece).is_err() { break }
+                    }
+                    if closes { return }
+                }
+            });
+        });
+        (addr, count)
+    }
+
+    /// What tests of answers sent as they come run under: nothing is shutting down.
+    fn serving_on() -> std::sync::MutexGuard<'static, ()> {
+        let busy = counted();
+        SHUTTING.store(false, Ordering::SeqCst);
+        HALTED.store(false, Ordering::SeqCst);
+        busy
+    }
+
+    /// What location / of a server with the directives has for the server it passes to.
+    fn passing(addr: SocketAddr, directives: &str) -> String {
+        format!("log_format f '$status $body_bytes_sent $bytes_sent $upstream_status $upstream_response_length $upstream_bytes_received $sent_trailer_x'; access_log off; upstream u {{ server {addr}; keepalive 4; }} \
+                 server {{ location / {{ proxy_pass http://u; {directives} }} }}")
+    }
+
+    /// What comes at once, and the milliseconds after the request it comes at, until the connection is closed.
+    async fn arrivals(http: &str, request: &str) -> Vec<(u128, String)> {
+        let (mut client, task) = served_by(http).await;
+        client.write_all(request.as_bytes()).await.unwrap();
+        let (started, mut all, mut buf) = (Instant::now(), Vec::new(), [0; 16384]);
+        while let n @ 1.. = within(Some(Duration::from_secs(4)), client.read(&mut buf)).await.unwrap().unwrap() {
+            all.push((started.elapsed().as_millis(), undated(&buf[..n])));
+        }
+        drop(client);
+        within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
+        all
+    }
+
+    /// Text without its Date lines.
+    fn undated(text: &[u8]) -> String {
+        String::from_utf8_lossy(text).split_inclusive('\n').filter(|l| !l.starts_with("Date: ")).collect()
+    }
+
+    /// What was written to a log, which is removed.
+    fn logged(log: &std::path::Path) -> String {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        let _ = std::fs::remove_file(log);
+        text
+    }
+
+    /// Where a test logs to.
+    fn log_path(name: &str) -> PathBuf {
+        let log = std::env::temp_dir().join(format!("twinx-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        log
+    }
+
+    const DELIMITED: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+    const HTTP11: &str = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+    const HTTP10: &str = "GET / HTTP/1.0\r\n\r\n";
+
+    /// Data as one chunk, in text.
+    fn chunk_of(data: &str) -> String {
+        format!("{:x}\r\n{data}\r\n", data.len())
+    }
+
+    /// The pieces, the first of them with the head.
+    fn after_head(head: &str, pieces: &[&str], ms: u64) -> Pieces {
+        pieces.iter().enumerate().map(|(i, p)| if i == 0 { (0, format!("{head}{p}").into_bytes()) } else { (ms, p.as_bytes().to_vec()) }).collect()
+    }
+
+    #[test]
+    fn answers_are_sent_as_they_come() {
+        let _busy = serving_on();
+        let parts = ["one--", "two--", "three", "four-", "five-", "six--"];
+        let chunks: Vec<String> = parts.iter().map(|p| chunk_of(p)).collect();
+        let chunks: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        let length = LENGTH.replace("30000", "30");
+        let chunked = [&chunks[..], &["0\r\n\r\n"]].concat();
+        let (with_length, in_chunks, plain) = (head("Content-Length: 30\r\n", "close"), head("Transfer-Encoding: chunked\r\n", "close"), head("", "close"));
+        let cases = [
+            (&length, &parts[..], false, HTTP11, "", &with_length, &parts[..]), (&length, &parts, false, HTTP10, "", &with_length, &parts),
+            (&CHUNKED.to_string(), &chunked, false, HTTP11, "", &in_chunks, &chunked), (&CHUNKED.to_string(), &chunked, false, HTTP10, "", &plain, &parts),
+            (&DELIMITED.to_string(), &parts, true, HTTP11, "", &in_chunks, &chunked), (&DELIMITED.to_string(), &parts, true, HTTP10, "", &plain, &parts),
+            (&CHUNKED.to_string(), &chunked, false, HTTP11, "chunked_transfer_encoding off;", &plain, &parts),
+            (&length, &parts, false, HTTP11, "proxy_limit_rate 1m;", &with_length, &parts),
+        ];
+        block_on(async {
+            let all = cases.map(|(head, pieces, closes, request, directives, sent_head, want)| {
+                let (addr, count) = plays(&after_head(head, pieces, 200), closes);
+                let (http, mut want) = (passing(addr, directives), want.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+                want[0].insert_str(0, sent_head);
+                tokio::task::spawn_local(async move {
+                    let (_count, mut got) = (count, arrivals(&http, request).await);
+                    // The end may come with what it ends.
+                    let end = got.pop_if(|g| g.1 == "0\r\n\r\n").map(|g| g.1);
+                    if let Some(end) = end { got.last_mut().unwrap().1 += &end; }
+                    let last = want.pop_if(|w| w == "0\r\n\r\n").unwrap_or_default();
+                    *want.last_mut().unwrap() += &last;
+                    assert_eq!(got.iter().map(|g| &g.1).collect::<Vec<_>>(), want.iter().collect::<Vec<_>>(), "{http} {request}");
+                    for (i, g) in got.iter().enumerate() { assert!(g.0 + 20 >= i as u128 * 200 && g.0 < i as u128 * 200 + 190, "{i} {got:?}"); }
+                })
+            });
+            for task in all { task.await.unwrap(); }
+        });
+    }
+
+    #[test]
+    fn small_answers_are_written_at_once() {
+        let _busy = serving_on();
+        let (length, chunked) = (LENGTH.replace("30000", "2"), format!("{CHUNKED}2\r\nab\r\n0\r\n\r\n"));
+        for (answer, request, want) in [
+            (format!("{length}ab"), HTTP11, head("Content-Length: 2\r\n", "close") + "ab"),
+            (format!("{length}ab"), HTTP10, head("Content-Length: 2\r\n", "close") + "ab"),
+            (chunked.clone(), HTTP11, head("Transfer-Encoding: chunked\r\n", "close") + "2\r\nab\r\n0\r\n\r\n"),
+            (chunked, HTTP10, head("", "close") + "ab"),
+            (format!("{CHUNKED}0\r\n\r\n"), HTTP11, head("Transfer-Encoding: chunked\r\n", "close") + "0\r\n\r\n"),
+        ] {
+            let (addr, _count) = plays(&vec![(0, answer.into_bytes())], false);
+            let got = block_on(arrivals(&passing(addr, ""), request));
+            assert_eq!(got.iter().map(|g| &g.1).collect::<Vec<_>>(), [&want]);
+        }
+        // A head waits for the first of the body, and for its end if there is none.
+        let pieces = |last: &str| vec![(0, length.clone().into_bytes()), (200, last.as_bytes().to_vec())];
+        for (last, closes, want) in [("ab", false, "ab"), ("", true, "")] {
+            let (addr, _count) = plays(&pieces(last), closes);
+            let got = block_on(arrivals(&passing(addr, ""), HTTP11));
+            assert_eq!(got.iter().map(|g| g.1.as_str()).collect::<Vec<_>>(), [head("Content-Length: 2\r\n", "close") + want]);
+            assert!(got[0].0 >= 190);
+        }
+    }
+
+    #[test]
+    fn large_answers_are_the_same_byte_for_byte() {
+        let _busy = serving_on();
+        let data: Vec<u8> = (0..5usize << 20).map(|i| (i * 7 + i / 251) as u8).collect();
+        let mut chunks: Vec<u8> = data.chunks(50_000).flat_map(chunk).collect();
+        chunks.extend_from_slice(b"0\r\n\r\n");
+        let length = LENGTH.replace("30000", &data.len().to_string());
+        for (answer, closes, request) in [
+            ([length.as_bytes(), &data].concat(), false, HTTP11), ([CHUNKED.as_bytes(), &chunks].concat(), false, HTTP11),
+            ([CHUNKED.as_bytes(), &chunks].concat(), false, HTTP10), ([DELIMITED.as_bytes(), &data].concat(), true, HTTP11),
+        ] {
+            let (addr, _count) = plays(&vec![(0, answer)], closes);
+            block_on(async {
+                let (mut client, task) = served_by(&passing(addr, "")).await;
+                client.write_all(request.as_bytes()).await.unwrap();
+                // A client that reads slowly.
+                let (mut got, mut buf) = (Vec::new(), vec![0; 65536]);
+                while let n @ 1.. = within(Some(Duration::from_secs(4)), client.read(&mut buf)).await.unwrap().unwrap() {
+                    got.extend_from_slice(&buf[..n]);
+                    if got.len() % 3 == 0 { tokio::time::sleep(Duration::from_millis(2)).await; }
+                }
+                drop(client);
+                within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
+                let start = head_end(&got).unwrap();
+                let chunked = got[..start].windows(7).any(|w| w == b"chunked");
+                assert_eq!(chunked, request == HTTP11 && !answer_has_length(&got[..start]));
+                let body = if chunked { dechunk(&got[start..], u64::MAX).unwrap().map(|(body, used)| { assert_eq!(used, got.len() - start); body }).unwrap() } else { got[start..].to_vec() };
+                assert!(body == data);
+            });
+        }
+    }
+
+    fn answer_has_length(head: &[u8]) -> bool {
+        head.windows(16).any(|w| w == b"Content-Length: ")
+    }
+
+    #[test]
+    fn connections_are_used_again_after_answers_sent_as_they_come() {
+        let _busy = serving_on();
+        let request = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+        let length = LENGTH.replace("30000", "4");
+        for (pieces, connections, want) in [
+            (after_head(&length, &["ab", "cd"], 30), 1, head("Content-Length: 4\r\n", "keep-alive") + "abcd"),
+            (after_head(CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], 30), 1, head("Transfer-Encoding: chunked\r\n", "keep-alive") + "4\r\nabcd\r\n0\r\n\r\n"),
+            // More than the body, with it or in its last piece.
+            (after_head(&length, &["ab", "cde"], 30), 2, head("Content-Length: 4\r\n", "keep-alive") + "abcd"),
+            (after_head(&length, &["abcde"], 30), 2, head("Content-Length: 4\r\n", "keep-alive") + "abcd"),
+        ] {
+            let (addr, count) = plays(&pieces, false);
+            block_on(async {
+                let (mut client, _task) = served_by(&passing(addr, "")).await;
+                for _ in 0..2 {
+                    client.write_all(request.as_bytes()).await.unwrap();
+                    let mut got = Vec::new();
+                    let ends = |got: &[u8]| head_end(got).is_some_and(|end| if answer_has_length(&got[..end]) { got.len() - end >= 4 } else { got.ends_with(b"0\r\n\r\n") });
+                    while !ends(&got) { assert!(read_into(&mut client, &mut got, Some(Duration::from_secs(2))).await > 0); }
+                    // The server's connection is there again once the client has the end.
+                    assert_eq!(joined(undated(&got).as_bytes()), want);
+                }
+            });
+            assert_eq!(count.lock().unwrap()[0], connections, "{pieces:?}");
+        }
+        // Both requests at once.
+        let (addr, count) = plays(&after_head(&length, &["ab", "cd"], 30), false);
+        let got = block_on(received(&passing(addr, ""), &(request.to_string() + HTTP11)));
+        assert_eq!(String::from_utf8(got).unwrap(), head("Content-Length: 4\r\n", "keep-alive") + "abcd" + &head("Content-Length: 4\r\n", "close") + "abcd");
+        assert_eq!(count.lock().unwrap()[0], 1);
+    }
+
+    #[test]
+    fn answers_cut_off_or_malformed_later_end_there() {
+        let _busy = serving_on();
+        let log = log_path("later");
+        let (with_length, in_chunks, plain) = (head("Content-Length: 30000\r\n", "close"), head("Transfer-Encoding: chunked\r\n", "close"), head("", "close"));
+        // The Date line, which is left out of what comes, is counted.
+        let counted = |head: &str, body: usize| format!("200 {body} {} 200", head.len() + 37 + body);
+        for (head, pieces, closes, request, want, received) in [
+            (LENGTH, &["ab", "cd", ""][..], true, HTTP11, vec![with_length.clone() + "ab", "cd".into()], 4),
+            (LENGTH, &["ab", ""], true, HTTP11, vec![with_length.clone() + "ab"], 2),
+            (LENGTH, &["", ""], true, HTTP11, vec![with_length.clone()], 0),
+            (CHUNKED, &["2\r\nab\r\n", "3\r\ncd", ""], true, HTTP11, vec![in_chunks.clone() + "2\r\nab\r\n", "2\r\ncd\r\n".into()], 12),
+            (CHUNKED, &["2\r\nab\r\n", "0\r\n", ""], true, HTTP10, vec![plain.clone() + "ab"], 10),
+            (CHUNKED, &["", ""], true, HTTP11, vec![in_chunks.clone()], 0),
+            // Malformed, where nothing more is sent, not what came with it either.
+            (CHUNKED, &["2\r\nab\r\n", "zz"], false, HTTP11, vec![in_chunks.clone() + "2\r\nab\r\n"], 9),
+            (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\nzz"], false, HTTP11, vec![in_chunks.clone() + "2\r\nab\r\n"], 16),
+            (CHUNKED, &["2\r\nab\r\n", "zz"], false, HTTP10, vec![plain.clone() + "ab"], 9),
+            (CHUNKED, &["", "2\r\nab\r\nzz"], false, HTTP11, vec![], 9),
+            (CHUNKED, &["2\r\nab\r\nzz"], false, HTTP11, vec![], 9),
+        ] {
+            let (addr, count) = plays(&after_head(head, pieces, 60), closes);
+            let got = block_on(arrivals(&passing(addr, &format!("access_log {} f;", log.display())), request));
+            assert_eq!(got.iter().map(|g| &g.1).collect::<Vec<_>>(), want.iter().collect::<Vec<_>>(), "{head} {pieces:?}");
+            let sent: usize = want.iter().map(String::len).sum();
+            let start = want.first().map_or(0, |w| head_end(w.as_bytes()).unwrap());
+            let line = if want.is_empty() { "200 0 0 200".to_string() } else { counted(&want[0][..start], sent - start) };
+            assert_eq!(logged(&log), format!("{line} {received} {} -\n", head.len() + received), "{head} {pieces:?}");
+            assert_eq!(count.lock().unwrap()[0], 1);
+        }
+        // A read of it that waits longer than proxy_read_timeout.
+        let (addr, count) = plays(&after_head(LENGTH, &["ab", "cd"], 60), false);
+        let got = block_on(arrivals(&passing(addr, "proxy_read_timeout 1s;"), HTTP11));
+        assert_eq!(got.iter().map(|g| g.1.as_str()).collect::<String>(), with_length + "abcd");
+        while count.lock().unwrap()[1] == 0 { thread::sleep(Duration::from_millis(1)); }
+    }
+
+    #[test]
+    fn answers_sent_as_they_come_are_sent_at_the_rate() {
+        let _busy = serving_on();
+        let length = LENGTH.replace("30000", "3000");
+        let data = "x".repeat(1500);
+        let pieces = after_head(&length, &[&data, &data], 100);
+        let (addr, _count) = plays(&pieces, false);
+        let run = |directives: &str| block_on(arrivals(&passing(addr, directives), HTTP11));
+        // Head and body are paced together: 2000 bytes in the first second of the clock, or 4000 in two.
+        let got = run("limit_rate 2000;");
+        assert_eq!(got.iter().map(|g| g.1.as_str()).collect::<String>(), head("Content-Length: 3000\r\n", "close") + &data + &data);
+        assert!((600..2000).contains(&got.last().unwrap().0), "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
+        // What goes before limit_rate_after is not waited for.
+        let got = run("limit_rate 100; limit_rate_after 10000;");
+        assert!(got.len() == 2 && got[1].0 < 600, "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn clients_may_go_away_at_any_point() {
+        let _busy = serving_on();
+        let log = log_path("gone");
+        let length = LENGTH.replace("30000", "60000000");
+        let big = "x".repeat(8 << 20);
+        for resets in [false, true] {
+            for (pieces, directives, reads, status) in [
+                // Before the body, after the first of it, in it, while it is paced, and while the client takes no more.
+                (vec![(0, length.clone().into_bytes())], "", 0, "499"),
+                (after_head(&length, &["ab"], 0), "", 1, "200"),
+                (after_head(&length, &["ab", "cd", "ef"], 60), "", 2, "200"),
+                (after_head(&length, &["ab", &"x".repeat(5000)], 0), "limit_rate 500;", 1, "200"),
+                (after_head(&length, &["ab", &big, &big], 0), "", 1, "200"),
+                (after_head(CHUNKED, &["2\r\nab\r\n"], 0), "", 1, "200"),
+            ] {
+                let (addr, count) = plays(&pieces, false);
+                block_on(async {
+                    let (mut client, task) = served_by(&passing(addr, &format!("{directives} access_log {} f;", log.display()))).await;
+                    client.write_all(HTTP11.as_bytes()).await.unwrap();
+                    let (mut came, mut buf) = (0, [0; 512]);
+                    if reads == 0 { tokio::time::sleep(Duration::from_millis(60)).await; }
+                    for _ in 0..reads { came += client.read(&mut buf).await.unwrap(); }
+                    if pieces.len() == 3 { tokio::time::sleep(Duration::from_millis(60)).await; }
+                    if resets { socket2::SockRef::from(&client).set_linger(Some(Duration::ZERO)).unwrap(); }
+                    drop(client);
+                    within(Some(Duration::from_secs(1)), task).await.unwrap().unwrap();
+                    let text = logged(&log);
+                    let line: Vec<usize> = text.split(' ').take(6).map(|n| n.parse().unwrap()).collect();
+                    assert!(text.starts_with(&format!("{status} ")) && line[2] >= came && (reads > 0 || line[2] == 0) && line[1] <= line[2] && line[4] < 2 * big.len(), "{pieces:.0?} {text}");
+                });
+                // The server's connection is closed at once.
+                let started = Instant::now();
+                while count.lock().unwrap()[1] == 0 { assert!(started.elapsed() < Duration::from_secs(2)); thread::sleep(Duration::from_millis(1)); }
+            }
+        }
+        // One that closes its side only has gone away too; one that takes nothing for send_timeout as well.
+        let (addr, count) = plays(&after_head(&length, &["ab"], 0), false);
+        block_on(async {
+            let (mut client, _task) = served_by(&passing(addr, "")).await;
+            client.write_all(HTTP11.as_bytes()).await.unwrap();
+            assert!(client.read(&mut [0; 512]).await.unwrap() > 0);
+            client.shutdown().await.unwrap();
+            assert_eq!(within(Some(Duration::from_secs(1)), client.read(&mut [0; 512])).await.unwrap().unwrap(), 0);
+        });
+        let (stuck, stuck_count) = plays(&after_head(&length, &[&big, &big], 0), false);
+        block_on(async {
+            let (mut client, task) = served_by(&passing(stuck, "send_timeout 1s;")).await;
+            client.write_all(HTTP11.as_bytes()).await.unwrap();
+            within(Some(Duration::from_secs(3)), task).await.unwrap().unwrap();
+        });
+        while count.lock().unwrap()[1] + stuck_count.lock().unwrap()[1] < 2 { thread::sleep(Duration::from_millis(1)); }
+    }
+
+    #[test]
+    fn answers_sent_as_they_come_have_trailers_and_are_logged() {
+        let _busy = serving_on();
+        let log = log_path("passed");
+        let length = LENGTH.replace("30000", "4");
+        let in_chunks = head("Transfer-Encoding: chunked\r\n", "close");
+        let trailer = "0\r\nX: 4-200\r\n\r\n";
+        for (answer, pieces, directives, request, want, body, read) in [
+            (&length, &["ab", "cd"][..], "add_trailer X $upstream_response_length-$upstream_status;", HTTP11, in_chunks.clone() + "4\r\nabcd\r\n" + trailer, 29, "4 4-200"),
+            (&length, &["ab", "cd"], "add_trailer X 1;", HTTP10, head("Content-Length: 4\r\n", "close") + "abcd", 4, "4 -"),
+            (&CHUNKED.to_string(), &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], "", HTTP11, in_chunks.clone() + "4\r\nabcd\r\n0\r\n\r\n", 19, "19 -"),
+            (&CHUNKED.to_string(), &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], "", HTTP10, head("", "close") + "abcd", 4, "19 -"),
+        ] {
+            let (addr, _count) = plays(&after_head(answer, pieces, 40), false);
+            let got = block_on(arrivals(&passing(addr, &format!("{directives} access_log {} f;", log.display())), request));
+            let got: String = got.into_iter().map(|g| g.1).collect();
+            assert_eq!(joined(got.as_bytes()), want);
+            let start = head_end(want.as_bytes()).unwrap();
+            let (length, trailer) = read.split_once(' ').unwrap();
+            assert_eq!(logged(&log), format!("200 {body} {} 200 {length} {} {trailer}\n", start + 37 + body, answer.len() + length.parse::<usize>().unwrap()));
+        }
+    }
+
+    #[test]
+    fn what_gzip_may_change_is_not_sent_as_it_comes() {
+        let _busy = serving_on();
+        let length = LENGTH.replace("30000", "40");
+        let part = "x".repeat(20);
+        let pieces = after_head(&length, &[&part, &part], 60);
+        let takes_gzip = HTTP11.replace("\r\n\r\n", "\r\nAccept-Encoding: gzip\r\n\r\n");
+        for (directives, request, pieces, came, vary) in [
+            ("gzip on; gzip_vary on;", takes_gzip.as_str(), &pieces, 1, true),
+            // Not compressed, but may be for another client, or of another type.
+            ("gzip on; gzip_vary on;", HTTP11, &pieces, 2, true),
+            ("gzip on; gzip_vary on;", &takes_gzip, &after_head(&length.replace("html", "css"), &[&part, &part], 60), 2, false),
+            ("gunzip on; gzip_vary on;", HTTP11, &after_head(&length.replacen("\r\n\r\n", "\r\nContent-Encoding: gzip\r\n\r\n", 1), &[&part, &part], 60), 1, true),
+            ("gunzip on; gzip_vary on;", &takes_gzip, &after_head(&length.replacen("\r\n\r\n", "\r\nContent-Encoding: gzip\r\n\r\n", 1), &[&part, &part], 60), 2, true),
+        ] {
+            let (addr, _count) = plays(pieces, false);
+            let got = block_on(arrivals(&passing(addr, directives), request));
+            assert_eq!((got.len(), got[0].1.contains("Vary: Accept-Encoding\r\n")), (came, vary), "{directives} {request} {got:?}");
+        }
+    }
+
+    #[test]
+    fn answers_being_passed_end_when_the_time_to_shut_down_has_passed() {
+        let _busy = serving_on();
+        let log = log_path("halted");
+        for (pieces, line) in [(after_head(LENGTH, &["ab"], 0), "200 2 "), (vec![(0, LENGTH.as_bytes().to_vec())], "200 0 0 ")] {
+            let (addr, count) = plays(&pieces, false);
+            block_on(async {
+                let (mut client, task) = served_by(&passing(addr, &format!("access_log {} f;", log.display()))).await;
+                client.write_all(HTTP11.as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                HALTED.store(true, Ordering::SeqCst);
+                HALT.notify_waiters();
+                within(Some(Duration::from_secs(1)), task).await.unwrap().unwrap();
+                HALTED.store(false, Ordering::SeqCst);
+            });
+            let text = logged(&log);
+            assert!(text.starts_with(line), "{text}");
+            while count.lock().unwrap()[1] == 0 { thread::sleep(Duration::from_millis(1)); }
+        }
     }
 
     /// A server that reads a request, sends the answer and then nothing until the
@@ -2934,7 +3517,8 @@ mod tests {
             }
             // One going away after the stream goes on with it.
             let (whole, came) = over_h2(&[head.clone(), data.clone(), going.clone(), h2_frame(0, 1, 1, b"fghij")], false, "", request);
-            assert!(came == 1 && whole.ends_with("\r\n\r\nabcdefghij"), "{whole}");
+            let want = if *head == length { text("Content-Length: 10", "abcdefghij") } else { text("Transfer-Encoding: chunked", "a\r\nabcdefghij\r\n0\r\n\r\n") };
+            assert_eq!((joined(whole.as_bytes()), came), (want, 1));
         }
         // What has no body is not cut.
         let head_only = "HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
@@ -3649,20 +4233,33 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         block_on(async {
             let (mut s, mut client) = pair().await;
             let started = Instant::now();
-            assert!(send(&mut s, &[&[b'x'; 1000], &[b'y'; 2000], &[]], 0, 0, started, None).await);
-            // 1000 bytes and 1000 a second: the rest goes after a second or two.
-            assert!(send(&mut s, &[&[b'z'; 700], &[b'w'; 1800]], 1000, 1000, started, None).await);
-            assert!(started.elapsed() >= Duration::from_millis(1400));
-            let mut got = vec![0u8; 5500];
+            let pace = |rate, after| Pace::new(rate, after, started, false);
+            assert!(send(&mut s, &[&[b'x'; 1000], &[b'y'; 2000], &[]], &mut pace(0, 0), None).await);
+            // 1000 bytes and 1000 a second: the rest goes after a second.
+            assert!(send(&mut s, &[&[b'z'; 700], &[b'w'; 1800]], &mut pace(1000, 1000), None).await);
+            assert!((1000..1900).contains(&started.elapsed().as_millis()));
+            // So it does in several writes, which go on counting.
+            let (started, mut pace) = (Instant::now(), Pace::new(1000, 1000, Instant::now(), true));
+            for part in [&[b'z'; 900][..], &[b'w'; 100], &[b'w'; 1000], &[b'w'; 500]] {
+                let before = started.elapsed();
+                assert!(send(&mut s, &[part], &mut pace, None).await);
+                // What goes before the rate is looked at is not waited for.
+                assert!(part.len() == 500 || started.elapsed() - before < Duration::from_millis(500));
+            }
+            assert!(pace.sent == 2500 && (1000..1900).contains(&started.elapsed().as_millis()));
+            let mut got = vec![0u8; 8000];
             client.read_exact(&mut got).await.unwrap();
-            let want = [vec![b'x'; 1000], vec![b'y'; 2000], vec![b'z'; 700], vec![b'w'; 1800]].concat();
+            let want = [vec![b'x'; 1000], vec![b'y'; 2000], vec![b'z'; 700], vec![b'w'; 1800], vec![b'z'; 900], vec![b'w'; 1600]].concat();
             assert!(got == want);
             drop(client);
             tokio::time::sleep(Duration::from_millis(100)).await;
-            assert!(!send(&mut s, &[&vec![b'x'; 1 << 22]], 1 << 20, 0, Instant::now(), None).await);
+            assert!(!send(&mut s, &[&vec![b'x'; 1 << 22]], &mut Pace::new(1 << 20, 0, Instant::now(), false), None).await);
             // A client that does not read for send_timeout fails the write.
             let (mut s, _client) = pair().await;
-            assert!(!send(&mut s, &[&vec![b'x'; 1 << 24]], 0, 0, Instant::now(), Some(Duration::from_millis(200))).await);
+            let mut pace = Pace::new(0, 0, Instant::now(), false);
+            assert!(!send(&mut s, &[&vec![b'x'; 1 << 24]], &mut pace, Some(Duration::from_millis(200))).await);
+            // What it took before is counted.
+            assert!((1..1 << 24).contains(&pace.sent));
         });
     }
 

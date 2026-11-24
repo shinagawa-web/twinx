@@ -155,14 +155,22 @@ pub async fn write_all<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8], time: Opti
 
 /// Writes the slices one after another, as writev does, and flushes them;
 /// each write waits at most the time.
-pub async fn write_vectored<S: AsyncWrite + Unpin>(s: &mut S, mut bufs: &mut [IoSlice<'_>], time: Option<Duration>) -> bool {
+pub async fn write_vectored<S: AsyncWrite + Unpin>(s: &mut S, bufs: &mut [IoSlice<'_>], time: Option<Duration>) -> bool {
+    write_counted(s, bufs, time, &mut 0).await
+}
+
+/// The same, adding the bytes written to a count, also when a write fails after others.
+pub async fn write_counted<S: AsyncWrite + Unpin>(s: &mut S, mut bufs: &mut [IoSlice<'_>], time: Option<Duration>, count: &mut usize) -> bool {
     loop {
         // Empty slices are left out: a write of nothing would look like a closed connection.
         IoSlice::advance_slices(&mut bufs, 0);
         if bufs.is_empty() { break }
         match within(time, s.write_vectored(bufs)).await {
             Some(Ok(0)) | None => return false,
-            Some(Ok(n)) => IoSlice::advance_slices(&mut bufs, n),
+            Some(Ok(n)) => {
+                *count += n;
+                IoSlice::advance_slices(&mut bufs, n);
+            }
             Some(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Some(Err(_)) => return false,
         }
@@ -186,6 +194,12 @@ pub async fn closed(tcp: &TcpStream) {
         if unsafe { libc::poll(&mut fd, 1, 0) } != 0 { return }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// What a future gives, None when the client closes its side of the connection before.
+pub async fn unless_closed<F: Future>(client: &Stream, f: F) -> Option<F::Output> {
+    let closed = async { match client.tcp() { Some(tcp) => closed(tcp).await, None => std::future::pending().await } };
+    tokio::select! { biased; out = f => Some(out), () = closed => None }
 }
 
 #[cfg(test)]
@@ -221,6 +235,11 @@ mod tests {
             other.write_all(b"x").await.unwrap();
             assert_eq!((read_into(&mut s, &mut buf, None).await, buf.as_slice()), (1, &b"x"[..]));
             assert_eq!(within(Some(Duration::from_millis(10)), std::future::pending::<()>()).await, None);
+            // What was written before a write that fails is counted.
+            let (mut count, data) = (3, vec![b'x'; 1 << 24]);
+            assert!(write_counted(&mut s, &mut [IoSlice::new(b"ab")], None, &mut count).await && count == 5);
+            assert!(!write_counted(&mut s, &mut [IoSlice::new(&data)], Some(Duration::from_millis(50)), &mut count).await);
+            assert!((6..data.len()).contains(&count));
         });
     }
 
@@ -278,6 +297,8 @@ mod tests {
             other.shutdown().await.unwrap();
             assert!(within(Some(Duration::from_secs(2)), closed(&s)).await.is_some());
             let s = Stream::Tcp(s);
+            assert_eq!(unless_closed(&s, std::future::ready(1)).await, Some(1));
+            assert_eq!(unless_closed(&s, std::future::pending::<()>()).await, None);
             s.close();
             let mut buf = [0u8; 16];
             assert_eq!(other.read(&mut buf).await.unwrap(), 0);
