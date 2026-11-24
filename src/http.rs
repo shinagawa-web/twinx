@@ -2106,18 +2106,22 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // proxy_cache: a GET or HEAD is answered with what the cache keeps for its key
     // ($scheme$proxy_host$request_uri) while that is valid.
     let cache = level.proxy_cache.as_ref().filter(|_| matches!(r.method.as_str(), "GET" | "HEAD"));
-    let key = format!("{}://{host}{}", if r.ssl.is_some() { "https" } else { "http" }, r.request_uri());
+    let to_host = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
+    let key = level.proxy_cache_key.as_ref().map_or_else(|| format!("{}://{host}{}", if r.ssl.is_some() { "https" } else { "http" }, r.request_uri()), |k| k.render(r, &to_host));
+    // proxy_cache_bypass: the server is asked whatever the cache keeps.
+    let any_set = |t: &[Template]| t.iter().any(|t| !matches!(t.render(r, &to_host).as_str(), "" | "0"));
+    let bypass = cache.is_some() && any_set(&level.proxy_cache_bypass);
     let hit = |e: crate::cache::Entry| Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, ranges: true, proxy_host: Some(host.clone()), ..Response::default() };
     // $upstream_cache_status: how the cache answered.
     let noted = |status| { if cache.is_some() { *r.shared.cache_status.lock().unwrap() = Some(status); } };
-    if let Some(e) = cache.and_then(|z| z.get(&key)) { noted("HIT"); return hit(e) }
+    if let Some(e) = cache.filter(|_| !bypass).and_then(|z| z.get(&key)) { noted("HIT"); return hit(e) }
     // What is kept but no longer valid may be given instead of the server's answer (proxy_cache_use_stale).
-    let stale = cache.and_then(|z| z.stale(&key));
-    noted(if stale.is_some() { "EXPIRED" } else { "MISS" });
+    let stale = cache.filter(|_| !bypass).and_then(|z| z.stale(&key));
+    noted(if bypass { "BYPASS" } else if stale.is_some() { "EXPIRED" } else { "MISS" });
     let uses = cache.map_or(0, |z| z.used(&key));
     // proxy_cache_lock: while another request asks the server for the key, this one waits
     // for what it caches; once that wait is over, it asks too, and its answer is not cached.
-    let locked = match cache.filter(|_| level.proxy_cache_lock) {
+    let locked = match cache.filter(|_| level.proxy_cache_lock && !bypass) {
         Some(zone) => Some(zone.lock(&key, crate::cache::LOCK_TIMEOUT).await),
         None => None,
     };
@@ -2315,7 +2319,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     resp.unconditional = cache.is_none();
     // An answer whose status proxy_cache_valid names is read whole and kept.
     // Not before proxy_cache_min_uses requests asked for it, nor when proxy_no_cache says so.
-    let no_cache = level.proxy_no_cache.iter().any(|t| !matches!(t.render(r, &sent).as_str(), "" | "0"));
+    let no_cache = any_set(&level.proxy_no_cache);
     let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !no_cache;
     if let Some((zone, valid)) = cache.filter(|_| cacheable).zip(crate::cache::validity(&level.proxy_cache_valid, resp.status)) {
         finish(&mut resp, (level, r)).await;
