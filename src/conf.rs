@@ -344,9 +344,9 @@ pub struct Level {
     /// index: the files looked for in a directory, in order; one that starts
     /// with "/" is a URI redirected to whether it exists or not.
     pub index: Vec<Template>,
-    /// error_log of http, server or location: where errors of requests are
-    /// written, and from which of the levels on.
-    pub error_log: Option<(Arc<File>, usize)>,
+    /// error_log, of the main block if not of http, server or location: where errors
+    /// of requests are written, and from which of the levels on.
+    pub error_log: Vec<(Arc<File>, usize)>,
     /// log_not_found: whether files that are not found are logged.
     pub log_not_found: bool,
     pub proxy: Option<Arc<Proxy>>,
@@ -692,6 +692,8 @@ struct Builder<'a> {
     logs: HashMap<PathBuf, Arc<File>>,
     upstreams: HashMap<String, Arc<Upstream>>,
     implicit: Implicit,
+    /// error_log of the main block.
+    errors: Vec<(Arc<File>, usize)>,
     /// The directories of temporary files of all levels, with their levels of subdirectories
     /// and where the directives are, the defaults having none.
     temp_paths: Vec<(PathBuf, Vec<usize>, Option<String>)>,
@@ -704,11 +706,17 @@ struct Builder<'a> {
 pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
-    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), implicit: Implicit::default(), temp_paths: Vec::new(), location: String::new() };
+    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new() };
     let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
     crate::tls::new_configuration(inheritable);
+    // So are the error logs, which the http block inherits wherever they are.
+    for d in main.iter().filter(|d| d.name == "error_log") {
+        b.check(d, MAIN)?;
+        let log = b.error_log(d)?;
+        b.errors.push(log);
+    }
     for (i, d) in main.iter().enumerate() {
         b.check(d, MAIN)?;
         once(&main[..i], d)?;
@@ -777,10 +785,16 @@ impl Builder<'_> {
         Ok(file)
     }
 
+    /// The file of an error_log, and the level from which on it is written to.
+    fn error_log(&mut self, d: &Directive) -> Result<(Arc<File>, usize), String> {
+        let file = self.open(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
+        Ok((file, d.args.get(1).and_then(|l| LEVELS.iter().position(|v| v == l)).unwrap_or(4)))
+    }
+
     fn http(&mut self, block: &[Directive]) -> Result<Vec<Server>, String> {
         let (temp, proxy_temp) = (self.path("client_body_temp"), self.path("proxy_temp"));
         // Without root, files come from html under the prefix, as nginx's default root is.
-        let mut level = Level { root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
+        let mut level = Level { error_log: self.errors.clone(), root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, lingering_close: Some(false),
             resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), sendfile_max_chunk: 2 << 20, tcp_nodelay: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
@@ -877,9 +891,10 @@ impl Builder<'_> {
     }
 
     /// Applies the directives of one level that are not blocks of their own;
-    /// access_log replaces what the level above set as a whole.
+    /// access_log and error_log replace what the level above set as a whole.
     fn level(&mut self, block: &[Directive], ctx: u16, level: &mut Level) -> Result<(), String> {
         let mut logs: Option<Vec<Arc<AccessLog>>> = None;
+        let mut errors: Option<Vec<(Arc<File>, usize)>> = None;
         let (mut headers, mut trailers): (Option<Vec<(String, Template, bool)>>, Option<Vec<_>>) = (None, None);
         let mut pages: Option<Vec<ErrorPage>> = None;
         // ssl_certificate and ssl_certificate_key of this level, which replace those inherited.
@@ -1027,10 +1042,7 @@ impl Builder<'_> {
                 "max_headers" => level.max_headers = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
                 "index" => level.index = d.args.iter().map(|a| Template::parse(a)).collect::<Result<_, _>>().map_err(at)?,
                 "log_not_found" => level.log_not_found = flag(d).map_err(at)?,
-                "error_log" => {
-                    let file = self.open(&d.args[0]).map_err(at)?;
-                    level.error_log = Some((file, d.args.get(1).and_then(|l| LEVELS.iter().position(|v| v == l)).unwrap_or(4)));
-                }
+                "error_log" => errors.get_or_insert_default().push(self.error_log(d)?),
                 "ignore_invalid_headers" => level.ignore_invalid_headers = flag(d).map_err(at)?,
                 "underscores_in_headers" => level.underscores_in_headers = flag(d).map_err(at)?,
                 "merge_slashes" => level.merge_slashes = flag(d).map_err(at)?,
@@ -1120,6 +1132,7 @@ impl Builder<'_> {
             }
         }
         if let Some(logs) = logs { level.access_log = logs; }
+        if let Some(errors) = errors { level.error_log = errors; }
         if let Some(headers) = headers { level.add_header = headers; }
         if let Some(trailers) = trailers { level.add_trailer = trailers; }
         if let Some(pages) = pages { level.error_page = pages; }
@@ -1798,6 +1811,15 @@ mod tests {
         assert_eq!(build_text("http { }").unwrap().working_directory, None);
         assert!(build_text("working_directory;").is_err());
         assert!(build_text("http { working_directory wd; }").is_err());
+    }
+
+    #[test]
+    fn inherits_and_overrides_error_log() {
+        let c = build_text("http { server { location /a { error_log a2.log; error_log b2.log info; } location /b { } } } error_log m.log; error_log n.log warn;").unwrap();
+        let logs = |l: usize| c.servers[0].locations[l].level.error_log.iter().map(|e| e.1).collect::<Vec<_>>();
+        // Those of the main block, wherever they are.
+        assert_eq!((logs(0), logs(1)), (vec![4, 1], vec![4, 3]));
+        assert!(build_text("http { } error_log;").is_err());
     }
 
     #[test]
