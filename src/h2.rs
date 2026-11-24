@@ -324,6 +324,8 @@ fn request<'a>(fields: impl Iterator<Item = (&'a [u8], &'a [u8])>, end: bool) ->
         lines.push((name, value));
     }
     let [Some(method), Some(scheme), Some(path), authority] = pseudo else { return None };
+    // A method has only upper case letters, "_" and "-", as ngx_http_v2_parse_method() checks.
+    if !method.iter().all(|&c| c.is_ascii_uppercase() || c == b'_' || c == b'-') { return None }
     let scheme_char = |(i, &c): (usize, &u8)| c.is_ascii_alphabetic() || i > 0 && (c.is_ascii_digit() || b"+-.".contains(&c));
     let valid = scheme.iter().enumerate().all(scheme_char) && path.iter().all(|&c| c > 0x20 && c != 0x7f);
     // Content-Length with a stream that has ended is a body that did not come.
@@ -520,7 +522,9 @@ impl Connection {
         let skip = usize::from(flags & PADDED != 0) + if flags & PRIORITY_FLAG != 0 { 5 } else { 0 };
         if kind != HEADERS || self.block.is_some() || p.len() <= skip { return Ok(()) }
         let length = len.saturating_sub(skip + if flags & PADDED != 0 { usize::from(p[0]) } else { 0 });
-        match self.table.clone().decode(&p[skip..p.len().min(skip + length)], length, self.limits) {
+        // A field may go on in a CONTINUATION frame when this one does not end the block.
+        let whole = if flags & END_HEADERS != 0 { length } else { usize::MAX };
+        match self.table.clone().decode(&p[skip..p.len().min(skip + length)], whole, self.limits) {
             Err(code) if code != AGAIN => { self.last_sid = sid; Err(code) }
             _ => Ok(()),
         }
@@ -1351,6 +1355,8 @@ mod tests {
         assert!(request(&[&base[..], &[(":other", "/")]].concat(), true).is_none());
         assert!(request(&base[..3], true).is_none());
         assert!(request(&[base[0], (":scheme", "1x"), base[2], base[3]], true).is_none());
+        assert!(request(&[(":method", "GET "), base[1], base[2], base[3]], true).is_none());
+        assert!(request(&[(":method", "M-_"), base[1], base[2], base[3]], true).is_some());
     }
 
     #[test]
@@ -2796,5 +2802,24 @@ mod tests {
             assert!(started.elapsed() >= Duration::from_millis(900), "{:?}", started.elapsed());
             c.close().await;
         });
+    }
+
+    #[test]
+    fn fields_go_on_in_continuation_frames() {
+        // A HEADERS frame that has not come whole, a field going on past it.
+        let block = [&[0x82, 0x86, 0x84, 0x00, 0x03][..], b"x-a", &[0x0a], b"abcde"].concat();
+        let mut c = connection();
+        let head = framed(HEADERS, END_STREAM, 1, &block);
+        let frames = [&head[..head.len() - 2], &head[head.len() - 2..], &framed(CONTINUATION, END_HEADERS, 1, b"fghij")];
+        let mut buf = Vec::new();
+        for part in frames {
+            buf.extend_from_slice(part);
+            assert_eq!(c.read(&mut buf), Ok(()));
+        }
+        assert_eq!(c.ready, [1]);
+        // The block ends with it: the field is too long.
+        let mut c = connection();
+        let head = framed(HEADERS, END_STREAM | END_HEADERS, 1, &block);
+        assert_eq!(c.read(&mut head[..head.len() - 2].to_vec()), Err(FRAME_SIZE_ERROR));
     }
 }
