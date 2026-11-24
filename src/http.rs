@@ -550,6 +550,9 @@ struct Response {
     /// closed the connection before the end of it, or a read of it having failed or
     /// waited longer than proxy_read_timeout, or its chunks being malformed.
     cut: Option<Box<Cut>>,
+    /// Of a proxied answer whose body does not come (to HEAD, or 204 or 304): the length
+    /// the server gave of it, if it did.
+    told: Option<Option<usize>>,
     /// Whether it is a proxied answer that is not buffered, which limit_rate does not pace.
     unbuffered: bool,
 }
@@ -937,7 +940,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         if !streams { finish(&mut resp).await; }
         if !gzip_ok(r, level) {
             load(r, level, &mut resp);
-            if streams { coded(&mut resp, Coder::gunzip()); } else { gunzip(&mut resp); }
+            if streams || resp.told.is_some() { coded(&mut resp, Coder::gunzip()); } else { gunzip(&mut resp); }
         }
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
@@ -972,9 +975,10 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     if resp.generated && !level.server_tokens {
         resp.body = String::from_utf8_lossy(&resp.body).replace(&format!("<hr><center>{NAME}</center>"), "<hr><center>twinx</center>").into_bytes();
     }
-    match &resp.rest {
-        // As gzip() does, looking at the length the server gave, if any. It may be compressed for another client.
-        Some(rest) => if rest.length.is_none_or(|n| n >= 20) && gzips(level, &resp) {
+    // The length the server gave of a proxied answer, if any, also of one without its body.
+    match resp.rest.as_ref().map(|rest| rest.length).or(resp.told) {
+        // As gzip() does. It may be compressed for another client.
+        Some(length) => if length.is_none_or(|n| n >= 20) && gzips(level, &resp) {
             resp.vary = true;
             if gzip_ok(r, level) {
                 coded(&mut resp, Coder::gzip());
@@ -1012,8 +1016,8 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     // chunked_transfer_encoding off leaves both unchunked.
     // One whose body is still to be read has the length its server gave.
     let whole = || resp.cut.as_ref().filter(|_| cut).map_or(Some(resp.len()), |c| c.length);
-    let length = resp.rest.as_ref().map_or_else(whole, |rest| rest.length).filter(|_| !resp.unknown_length);
-    let unknown = length.is_none() && r.method != "HEAD";
+    let length = resp.told.unwrap_or_else(|| resp.rest.as_ref().map_or_else(whole, |rest| rest.length)).filter(|_| !resp.unknown_length);
+    let unknown = length.is_none() && r.method != "HEAD" && ![204, 304].contains(&status);
     let trailing = level.add_trailer.iter().any(|t| t.2 || added) && r.method != "HEAD" && ![204, 304].contains(&status);
     // An upgraded connection is neither chunked nor kept alive, and has no length.
     let upgraded = resp.tunnel.is_some();
@@ -1031,7 +1035,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         crate::clock::date(|date| add(&[date, "\r\n"]));
         if let Some(ctype) = &resp.ctype { add(&["Content-Type: ", ctype, "\r\n"]); }
         if chunked { add(&["Transfer-Encoding: chunked\r\n"]); }
-        if let Some(n) = length.filter(|_| (!chunked || h2) && status != 304 && !upgraded) { add(&["Content-Length: ", decimal(&mut [0; 20], n as u64), "\r\n"]); }
+        if let Some(n) = length.filter(|_| (!chunked || h2) && (![204, 304].contains(&status) || resp.told.is_some() && (status == 304 || !r.line.ends_with("HTTP/2.0"))) && !upgraded) { add(&["Content-Length: ", decimal(&mut [0; 20], n as u64), "\r\n"]); }
         add(&["Connection: ", if upgraded { "upgrade" } else if keepalive { "keep-alive" } else { "close" }, "\r\n"]);
         if let Some(t) = level.keepalive_header.filter(|_| keepalive) { add(&["Keep-Alive: timeout=", decimal(&mut [0; 20], t), "\r\n"]); }
         if resp.vary && level.gzip_vary { add(&["Vary: Accept-Encoding\r\n"]); }
@@ -1163,7 +1167,7 @@ fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
     let (ims, inm) = (header(r, "if-modified-since"), header(r, "if-none-match"));
     let same = |t: &str| level.if_modified_since.zip(modified).is_some_and(|(before, m)| expires::http_time(t).is_some_and(|t| t == m || before && t > m));
     if (ims.is_none() && inm.is_none()) || ims.is_some_and(|t| !same(t)) || inm.is_some_and(|v| !etag_match(v, etag.as_deref(), true)) { return; }
-    (resp.status, resp.ctype, resp.body, resp.file, resp.rest, resp.cut) = (304, None, Vec::new(), None, None, None);
+    (resp.status, resp.ctype, resp.body, resp.file, resp.rest, resp.cut, resp.told) = (304, None, Vec::new(), None, None, None, None);
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges") && !h.0.eq_ignore_ascii_case("content-encoding"));
 }
 
@@ -2275,10 +2279,11 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     // read for X-Accel-Redirect would come before the next answer.
     let skipped = accel && !no_body && length != Some(0);
     let keep = status >= 200 && !closes(version, &values("connection")) && !skipped;
+    let told = no_body.then_some(length);
     let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
     if length == Some(0) {
         (bytes[0], bytes[1]) = ((answer.len() - end) as u64, answer.len() as u64);
-        return Ok((resp, Some(conn).filter(|_| keep && answer.len() == end)));
+        return Ok((Response { told, ..resp }, Some(conn).filter(|_| keep && answer.len() == end)));
     }
     // X-Accel-Buffering, the last of them that is "yes" or "no", comes before proxy_buffering.
     let buffering = values("x-accel-buffering").iter().rev().find_map(|v| match v.to_ascii_lowercase().as_str() { "yes" => Some(true), "no" => Some(false), _ => None }).unwrap_or(level.proxy_buffering);
@@ -5884,6 +5889,39 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             assert!(got("GET /f\r\n") == data);
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn answers_without_their_body_have_its_length() {
+        let _busy = serving_on();
+        let gz = "gzip on; gunzip on; gzip_vary on;";
+        for (method, status, more, directives, want) in [
+            ("HEAD", "200 OK", "Content-Length: 1234\r\n", "", "Content-Length: 1234\r\n"),
+            ("HEAD", "404 Not Found", "Content-Length: 77\r\n", "", "Content-Length: 77\r\n"),
+            ("HEAD", "200 OK", "", "", ""),
+            ("HEAD", "200 OK", "Content-Length: 0\r\n", "", "Content-Length: 0\r\n"),
+            ("HEAD", "200 OK", "Transfer-Encoding: chunked\r\n", "", ""),
+            ("HEAD", "200 OK", "Content-Length: 1234\r\n", "add_trailer X 1;", "Content-Length: 1234\r\n"),
+            ("HEAD", "200 OK", "Content-Length: 1234\r\n", gz, "Vary: Accept-Encoding\r\nContent-Encoding: gzip\r\n"),
+            ("HEAD", "200 OK", "", gz, "Vary: Accept-Encoding\r\nContent-Encoding: gzip\r\n"),
+            ("HEAD", "200 OK", "Content-Length: 19\r\n", gz, "Content-Length: 19\r\n"),
+            ("HEAD", "201 Created", "Content-Length: 1234\r\n", gz, "Content-Length: 1234\r\n"),
+            ("HEAD", "200 OK", "Content-Length: 1234\r\nContent-Encoding: gzip\r\n", "gunzip on; gzip_http_version 1.1; proxy_set_header X 1;", "Content-Length: 1234\r\nContent-Encoding: gzip\r\n"),
+            ("GET", "204 No Content", "", "", ""), ("GET", "204 No Content", "Content-Length: 5\r\n", gz, "Content-Length: 5\r\n"),
+            ("GET", "304 Not Modified", "", "", ""), ("GET", "304 Not Modified", "Content-Length: 1234\r\n", gz, "Content-Length: 1234\r\n"),
+            ("HEAD", "304 Not Modified", "Content-Length: 1234\r\n", "", "Content-Length: 1234\r\n"),
+            // What twinx answers itself has no length then.
+            ("GET", "200 OK", "Content-Length: 4\r\n\r\nabcd", "return 204;", ""),
+        ] {
+            let head = format!("HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{more}\r\n");
+            let (addr, _count) = plays(&vec![(0, head.into_bytes())], false);
+            let requests = format!("{method} / HTTP/1.1\r\nHost: a\r\nAccept-Encoding: gzip\r\n\r\n");
+            // The connection serves the next request.
+            let got = String::from_utf8(block_on(received(&passing(addr, directives), &format!("{requests}{}", requests.replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n"))))).unwrap();
+            let lines = |part: &str| part.split("\r\n").skip(1).filter(|l| ["content-length", "content-encoding", "transfer-encoding", "vary"].iter().any(|n| l.to_ascii_lowercase().starts_with(n))).map(|l| format!("{l}\r\n")).collect::<String>();
+            let parts: Vec<_> = got.split_inclusive("\r\n\r\n").map(lines).collect();
+            assert_eq!(parts, [want, want], "{method} {status} {more} {directives} {got}");
+        }
     }
 
     #[test]

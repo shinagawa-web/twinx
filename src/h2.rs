@@ -1755,8 +1755,10 @@ mod tests {
         // What has no body ends with its head.
         let all = got(&vec![(0, length.into_bytes())], false, "", "HEAD");
         assert!(all.len() == 1 && all[0].1.ends_with('|'), "{all:?}");
-        let all = got(&vec![(0, b"HTTP/1.1 204 No Content\r\n\r\n".to_vec())], false, "", "GET");
-        assert!(all.len() == 1 && all[0].1.starts_with(":status: 204;") && all[0].1.ends_with('|'), "{all:?}");
+        for (head, method, want) in [("204 No Content", "GET", ":status: 204;|"), ("204 No Content\r\nContent-Length: 5", "GET", ":status: 204;|"), ("304 Not Modified\r\nContent-Length: 5", "GET", ":status: 304;content-length: 5;|"), ("200 OK\r\nContent-Length: 5", "HEAD", ":status: 200;content-length: 5;|"), ("200 OK", "HEAD", ":status: 200;|")] {
+            let all = got(&vec![(0, format!("HTTP/1.1 {head}\r\n\r\n").into_bytes())], false, "", method);
+            assert_eq!(texts(&all), [want], "{head}");
+        }
     }
 
     #[test]
