@@ -749,6 +749,7 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
     let (limits, keepalive) = (level.large_header_buffers, (level.keepalive_requests, level.keepalive_timeout, level.keepalive_time));
     // lingering_close on or always: closing, it reads what the client still sends.
     let lingers = level.lingering_close.is_some();
+    let send = crate::http::send_timeout(level);
     let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
     let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive };
     // nginx's settings: the streams at a time, the window of each, the largest frame it takes; and the largest window of the connection.
@@ -794,7 +795,8 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
             return;
         }
         let out = std::mem::take(&mut c.out);
-        if !out.is_empty() && !write_all(&mut stream, &out, None).await { return }
+        // A client that takes nothing of it for send_timeout of the default server loses the connection.
+        if !out.is_empty() && !write_all(&mut stream, &out, send).await { return }
         recycle(out);
         // After GOAWAY, the connection closes once its streams are answered.
         if c.goaway && c.streams.is_empty() { return crate::http::close(&mut stream, lingers).await }
@@ -2448,6 +2450,24 @@ mod tests {
             let all: String = c.all(1).await.into_iter().map(|f| f.1).collect();
             assert!(all.ends_with("reset 2") && (1 << 20) - 32768 - 65535 <= all.len() && all.len() <= (1 << 20) + 7, "{}", all.len());
             c.close().await;
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_client_that_takes_nothing_for_send_timeout_loses_its_connection() {
+        let _busy = serving_on();
+        let dir = files("h2-send");
+        std::fs::write(dir.join("f"), letters(32 << 20)).unwrap();
+        let http = format!("http2 on; send_timeout 1s; {}", serves_files(&dir, "location / { index f; }"));
+        crate::stream::block_on(async {
+            let mut c = Client::new_by(&http, 1 << 30).await;
+            c.send(&[framed(WINDOW_UPDATE, 0, 0, &(1u32 << 30).to_be_bytes())]).await;
+            c.get(1, "GET").await;
+            // It reads nothing: once the buffers are full, a write waits for send_timeout and the connection ends.
+            let started = Instant::now();
+            within(Some(Duration::from_secs(10)), &mut c.task).await.expect("still served").unwrap();
+            assert!(started.elapsed() >= Duration::from_secs(1), "{:?}", started.elapsed());
         });
         std::fs::remove_dir_all(dir).unwrap();
     }

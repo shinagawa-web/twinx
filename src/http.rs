@@ -473,7 +473,7 @@ pub(crate) async fn close(stream: &mut Stream, lingers: bool) {
 }
 
 /// How long a write to the client may wait (send_timeout; zero: no limit).
-fn send_timeout(level: &Level) -> Option<Duration> {
+pub fn send_timeout(level: &Level) -> Option<Duration> {
     Some(level.send_timeout).filter(|t| !t.is_zero())
 }
 
