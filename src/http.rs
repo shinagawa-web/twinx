@@ -609,9 +609,18 @@ fn load(r: &Request, level: &Level, resp: &mut Response) {
 /// more sent. It ends too when a write fails, the client goes away or worker_shutdown_timeout passes. Gives whether
 /// all was written, how much was, and how much of that of the body, and the trailers.
 async fn send_file<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(stream: &mut Stream, mut file: Box<FileBody>, resp: &Response, (mut head, chunked): (&[u8], bool), mut pace: Pace, asked: (&Request, &Level), ending: E) -> (bool, (usize, usize), Vec<(String, String)>) {
-    let (mut buf, mut size, mut tail, mut passed, mut trailers) = (vec![0; file.len.min(PIECE) as usize], Vec::new(), Vec::new(), 0, Vec::new());
+    let direct = asked.1.sendfile && file.coder.is_none() && matches!(stream, Stream::Tcp(_));
+    let (mut buf, mut size, mut tail, mut passed, mut trailers) = (vec![0; if direct { 0 } else { file.len.min(PIECE) as usize }], Vec::new(), Vec::new(), 0, Vec::new());
     let (time, mut ending) = (send_timeout(asked.1), Some(ending));
     let written = async {
+        if direct {
+            // One chunk, as in nginx, whose end is made before any of it is sent.
+            in_chunk(chunked, file.len as usize, &mut size, &mut tail);
+            if let Some(ending) = ending.take().filter(|_| chunked) { trailers = ending(resp, &mut tail); }
+            let sent = send_direct(stream, (&[head, &size], &tail), &file, &mut pace, asked).await;
+            passed = pace.sent.saturating_sub(head.len() + size.len()).min(file.len as usize);
+            return sent
+        }
         loop {
             let n = file.len.min(PIECE);
             let piece = &mut buf[..n as usize];
@@ -630,7 +639,7 @@ async fn send_file<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(
                 if let Some(ending) = ending.take_if(|_| chunked && last) { trailers = ending(resp, &mut tail); }
                 if last || !part.is_empty() {
                     // The last of it, small as it may be, does not wait for the client to acknowledge what was before (tcp_nodelay).
-                    if let Some(tcp) = stream.tcp().filter(|_| last) { let _ = tcp.set_nodelay(true); }
+                    if let Some(tcp) = stream.tcp().filter(|_| last && asked.1.tcp_nodelay) { let _ = tcp.set_nodelay(true); }
                     let (before, sent) = (pace.sent, send_watched(stream, &[head, &size, part, &tail], &mut pace, time).await);
                     passed += (pace.sent - before).saturating_sub(head.len() + size.len()).min(part.len());
                     if !sent || last { return sent }
@@ -643,6 +652,68 @@ async fn send_file<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(
     };
     let written = tokio::select! { biased; written = written => written, () = halted() => false };
     (written, (pace.sent, passed), trailers)
+}
+
+/// Sends what is before a file, the file, and what is after it, with sendfile, as nginx's
+/// ngx_linux_sendfile_chain() does: as much at a time as limit_rate lets it, up to
+/// sendfile_max_chunk, after which it is the turn of other connections. It ends when the
+/// client goes away, or waits for send_timeout. A file that has become shorter ends it there.
+async fn send_direct(stream: &Stream, (before, after): (&[&[u8]; 2], &[u8]), file: &FileBody, pace: &mut Pace, (r, level): (&Request, &Level)) -> bool {
+    let Stream::Tcp(tcp) = stream else { return false };
+    let lead = before[0].len() + before[1].len();
+    let (end, total) = (lead + file.len as usize, lead + file.len as usize + after.len());
+    let chunk = if level.sendfile_max_chunk == 0 { usize::MAX } else { level.sendfile_max_chunk as usize };
+    let sent = async {
+        let mut at = 0;
+        while at < total {
+            let (from, to) = (at, at + pace.allowed(total - at).await.min(chunk));
+            let failed = loop {
+                if at >= to { break None }
+                let sent = if at < lead {
+                    let first = before[0].len().min(to);
+                    tcp.try_write_vectored(&[std::io::IoSlice::new(&before[0][at.min(first)..first]), std::io::IoSlice::new(&before[1][at.saturating_sub(first)..to.min(lead) - first])])
+                } else if at < end {
+                    // What is not all that is left of it goes up to the end of a page, as in nginx.
+                    let start = file.start as usize + at - lead;
+                    let n = ((start + to.min(end) - at).next_multiple_of(4096) - start).min(end - at);
+                    crate::stream::sendfile(tcp, &file.file, start as u64, n)
+                } else {
+                    tcp.try_write(&after[at - end..to - end])
+                };
+                match sent {
+                    Ok(0) => break Some(std::io::ErrorKind::UnexpectedEof.into()),
+                    Ok(n) => at += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => break Some(e),
+                }
+            };
+            pace.wrote(at - from);
+            match failed {
+                None if at < total => tokio::task::yield_now().await,
+                None => {}
+                Some(e) if e.kind() == std::io::ErrorKind::WouldBlock => if !matches!(within(send_timeout(level), tcp.writable()).await, Some(Ok(()))) { return false },
+                Some(e) => {
+                    let path = file.path.display();
+                    match e.raw_os_error() {
+                        None => log_at(level, r, "alert", &format!("sendfile() reported that \"{path}\" was truncated at {} while sending response to client", file.start + at.saturating_sub(lead) as u64), ""),
+                        // What a client that went away makes of it is no error of the server's.
+                        Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN | libc::ETIMEDOUT | libc::EHOSTUNREACH | libc::ENETUNREACH | libc::ENETDOWN | libc::EHOSTDOWN) => {}
+                        Some(_) => log_at(level, r, "alert", &format!("sendfile() failed {} while sending response to client", os_error(&e)), ""),
+                    }
+                    return false
+                }
+            }
+        }
+        true
+    };
+    let socket = socket2::SockRef::from(tcp);
+    // As in nginx, only full packets are sent until all is written (tcp_nopush); what is left then, and what
+    // follows it, does not wait for the client to acknowledge what was before (tcp_nodelay).
+    if level.tcp_nopush { let _ = socket.set_tcp_cork(true); }
+    let sent = tokio::select! { biased; sent = sent => sent, () = crate::stream::closed(tcp) => false };
+    if level.tcp_nopush { let _ = socket.set_tcp_cork(false); }
+    if level.tcp_nodelay { let _ = tcp.set_nodelay(true); }
+    sent
 }
 
 /// A proxied answer cut off: the length its server gave it, if any, until a
@@ -1004,8 +1075,9 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         }
     }
     range(r, &mut resp);
-    // What is read at once is written with the head.
-    if r.method != "HEAD" && resp.len() as u64 <= PIECE { load(r, level, &mut resp); }
+    // What is read at once is written with the head. With sendfile, less is: one write of both costs less than two up to about there.
+    let once = if level.sendfile && matches!(stream, Stream::Tcp(_)) { PIECE / 2 } else { PIECE };
+    if r.method != "HEAD" && resp.len() as u64 <= once { load(r, level, &mut resp); }
     let status = resp.status;
     // 444 closes the connection without an answer; 499 is the status of a client that closed it.
     let silent = [444, 499].contains(&status);
@@ -1421,7 +1493,7 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
                 if !send(stream, &[head, &size, part, &tail], pace, time).await { return Some(false) }
                 *passed += part.len();
                 if let Some(c) = &mut coder { c.written(); }
-                if let Some(tcp) = stream.tcp() { let _ = tcp.set_nodelay(true); }
+                if let Some(tcp) = stream.tcp().filter(|_| level.tcp_nodelay) { let _ = tcp.set_nodelay(true); }
                 head = &[];
             }
             unless_closed(stream, incoming.next(true)).await?;
@@ -1497,7 +1569,7 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
                 *passed += (pace.sent - before).saturating_sub(lead).min(length);
                 if let Err(written) = written { return written }
                 // What follows, small as it may be, does not wait for the client to acknowledge that (tcp_nodelay).
-                if let Some(tcp) = stream.tcp().filter(|_| !head.is_empty() && !last) { let _ = tcp.set_nodelay(true); }
+                if let Some(tcp) = stream.tcp().filter(|_| level.tcp_nodelay && !head.is_empty() && !last) { let _ = tcp.set_nodelay(true); }
                 head = &[];
             }
             match &mut coder { Some(c) => c.written(), None => release(&mut incoming.buffers, &mut lent, owned, end) }
@@ -1538,6 +1610,32 @@ impl Pace {
         let start = if rate == 0 { 0 } else { (now() - started.elapsed()).as_secs() as i64 };
         Pace { rate: rate as i64, after: after as i64, start, sent: 0, until: None }
     }
+
+    /// How much of what is left may be written, waited for until any of it may.
+    async fn allowed(&mut self, left: usize) -> usize {
+        while self.rate != 0 {
+            if let Some(until) = self.until {
+                tokio::time::sleep_until(until.into()).await;
+                self.until = None;
+            } else {
+                let limit = self.rate * (seconds() - self.start + 1) - (self.sent as i64 - self.after);
+                if limit > 0 || left == 0 { return left.min(limit.max(0) as usize) }
+                self.until = Some(Instant::now() + Duration::from_millis((-limit * 1000 / self.rate + 1) as u64));
+            }
+        }
+        left
+    }
+
+    /// So much was written.
+    fn wrote(&mut self, n: usize) {
+        let paced = |sent: usize| (sent as i64 - self.after).max(0);
+        let before = paced(self.sent);
+        self.sent += n;
+        if self.rate != 0 {
+            let delay = (paced(self.sent) - before) * 1000 / self.rate;
+            if delay > 0 { self.until = Some(Instant::now() + Duration::from_millis(delay as u64)); }
+        }
+    }
 }
 
 /// The time of day, and in whole seconds.
@@ -1574,18 +1672,8 @@ async fn send_from<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts:
 /// rate. Without a rate it is written at once. The write waits at most the time
 /// (send_timeout). When this is dropped, the pace tells what was done.
 async fn write_some<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts: &[&[u8]; N], from: usize, pace: &mut Pace, time: Option<Duration>) -> bool {
-    let (total, after) = (parts.iter().map(|p| p.len()).sum::<usize>(), pace.after);
-    let mut to = total;
-    while pace.rate != 0 && (from < total || total == 0) {
-        if let Some(until) = pace.until {
-            tokio::time::sleep_until(until.into()).await;
-            pace.until = None;
-        } else {
-            let limit = pace.rate * (seconds() - pace.start + 1) - (pace.sent as i64 - after);
-            if limit > 0 || total == 0 { to = total.min(from + limit.max(0) as usize); break }
-            pace.until = Some(Instant::now() + Duration::from_millis((-limit * 1000 / pace.rate + 1) as u64));
-        }
-    }
+    let total = parts.iter().map(|p| p.len()).sum::<usize>();
+    let to = if from < total || total == 0 { from + pace.allowed(total - from).await } else { total };
     if from < to {
         let (mut at, mut used, mut bufs) = (0, 0, [std::io::IoSlice::new(&[]); N]);
         for p in parts {
@@ -1597,13 +1685,7 @@ async fn write_some<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts
             at += p.len();
         }
         let Some(n) = crate::stream::write_once(stream, &bufs[..used], time).await else { return false };
-        let paced = |sent: usize| (sent as i64 - after).max(0);
-        let before = paced(pace.sent);
-        pace.sent += n;
-        if pace.rate != 0 {
-            let delay = (paced(pace.sent) - before) * 1000 / pace.rate;
-            if delay > 0 { pace.until = Some(Instant::now() + Duration::from_millis(delay as u64)); }
-        }
+        pace.wrote(n);
         if from + n < total && pace.rate == 0 { return true }
     }
     matches!(within(time, tokio::io::AsyncWriteExt::flush(stream)).await, Some(Ok(())))
@@ -6047,13 +6129,15 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = files("pieces");
         let directives = "location /t { alias DIR/f; add_trailer X-T v; } location /g { gzip_static always; alias DIR/f; } location /e { error_page 404 /f; return 404; }
             location /x { try_files /none /f =404; } location /i/ { alias DIR/; index f; } location /r { rewrite . /f; } location /z { alias DIR/f; gzip on; gzip_types *; }".replace("DIR", &dir.display().to_string());
-        for n in [0, 1, 20, 32767, 32768, 32769, 65535, 65536, 65537, 100_000, 300_001] {
+        const SENDFILE: [&str; 5] = ["", "sendfile on;", "sendfile on; sendfile_max_chunk 100;", "sendfile on; sendfile_max_chunk 0; tcp_nopush on; tcp_nodelay off;", "sendfile on; tcp_nopush on; limit_rate 100m;"];
+        for (n, sendfile) in [0, 1, 20, 16384, 16385, 32767, 32768, 32769, 65535, 65536, 65537, 100_000, 300_001].into_iter().flat_map(|n| SENDFILE.map(|s| (n, s))) {
+            let directives = format!("{sendfile} {directives}");
             let data = letters(n);
             std::fs::write(dir.join("f"), &data).unwrap();
             std::fs::write(dir.join("f.gz"), &data).unwrap();
             let got = |requests: &str| block_on(received(&serves_files(&dir, &directives), requests));
             let ask = |uri: &str| parted(&got(&format!("GET {uri} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")));
-            let pieces: Vec<usize> = if n <= 32768 { [n].into_iter().filter(|&n| n > 0).collect() } else { data.chunks(32768).map(<[u8]>::len).collect() };
+            let pieces: Vec<usize> = if n <= 32768 || !sendfile.is_empty() { [n].into_iter().filter(|&n| n > 0).collect() } else { data.chunks(32768).map(<[u8]>::len).collect() };
             for (uri, status) in [("/f", 200), ("/e", 404), ("/x", 200), ("/i/", 200), ("/r", 200), ("/g", 200)] {
                 let (head, body, _) = ask(uri);
                 assert!(head.starts_with(&format!("HTTP/1.1 {status} ")) && head.contains(&format!("\r\nContent-Length: {n}\r\n")) && body == data, "{uri} {n} {head}");
@@ -6149,19 +6233,21 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let _busy = serving_on();
         let (dir, data) = (files("parts"), letters(100_000));
         std::fs::write(dir.join("f"), &data).unwrap();
-        let get = |more: &str| parted(&block_on(received(&serves_files(&dir, ""), &format!("GET /f HTTP/1.1\r\nHost: a\r\nConnection: close\r\n{more}\r\n"))));
-        for (range, from, to) in [("0-0", 0, 1), ("0-32767", 0, 32768), ("0-32768", 0, 32769), ("32767-32768", 32767, 32769), ("32768-65535", 32768, 65536), ("10-99998", 10, 99999), ("0-", 0, 100_000),
-                                  ("99999-", 99999, 100_000), ("-1", 99999, 100_000), ("-40000", 60000, 100_000), ("-200000", 0, 100_000), ("50000-200000", 50000, 100_000)] {
-            let (head, body, _) = get(&format!("Range: bytes={range}\r\n"));
-            assert!(head.starts_with("HTTP/1.1 206 ") && head.contains(&format!("\r\nContent-Length: {}\r\n", to - from)) && head.contains(&format!("\r\nContent-Range: bytes {from}-{}/100000\r\n", to - 1)), "{range} {head}");
-            assert!(body == data[from..to], "{range}");
-        }
-        let etag = get("").0.split_once("ETag: ").unwrap().1.split_once("\r\n").unwrap().0.to_string();
-        assert!(etag.ends_with("-186a0\""));
-        for (more, status, length, has) in [("Range: bytes=100000-\r\n".to_string(), "416", None, "bytes */100000"), ("If-None-Match: *\r\n".into(), "304", Some(0), ""), ("If-Match: \"x\"\r\n".into(), "412", None, ""),
-                                            (format!("If-Range: {etag}\r\nRange: bytes=1-40000\r\n"), "206", Some(40000), ""), ("If-Range: \"x\"\r\nRange: bytes=1-2\r\n".into(), "200", Some(100_000), "")] {
-            let (head, body, _) = get(&more);
-            assert!(head.starts_with(&format!("HTTP/1.1 {status} ")) && head.contains(has) && length.is_none_or(|n| body.len() == n), "{more} {head}");
+        for directives in ["", "sendfile on;", "sendfile on; sendfile_max_chunk 5k; tcp_nopush on;"] {
+            let get = |more: &str| parted(&block_on(received(&serves_files(&dir, directives), &format!("GET /f HTTP/1.1\r\nHost: a\r\nConnection: close\r\n{more}\r\n"))));
+            for (range, from, to) in [("0-0", 0, 1), ("0-32767", 0, 32768), ("0-32768", 0, 32769), ("32767-32768", 32767, 32769), ("32768-65535", 32768, 65536), ("10-99998", 10, 99999), ("0-", 0, 100_000),
+                                      ("99999-", 99999, 100_000), ("-1", 99999, 100_000), ("-40000", 60000, 100_000), ("-200000", 0, 100_000), ("50000-200000", 50000, 100_000)] {
+                let (head, body, _) = get(&format!("Range: bytes={range}\r\n"));
+                assert!(head.starts_with("HTTP/1.1 206 ") && head.contains(&format!("\r\nContent-Length: {}\r\n", to - from)) && head.contains(&format!("\r\nContent-Range: bytes {from}-{}/100000\r\n", to - 1)), "{range} {head}");
+                assert!(body == data[from..to], "{range}");
+            }
+            let etag = get("").0.split_once("ETag: ").unwrap().1.split_once("\r\n").unwrap().0.to_string();
+            assert!(etag.ends_with("-186a0\""));
+            for (more, status, length, has) in [("Range: bytes=100000-\r\n".to_string(), "416", None, "bytes */100000"), ("If-None-Match: *\r\n".into(), "304", Some(0), ""), ("If-Match: \"x\"\r\n".into(), "412", None, ""),
+                                                (format!("If-Range: {etag}\r\nRange: bytes=1-40000\r\n"), "206", Some(40000), ""), ("If-Range: \"x\"\r\nRange: bytes=1-2\r\n".into(), "200", Some(100_000), "")] {
+                let (head, body, _) = get(&more);
+                assert!(head.starts_with(&format!("HTTP/1.1 {status} ")) && head.contains(has) && length.is_none_or(|n| body.len() == n), "{more} {head}");
+            }
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -6252,6 +6338,25 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             });
         }
         assert!(std::fs::read_to_string(dir.join("errors")).unwrap().contains(&shorter(32768).replace("NUMBER", "4464")));
+        // With sendfile, it is sent as far as it goes.
+        let log = std::fs::read_to_string(dir.join("errors")).unwrap().len();
+        for (n, to, kept) in [(200_000, 0, 0), (200_000, 70_000, 70_000), (40_000, 39_999, 39_999), (200_000, 400_000, 200_000)] {
+            std::fs::write(&path, &data[..n]).unwrap();
+            let (mut config, r, resp) = unread(&dir, "GET /f HTTP/1.0\n\n");
+            config.servers[0].level.sendfile = true;
+            length(to);
+            block_on(async {
+                let (mut s, mut client) = pair().await;
+                let sent = send_file(&mut s, resp.file.unwrap(), &Response::default(), (b"head", false), Pace::new(0, 0, Instant::now()), (&r, &config.servers[0].level), |_, _| Vec::new()).await;
+                drop(s);
+                let mut got = Vec::new();
+                client.read_to_end(&mut got).await.unwrap();
+                assert!((sent.0, sent.1) == (kept == n, (4 + kept, kept)) && got[..4] == *b"head" && got[4..] == data[..kept], "{n} {to} {}", got.len());
+            });
+        }
+        let log = std::fs::read_to_string(dir.join("errors")).unwrap().split_off(log);
+        let said: Vec<_> = log.lines().map(|l| l.split_once("#0: ").unwrap().1.split_once(", client: ").unwrap().0).collect();
+        assert_eq!(said, [0, 70_000, 39_999].map(|n| format!("sendfile() reported that \"{}\" was truncated at {n} while sending response to client", path.display())));
         // One loaded whole is not sent in part either.
         let (config, r, mut resp) = unread(&dir, "GET /f HTTP/1.0\n\n");
         length(100);
@@ -6266,7 +6371,9 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let (dir, data) = (files("gone"), letters(16 << 20));
         std::fs::write(dir.join("f"), &data).unwrap();
         // While the client takes no more, while that is paced, for send_timeout, and until worker_shutdown_timeout has passed.
-        for (directives, ends) in [("", "close"), ("", "reset"), ("limit_rate 40k;", "close"), ("limit_rate 40k;", "reset"), ("limit_rate 40k;", "shut"), ("send_timeout 1s;", "wait"), ("", "halt"), ("limit_rate 40k;", "halt")] {
+        for (directives, ends) in [("", "close"), ("", "reset"), ("limit_rate 40k;", "close"), ("limit_rate 40k;", "reset"), ("limit_rate 40k;", "shut"), ("send_timeout 1s;", "wait"), ("", "halt"), ("limit_rate 40k;", "halt"),
+                                   ("sendfile on;", "close"), ("sendfile on;", "reset"), ("sendfile on; sendfile_max_chunk 0;", "shut"), ("sendfile on; tcp_nopush on; limit_rate 40k;", "close"), ("sendfile on; limit_rate 40k;", "reset"),
+                                   ("sendfile on; send_timeout 1s;", "wait"), ("sendfile on; tcp_nopush on;", "halt"), ("sendfile on; limit_rate 40k;", "halt")] {
             let _ = std::fs::remove_file(dir.join("log"));
             block_on(async {
                 let (mut client, task) = served_by(&serves_files(&dir, directives)).await;
@@ -6298,7 +6405,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let _busy = serving_on();
         let (dir, data) = (files("rate"), letters(150_000));
         std::fs::write(dir.join("f"), &data).unwrap();
-        for (directives, ms) in [("limit_rate 100k;", 500..1800), ("limit_rate 50k; limit_rate_after 100k;", 400..1800)] {
+        for (directives, ms) in [("limit_rate 100k;", 500..1800), ("limit_rate 50k; limit_rate_after 100k;", 400..1800), ("sendfile on; limit_rate 100k;", 500..1800), ("sendfile on; tcp_nopush on; limit_rate 50k; limit_rate_after 50k;", 500..1800)] {
             let started = Instant::now();
             let got = block_on(received(&serves_files(&dir, directives), "GET /f HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"));
             assert!(parted(&got).1 == data && ms.contains(&started.elapsed().as_millis()), "{directives} {:?}", started.elapsed());
