@@ -1087,8 +1087,8 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         resp.vary = true;
         if !streams { finish(&mut resp, (level, r)).await; }
         if !gzip_ok(r, level) {
-            load(r, level, &mut resp);
-            if streams || resp.told.is_some() { coded(&mut resp, Coder::gunzip()); } else { gunzip(&mut resp); }
+            // A file is decompressed piece by piece as it is sent, of a length not known before.
+            if streams || resp.told.is_some() || resp.file.is_some() { coded(&mut resp, Coder::gunzip()); } else { gunzip(&mut resp); }
         }
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
@@ -1150,7 +1150,9 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     range(r, level, &mut resp);
     // What is read at once is written with the head. With sendfile, less is: one write of both costs less than two up to about there.
     let once = if level.sendfile && matches!(stream, Stream::Tcp(_)) { PIECE / 2 } else { PIECE };
-    if r.method != "HEAD" && resp.len() as u64 <= once { load(r, level, &mut resp); }
+    // One that is decompressed as it is sent stays in its file.
+    let coded = resp.file.as_ref().is_some_and(|f| f.coder.is_some());
+    if r.method != "HEAD" && resp.len() as u64 <= once && !coded { load(r, level, &mut resp); }
     let status = resp.status;
     // 444 closes the connection without an answer; 499 is the status of a client that closed it.
     let silent = [444, 499].contains(&status);
@@ -6972,6 +6974,26 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             assert_eq!(log, [line(head("keep-alive").len(), n), line(head("keep-alive").len(), 0), line(head("close").len(), n)].concat());
             assert!(got("GET /f\r\n") == data);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn files_gunzipped_are_sent_as_they_are_decompressed() {
+        let _busy = serving_on();
+        let dir = files("gunzipped");
+        let directives = "location / { gunzip on; gzip_static always; alias DIR/; }".replace("DIR", &dir.display().to_string());
+        let data: Vec<u8> = (0..3000).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&data).unwrap();
+        let gz = gz.finish().unwrap();
+        std::fs::write(dir.join("whole.gz"), &gz).unwrap();
+        std::fs::write(dir.join("short.gz"), &gz[..gz.len() / 2]).unwrap();
+        std::fs::write(dir.join("empty.gz"), b"").unwrap();
+        let get = |uri: &str| block_on(received(&serves_files(&dir, &directives), &format!("GET {uri} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")));
+        let (head, body, _) = parted(&get("/whole"));
+        assert!(head.contains("\r\nTransfer-Encoding: chunked\r\n") && !head.contains("Content-Length") && body == data, "{head}");
+        // What is not whole has no last chunk.
+        for uri in ["/short", "/empty"] { assert!(!get(uri).ends_with(b"0\r\n\r\n"), "{uri}"); }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
