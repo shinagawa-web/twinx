@@ -30,7 +30,7 @@ const HSL: u16 = HTTP | SRV | LOC;
 /// Every directive twinx knows: where it may appear, its argument counts, and
 /// whether it takes a block.
 /// The levels of error_log, from the lowest.
-const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
+pub const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
 
 const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("daemon", MAIN, 1, 1, false),
@@ -334,8 +334,8 @@ pub struct Level {
     /// with "/" is a URI redirected to whether it exists or not.
     pub index: Vec<Template>,
     /// error_log of http, server or location: where errors of requests are
-    /// written, when its level lets errors through.
-    pub error_log: Option<Arc<File>>,
+    /// written, and from which of the levels on.
+    pub error_log: Option<(Arc<File>, usize)>,
     /// log_not_found: whether files that are not found are logged.
     pub log_not_found: bool,
     pub proxy: Option<Arc<Proxy>>,
@@ -442,10 +442,7 @@ pub struct Level {
     /// proxy_max_temp_file_size: how large the file of an answer may be, 0 for no file.
     pub proxy_max_temp_file_size: usize,
     /// proxy_temp_path and its levels, as client_body_temp_path's.
-    // Nothing reads them until answers are written to files.
-    #[allow(dead_code)]
     pub proxy_temp_path: PathBuf,
-    #[allow(dead_code)]
     pub proxy_temp_levels: Vec<usize>,
     /// proxy_next_upstream: when the next server is tried ("error", "http_404", ...).
     pub proxy_next_upstream: Vec<String>,
@@ -976,7 +973,7 @@ impl Builder<'_> {
                 "log_not_found" => level.log_not_found = flag(d).map_err(at)?,
                 "error_log" => {
                     let file = self.open(&d.args[0]).map_err(at)?;
-                    level.error_log = d.args.get(1).is_none_or(|l| LEVELS.iter().position(|v| v == l) <= Some(4)).then_some(file);
+                    level.error_log = Some((file, d.args.get(1).and_then(|l| LEVELS.iter().position(|v| v == l)).unwrap_or(4)));
                 }
                 "ignore_invalid_headers" => level.ignore_invalid_headers = flag(d).map_err(at)?,
                 "underscores_in_headers" => level.underscores_in_headers = flag(d).map_err(at)?,

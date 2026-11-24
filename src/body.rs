@@ -141,25 +141,23 @@ pub struct Sizes { pub first: usize, pub count: usize, pub size: usize, pub busy
 #[derive(Debug)]
 pub struct Buffers {
     body: Body,
-    /// The data that has come, how much of it may be sent, and where the parts of that
-    /// end but for the last, with the number of their buffers.
+    /// The data that has come and how much of it may be sent.
     pub data: Vec<u8>,
     pub ready: usize,
-    parts: Vec<(usize, usize)>,
     /// Whether the body goes on with any data, as that of an answer over HTTP/2 does.
     any: bool,
     sizes: Option<Sizes>,
     /// The sizes of the buffers there are to read into, the first of which is being
     /// filled, its room, what was read into it, how many buffers more there may be, what
-    /// the body needed when it was begun, and the sizes of the full ones.
+    /// the body needed when it was begun, the sizes of the full ones and how much data
+    /// each has, and the sizes of those whose data has been lent.
     free: VecDeque<usize>,
     room: usize,
     held: usize,
     more: usize,
     need: Option<u64>,
-    full: Vec<usize>,
-    /// The sum of the sizes of the last part's buffers.
-    busy: usize,
+    full: VecDeque<(usize, usize)>,
+    lent: Vec<usize>,
     came: Came,
 }
 
@@ -169,7 +167,7 @@ impl Buffers {
         let s = sizes.unwrap_or(Sizes { first: 0, count: 0, size: 0, busy: 0 });
         let came = if body.need() == Some(0) { Came::Whole { followed: false } } else { Came::More };
         let need = if any { Some(1) } else { body.need() };
-        let mut buffers = Buffers { body, data, ready: 0, parts: Vec::new(), any, sizes, free: VecDeque::from([s.first]), room: s.first.saturating_sub(head), held: 0, more: s.count, need, full: Vec::new(), busy: 0, came };
+        let mut buffers = Buffers { body, data, ready: 0, any, sizes, free: VecDeque::from([s.first]), room: s.first.saturating_sub(head), held: 0, more: s.count, need, full: VecDeque::new(), lent: Vec::new(), came };
         if sizes.is_some() && buffers.room == 0 { buffers.pass(); }
         buffers
     }
@@ -222,38 +220,91 @@ impl Buffers {
     pub fn let_go(&mut self) {
         if self.came == Came::More { self.look(); }
         self.ready = self.data.len();
-        self.parts.clear();
+        self.full.clear();
     }
 
-    /// What has not gone on by now will not.
+    /// What has not been written or lent by now will not be.
     pub fn drop_held(&mut self) {
-        self.data.truncate(self.ready);
+        self.data.clear();
+        self.ready = 0;
+        self.full.clear();
     }
 
     /// Where the next part of what goes on ends, the last one if asked for at once.
     pub fn part(&self, at_once: bool) -> usize {
-        self.parts.first().map_or(self.ready, |p| if at_once { self.ready } else { p.0 })
+        if at_once { self.ready } else { self.part_of(0) }
     }
 
-    /// The data up to there, the end of a part, has been written: its buffers are used again.
+    /// Where the part ends that has the byte there.
+    pub fn part_of(&self, at: usize) -> usize {
+        let Some(s) = self.sizes.filter(|_| !self.full.is_empty()) else { return self.ready };
+        let (mut busy, mut end) = (0, 0);
+        for &(size, data) in &self.full {
+            if busy > 0 && busy + size > s.busy {
+                if end > at { break }
+                busy = 0;
+            }
+            busy += size;
+            end += data;
+        }
+        end
+    }
+
+    /// How much data there is in the full buffers that end by there.
+    pub fn whole(&self, upto: usize) -> usize {
+        self.full.iter().scan(0, |end, b| { *end += b.1; Some(*end) }).take_while(|&end| end <= upto).last().unwrap_or(0)
+    }
+
+    /// The data up to there, the end of a buffer, has been written: the buffers are used again.
     pub fn written(&mut self, end: usize) {
-        while !self.parts.is_empty() && self.parts[0].0 <= end {
-            let n = self.parts.remove(0).1;
-            self.free(n);
-        }
-        if end == self.ready {
-            self.free(self.full.len());
-            self.busy = 0;
-        }
+        let n = self.leave(end);
         self.data.drain(..end);
-        self.ready -= end;
-        for p in &mut self.parts { p.0 -= end; }
+        for (i, b) in self.full.drain(..n).enumerate() { self.free.insert(i + usize::from(self.held > 0), b.0); }
+        self.fill();
     }
 
-    /// So many of the full buffers are free: they are the next to be filled, as in
+    /// The data up to there, the end of a buffer, is moved to the empty vector. Its buffers
+    /// are not used until it is told that it has been written.
+    pub fn lend(&mut self, end: usize, to: &mut Vec<u8>) {
+        let n = self.leave(end);
+        self.lent.extend(self.full.drain(..n).map(|b| b.0));
+        to.extend_from_slice(&self.data[end..]);
+        std::mem::swap(&mut self.data, to);
+        to.truncate(end);
+    }
+
+    /// What was lent has been written.
+    pub fn returned(&mut self) {
+        for (i, size) in self.lent.drain(..).enumerate() { self.free.insert(i + usize::from(self.held > 0), size); }
+        self.fill();
+    }
+
+    /// How much data of how many full buffers may be written to a file, at most so much.
+    pub fn for_file(&self, most: u64) -> (usize, usize) {
+        let mut end = 0;
+        let n = self.full.iter().take_while(|b| { end += b.1; end as u64 <= most }).count();
+        (self.full.iter().take(n).map(|b| b.1).sum(), n)
+    }
+
+    /// It has been written there: the buffers are used again after those that are free, as
+    /// in ngx_event_pipe_write_chain_to_temp_file().
+    pub fn in_file(&mut self, end: usize) {
+        let n = self.leave(end);
+        self.data.drain(..end);
+        self.free.extend(self.full.drain(..n).map(|b| b.0));
+        self.fill();
+    }
+
+    /// The data up to there does not go on any more: how many buffers it has.
+    fn leave(&mut self, end: usize) -> usize {
+        self.ready -= end;
+        let mut left = end;
+        self.full.iter().take_while(|b| { let is = b.1 <= left; left = left.saturating_sub(b.1); is }).count()
+    }
+
+    /// Buffers are free. Those written are the next to be filled, as in
     /// ngx_event_pipe_add_free_buf(), after one in which there is something already.
-    fn free(&mut self, n: usize) {
-        for (i, size) in self.full.drain(..n).enumerate() { self.free.insert(i + usize::from(self.held > 0), size); }
+    fn fill(&mut self) {
         if self.held == 0 { self.room = self.free.front().copied().unwrap_or(0); }
     }
 
@@ -270,13 +321,7 @@ impl Buffers {
         let Some(s) = self.sizes else { self.ready = self.data.len(); return };
         let size = self.free.pop_front().unwrap_or(s.size);
         if self.data.len() > self.ready {
-            let parted: usize = self.parts.iter().map(|p| p.1).sum();
-            if self.busy > 0 && self.busy + size > s.busy {
-                self.parts.push((self.ready, self.full.len() - parted));
-                self.busy = 0;
-            }
-            self.busy += size;
-            self.full.push(size);
+            self.full.push_back((size, self.data.len() - self.ready));
             self.ready = self.data.len();
         } else {
             self.free.push_back(size);
@@ -537,6 +582,55 @@ mod tests {
         // What is there after the end.
         let mut b = buffers(Body::new(Some(10), false), Some(SIZES), 96);
         assert_eq!((parts(&mut b, &x[..5]), parts(&mut b, &x[..6]), b.came()), (vec![], vec![10], Came::Whole { followed: true }));
+    }
+
+    #[test]
+    fn buffers_are_lent_and_written_to_files() {
+        let x: Vec<u8> = (0..60000).map(|i| (i % 251) as u8).collect();
+        let mut b = buffers(Body::new(None, false), Some(SIZES), 96);
+        b.take(&x[..4000 + 8 * 4096]);
+        assert_eq!((b.ready, b.room()), (4000 + 8 * 4096, 0));
+        // The parts are of two buffers, the last of one.
+        assert_eq!([0, 4000, 8095, 8096, 36767, 36768].map(|at| b.part_of(at)), [8096, 8096, 8096, 8096 + 8192, 36768, 36768]);
+        // What was written of them, whole buffers of which are used again.
+        assert_eq!([0, 3999, 4000, 8095, 8096, 40000].map(|at| b.whole(at)), [0, 0, 4000, 4000, 8096, 36768]);
+        b.written(4000);
+        assert_eq!((b.ready, b.room()), (8 * 4096, 4096));
+        // Of what is being written the buffers are not used, of what goes to the file they are.
+        let mut lent = Vec::new();
+        b.lend(4096, &mut lent);
+        assert!(lent == x[4000..8096] && b.data == x[8096..36768] && b.room() == 4096);
+        assert_eq!([0, 4095, 4096, 8192, 1 << 40].map(|most| b.for_file(most)), [(0, 0), (0, 0), (4096, 1), (8192, 2), (7 * 4096, 7)]);
+        b.in_file(8192);
+        assert!(b.data == x[16288..36768] && (b.ready, b.room()) == (5 * 4096, 3 * 4096));
+        lent.clear();
+        b.returned();
+        assert_eq!(b.room(), 4 * 4096);
+        // One being filled is before those that are free.
+        b.take(&x[36768..36778]);
+        assert_eq!((b.ready, b.room()), (5 * 4096, 4 * 4096 - 10));
+        b.lend(b.ready, &mut lent);
+        assert!(lent == x[16288..36768] && b.data == x[36768..36778] && b.ready == 0);
+        b.returned();
+        assert_eq!((b.room(), b.for_file(1 << 40)), (9 * 4096 - 10, (0, 0)));
+        b.let_go();
+        assert_eq!((b.ready, b.part(true), b.part(false)), (10, 10, 10));
+        // What is not lent is dropped.
+        let mut b = buffers(Body::new(Some(60000), false), Some(SIZES), 96);
+        b.take(&x[..9000]);
+        lent.clear();
+        b.lend(4000, &mut lent);
+        b.drop_held();
+        assert!(lent == x[..4000] && b.data.is_empty() && b.ready == 0 && b.cut(true));
+        // Without buffers all of it may be lent.
+        let mut b = buffers(Body::new(Some(60000), false), None, 96);
+        b.take(&x[..9000]);
+        lent.clear();
+        assert_eq!((b.part_of(0), b.whole(9000), b.for_file(1 << 40)), (9000, 0, (0, 0)));
+        b.lend(9000, &mut lent);
+        assert!(lent == x[..9000] && b.ready == 0);
+        b.returned();
+        assert_eq!(b.room(), usize::MAX);
     }
 
     #[test]

@@ -1893,7 +1893,7 @@ mod tests {
         let size = 8 << 20;
         let (addr, count) = plays(&vec![(0, [LENGTH.replace("30000", &size.to_string()).as_bytes(), &vec![b'x'; size]].concat())], false);
         crate::stream::block_on(async {
-            let mut c = Client::new(&passing(addr, &format!("access_log {} f;", log.display())), 20000).await;
+            let mut c = Client::new(&passing(addr, &format!("proxy_max_temp_file_size 0; access_log {} f;", log.display())), 20000).await;
             c.send(&[framed(WINDOW_UPDATE, 0, 0, &(1u32 << 30).to_be_bytes())]).await;
             c.get(1, "GET").await;
             c.get(3, "GET").await;
