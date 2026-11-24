@@ -1394,14 +1394,14 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         };
         let connecting = Instant::now();
         let conn = match taken {
-            Some(conn) => Some(conn),
+            Some(conn) => Ok(conn),
             None => connect(&addr, socket.flatten(), level).await.map(|s| Conn::new(Stream::Tcp(s), connecting)),
         };
         let conn = match (conn, &tls) {
             // Over HTTP/2, ALPN offers h2.
-            (Some(conn), Some(tls)) if level.proxy_h2 => secure(conn, &addr, (&crate::tls::h2(tls), name.as_deref()), level).await,
-            (Some(conn), Some(tls)) => secure(conn, &addr, (tls, name.as_deref()), level).await,
-            (conn, _) => conn.ok_or(None),
+            (Ok(conn), Some(tls)) if level.proxy_h2 => secure(conn, &addr, (&crate::tls::h2(tls), name.as_deref()), level).await,
+            (Ok(conn), Some(tls)) => secure(conn, &addr, (tls, name.as_deref()), level).await,
+            (conn, _) => conn,
         };
         // proxy_http_version 2: the request goes through a pipe, over HTTP/2 beyond it.
         // Its trailers come in a slot of their own.
@@ -1416,7 +1416,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
                 time[0] = Some(connecting.elapsed().as_millis());
                 let fetched = fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints)).await;
                 closed = matches!(fetched, Err(NoAnswer::Closed));
-                fetched.ok().unzip()
+                // A head that does not come in time is a timeout.
+                if matches!(fetched, Err(NoAnswer::TimedOut)) { (Some(special(504)), None) } else { fetched.ok().unzip() }
             }
             Err(resp) => (resp, None),
         };
@@ -1438,7 +1439,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         statuses.push(status.unwrap_or(502).to_string());
         // proxy_next_upstream_tries and proxy_next_upstream_timeout end the tries too.
         let timeout = level.proxy_next_upstream_timeout;
-        // The page secure() generates for a timeout, rather than an answer of the server.
+        // The page generated for a timeout, rather than an answer of the server.
         let timed_out = answer.as_ref().is_some_and(|a| a.generated);
         let again = if timed_out { next("timeout") } else { status.map_or(next("error"), |s| tries > 0 && next(&format!("http_{s}"))) } && (timeout.is_zero() || first.elapsed() < timeout) && (resend || !begun);
         // The connection of an answer that is not used is closed.
@@ -1467,7 +1468,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     }
     let hidden = |name: &str| level.proxy_hide_header.iter().any(|h| h.eq_ignore_ascii_case(name));
     resp.headers.retain(|h| !hidden(&h.0));
-    if hidden("content-type") { resp.ctype = None; }
+    // The page generated for a timeout keeps its own.
+    if hidden("content-type") && !resp.generated { resp.ctype = None; }
     for h in resp.headers.iter_mut().filter(|h| h.0.eq_ignore_ascii_case("set-cookie")) {
         if let Some(cookie) = rewrite_cookie(r, &h.1, level) { h.1 = cookie; }
     }
@@ -1586,14 +1588,16 @@ fn ssl_name(name: &str) -> &str {
 }
 
 /// Opens a TCP connection to a proxied server, from the bound socket if one is given.
-async fn connect(peer: &SocketAddr, socket: Option<socket2::Socket>, level: &Level) -> Option<TcpStream> {
+/// The error is what answers the request instead, if anything does: a connection that
+/// is not made within proxy_connect_timeout is a timeout, answered with 504.
+async fn connect(peer: &SocketAddr, socket: Option<socket2::Socket>, level: &Level) -> Result<TcpStream, Option<Response>> {
     let connect = async {
         match socket {
             Some(socket) => { socket.set_nonblocking(true)?; tokio::net::TcpSocket::from_std_stream(socket.into()).connect(*peer).await }
             None => TcpStream::connect(peer).await,
         }
     };
-    tokio::time::timeout(level.proxy_connect_timeout, connect).await.ok().and_then(Result::ok)
+    tokio::time::timeout(level.proxy_connect_timeout, connect).await.map_err(|_| Some(special(504)))?.map_err(|_: std::io::Error| None)
 }
 
 /// Makes the TLS handshake of proxy_pass https:// on a TCP connection; one over
@@ -1611,8 +1615,9 @@ async fn secure(mut conn: Conn, peer: &SocketAddr, (tls, name): (&Arc<rustls::Cl
 enum NoAnswer {
     /// The connection failed or was closed before the whole head came.
     Closed,
-    /// The answer's head is invalid or did not come in time; or the request's
-    /// body could not be passed.
+    /// The answer's head did not come in time.
+    TimedOut,
+    /// The answer's head is invalid, or the request's body could not be passed.
     Other,
 }
 
@@ -1622,7 +1627,7 @@ enum NoAnswer {
 /// after it. With a rate it is in the answer's rest.
 #[allow(clippy::too_many_arguments)]
 async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, (upgrade, hints): (bool, bool)) -> Result<(Response, Option<Conn>), NoAnswer> {
-    use NoAnswer::{Closed, Other};
+    use NoAnswer::{Closed, Other, TimedOut};
     let s = &mut conn.stream;
     // proxy_read_timeout: how long each read may wait.
     let wait = Some(level.proxy_read_timeout).filter(|t| !t.is_zero());
@@ -1643,7 +1648,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
             let n = tokio::select! {
                 biased;
                 () = closed => return Ok((Response { status: 499, ..Response::default() }, None)),
-                n = within(wait, s.read(&mut chunk)) => n.ok_or(Other)?.ok().filter(|n| *n > 0).ok_or(Closed)?,
+                n = within(wait, s.read(&mut chunk)) => n.ok_or(TimedOut)?.ok().filter(|n| *n > 0).ok_or(Closed)?,
             };
             answer.extend_from_slice(&chunk[..n]);
             bytes[1] = answer.len() as u64;
@@ -2600,7 +2605,7 @@ mod tests {
     /// Connects to a server and fetches its answer to a GET request.
     async fn fetched(addr: &SocketAddr, socket: Option<socket2::Socket>, level: &Level, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64) -> Option<Response> {
         let start = Instant::now();
-        let s = connect(addr, socket, level).await?;
+        let s = connect(addr, socket, level).await.ok()?;
         time[0] = Some(start.elapsed().as_millis());
         fetch(Conn::new(Stream::Tcp(s), start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, (false, false)).await.ok().map(|(resp, _)| resp)
     }
@@ -3224,7 +3229,7 @@ mod tests {
         for (method, answer, _, kept) in answers {
             let req = format!("{method} / HTTP/1.1\r\n\r\n");
             let (_, conn) = block_on(async {
-                let s = connect(&addr, None, &level).await?;
+                let s = connect(&addr, None, &level).await.ok()?;
                 fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, (false, false)).await.ok()
             }).unwrap();
             assert_eq!(conn.is_some(), kept, "{method} {answer}");
@@ -3507,6 +3512,126 @@ mod tests {
             for (i, (_, came)) in servers.iter().enumerate() {
                 assert_eq!(*came.lock().unwrap(), kept / servers.len() + want.iter().filter(|w| w.0 == i).count(), "{case}");
             }
+        }
+    }
+
+    /// A server that sends the answers to a connection's requests in turn, and then
+    /// nothing until the connection is closed; and how many connections came.
+    fn silent(answers: &'static [&str]) -> (SocketAddr, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, came) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(0)));
+        let all = came.clone();
+        thread::spawn(move || {
+            for s in listener.incoming() {
+                *all.lock().unwrap() += 1;
+                let mut s = s.unwrap();
+                for answer in answers {
+                    if request_line(&mut s).is_none() { break }
+                    s.write_all(answer.as_bytes()).unwrap();
+                }
+                let _ = s.read_to_end(&mut Vec::new());
+            }
+        });
+        (addr, came)
+    }
+
+    /// A configuration whose server passes requests to an upstream of the servers,
+    /// with the directives in its location.
+    fn passing_to(servers: &[SocketAddr], directives: &str) -> crate::conf::Config {
+        let list: String = servers.iter().map(|s| format!("server {s}; ")).collect();
+        let text = format!("http {{ upstream u {{ {list}keepalive 2; }} proxy_connect_timeout 1s; proxy_read_timeout 1s; \
+                            server {{ location / {{ proxy_pass http://u; {directives} }} }} }}");
+        crate::conf::build(&crate::config::parse(&text, std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap()
+    }
+
+    #[test]
+    fn servers_that_do_not_answer_in_time() {
+        const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        const NEVER: &[&str] = &[];
+        const PARTIAL: &[&str] = &["HTTP/1.1 200 OK\r\nX: 1\r\n"];
+        let (error, timeout, off, any) = ("proxy_next_upstream error;", "proxy_next_upstream timeout;", "proxy_next_upstream off;", "proxy_next_upstream timeout non_idempotent;");
+        // What the servers answer, the directives and the method, the status, and $upstream_status.
+        let cases: [(&[&'static [&str]], &str, &str, u16, &str); 15] = [
+            (&[NEVER], "", "GET", 504, "504"),
+            (&[PARTIAL], "", "GET", 504, "504"),
+            (&[NEVER, &[OK]], "", "GET", 200, "504, 200"),
+            (&[PARTIAL, &[OK]], "", "GET", 200, "504, 200"),
+            (&[NEVER, NEVER], "", "GET", 504, "504, 504"),
+            (&[NEVER, &[OK]], timeout, "GET", 200, "504, 200"),
+            (&[NEVER, &[OK]], error, "GET", 504, "504"),
+            (&[NEVER, &[OK]], off, "GET", 504, "504"),
+            (&[NEVER, &[OK]], "proxy_next_upstream http_504;", "GET", 504, "504"),
+            (&[NEVER, &[OK]], "proxy_next_upstream_tries 1;", "GET", 504, "504"),
+            (&[NEVER, &[OK]], "", "POST", 504, "504"),
+            (&[NEVER, &[OK]], "", "LOCK", 504, "504"),
+            (&[NEVER, &[OK]], "", "PATCH", 504, "504"),
+            (&[NEVER, &[OK]], any, "POST", 200, "504, 200"),
+            (&[NEVER], "proxy_hide_header Content-Type;", "GET", 504, "504"),
+        ];
+        let _busy = counted();
+        // A test of shutting down leaves it set, which ends requests.
+        HALTED.store(false, Ordering::SeqCst);
+        block_on(async {
+            // At once, as each waits for the timeout.
+            let all: Vec<_> = cases.into_iter().map(|(answers, directives, method, status, statuses)| tokio::task::spawn_local(async move {
+                let servers: Vec<_> = answers.iter().map(|a| silent(a)).collect();
+                let config = passing_to(&servers.iter().map(|s| s.0).collect::<Vec<_>>(), directives);
+                let resp = answered(&config.servers[0], &format!("{method} / HTTP/1.0\n\n")).await;
+                let case = format!("{answers:?} {method} {directives}");
+                assert_eq!((resp.status, resp.upstream_status.as_deref()), (status, Some(statuses)), "{case}");
+                assert_eq!(resp.ctype.as_deref(), (status != 200).then_some("text/html"), "{case}");
+                // Each server got the request once, or not at all.
+                let tried = statuses.split(", ").count();
+                for (i, (_, came)) in servers.iter().enumerate() { assert_eq!(*came.lock().unwrap(), (i < tried) as usize, "{case}"); }
+            })).collect();
+            for task in all { task.await.unwrap(); }
+        });
+        // error_page takes the 504.
+        let http = format!("server {{ proxy_read_timeout 1s; location / {{ proxy_pass http://{}; error_page 504 = /e; }} location = /e {{ return 403; }} }}", silent(NEVER).0);
+        let got = block_on(received(&http, "GET / HTTP/1.0\r\n\r\n"));
+        assert!(got.starts_with(b"HTTP/1.1 403 "), "{got:?}");
+        // A body passed as it comes is passed once.
+        let ((a, sent), (b, again)) = (silent(NEVER), silent(&[OK]));
+        let body = Unread { left: 1, chunked: None, rest: Vec::new() };
+        assert_eq!(passed_to([a, b], "proxy_request_buffering off;", "PUT / HTTP/1.1\nHost: h\nContent-Length: 1\n\n", Some(body)), 504);
+        assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, 0));
+        // On a kept connection it uses up the try: no other is made to the server.
+        let (a, came) = silent(&[OK]);
+        let config = passing_to(&[a], "");
+        // A server that timed out has failed: the other one gets the requests for a while.
+        let ((b, sent), (c, _)) = (silent(NEVER), silent(&[OK, OK]));
+        let two = passing_to(&[b, c], off);
+        block_on(async {
+            for want in [200, 504] {
+                let resp = answered(&config.servers[0], "GET / HTTP/1.0\n\n").await;
+                assert_eq!((resp.status, resp.upstream_status), (want, Some(want.to_string())));
+            }
+            for want in [504, 200, 200] { assert_eq!(answered(&two.servers[0], "GET / HTTP/1.0\n\n").await.status, want); }
+        });
+        assert_eq!((*came.lock().unwrap(), *sent.lock().unwrap()), (1, 1));
+    }
+
+    #[test]
+    fn servers_that_take_no_connection_in_time() {
+        // Its queue of connections, for as many as none, is full.
+        let full = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        full.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
+        full.listen(0).unwrap();
+        let a = full.local_addr().unwrap().as_socket().unwrap();
+        let mut queue = Vec::new();
+        while let Ok(s) = std::net::TcpStream::connect_timeout(&a, Duration::from_millis(200)) { queue.push(s); }
+        let _busy = counted();
+        HALTED.store(false, Ordering::SeqCst);
+        for (directives, method, status, statuses) in [
+            ("", "GET", 200, "504, 200"), ("proxy_next_upstream error;", "GET", 504, "504"), ("proxy_next_upstream timeout;", "GET", 200, "504, 200"),
+            // Nothing was sent to it.
+            ("", "POST", 200, "504, 200"),
+        ] {
+            let (b, came) = silent(&["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]);
+            let config = passing_to(&[a, b], directives);
+            let resp = block_on(answered(&config.servers[0], &format!("{method} / HTTP/1.0\n\n")));
+            assert_eq!((resp.status, resp.upstream_status.as_deref()), (status, Some(statuses)), "{directives} {method}");
+            assert_eq!(*came.lock().unwrap(), (status == 200) as usize, "{directives} {method}");
         }
     }
 
