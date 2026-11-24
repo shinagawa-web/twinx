@@ -553,6 +553,9 @@ struct Response {
     /// Whether this is the answer of a proxied server, which error_page
     /// replaces only with proxy_intercept_errors on.
     proxied: bool,
+    /// Whether the not modified filter leaves it as it is: the answer of a proxied
+    /// server that is not cached (r->disable_not_modified).
+    unconditional: bool,
     /// Whether the range filter may answer a Range with a part of it: a
     /// static file's answer (r->allow_ranges).
     ranges: bool,
@@ -1252,15 +1255,17 @@ async fn post_action(server: &Server, r: &Request, level: &Level, client: Option
 }
 
 /// The not modified filter, as ngx_http_not_modified_filter() is: a 200
-/// answer is 412 when If-Match fails, and 304, with no
-/// body, Content-Type, Accept-Ranges or Content-Encoding, when the
-/// If-Modified-Since (as if_modified_since says) and If-None-Match it has hold.
+/// answer, unless it is one a proxied server sent and the cache does not keep, is
+/// 412 when If-Unmodified-Since is before its Last-Modified (or it has none) or
+/// If-Match fails, and 304, with no body, Content-Type, Accept-Ranges or
+/// Content-Encoding, when the If-Modified-Since (as if_modified_since says) and
+/// If-None-Match it has hold.
 fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
-    const CONDITIONS: &[&str] = &["if-match", "if-modified-since", "if-none-match"];
-    if resp.status != 200 || !r.headers.iter().any(|h| CONDITIONS.iter().any(|c| h.0.eq_ignore_ascii_case(c))) { return; }
+    const CONDITIONS: &[&str] = &["if-match", "if-modified-since", "if-none-match", "if-unmodified-since"];
+    if resp.status != 200 || resp.unconditional || !r.headers.iter().any(|h| CONDITIONS.iter().any(|c| h.0.eq_ignore_ascii_case(c))) { return; }
     let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     let (modified, etag) = (sent("last-modified").and_then(|t| expires::http_time(&t)), sent("etag"));
-    // If-Unmodified-Since, which no test needs, is not done yet.
+    if header(r, "if-unmodified-since").is_some_and(|t| !modified.zip(expires::http_time(t)).is_some_and(|(m, t)| t >= m)) { return *resp = special(412); }
     if header(r, "if-match").is_some_and(|v| !etag_match(v, etag.as_deref(), false)) { return *resp = special(412); }
     let (ims, inm) = (header(r, "if-modified-since"), header(r, "if-none-match"));
     let same = |t: &str| level.if_modified_since.zip(modified).is_some_and(|(before, m)| expires::http_time(t).is_some_and(|t| t == m || before && t > m));
@@ -2238,6 +2243,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         if let Some(cookie) = rewrite_cookie(r, &h.1, level) { h.1 = cookie; }
     }
     resp.relative = !rewrite_redirect(r, level, &mut resp.headers);
+    // Conditions are only for what the cache may keep.
+    resp.unconditional = cache.is_none();
     // An answer whose status proxy_cache_valid names is read whole and kept.
     if let Some((zone, valid)) = cache.filter(|_| !matches!(locked, Some(None))).zip(crate::cache::validity(&level.proxy_cache_valid, resp.status)) {
         finish(&mut resp, (level, r)).await;
@@ -3693,20 +3700,13 @@ pub(crate) mod tests {
         // Requests on one connection are all answered. A page or a head instead of the
         // answer cut off is whole too.
         let error = format!("{LENGTH}ab").replace("200 OK", "404 Not Found");
-        let etag = format!("{LENGTH}ab").replace("\r\n\r\n", "\r\nETag: \"e\"\r\n\r\n");
-        let fresh = "GET / HTTP/1.1\r\nHost: a\r\nIf-None-Match: \"e\"\r\n\r\n".repeat(2);
-        let stale = fresh.replace("If-None-Match: \"e\"", "If-Match: \"x\"");
         let malformed = format!("{CHUNKED}2\r\nab\r\nzz\r\n");
-        let bad_etag = malformed.replace("\r\n\r\n", "\r\nETag: \"e\"\r\n\r\n");
         for (answer, directives, requests, status, ends) in [
             (format!("{length}ab"), "", two.as_str(), 200, "\r\n\r\nab"),
             (error, "proxy_intercept_errors on; error_page 404 /e;", &two, 404, "\r\n\r\ne"),
-            (etag, "", &fresh, 304, "\r\n\r\n"),
             (format!("{CHUNKED}2\r\nab\r\n"), "proxy_method GET;", &two.replace("GET", "HEAD"), 200, "\r\n\r\n"),
             (LENGTH.replace("\r\n\r\n", "\r\nX-Accel-Redirect: /e\r\n\r\n"), "", &two, 200, "\r\n\r\ne"),
             (malformed.replace("200 OK", "404 Not Found"), "proxy_intercept_errors on; error_page 404 /e;", &two, 404, "\r\n\r\ne"),
-            (bad_etag.clone(), "", &fresh, 304, "\r\n\r\n"),
-            (bad_etag, "", &stale, 412, "</html>\r\n"),
             (malformed.clone(), "proxy_method GET;", &two.replace("GET", "HEAD"), 200, "\r\n\r\n"),
             (malformed.replace("\r\n\r\n", "\r\nX-Accel-Redirect: /e\r\n\r\n"), "", &two, 200, "\r\n\r\ne"),
         ] {
@@ -5874,6 +5874,18 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(status("If-None-Match: \"a\",\tW/\"e\"", &level), 304);
         assert_eq!(status("If-Match: W/\"e\"", &level), 412);
         assert_eq!(status("If-Match: *", &level), 200);
+        // If-Unmodified-Since holds at Last-Modified and after it; before it, unreadable, or without one, it fails.
+        assert_eq!(status("If-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT", &level), 200);
+        assert_eq!(status("If-Unmodified-Since: Sun, 06 Nov 1994 08:49:38 GMT", &level), 200);
+        assert_eq!(status("If-Unmodified-Since: Sun, 06 Nov 1994 08:49:36 GMT", &level), 412);
+        assert_eq!(status("If-Unmodified-Since: x", &level), 412);
+        let mut resp = Response { headers: Vec::new(), ..ok() };
+        not_modified(&request("GET / HTTP/1.0\nIf-Unmodified-Since: Sun, 06 Nov 1994 08:49:38 GMT\n\n").1, &level, &mut resp);
+        assert_eq!(resp.status, 412);
+        // The answer of a proxied server that is not cached is left as it is.
+        let mut resp = Response { unconditional: true, ..ok() };
+        not_modified(&request("GET / HTTP/1.0\nIf-None-Match: *\nIf-Match: \"x\"\n\n").1, &level, &mut resp);
+        assert_eq!(resp.status, 200);
         let mut resp = ok();
         not_modified(&request("GET / HTTP/1.0\nIf-None-Match: *\n\n").1, &level, &mut resp);
         assert_eq!((resp.ctype, resp.body.len(), resp.headers.len()), (None, 0, 2));
