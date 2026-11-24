@@ -150,7 +150,7 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
                 let (config, fresh) = (config.clone(), Busy::new());
                 // As in nginx, only a socket that listens on every address is asked which one it is.
                 let local = if addr.ip().is_unspecified() { stream.local_addr().unwrap_or(addr) } else { addr };
-                tokio::task::spawn_local(serving(config, stream, tls, (addr, local, (peer, number())), fresh));
+                tokio::task::spawn_local(Box::pin(serving(config, stream, tls, (addr, local, (peer, number())), fresh)));
             }
         }));
     }
