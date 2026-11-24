@@ -164,6 +164,8 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_no_cache", HSL, 1, usize::MAX, false),
     ("proxy_cache_bypass", HSL, 1, usize::MAX, false),
     ("proxy_cache_key", HSL, 1, 1, false),
+    ("proxy_cache_background_update", HSL, 1, 1, false),
+    ("proxy_ignore_headers", HSL, 1, usize::MAX, false),
     ("proxy_request_buffering", HSL, 1, 1, false),
     ("proxy_http_version", HSL, 1, 1, false),
     ("proxy_bind", HSL, 1, 2, false),
@@ -200,7 +202,7 @@ const REPEATED: &[&str] = &[
     "error_log", "index", "server", "upstream", "listen", "server_name", "location", "return", "break", "set", "if", "rewrite", "log_format", "access_log", "add_header", "add_trailer", "keepalive_disable", "error_page",
     "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_next_upstream",
     "proxy_cookie_domain", "proxy_cookie_path", "proxy_redirect", "proxy_cookie_flags", "gzip_types", "proxy_cache_path", "proxy_cache_valid",
-    "proxy_no_cache", "proxy_cache_bypass",
+    "proxy_no_cache", "proxy_cache_bypass", "proxy_ignore_headers",
 ];
 
 const COMBINED: &str =
@@ -471,6 +473,11 @@ pub struct Level {
     pub proxy_cache_bypass: Vec<Template>,
     /// proxy_cache_key: what an answer is cached by ($scheme$proxy_host$request_uri without it).
     pub proxy_cache_key: Option<Template>,
+    /// proxy_cache_background_update: what is no longer valid but may be given while it is
+    /// updated is given at once, and the server asked for the update meanwhile.
+    pub proxy_cache_background_update: bool,
+    /// proxy_ignore_headers: the headers of proxied answers that are not acted on, lowercase.
+    pub proxy_ignore_headers: Vec<String>,
     /// proxy_buffers: the number and the size of the buffers the body is read into.
     pub proxy_buffers: (usize, usize),
     /// proxy_busy_buffers_size: how much of those is written at once, twice the size of
@@ -1110,6 +1117,13 @@ impl Builder<'_> {
                     *if d.name == "proxy_no_cache" { &mut level.proxy_no_cache } else { &mut level.proxy_cache_bypass } = all.collect::<Result<_, _>>()?;
                 }
                 "proxy_cache_key" => level.proxy_cache_key = Some(Template::parse(&d.args[0]).map_err(at)?),
+                "proxy_cache_background_update" => level.proxy_cache_background_update = flag(d).map_err(at)?,
+                // All of those of a level replace those it inherits.
+                "proxy_ignore_headers" => {
+                    const VALUES: &[&str] = &["x-accel-redirect", "x-accel-expires", "x-accel-limit-rate", "x-accel-buffering", "x-accel-charset", "expires", "cache-control", "set-cookie", "vary"];
+                    let all = block.iter().filter(|v| v.name == d.name).flat_map(|v| v.args.iter().map(move |a| (a, &v.at)));
+                    level.proxy_ignore_headers = all.map(|(a, at)| Some(a.to_ascii_lowercase()).filter(|l| VALUES.contains(&l.as_str())).ok_or_else(|| format!("invalid value \"{a}\" in {at}"))).collect::<Result<_, _>>()?;
+                }
                 "proxy_request_buffering" => level.proxy_request_buffering = flag(d).map_err(at)?,
                 "proxy_http_version" => {
                     let version = ["1.0", "1.1", "2"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"proxy_http_version\" directive, it must be \"1.0\", \"1.1\" or \"2\"", d.args[0])))?;
@@ -1761,6 +1775,11 @@ mod tests {
         assert_eq!(l.proxy_cache_use_stale, ["error", "http_404"]);
         assert!(c.servers[0].locations[0].level.proxy_cache_use_stale.is_empty());
         assert_eq!(build_text("http { proxy_cache_use_stale http_418; }").unwrap_err(), "invalid value \"http_418\" in t.conf:1");
+        let c = build_text("http { proxy_cache_background_update on; proxy_ignore_headers Expires Set-Cookie; proxy_ignore_headers X-Accel-Expires; server { location / { proxy_ignore_headers vary; } } }").unwrap();
+        let (http, l) = (&c.servers[0].level, &c.servers[0].locations[0].level);
+        assert_eq!((http.proxy_cache_background_update, http.proxy_ignore_headers.clone()), (true, vec!["expires".to_string(), "set-cookie".into(), "x-accel-expires".into()]));
+        assert_eq!(l.proxy_ignore_headers, ["vary"]);
+        assert!(build_text("http { proxy_ignore_headers Server; }").unwrap_err().starts_with("invalid value \"Server\" in "));
         assert!(build_text("http { proxy_cache_min_uses x; }").is_err());
         assert_eq!(build_text("http { server { proxy_cache Z; } }").unwrap_err(), "\"proxy_cache\" zone \"Z\" is unknown in t.conf:1");
         assert_eq!(build_text("http { proxy_cache_path c levels=1; }").unwrap_err(), "\"proxy_cache_path\" must have \"keys_zone\" parameter in t.conf:1");
