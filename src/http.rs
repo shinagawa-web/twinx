@@ -1420,11 +1420,11 @@ fn byte_ranges(spec: &str, len: u64) -> Result<Option<Vec<(u64, u64)>>, ()> {
 }
 
 /// Whether an If-Match (or, weak, If-None-Match) list has the ETag, as
-/// ngx_http_test_if_match() reads it: "*" or one of its entries, a weak
-/// comparison ignoring "W/".
+/// ngx_http_test_if_match() reads it: "*", whether the answer has an ETag or
+/// not, or one of its entries, a weak comparison ignoring "W/".
 fn etag_match(list: &str, etag: Option<&str>, weak: bool) -> bool {
-    let Some(etag) = etag else { return false };
     if list == "*" { return true; }
+    let Some(etag) = etag else { return false };
     let etag = etag.strip_prefix("W/").filter(|e| weak && !e.is_empty()).unwrap_or(etag);
     list.split(',').map(|e| e.trim_matches([' ', '\t'])).any(|e| (if weak { e.strip_prefix("W/").unwrap_or(e) } else { e }) == etag)
 }
@@ -6158,7 +6158,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let mut resp = ok();
         not_modified(&request("GET / HTTP/1.0\nIf-None-Match: *\n\n").1, &level, &mut resp);
         assert_eq!((resp.ctype, resp.body.len(), resp.headers.len()), (None, 0, 2));
-        assert!(!etag_match("*", None, true));
+        assert!(etag_match("*", None, true) && etag_match("*", None, false) && !etag_match("\"x\"", None, false));
     }
 
     #[test]
