@@ -1003,7 +1003,12 @@ async fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str, clie
         let path = PathBuf::from(format!("{}{rest}", base.display()));
         if std::fs::metadata(&path).is_ok_and(|m| m.is_dir() == *dir) {
             let to = Request { uri: name, ..r.clone() };
-            return match &level.proxy { Some(p) => Box::pin(async move { proxy(p, level, &to, prefix, client).await }).await, None => file_at(level, &to, path) };
+            return match &level.proxy {
+                Some(p) => Box::pin(async move { proxy(p, level, &to, prefix, client).await }).await,
+                // A directory whose URI ends with "/" is answered by the index module.
+                None if to.uri.ends_with('/') => index(level, &to, &path),
+                None => file_at(level, &to, path),
+            };
         }
     }
     match &tf.fallback {
@@ -3131,32 +3136,70 @@ fn keepalive(r: &Request) -> bool {
 /// request is redirected to the URI with "/" added.
 type Found<'a> = (&'a str, &'a Level, bool);
 
-/// The location for a URI as nginx finds it: an exact match, else a location
-/// whose path is the URI with "/" added and that redirects to it, else the
-/// longest prefix if it is "^~", else the first regular expression that
-/// matches, else the longest prefix; the server's own settings when nothing matches.
-/// The location of a URI, as location() finds it, with the captures of a
-/// regular expression location set for the request.
+/// The location of a URI, as location() finds it, with the captures of the
+/// last regular expression location that matched set for the request.
 fn located<'a>(server: &'a Server, r: &Request, uri: &str) -> Found<'a> {
-    let found = location(server, uri);
-    let kind = server.locations.iter().find(|l| std::ptr::eq(&l.level, found.1)).map(|l| &l.kind);
-    if let Some(caps) = kind.and_then(|k| if let Match::Regex(re) = k { re.captures(uri) } else { None }) { r.set_captures(&caps); }
+    let (found, regex) = search(server, uri);
+    if let Some(Match::Regex(re)) = regex.map(|i| &server.locations[i].kind) {
+        if let Some(caps) = re.captures(uri) { r.set_captures(&caps); }
+    }
     // A method limit_except does not allow gets the settings of its block.
     let limited = found.1.limit_except.as_ref().filter(|(methods, _)| !methods.contains(&r.method)).map(|(_, l)| &**l);
     (found.0, limited.unwrap_or(found.1), found.2)
 }
 
+/// The location for a URI as nginx finds it; the server's own settings when nothing matches.
+#[cfg(test)]
 fn location<'a>(server: &'a Server, uri: &str) -> Found<'a> {
-    let locs = &server.locations;
-    let exact = locs.iter().find(|l| matches!(l.kind, Match::Exact) && l.path == uri);
-    let equal = locs.iter().any(|l| !matches!(l.kind, Match::Regex(_)) && l.path == uri);
-    let auto = locs.iter().find(|l| l.auto_redirect && !equal && !uri.is_empty() && l.path.strip_prefix(uri) == Some("/"));
-    if let Some(l) = auto { return (l.path.as_str(), &l.level, true); }
-    let prefixes = locs.iter().filter(|l| matches!(l.kind, Match::Prefix | Match::NoRegex) && uri.starts_with(l.path.as_str()));
-    let longest = prefixes.max_by_key(|l| l.path.len());
-    let regex = || locs.iter().find(|l| matches!(&l.kind, Match::Regex(re) if re.is_match(uri)));
-    let found = exact.or(longest.filter(|l| matches!(l.kind, Match::NoRegex))).or_else(regex).or(longest);
-    found.map_or(("", &server.level, false), |l| (l.path.as_str(), &l.level, false))
+    search(server, uri).0
+}
+
+/// The location for a URI, and the index of the last regular expression location that matched it.
+fn search<'a>(server: &'a Server, uri: &str) -> (Found<'a>, Option<usize>) {
+    let mut search = Search { found: None, regex: None };
+    let redirect = search.level(&server.locations, None, uri) == Ended::Redirect;
+    let found = search.found.map_or(("", &server.level, false), |i| (server.locations[i].path.as_str(), &server.locations[i].level, redirect));
+    (found, search.regex)
+}
+
+/// How the search of one level of locations ended, as ngx_http_core_find_location() returns.
+#[derive(PartialEq)]
+enum Ended { Exact, Redirect, Other }
+
+/// The location found so far (by its index), and the last regular expression one that matched.
+struct Search { found: Option<usize>, regex: Option<usize> }
+
+impl Search {
+    /// Searches the locations inside `parent` (the server's own at None): an exact match, else a
+    /// location whose path is the URI with "/" added and that redirects to it, else the longest
+    /// prefix, searched for the locations inside it; then, unless that prefix is "^~", the first
+    /// regular expression that matches, searched for the locations inside it.
+    fn level(&mut self, locs: &[crate::conf::Location], parent: Option<usize>, uri: &str) -> Ended {
+        let here = || locs.iter().enumerate().filter(move |(_, l)| l.parent == parent);
+        if let Some((i, _)) = here().find(|(_, l)| matches!(l.kind, Match::Exact) && l.path == uri) {
+            self.found = Some(i);
+            return Ended::Exact;
+        }
+        let equal = here().any(|(_, l)| !matches!(l.kind, Match::Regex(_)) && l.path == uri);
+        if let Some((i, _)) = here().find(|(_, l)| l.auto_redirect && !equal && !uri.is_empty() && l.path.strip_prefix(uri) == Some("/")) {
+            self.found = Some(i);
+            return Ended::Redirect;
+        }
+        let longest = here().filter(|(_, l)| matches!(l.kind, Match::Prefix | Match::NoRegex) && uri.starts_with(l.path.as_str())).max_by_key(|(_, l)| l.path.len());
+        let mut noregex = false;
+        if let Some((i, l)) = longest {
+            self.found = Some(i);
+            noregex = matches!(l.kind, Match::NoRegex);
+            let step = self.level(locs, Some(i), uri);
+            if step != Ended::Other { return step; }
+        }
+        if noregex { return Ended::Other; }
+        let Some((i, _)) = here().find(|(_, l)| matches!(&l.kind, Match::Regex(re) if re.is_match(uri))) else { return Ended::Other };
+        (self.found, self.regex) = (Some(i), Some(i));
+        // Whatever the locations inside a regular expression one find, the search ends there.
+        self.level(locs, Some(i), uri);
+        Ended::Exact
+    }
 }
 
 /// The page nginx generates for an error status.
@@ -6800,8 +6843,11 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         std::fs::create_dir_all(dir.join("d")).unwrap();
         std::fs::write(dir.join("f.html"), "f").unwrap();
         std::fs::write(dir.join("d/r.html"), "r").unwrap();
+        std::fs::create_dir_all(dir.join("w/e")).unwrap();
+        std::fs::write(dir.join("w/index.html"), "w").unwrap();
         let text = format!(
             "http {{ server {{ root {0}; location / {{ try_files $uri /x/ /back?a=1; }} location /back {{ return 200 $uri:$args; }} \
+             location /w/ {{ try_files $uri $uri/ =404; }} \
              location /s/ {{ try_files /f.html/ =410; }} location /t/ {{ try_files /d/ =404; }} location ~ /r.html {{ alias {0}/d; try_files $uri =404; }} \
              location /n/ {{ alias {0}/; try_files $uri =404; }} }} }}",
             dir.display()
@@ -6820,6 +6866,36 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(answer("/none"), (200, "/back:a=1".to_string()));
         assert_eq!(answer("/s/").0, 410);
         assert_eq!(answer("/t/").0, 301);
+        // A directory with "/" goes to its index, or is forbidden without one.
+        let (_, r) = request("GET /w/ HTTP/1.0\n\n");
+        let level = location(s, &r.uri).1;
+        assert_eq!(block_on(super::try_files(level.try_files.as_deref().unwrap(), level, &r, "/w/", None)).internal.as_deref(), Some("/w/index.html"));
+        assert_eq!(answer("/w/e/").0, 403);
+    }
+
+    #[test]
+    fn finds_nested_locations() {
+        let text = "http { server { location /a { location /ab { } } location /abc { } \
+             location /n { location /n/ { location /n/o { } } location = /n/e { } location ~ \\.php$ { } } \
+             location ~ ^/r { location ~ ^/r/(.) { } } location /p { location ^~ /p/q { } } \
+             location ~ \\.php$ { } location ~ /p/q { } location / { } } }";
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {text}"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let found = |uri: &str| {
+            let (_, r) = request(&format!("GET {uri} HTTP/1.0\n\n"));
+            let (path, level, _) = located(s, &r, uri);
+            let i = s.locations.iter().position(|l| std::ptr::eq(&l.level, level)).unwrap();
+            let capture = r.shared.vars.lock().unwrap().iter().find(|v| v.0 == "1").map(|v| v.1.clone());
+            (path.to_string(), i, capture)
+        };
+        let path = |uri: &str| found(uri).0;
+        assert_eq!([path("/ab"), path("/abc"), path("/abd"), path("/a")], ["/ab", "/abc", "/ab", "/a"]);
+        assert_eq!([path("/n/o"), path("/n/x"), path("/n/e"), path("/n")], ["/n/o", "/n/", "/n/e", "/n"]);
+        // Regular expressions: those inside the prefix first, then those around it unless "^~" stops them.
+        assert_eq!((found("/n/x.php").1, found("/n.php").1), (7, 7));
+        assert_eq!(found("/r/x"), ("^/r/(.)".to_string(), 9, Some("x".to_string())));
+        assert_eq!(found("/r").1, 8);
+        assert_eq!([found("/p/q").1, found("/p/r.php").1], [13, 12]);
     }
 
     #[test]
