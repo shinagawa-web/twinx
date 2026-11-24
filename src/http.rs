@@ -1078,7 +1078,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     // The length the server gave of a proxied answer, if any, also of one without its body.
     match resp.rest.as_ref().map(|rest| rest.length).or(resp.told) {
         // As gzip() does. It may be compressed for another client.
-        Some(length) => if length.is_none_or(|n| n >= 20) && gzips(level, &resp) {
+        Some(length) => if length.is_none_or(|n| n as u64 >= level.gzip_min_length) && gzips(level, &resp) {
             resp.vary = true;
             if gzip_ok(r, level) {
                 coded(&mut resp, Coder::gzip());
@@ -1086,7 +1086,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             }
         },
         None => {
-            if resp.file.as_ref().is_some_and(|f| f.len >= 20) && gzips(level, &resp) {
+            if resp.file.as_ref().is_some_and(|f| f.len >= level.gzip_min_length) && gzips(level, &resp) {
                 resp.vary = true;
                 if gzip_ok(r, level) {
                     if resp.len() as u64 > PIECE || r.method == "HEAD" {
@@ -1098,7 +1098,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             gzip(r, level, &mut resp);
         }
     }
-    range(r, &mut resp);
+    range(r, level, &mut resp);
     // What is read at once is written with the head. With sendfile, less is: one write of both costs less than two up to about there.
     let once = if level.sendfile && matches!(stream, Stream::Tcp(_)) { PIECE / 2 } else { PIECE };
     if r.method != "HEAD" && resp.len() as u64 <= once { load(r, level, &mut resp); }
@@ -1280,27 +1280,85 @@ fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
 /// unless an If-Range differs from its ETag (a quoted value, compared exactly)
 /// or its Last-Modified time. A range that starts past the end is 416.
 /// Several ranges (multipart), which no test needs, are not done yet.
-fn range(r: &Request, resp: &mut Response) {
+fn range(r: &Request, level: &Level, resp: &mut Response) {
     let ok = resp.status == 200 && resp.ranges && resp.cut.is_none() && !resp.unknown_length && !http09(r.line.as_bytes());
     let Some(spec) = header(r, "range").filter(|v| ok && v.len() > 6 && v[..6].eq_ignore_ascii_case("bytes=")).map(|v| v[6..].trim()) else { return };
     let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     let same = |v: &str| if v.len() >= 2 && v.ends_with('"') { sent("etag").as_deref() == Some(v) } else { sent("last-modified").and_then(|t| expires::http_time(&t)).is_some_and(|t| expires::http_time(v) == Some(t)) };
-    if !header(r, "if-range").is_none_or(same) || spec.contains(',') { return; }
+    if !header(r, "if-range").is_none_or(same) { return; }
     let len = resp.len() as u64;
-    let num = |s: &str| Some(s).filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).and_then(|s| s.parse::<u64>().ok());
-    let Some((from, to)) = spec.split_once('-').map(|(f, t)| (f.trim(), t.trim())) else { return };
-    // "-suffix" is the last bytes; "start-end" and "start-" start at start.
-    let suffix = from.is_empty();
-    let (Some(n), true) = (num(if suffix { to } else { from }), suffix || to.is_empty() || num(to).is_some()) else { return };
-    let (start, end) = if suffix { (len.saturating_sub(n), len) } else { (n, num(to).map_or(len, |e| e.saturating_add(1).min(len))) };
-    if start >= end { if start > 0 { *resp = Response { headers: vec![("Content-Range".into(), format!("bytes */{len}"))], ..special(416) }; } return; }
+    let ranges = match byte_ranges(spec, len) {
+        Ok(Some(ranges)) => ranges,
+        Ok(None) => return,
+        Err(()) => { *resp = Response { headers: vec![("Content-Range".into(), format!("bytes */{len}"))], ..special(416) }; return }
+    };
     resp.status = 206;
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
-    resp.headers.push(("Content-Range".into(), format!("bytes {start}-{}/{len}", end - 1)));
-    match &mut resp.file {
-        Some(file) => (file.start, file.len) = (file.start + start, end - start),
-        None => resp.body = resp.body[start as usize..end as usize].to_vec(),
+    if let [(start, end)] = ranges[..] {
+        resp.headers.push(("Content-Range".into(), format!("bytes {start}-{}/{len}", end - 1)));
+        match &mut resp.file {
+            Some(file) => (file.start, file.len) = (file.start + start, end - start),
+            None => resp.body = resp.body[start as usize..end as usize].to_vec(),
+        }
+        return;
     }
+    // More than one: each a part of a multipart/byteranges body, with the type of the whole.
+    load(r, level, resp);
+    let boundary = format!("{:020}", BOUNDARY.fetch_add(1, Ordering::Relaxed) + 1);
+    let ctype = resp.ctype.as_ref().map_or_else(String::new, |t| format!("Content-Type: {t}\r\n"));
+    let mut body = Vec::new();
+    for (start, end) in ranges {
+        body.extend_from_slice(format!("\r\n--{boundary}\r\n{ctype}Content-Range: bytes {start}-{}/{len}\r\n\r\n", end - 1).as_bytes());
+        body.extend_from_slice(resp.body.get(start as usize..end as usize).unwrap_or_default());
+    }
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (resp.body, resp.ctype) = (body, Some(format!("multipart/byteranges; boundary={boundary}").into()));
+}
+
+/// The boundaries of multipart/byteranges bodies are numbered, from 1.
+static BOUNDARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The byte ranges, each from its start to before its end, of a body so long that a Range
+/// header's value after "bytes=" asks for, as ngx_http_range_parse() reads it. None when the
+/// whole body is sent instead (a range from 0 that is empty, or ranges longer than the body
+/// together); an error when the value is malformed or no range is in the body (416).
+fn byte_ranges(spec: &str, len: u64) -> Result<Option<Vec<(u64, u64)>>, ()> {
+    let b = spec.as_bytes();
+    let at = |i: usize| b.get(i).copied().unwrap_or(0);
+    let spaces = |i: &mut usize| while at(*i) == b' ' { *i += 1 };
+    let number = |i: &mut usize| {
+        if !at(*i).is_ascii_digit() { return Err(()) }
+        let mut n: u64 = 0;
+        while at(*i).is_ascii_digit() {
+            n = n.checked_mul(10).and_then(|n| n.checked_add(u64::from(at(*i) - b'0'))).filter(|&n| n <= i64::MAX as u64).ok_or(())?;
+            *i += 1;
+        }
+        Ok(n)
+    };
+    let (mut i, mut ranges, mut size) = (0, Vec::new(), 0u64);
+    loop {
+        spaces(&mut i);
+        let suffix = at(i) == b'-';
+        let mut start = 0;
+        if suffix { i += 1 } else {
+            start = number(&mut i)?;
+            spaces(&mut i);
+            if at(i) != b'-' { return Err(()) }
+            i += 1;
+            spaces(&mut i);
+        }
+        let end = if !suffix && matches!(at(i), b',' | 0) { len } else {
+            let n = number(&mut i)?;
+            spaces(&mut i);
+            if !matches!(at(i), b',' | 0) { return Err(()) }
+            if suffix { start = len.saturating_sub(n); len } else { n.saturating_add(1).min(len) }
+        };
+        if start < end { ranges.push((start, end)); size += end - start; } else if start == 0 { return Ok(None) }
+        if at(i) != b',' { break }
+        i += 1;
+    }
+    if ranges.is_empty() { return Err(()) }
+    Ok(Some(ranges).filter(|_| size <= len))
 }
 
 /// Whether an If-Match (or, weak, If-None-Match) list has the ETag, as
@@ -1987,11 +2045,11 @@ fn recoded(resp: &mut Response) {
 }
 
 /// The gzip filter: with gzip on, an answer with status 200, 403 or 404, no
-/// Content-Encoding, at least 20 bytes (gzip_min_length) and a type of
+/// Content-Encoding, at least gzip_min_length bytes (20 by default) and a type of
 /// gzip_types (text/html always) is compressed for a client that takes gzip,
 /// at gzip_comp_level 1, and sent without a length.
 fn gzip(r: &Request, level: &Level, resp: &mut Response) {
-    if resp.body.len() < 20 || !gzips(level, resp) { return; }
+    if (resp.body.len() as u64) < level.gzip_min_length || !gzips(level, resp) { return; }
     resp.vary = true;
     if !gzip_ok(r, level) { return; }
     recoded(resp);
@@ -2050,14 +2108,20 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let cache = level.proxy_cache.as_ref().filter(|_| matches!(r.method.as_str(), "GET" | "HEAD"));
     let key = format!("{}://{host}{}", if r.ssl.is_some() { "https" } else { "http" }, r.request_uri());
     let hit = |e: crate::cache::Entry| Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, ranges: true, proxy_host: Some(host.clone()), ..Response::default() };
-    if let Some(e) = cache.and_then(|z| z.get(&key)) { return hit(e) }
+    // $upstream_cache_status: how the cache answered.
+    let noted = |status| { if cache.is_some() { *r.shared.cache_status.lock().unwrap() = Some(status); } };
+    if let Some(e) = cache.and_then(|z| z.get(&key)) { noted("HIT"); return hit(e) }
+    // What is kept but no longer valid may be given instead of the server's answer (proxy_cache_use_stale).
+    let stale = cache.and_then(|z| z.stale(&key));
+    noted(if stale.is_some() { "EXPIRED" } else { "MISS" });
+    let uses = cache.map_or(0, |z| z.used(&key));
     // proxy_cache_lock: while another request asks the server for the key, this one waits
     // for what it caches; once that wait is over, it asks too, and its answer is not cached.
     let locked = match cache.filter(|_| level.proxy_cache_lock) {
         Some(zone) => Some(zone.lock(&key, crate::cache::LOCK_TIMEOUT).await),
         None => None,
     };
-    if let Some(e) = cache.filter(|_| locked.is_some()).and_then(|z| z.get(&key)) { return hit(e) }
+    if let Some(e) = cache.filter(|_| locked.is_some()).and_then(|z| z.get(&key)) { noted("HIT"); return hit(e) }
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     // proxy_set_body replaces the client's body, whatever proxy_pass_request_body
@@ -2099,7 +2163,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // proxy_limit_rate, which may have the answer's headers ($upstream_http_*).
     let rate = |resp: &Response| crate::conf::size(&level.proxy_limit_rate.render(r, &Sent { upstream: resp.upstream.clone(), ..Sent::default() })).unwrap_or(0);
     let (mut tried, mut answer, mut addrs, mut times, mut bytes) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new(), Vec::new());
-    let (mut statuses, limit, first) = (Vec::new(), level.proxy_next_upstream_tries, Instant::now());
+    let (mut statuses, limit, first, mut failed) = (Vec::new(), level.proxy_next_upstream_tries, Instant::now(), "error");
     let (mut tries, next) = (if limit > 0 { up.tries().min(limit) } else { up.tries() }, |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
     // Whether a request that a server may have got can go on to another: not one whose
     // body is passed as it comes, nor, without non_idempotent, one of these methods.
@@ -2167,6 +2231,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // Over HTTP/2, what fails the stream before the head makes the answer invalid too.
         let stream_failed = slot.lock().unwrap().end == crate::h2::End::Failed;
         let failure = if stream_failed || matches!(fetched, Err(NoAnswer::Other(_))) { "invalid_header" } else { "error" };
+        failed = failure;
         let (mut kept, mut why) = (None, String::new());
         answer = match fetched {
             Ok((resp, conn)) => { kept = Some(conn); Some(resp) }
@@ -2220,6 +2285,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         if !again || tries == 0 { break; }
         answer = None;
     }
+    // proxy_cache_use_stale: what the cache keeps is given when the server failed so.
+    let condition = answer.as_ref().map_or_else(|| failed.to_string(), |a| if a.generated { "timeout".to_string() } else { format!("http_{}", a.status) });
+    if let Some(e) = stale.filter(|_| level.proxy_cache_use_stale.contains(&condition)) { noted("STALE"); return hit(e) }
     let (upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host) = (Some(addrs.join(", ")), Some(statuses.join(", ")), Some(times), Some(bytes), Some(host));
     let Some(mut resp) = answer else { return Response { upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host, ..special(502) } };
     (resp.upstream_addr, resp.upstream_status, resp.upstream_time, resp.upstream_bytes, resp.proxy_host) = (upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host);
@@ -2246,7 +2314,10 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // Conditions are only for what the cache may keep.
     resp.unconditional = cache.is_none();
     // An answer whose status proxy_cache_valid names is read whole and kept.
-    if let Some((zone, valid)) = cache.filter(|_| !matches!(locked, Some(None))).zip(crate::cache::validity(&level.proxy_cache_valid, resp.status)) {
+    // Not before proxy_cache_min_uses requests asked for it, nor when proxy_no_cache says so.
+    let no_cache = level.proxy_no_cache.iter().any(|t| !matches!(t.render(r, &sent).as_str(), "" | "0"));
+    let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !no_cache;
+    if let Some((zone, valid)) = cache.filter(|_| cacheable).zip(crate::cache::validity(&level.proxy_cache_valid, resp.status)) {
         finish(&mut resp, (level, r)).await;
         if resp.cut.is_none() { zone.put(key, (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid); }
     }
@@ -5836,7 +5907,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     fn range_filter() {
         let file = || Response { status: 200, body: b"0123456789".to_vec(), ranges: true, headers: vec![
             ("Last-Modified".into(), "Sun, 06 Nov 1994 08:49:37 GMT".into()), ("ETag".into(), "\"e\"".into()), ("Accept-Ranges".into(), "bytes".into())], ..Response::default() };
-        let ranged = |h: &str| { let mut resp = file(); range(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, &mut resp); resp };
+        let ranged = |h: &str| { let mut resp = file(); range(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, &Level::default(), &mut resp); resp };
         let part = |resp: Response| (resp.status, String::from_utf8_lossy(&resp.body).into_owned(), resp.headers.last().map(|h| h.1.clone()).unwrap_or_default());
         assert_eq!(part(ranged("Range: bytes=2-4")), (206, "234".into(), "bytes 2-4/10".into()));
         assert_eq!(part(ranged("Range: BYTES=7-")), (206, "789".into(), "bytes 7-9/10".into()));
@@ -5847,12 +5918,24 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(part(ranged("Range: bytes=10-")).2, "bytes */10");
         assert_eq!(ranged("Range: bytes=5-3").status, 416);
         assert!(!ranged("Range: bytes=1-2").headers.iter().any(|h| h.0 == "Accept-Ranges"));
-        // Not ranged: an If-Range that differs, an invalid or multiple range, no "bytes=".
-        for h in ["Range: bytes=1-2\nIf-Range: \"x\"", "Range: bytes=1-2\nIf-Range: wrong", "Range: bytes=a-2", "Range: bytes=1-2,4-5", "Range: bytes=12", "Range: items=1-2", "X: y"] {
+        // A malformed range is 416 too.
+        for h in ["Range: bytes=a-2", "Range: bytes=12", "Range: bytes=1-2x", "Range: bytes=99999999999999999999-"] {
+            assert_eq!(ranged(h).status, 416, "{h}");
+        }
+        // Not ranged: an If-Range that differs, an empty range from 0, ranges longer than the body, no "bytes=".
+        for h in ["Range: bytes=1-2\nIf-Range: \"x\"", "Range: bytes=1-2\nIf-Range: wrong", "Range: bytes=0-,1-", "Range: items=1-2", "X: y"] {
             assert_eq!(ranged(h).status, 200, "{h}");
         }
+        // More than one: parts of a multipart body, those past the end left out.
+        let multi = ranged("Range: bytes=1-2, 4-4,20-");
+        let boundary = multi.ctype.as_deref().unwrap().strip_prefix("multipart/byteranges; boundary=").unwrap().to_string();
+        assert_eq!(boundary.len(), 20);
+        let want = format!("\r\n--{boundary}\r\nContent-Range: bytes 1-2/10\r\n\r\n12\r\n--{boundary}\r\nContent-Range: bytes 4-4/10\r\n\r\n4\r\n--{boundary}--\r\n");
+        assert_eq!((multi.status, String::from_utf8_lossy(&multi.body).into_owned()), (206, want));
+        let typed = { let mut resp = Response { ctype: Some("text/plain".into()), ..file() }; range(&request("GET / HTTP/1.0\nRange: bytes=-1,0-0\n\n").1, &Level::default(), &mut resp); resp };
+        assert!(String::from_utf8_lossy(&typed.body).contains("\r\nContent-Type: text/plain\r\nContent-Range: bytes 9-9/10\r\n\r\n9\r\n"));
         let mut resp = Response { ranges: false, ..file() };
-        range(&request("GET / HTTP/1.0\nRange: bytes=1-2\n\n").1, &mut resp);
+        range(&request("GET / HTTP/1.0\nRange: bytes=1-2\n\n").1, &Level::default(), &mut resp);
         assert_eq!(resp.status, 200);
     }
 
@@ -6406,7 +6489,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn gzip_compresses_what_it_may() {
-        let level = Level { gzip: true, gzip_http_11: true, gzip_types: vec!["text/plain".to_string()], ..Level::default() };
+        let level = Level { gzip: true, gzip_http_11: true, gzip_min_length: 20, gzip_types: vec!["text/plain".to_string()], ..Level::default() };
         let (_, r) = request("GET / HTTP/1.1\nHost: a\nAccept-Encoding: gzip\n\n");
         let make = |status, ctype: &str, len| {
             let headers = vec![("ETag".to_string(), "\"1-2\"".to_string()), ("Accept-Ranges".to_string(), "bytes".to_string())];
@@ -6427,6 +6510,10 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             gzip(&r, level, &mut resp);
             assert!(!resp.unknown_length && !resp.vary && resp.body.iter().all(|&c| c == b'X'));
         }
+        // gzip_min_length 0 compresses an empty body too.
+        let mut empty = make(200, "text/html", 0);
+        gzip(&r, &Level { gzip_min_length: 0, ..level.clone() }, &mut empty);
+        assert_eq!(empty.body.len(), 20);
         // A client that does not take gzip still makes it vary.
         let (_, r) = request("GET / HTTP/1.1\nHost: a\n\n");
         let mut resp = make(200, "text/html", 64);
@@ -6780,7 +6867,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             let head = format!("HEAD /{name} HTTP/1.1\nHost: a\nIf-None-Match: *\nRange: bytes=10-29\n\n");
             let (config, r, mut resp) = unread(&dir, &head);
             assert!(resp.body.is_empty() && resp.len() == n);
-            range(&r, &mut resp);
+            range(&r, &Level::default(), &mut resp);
             let file = resp.file.as_ref().unwrap();
             assert!((resp.status, file.start, file.len, resp.len(), resp.body.len()) == (206, 10, 20, 20, 0));
             load(&r, &config.servers[0].level, &mut resp);

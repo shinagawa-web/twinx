@@ -22,6 +22,8 @@ pub struct Zone {
     entries: Mutex<HashMap<String, Entry>>,
     /// proxy_cache_lock: what a request that asks the server for a key holds meanwhile.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// How many requests asked for each key (proxy_cache_min_uses).
+    uses: Mutex<HashMap<String, u64>>,
 }
 
 /// How long a request waits for another that asks for the same key (proxy_cache_lock_timeout's default).
@@ -31,6 +33,19 @@ impl Zone {
     /// The answer kept for a key, while it is valid.
     pub fn get(&self, key: &str) -> Option<Entry> {
         self.entries.lock().unwrap().get(key).filter(|e| e.until > Instant::now()).cloned()
+    }
+
+    /// The answer kept for a key, also once it is no longer valid (proxy_cache_use_stale).
+    pub fn stale(&self, key: &str) -> Option<Entry> {
+        self.entries.lock().unwrap().get(key).cloned()
+    }
+
+    /// Counts one more request for a key, and gives how many asked for it so far.
+    pub fn used(&self, key: &str) -> u64 {
+        let mut uses = self.uses.lock().unwrap();
+        let n = uses.entry(key.to_string()).or_default();
+        *n += 1;
+        *n
     }
 
     /// Keeps an answer for a key, valid for so long.
@@ -109,12 +124,20 @@ mod tests {
     }
 
     #[test]
+    fn uses_counted_by_key() {
+        let z = Zone::default();
+        assert_eq!((z.used("k"), z.used("k"), z.used("other")), (1, 2, 1));
+    }
+
+    #[test]
     fn kept_while_valid() {
         let z = Zone::default();
         z.put("k".into(), (200, None, Vec::new(), b"x".to_vec()), Duration::from_secs(60));
         assert_eq!(z.get("k").unwrap().body, b"x");
         z.put("k".into(), (200, None, Vec::new(), b"x".to_vec()), Duration::ZERO);
         assert!(z.get("k").is_none());
+        assert_eq!(z.stale("k").unwrap().body, b"x");
+        assert!(z.stale("other").is_none());
         assert!(z.get("other").is_none());
     }
 }
