@@ -55,8 +55,9 @@ jobs:
       - name: Load the kernel's TLS module
         run: sudo modprobe tls && test -r /proc/net/tls_stat
 
-      # What passes on main right now. Cached per main commit, and saved before
-      # any of the pull request's code runs.
+      # What passes on main right now. baseline.yml saves it per main commit when main
+      # changes, under this key and these paths (both have to match); this workflow may
+      # only read the cache. Until it is there, the next step measures main here.
       - name: Restore main's results
         id: baseline-cache
         uses: actions/cache/restore@v4
@@ -70,16 +71,6 @@ jobs:
       - name: Run nginx-tests against nginx and against main
         if: steps.baseline-cache.outputs.cache-hit != 'true'
         run: '"$RUNNER_TEMP/harness/judge.sh" baseline'
-
-      - name: Save main's results
-        if: steps.baseline-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ${{ runner.temp }}/judge/out/reference.json
-            ${{ runner.temp }}/judge/out/baseline.json
-            ${{ runner.temp }}/judge/out/unit-main.json
-          key: nginx-tests-unit-${{ steps.base.outputs.sha }}
 
       - name: Judge the pull request
         env:

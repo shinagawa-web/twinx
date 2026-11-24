@@ -3416,6 +3416,7 @@ pub(crate) mod tests {
 
     #[test]
     fn fetches_from_a_server() {
+        let _busy = serving_on();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
@@ -3442,6 +3443,7 @@ pub(crate) mod tests {
 
     #[test]
     fn intercepts_errors_of_proxied_servers() {
+        let _busy = serving_on();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
@@ -3532,6 +3534,7 @@ pub(crate) mod tests {
 
     #[test]
     fn connects_from_the_bound_address() {
+        let _busy = serving_on();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let from = thread::spawn(move || {
@@ -3551,6 +3554,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_proxied_answers_at_the_rate() {
+        let _busy = serving_on();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
@@ -5099,6 +5103,7 @@ pub(crate) mod tests {
 
     #[test]
     fn connections_that_may_be_used_again() {
+        let _busy = serving_on();
         // Whether the server closes the connection after its answer comes before
         // whether fetch() returns the connection, or finish() gives it back.
         let answers: [(&str, &str, bool, bool); 19] = [
@@ -5215,6 +5220,7 @@ pub(crate) mod tests {
 
     #[test]
     fn proxied_connections_are_kept() {
+        let _busy = serving_on();
         let (a, b) = (("GET /a HTTP/1.0\n\n", ""), ("GET /b HTTP/1.0\n\n", ""));
         for (settings, lines, requests, connections) in [
             ("keepalive 2;", "", [a, a], [0, 0]),
@@ -5232,6 +5238,7 @@ pub(crate) mod tests {
 
     #[test]
     fn connections_of_answers_read_at_the_rate_are_kept() {
+        let _busy = serving_on();
         // The bodies are too long to come with the head.
         let long = "x".repeat(6000);
         let (one, two) = (format!("GET /c?1{long} HTTP/1.0\n\n"), format!("GET /c?2{long} HTTP/1.0\n\n"));
@@ -5257,6 +5264,7 @@ pub(crate) mod tests {
 
     #[test]
     fn requests_on_kept_connections() {
+        let _busy = serving_on();
         let requests = [("GET /a?1 HTTP/1.0\nX: 1\n\n", ""), ("POST /a/b HTTP/1.0\nContent-Length: 3\nX: 2\n\n", "xyz"), ("GET /a?3 HTTP/1.0\n\n", "")];
         let (bodies, came) = proxied("keepalive 1;", "", &requests);
         assert_eq!(bodies, ["GET /a?1 HTTP/1.1", "POST /a/b HTTP/1.1", "GET /a?3 HTTP/1.1"]);
@@ -5311,6 +5319,7 @@ pub(crate) mod tests {
 
     #[test]
     fn requests_sent_are_not_sent_again() {
+        let _busy = serving_on();
         const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
         let (error, any) = ("proxy_next_upstream error;", "proxy_next_upstream error non_idempotent;");
@@ -5393,6 +5402,7 @@ pub(crate) mod tests {
 
     #[test]
     fn kept_connections_that_are_closed_use_up_no_try() {
+        let _busy = serving_on();
         let (any, off, once) = ("proxy_next_upstream error non_idempotent;", "proxy_next_upstream off;", "proxy_next_upstream_tries 1;");
         // How many requests the connections to each server answer, and how many
         // connections there are to keep, as many to each server; the directives and the
@@ -5635,8 +5645,9 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                         if tls.is_none() && first[0] == 22 { tls = Some(rustls::ServerConnection::new(config.clone()).unwrap()); }
                         let Some(tls) = &mut tls else {
                             let Some(line) = request_line(&mut s) else { return };
-                            s.write_all(echo(&line, act).as_bytes()).unwrap();
+                            let answer = echo(&line, act);
                             came.lock().unwrap().push((i, line));
+                            s.write_all(answer.as_bytes()).unwrap();
                             continue;
                         };
                         let Some(line) = request_line(&mut rustls::Stream::new(tls, &mut s)) else { return };
@@ -5676,6 +5687,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn an_end_without_close_notify_is_an_end() {
+        let _busy = serving_on();
         // What the server sends before it closes, the body of the answer as it goes to the
         // client, whether the client's connection stays, and the log.
         const CASES: [(&str, &str, bool, &str); 7] = [
@@ -5715,6 +5727,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn connections_over_tls_are_kept() {
+        let _busy = serving_on();
         let all = |_, _| Act::Answer;
         let second = |i, n| if (i, n) == (0, 1) { Act::Close } else { Act::Answer };
         let (one, local) = ("keepalive 5;", "keepalive 5 local;");
@@ -5754,6 +5767,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn checks_the_length_of_answers() {
+        let _busy = serving_on();
         let answers: [&[u8]; 4] = [
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nExpires: a\r\nExpires: b\r\n\r\nabcd",
             b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\n",
@@ -5792,6 +5806,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn accel_headers_redirect_and_set_the_rate() {
+        let _busy = serving_on();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
@@ -5901,6 +5916,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn hides_proxied_headers() {
+        let _busy = serving_on();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
@@ -6243,6 +6259,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn sets_the_body_sent_to_proxied_servers() {
+        let _busy = serving_on();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let got = thread::spawn(move || {
@@ -6503,6 +6520,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn request_uri_is_that_of_the_request_line_after_redirects() {
+        let _busy = serving_on();
         // A server that answers with the request line it got, or redirects to /out.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
