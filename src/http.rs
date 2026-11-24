@@ -2976,10 +2976,13 @@ fn parse(r: &mut Request, head: &[u8], level: &Level, h2: bool) -> Result<(), u1
     let host = hosts.next();
     if hosts.next().is_some() || (host.is_none() && version == "HTTP/1.1") { return Err(400); }
     r.host = host.map(|h| valid_host(h).ok_or(400u16)).transpose()?;
-    if method == "CONNECT" { return Err(if target.starts_with('/') || !target.contains(':') { 400 } else { 405 }); }
+    // A stream of HTTP/2 has its method apart from its path, and CONNECT is not allowed.
+    if method == "CONNECT" { return Err(if !h2 && (target.starts_with('/') || !target.contains(':')) { 400 } else { 405 }); }
     if target.bytes().any(|c| c < 0x20 || c == 0x7f) { return Err(400); }
     // A fragment is not part of the request.
     let target = target.split('#').next().unwrap_or_default();
+    // The :path of a stream of HTTP/2 is a path, as ngx_http_parse_uri() takes it.
+    if h2 && !target.starts_with('/') { return Err(400); }
     let path = match target.split_once("://") {
         Some((_, rest)) if !target.starts_with('/') => {
             let (authority, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
@@ -2991,7 +2994,8 @@ fn parse(r: &mut Request, head: &[u8], level: &Level, h2: bool) -> Result<(), u1
     if !path.starts_with('/') { return Err(400); }
     // A path with nothing to decode, merge or resolve is the URI as it is.
     let mut uri = Cow::Borrowed(path.split('?').next().unwrap_or_default());
-    if uri.contains('%') { uri = decode(&uri).ok_or(400u16)?.into(); }
+    // An escaped NUL is refused too.
+    if uri.contains('%') { uri = decode(&uri).filter(|u| !u.contains('\0')).ok_or(400u16)?.into(); }
     if level.merge_slashes && uri.contains("//") { uri = merge_slashes(&uri).into(); }
     if uri.contains("/.") { uri = dots(&uri).ok_or(400u16)?.into(); }
     r.uri = uri.into_owned();
@@ -3109,7 +3113,7 @@ fn valid_host(h: &str) -> Option<String> {
     let port = if port.is_empty() { "" } else { port.strip_prefix(':')? };
     let port_ok = port.is_empty() || (port.len() <= 5 && port.bytes().all(|c| c.is_ascii_digit()) && port.parse::<u32>().ok()? <= 65535);
     let literal = host.starts_with('[');
-    let bad = |c: u8| c <= 0x20 || c == 0x7f || c == b'/' || c == b'\\' || (!literal && (c == b'[' || c == b']'));
+    let bad = |c: u8| c <= 0x20 || c == 0x7f || b"/\\@?#".contains(&c) || (!literal && (c == b'[' || c == b']'));
     let ok = port_ok && !host.bytes().any(bad) && !host.contains("..") && !host.ends_with("].");
     let host = host.strip_suffix('.').unwrap_or(host);
     let ok = ok && !host.is_empty();
@@ -3631,6 +3635,13 @@ pub(crate) mod tests {
         assert_eq!(request("TRACE / HTTP/1.0\n\n").0, Err(405));
         assert_eq!(request("CONNECT a:1 HTTP/1.0\n\n").0, Err(405));
         assert_eq!(request("CONNECT a HTTP/1.0\n\n").0, Err(400));
+        assert_eq!(request("GET /a%00b HTTP/1.0\n\n").0, Err(400));
+        assert_eq!(request("GET /a%2500 HTTP/1.0\n\n").0, Ok(()));
+        // A stream of HTTP/2 has a path, and CONNECT is not allowed there.
+        let over_h2 = |head: &str| parse(&mut request("GET / HTTP/1.0\n\n").1, head.as_bytes(), &Level::default(), true);
+        assert_eq!(over_h2("CONNECT / HTTP/2.0\nHost: a\n\n"), Err(405));
+        assert_eq!(over_h2("GET http://a/ HTTP/2.0\nHost: a\n\n"), Err(400));
+        assert_eq!(over_h2("GET / HTTP/2.0\nHost: a\n\n"), Ok(()));
         assert_eq!(request("GET / HTTP/1.0\nHost: a\nHost: b\n\n").0, Err(400));
         assert_eq!(request("GET / HTTP/1.0\nbad\n\n").0, Err(400));
         assert_eq!(request("GET / HTTP/1.0\nIf-Range: a\nAccept: b\nAccept: c\n\n").0, Ok(()));
@@ -3641,7 +3652,7 @@ pub(crate) mod tests {
 
     #[test]
     fn hosts() {
-        for bad in ["", ".", "a..b", "a..", "a/b", "a:1.2", "a:123456", "x[::1]", "[::1", "[::1].", "a:1:2"] {
+        for bad in ["", ".", "a..b", "a..", "a/b", "a:1.2", "a:123456", "x[::1]", "[::1", "[::1].", "a:1:2", "u@a", "@a", "a@", "a?b", "a#b"] {
             assert_eq!(valid_host(bad), None, "{bad}");
         }
         assert_eq!(valid_host("A.b.:"), Some("a.b".into()));
