@@ -709,6 +709,8 @@ pub struct Location {
     /// A request for the path without its trailing "/" is redirected to it,
     /// as nginx does for locations ending with "/" that proxy_pass passes on.
     pub auto_redirect: bool,
+    /// The index of the location it is inside, in the server's list; None at the server level.
+    pub parent: Option<usize>,
 }
 
 /// A server_name: an exact name, "*.name" (here ".name"), "name.*" (here
@@ -979,17 +981,20 @@ impl Builder<'_> {
         let named = files.iter().any(|(cert, key)| [cert, key].iter().any(|p| p.to_string_lossy().contains('$')));
         s.tls = (!files.is_empty()).then(|| crate::tls::server((&files, l.ssl_password_file.as_deref()), named.then(|| l.ssl_certificate_cache.clone()), &trust, options)).transpose()?;
         let level = s.level.clone();
-        self.locations(block, None, &level, &mut s.locations)?;
+        self.locations(block, None, (&level, &level.rewrite), &mut s.locations)?;
         Ok(s)
     }
 
-    /// The locations of a block, and of the location it is in, if any, with its kind and name.
-    fn locations(&mut self, block: &[Directive], around: Option<(Kind, &str)>, parent: &Level, out: &mut Vec<Location>) -> Result<(), String> {
+    /// The locations of a block, and of the location it is in, if any, with its kind, name and
+    /// index; they inherit the settings of the level above, but of rewrite, return and break
+    /// only those of the server.
+    fn locations(&mut self, block: &[Directive], around: Option<(Kind, &str, usize)>, (parent, server_rewrite): (&Level, &[Step]), out: &mut Vec<Location>) -> Result<(), String> {
         for d in block.iter().filter(|d| d.name == "location") {
-            let mut level = Level { proxy: None, try_files: None, script: Vec::new(), limit_except: None, ..parent.clone() };
+            let mut level = Level { proxy: None, try_files: None, script: Vec::new(), limit_except: None, rewrite: server_rewrite.to_vec(), ..parent.clone() };
             let inner = d.block.as_deref().unwrap_or_default();
             let (kind, path) = location(&d.args).map_err(|e| format!("{e} in {}", d.at))?;
-            nested(&kind, &path, around).map_err(|e| format!("{e} in {}", d.at))?;
+            nested(&kind, &path, around.map(|(k, n, _)| (k, n))).map_err(|e| format!("{e} in {}", d.at))?;
+            let parent_index = around.map(|a| a.2);
             self.location = d.args.last().cloned().unwrap_or_default();
             self.location_no_uri = matches!(kind, Match::Regex(_) | Match::Named);
             self.level(inner, LOC, &mut level)?;
@@ -997,8 +1002,9 @@ impl Builder<'_> {
             if inner.iter().any(|d| d.name == "alias") { level.alias_len = (!matches!(kind, Match::Regex(_))).then_some(path.len()); }
             let name = path.clone();
             let around = match &kind { Match::Exact => Kind::Exact, Match::Named => Kind::Named, Match::Regex(_) => Kind::Regex, _ => Kind::Prefix };
-            out.push(Location { kind, path, level: level.clone(), auto_redirect });
-            self.locations(inner, Some((around, &name)), &level, out)?;
+            let index = out.len();
+            out.push(Location { kind, path, level: level.clone(), auto_redirect, parent: parent_index });
+            self.locations(inner, Some((around, &name, index)), (&level, server_rewrite), out)?;
         }
         Ok(())
     }
