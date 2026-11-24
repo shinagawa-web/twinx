@@ -227,7 +227,10 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         return Box::pin(crate::h2::serve(config.clone(), stream, buf, (listen, local, peer, ssl), fresh.take())).await;
     }
     loop {
-        let (pipelined, started) = (!buf.is_empty(), Instant::now());
+        // As in nginx, the clock of a request starts when its first bytes have come,
+        // and that of a pipelined one when the request before it is done.
+        let pipelined = !buf.is_empty();
+        let mut started = if pipelined { Instant::now() } else { connected };
         piped |= pipelined;
         requests += 1;
         // Header lines are read with the settings of the default server of the address.
@@ -239,8 +242,10 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             if let Some((status, at)) = overflow(&buf[..end.unwrap_or(buf.len())], default.level.header_buffer, buffers) { break (at, Some(status)); }
             if let Some(end) = end { break (end, None); }
             // Waiting for a next request, the time left counts from the end of the last one.
-            let wait = idle.filter(|_| buf.is_empty()).and_then(|t| started.checked_add(t));
-            if read_until(&mut stream, &mut buf, || wait).await == 0 { return; }
+            let first = buf.is_empty();
+            let wait = idle.filter(|_| first);
+            if read_until(&mut stream, &mut buf, || wait.and_then(|t| crate::clock::coarse().checked_add(t))).await == 0 { return; }
+            if first { started = Instant::now(); }
         };
         // With http2 on in the default server of the address, a connection
         // that starts with the preface of HTTP/2 speaks it, as nginx decides.
@@ -2692,6 +2697,69 @@ pub(crate) mod tests {
         // The answer takes longer than what comes meanwhile, which is not read.
         let body = "b".repeat(1000);
         answered_while_sending(&format!("location / {{ limit_rate 500; return 200 {body}; }}"), "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", (200, &body));
+    }
+
+    /// Serves a connection whose client sends the parts, each after a wait of so
+    /// many milliseconds: the $request_time of each of its requests, as logged,
+    /// and how long the rest of the answers took from the last part on.
+    async fn timed(name: &str, parts: &[(u64, &str)]) -> (Vec<f64>, Duration) {
+        // A test of shutting down leaves it set, which closes connections.
+        SHUTTING.store(false, Ordering::SeqCst);
+        let log = std::env::temp_dir().join(format!("twinx-timed-{name}-{}", std::process::id()));
+        let (file, body) = (log.display(), "b".repeat(2500));
+        let (mut client, task) = served_by(&format!("log_format f $request_time; server {{ access_log {file} f; location / {{ return 200 ok; }} location /slow {{ limit_rate 1000; return 200 {body}; }} }}")).await;
+        let mut sent = Instant::now();
+        for (wait, part) in parts {
+            tokio::time::sleep(Duration::from_millis(*wait)).await;
+            client.write_all(part.as_bytes()).await.unwrap();
+            sent = Instant::now();
+        }
+        client.read_to_end(&mut Vec::new()).await.unwrap();
+        let took = sent.elapsed();
+        drop(client);
+        task.await.unwrap();
+        let times = std::fs::read_to_string(&log).unwrap().lines().map(|l| l.parse().unwrap()).collect();
+        std::fs::remove_file(log).unwrap();
+        (times, took)
+    }
+
+    #[test]
+    fn the_clock_of_a_request_starts_at_its_first_bytes() {
+        let _busy = counted();
+        const KEPT: &str = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+        const LAST: &str = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+        block_on(async {
+            let piped = format!("GET /slow HTTP/1.1\r\nHost: a\r\n\r\n{LAST}");
+            // The parts are read a little more or less than 0.55 s apart.
+            let parts = [(0, KEPT), (700, &LAST[..20]), (550, &LAST[20..])];
+            let piped = [(0, piped.as_str())];
+            let (first, idle, parts, piped) = tokio::join!(
+                timed("first", &[(700, LAST)]),
+                timed("idle", &[(0, KEPT), (1200, LAST)]),
+                timed("parts", &parts),
+                timed("piped", &piped),
+            );
+            assert!(matches!(first.0[..], [a] if a < 0.2), "{first:?}");
+            assert!(matches!(idle.0[..], [a, b] if a < 0.2 && b < 0.2), "{idle:?}");
+            assert!(matches!(parts.0[..], [a, b] if a < 0.2 && (0.5..0.9).contains(&b)), "{parts:?}");
+            // The pipelined request waits for the answer before it, 1 or 2 s long at its rate.
+            assert!(matches!(piped.0[..], [a, b] if a >= 0.9 && b < 0.2), "{piped:?}");
+        });
+    }
+
+    #[test]
+    fn limit_rate_does_not_count_the_idle_wait() {
+        let _busy = counted();
+        const SLOW: &str = "GET /slow HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+        block_on(async {
+            let (first, idle) = tokio::join!(
+                timed("paced", &[(0, SLOW)]),
+                timed("paced-idle", &[(0, "GET / HTTP/1.1\r\nHost: a\r\n\r\n"), (2200, SLOW)]),
+            );
+            // What goes before the last write is worth 1 or 2 s, by what part of a second it starts
+            // in; the idle wait, counted too, would let the whole answer go at once.
+            assert!(first.1 >= Duration::from_millis(900) && idle.1 >= Duration::from_millis(900), "{first:?} {idle:?}");
+        });
     }
 
     #[test]
