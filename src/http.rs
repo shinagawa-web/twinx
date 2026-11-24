@@ -249,10 +249,16 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         let default = config.servers.iter().find(|s| s.listen.contains(&listen)).unwrap_or(&config.servers[0]);
         let buffers = |host: Option<&str>| server(config, listen, host).0.level.large_header_buffers;
         // A head that overflows its buffers is answered with what of it came whole.
-        let (end, overflowed) = loop {
+        // The room left after the head in the buffer it ends in, which bounds what
+        // of the body comes with it, then the most bytes the body may take in
+        // memory: one u32, so that the future of the connection stays small.
+        let (end, overflowed, mut room) = loop {
             let end = head_end(&buf);
-            if let Some((status, at)) = overflow(&buf[..end.unwrap_or(buf.len())], default.level.header_buffer, buffers) { break (at, Some(status)); }
-            if let Some(end) = end { break (end, None); }
+            match (overflow(&buf[..end.unwrap_or(buf.len())], default.level.header_buffer, buffers), end) {
+                (Err((status, at)), _) => break (at, Some(status), 0),
+                (Ok(limit), Some(end)) => break (end, None, u32::try_from(limit.saturating_sub(end)).unwrap_or(u32::MAX)),
+                (Ok(_), None) => {}
+            }
             // Waiting for a next request, the time left counts from the end of the last one.
             let first = buf.is_empty();
             let wait = idle.filter(|_| first);
@@ -326,22 +332,31 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
                 *r.shared.unread.lock().unwrap() = Some(Unread { left: 0, chunked: Some((std::mem::take(&mut buf), r.body.len())), rest: Vec::new() });
                 Ok(())
             }
-            Ok(length) => loop {
-                match take_body(&buf, length, level.max_body) {
-                    Ok(None) => {}
-                    Ok(Some((body, used))) => {
-                        r.length += used;
-                        buf.drain(..used);
-                        // A body that would be passed as it comes but came whole with the
-                        // head stays in memory, client_body_in_file_only or not, as nginx's
-                        // request_body_no_buffering keeps it out of a file.
-                        if !body.is_empty() && unbuffered(level, length.is_none()) { r.body = body; break Ok(()); }
-                        break keep_body(&mut r, level, body);
+            Ok(length) => {
+                // What came with the head is what is in the buffer now.
+                room = if origin.is_some() { u32::MAX } else {
+                    let room = room as usize;
+                    u32::try_from(in_memory(level.body_buffer, length.is_none(), buf.len().min(room), room)).unwrap_or(u32::MAX)
+                };
+                loop {
+                    match take_body(&buf, length, level.max_body) {
+                        Ok(None) => {}
+                        Ok(Some((body, used))) => {
+                            r.length += used;
+                            buf.drain(..used);
+                            // A body that would be passed as it comes but came whole with the
+                            // head stays in memory, client_body_in_file_only or not, as nginx's
+                            // request_body_no_buffering keeps it out of a file.
+                            if !body.is_empty() && unbuffered(level, length.is_none()) { r.body = body; break Ok(()); }
+                            // A stream of HTTP/2 has its own buffer of client_body_buffer_size.
+                            let fits = used as u64 <= room as u64 && (origin.is_none() || body.len() as u64 <= level.body_buffer);
+                            break keep_body(&mut r, level, body, fits);
+                        }
+                        Err(status) => break Err(status),
                     }
-                    Err(status) => break Err(status),
+                    if read_into(&mut stream, &mut buf, None).await == 0 { return; }
                 }
-                if read_into(&mut stream, &mut buf, None).await == 0 { return; }
-            },
+            }
         };
         let busy = Busy::new();
         drop(fresh.take());
@@ -379,10 +394,11 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
 /// the line moves to a new large buffer, if one of large_client_header_buffers
 /// is left and the line so far is shorter than one. The large buffers are
 /// those of the server the Host header selects, once it has come. The status,
-/// 414 for the request line and 494 for a header line, and where that line starts.
-fn overflow(head: &[u8], first: usize, buffers: impl Fn(Option<&str>) -> (usize, usize)) -> Option<(u16, usize)> {
+/// 414 for the request line and 494 for a header line, and where that line
+/// starts; otherwise where the buffer the head is in ends.
+fn overflow(head: &[u8], first: usize, buffers: impl Fn(Option<&str>) -> (usize, usize)) -> Result<usize, (u16, usize)> {
     // Most heads fit in the first buffer, whatever lines they have.
-    if head.len() < first { return None }
+    if head.len() < first { return Ok(first) }
     let (mut start, mut cap, mut used, mut host) = (0, first, 0, None);
     let mut line = 0;
     while line < head.len() {
@@ -393,13 +409,13 @@ fn overflow(head: &[u8], first: usize, buffers: impl Fn(Option<&str>) -> (usize,
             if let Some((name, value)) = text.split_once(':').filter(|_| line > 0) {
                 if name.eq_ignore_ascii_case("host") { host = valid_host(value.trim_matches([' ', '\t', '\r', '\n'])); }
             }
-            match end { Some(end) => { line = end; continue } None => return None }
+            match end { Some(end) => { line = end; continue } None => return Ok(start + cap) }
         }
         let (number, size) = buffers(host.as_deref());
-        if start + cap - line >= size || used >= number { return Some((if line == 0 { 414 } else { 494 }, line)); }
+        if start + cap - line >= size || used >= number { return Err((if line == 0 { 414 } else { 494 }, line)); }
         (start, cap, used) = (line, size, used + 1);
     }
-    None
+    Ok(start + cap)
 }
 
 /// How the request body is framed: Some(length), or None when it is chunked.
@@ -452,13 +468,15 @@ fn decode_chunked(buf: &[u8], max: u64) -> Result<(Vec<u8>, Option<usize>), u16>
     }
 }
 
-/// A chunk's size as nginx reads it: hex digits from the start of the line, up
-/// to 2^63 - 1, then nothing or an extension after ";", a space or a tab.
+/// A chunk's size as nginx reads it: hex digits from the start of the line,
+/// then nothing or an extension after ";", a space or a tab. As
+/// ngx_http_parse_chunked() checks the size before each character after a
+/// digit, the line's end included, a size above (2^63 - 1) / 16 is invalid.
 fn chunk_size(line: &str) -> Option<u64> {
     let digits = line.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(line.len());
     let (hex, rest) = line.split_at(digits);
     let extension = rest.is_empty() || rest.starts_with([';', ' ', '\t']);
-    (digits > 0 && extension).then(|| i64::from_str_radix(hex, 16).ok()).flatten().map(|n| n as u64)
+    (digits > 0 && extension).then(|| u64::from_str_radix(hex, 16).ok()).flatten().filter(|&n| n <= i64::MAX as u64 / 16)
 }
 
 /// Ends the connection, which is closed when it is dropped, after a close_notify
@@ -478,18 +496,33 @@ pub fn send_timeout(level: &Level) -> Option<Duration> {
 }
 
 /// Keeps the request body in memory, or in a file under client_body_temp_path
-/// when it does not fit client_body_buffer_size or client_body_in_file_only is on;
+/// when it did not fit the buffers it was read into or client_body_in_file_only is on;
 /// 500 when the file cannot be written.
-fn keep_body(r: &mut Request, level: &Level, body: Vec<u8>) -> Result<(), u16> {
+fn keep_body(r: &mut Request, level: &Level, body: Vec<u8>, fits: bool) -> Result<(), u16> {
     // A body that was framed, even empty, goes in a file with client_body_in_file_only.
     let framed = header(r, "content-length").is_some() || header(r, "transfer-encoding").is_some();
-    let to_file = (!body.is_empty() || framed) && (level.body_in_file_only || body.len() as u64 > level.body_buffer);
+    let to_file = (!body.is_empty() || framed) && (level.body_in_file_only || !fits);
     if !to_file { r.body = body; return Ok(()); }
     let path = temp_path(&level.body_temp_path, &level.body_temp_levels);
     let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, &body));
     if let Err(e) = written { error_log(level, r, &format!("open() \"{}\" failed ({e})", path.display())); return Err(500); }
     r.body_file = Some(path);
     Ok(())
+}
+
+/// The most bytes a body of HTTP/1.x may take and be read without being
+/// written to a file, as ngx_http_read_client_request_body() reads it, when
+/// preread of them came in the buffer of the head, with room left in it after
+/// the head. The rest of a body with a length goes in the buffer of the head
+/// if it fits, or in a buffer of its size if that is less than
+/// client_body_buffer_size and a quarter; otherwise, as the rest of a chunked
+/// body, in a buffer of client_body_buffer_size, which is written to a file
+/// when it is full and more is to come.
+fn in_memory(buffer: u64, chunked: bool, preread: usize, room: usize) -> u64 {
+    let preread = preread as u64;
+    if chunked { return preread + buffer }
+    let head = if preread > 0 { room as u64 } else { 0 };
+    (preread + (buffer + buffer / 4).saturating_sub(1)).max(head)
 }
 
 /// Whether a location's proxy reads the request body as it passes it on, as
@@ -3190,17 +3223,17 @@ pub(crate) mod tests {
     fn header_buffers_overflow() {
         let four = |_: Option<&str>| (4, 16);
         // Lines that fit in the first buffer, or move whole to a large one.
-        assert_eq!(overflow(b"GET / HTTP/1.0\r\nA: b\r\n\r\n", 8, four), None);
-        assert_eq!(overflow(b"GET /12345678901 HTTP/1.0\r\n", 8, four), Some((414, 0)));
-        assert_eq!(overflow(b"GET / HTTP/1.0\r\nX: 123456789012345\r\n", 32, four), Some((494, 16)));
+        assert_eq!(overflow(b"GET / HTTP/1.0\r\nA: b\r\n\r\n", 8, four), Ok(32));
+        assert_eq!(overflow(b"GET /12345678901 HTTP/1.0\r\n", 8, four), Err((414, 0)));
+        assert_eq!(overflow(b"GET / HTTP/1.0\r\nX: 123456789012345\r\n", 32, four), Err((494, 16)));
         // A line that has not filled its buffer yet is waited for.
-        assert_eq!(overflow(b"GET / HTTP/1.0\r\nX: 12", 32, four), None);
+        assert_eq!(overflow(b"GET / HTTP/1.0\r\nX: 12", 32, four), Ok(32));
         // Out of large buffers.
         let one = |_: Option<&str>| (1, 16);
-        assert_eq!(overflow(b"GET / HTTP/1.0\r\nA: 1234567\r\nB: 1234567\r\n", 8, one), Some((494, 16)));
+        assert_eq!(overflow(b"GET / HTTP/1.0\r\nA: 1234567\r\nB: 1234567\r\n", 8, one), Err((494, 16)));
         // The large buffers of the server Host selects, once it has come.
         let by_host = |h: Option<&str>| if h == Some("big") { (4, 64) } else { (4, 16) };
-        assert_eq!(overflow(b"GET / HTTP/1.0\r\nHost: big\r\nX: 123456789012345\r\n", 8, by_host), None);
+        assert_eq!(overflow(b"GET / HTTP/1.0\r\nHost: big\r\nX: 123456789012345\r\n", 8, by_host), Ok(91));
         let page = String::from_utf8(special(494).body).unwrap();
         assert_eq!(special(494).status, 400);
         assert!(page.starts_with("<html>\r\n<head><title>400 Request Header Or Cookie Too Large</title></head>\r\n<body>\r\n\
@@ -6197,15 +6230,15 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = std::env::temp_dir().join(format!("twinx-body-{}", std::process::id()));
         let level = Level { body_buffer: 4, body_temp_path: dir, ..Level::default() };
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
-        keep_body(&mut r, &level, b"abc".to_vec()).unwrap();
+        keep_body(&mut r, &level, b"abc".to_vec(), true).unwrap();
         assert_eq!((r.body.as_slice(), r.body_file.is_none()), (&b"abc"[..], true));
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
-        keep_body(&mut r, &level, b"abcde".to_vec()).unwrap();
+        keep_body(&mut r, &level, b"abcde".to_vec(), false).unwrap();
         assert_eq!(std::fs::read(r.body_file.unwrap()).unwrap(), b"abcde");
         // A file that cannot be written (its directory is a file) is 500.
         let level = Level { body_buffer: 4, body_temp_path: std::env::current_exe().unwrap(), ..Level::default() };
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
-        assert_eq!(keep_body(&mut r, &level, b"abcde".to_vec()), Err(500));
+        assert_eq!(keep_body(&mut r, &level, b"abcde".to_vec(), false), Err(500));
     }
 
     #[test]
@@ -6228,11 +6261,22 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = std::env::temp_dir().join(format!("twinx-empty-body-{}", std::process::id()));
         let level = Level { body_in_file_only: true, body_buffer: 4, body_temp_path: dir, ..Level::default() };
         let (_, mut r) = request("POST / HTTP/1.0\nContent-Length: 0\n\n");
-        keep_body(&mut r, &level, Vec::new()).unwrap();
+        keep_body(&mut r, &level, Vec::new(), true).unwrap();
         assert_eq!(std::fs::read(r.body_file.unwrap()).unwrap(), b"");
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
-        keep_body(&mut r, &level, Vec::new()).unwrap();
+        keep_body(&mut r, &level, Vec::new(), true).unwrap();
         assert!(r.body_file.is_none());
+    }
+
+    #[test]
+    fn bodies_read_in_memory() {
+        // A body with a length: what is left after the head in a buffer of its size, less than a quarter more than client_body_buffer_size,
+        assert_eq!(in_memory(1024, false, 0, 900), 1279);
+        assert_eq!(in_memory(1024, false, 900, 900), 2179);
+        // or in what is left of the buffer of the head.
+        assert_eq!(in_memory(1024, false, 100, 6000), 6000);
+        // A chunked body: in a buffer of client_body_buffer_size that does not fill.
+        assert_eq!(in_memory(1024, true, 900, 900), 1924);
     }
 
     #[test]
@@ -6245,7 +6289,8 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     #[test]
     fn chunk_sizes() {
         assert_eq!((chunk_size("a"), chunk_size("00"), chunk_size("5;x=1"), chunk_size("5 ")), (Some(10), Some(0), Some(5), Some(5)));
-        assert_eq!((chunk_size("7fffffffffffffff"), chunk_size("8000000000000000")), (Some(i64::MAX as u64), None));
+        assert_eq!((chunk_size("7ffffffffffffff"), chunk_size("07ffffffffffffff"), chunk_size("800000000000000")), (Some(i64::MAX as u64 / 16), Some(i64::MAX as u64 / 16), None));
+        assert_eq!((chunk_size("7fffffffffffffff"), chunk_size("10000000000000000")), (None, None));
         assert_eq!((chunk_size("+5"), chunk_size(" 5"), chunk_size(""), chunk_size("5x")), (None, None, None, None));
     }
 
