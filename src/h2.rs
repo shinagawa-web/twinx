@@ -970,10 +970,12 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
         while got.len() >= 9 {
             let (len, kind, flags, sid) = (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize, got[3], got[4], u32::from_be_bytes([got[5], got[6], got[7], got[8]]) & 0x7fff_ffff);
             // A head too long; data before it; frames of the stream after its end; those of other
-            // streams; data the windows do not let come; and any other within a header block, or
-            // one that goes on without it.
+            // streams; those of the connection in a stream and those of a stream outside one; a
+            // push, which nginx's settings refuse; data the windows do not let come; and any other
+            // within a header block, or one that goes on without it.
             let block = sid == id && matches!(kind, HEADERS | CONTINUATION) && !headed;
-            failed = wrong_length(kind, flags, len) || block && size + 9 + len > head_size || sid == id && (kind == DATA && !headed || done && !matches!(kind, RST_STREAM | WINDOW_UPDATE)) || sid != id && (sid != 0 || kind == DATA) || kind == DATA && len as i64 > recv.min(stream_recv) || answer.is_some() != (kind == CONTINUATION);
+            let misplaced = if sid == 0 { matches!(kind, DATA | HEADERS | CONTINUATION | RST_STREAM) } else { matches!(kind, SETTINGS | PING | GOAWAY) };
+            failed = wrong_length(kind, flags, len) || block && size + 9 + len > head_size || sid == id && (kind == DATA && !headed || done && !matches!(kind, RST_STREAM | WINDOW_UPDATE)) || sid != id && sid != 0 || misplaced || kind == PUSH_PROMISE || kind == DATA && len as i64 > recv.min(stream_recv) || answer.is_some() != (kind == CONTINUATION);
             if failed || got.len() < 9 + len { break }
             if block { size += 9 + len; }
             let p: Vec<u8> = got.drain(..9 + len).skip(9).collect();
@@ -1799,7 +1801,6 @@ mod tests {
             ("no content, with a reset", "GET", |i| ([head(i, 204, END_STREAM), rst(i)].concat(), None), kept_none),
             ("the end with the head, and a ping", "GET", |i| ([ping(), head(i, 200, END_STREAM)].concat(), None), kept_none),
             ("the end with the head, and a ping after it", "GET", |i| ([head(i, 200, END_STREAM), ping()].concat(), None), kept_none),
-            ("more than the length", "GET", |i| ([fields(i, &[("content-length", "2")], 0), framed(DATA, 0, i, b"ok")].concat(), Some(framed(DATA, END_STREAM, i, b"!"))), kept_none),
         ];
         for (case, method, plays, connections) in cases {
             let (statuses, came) = kept(plays, method, ("", ""));
@@ -1821,6 +1822,17 @@ mod tests {
         assert_eq!(kept(|i| (fields(i, &[("x-accel-redirect", "/ok")], END_STREAM), None), "GET", ("", "")).1, kept_all);
         assert_eq!(kept(|i| ([fields(i, &[("x-accel-redirect", "/ok")], 0), framed(DATA, END_STREAM, i, b"ok")].concat(), None), "GET", ("", "")).1, kept_none);
         for buffering in ["proxy_buffering off;", "proxy_pass_trailers on;", "proxy_limit_rate 1m;"] { assert_eq!(kept(plain, "GET", ("", buffering)).1, kept_all, "{buffering}"); }
+    }
+
+    #[test]
+    fn frames_out_of_place_fail_the_answer() {
+        let (head, data) = (framed(HEADERS, END_HEADERS, 1, &header_block(200, &[], false)), framed(DATA, END_STREAM, 1, b"ok"));
+        let push = [&2u32.to_be_bytes()[..], b"\x00\x07:method\x03GET"].concat();
+        let misplaced = [framed(SETTINGS, 0, 1, &[]), framed(PING, 0, 1, &[0; 8]), framed(GOAWAY, 0, 1, &[0; 8]), framed(RST_STREAM, 0, 0, &[0; 4]), framed(HEADERS, END_HEADERS, 0, &header_block(200, &[], false)), framed(PUSH_PROMISE, END_HEADERS, 1, &push), framed(PUSH_PROMISE, END_HEADERS, 0, &push)];
+        for frame in &misplaced {
+            assert_eq!(passed(&[&[frame.clone(), head.clone(), data.clone()].concat()], false).1, End::Failed, "{frame:?}");
+            assert_eq!(passed(&[&[head.clone(), frame.clone(), data.clone()].concat()], false), ("HTTP/1.1 200 \r\n\r\n".to_string(), End::Failed, vec![]), "{frame:?}");
+        }
     }
 
     #[test]
