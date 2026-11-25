@@ -112,8 +112,8 @@ jobs:
           deps="$RUNNER_TEMP/deps"
           mkdir -p "$deps/target/release" "$deps/cargo"
           cd "$JUDGE_DIR/main/target/release"
-          rm -rf .fingerprint/twinx-* build/twinx-* deps/twinx-*
-          mv .fingerprint build deps "$deps/target/release/"
+          rm -r build/twinx
+          mv build "$deps/target/release/"
           mv "$JUDGE_DIR/cargo/registry" "$deps/cargo/"
 
       - name: Save the dependencies
