@@ -2625,8 +2625,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         if let Some(cookie) = rewrite_cookie(r, &h.1, level) { h.1 = cookie; }
     }
     resp.relative = !rewrite_redirect(r, level, &mut resp.headers);
-    // Conditions are only for what the cache may keep.
-    resp.unconditional = cache.is_none();
+    // Conditions are only for what the cache may keep, not before proxy_cache_min_uses requests.
+    resp.unconditional = cache.is_none() || scarce;
     // An answer whose status proxy_cache_valid names is read whole and kept.
     // Not before proxy_cache_min_uses requests asked for it, nor when proxy_no_cache says so.
     let no_cache = any_set(&level.proxy_no_cache);
