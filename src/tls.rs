@@ -209,6 +209,29 @@ fn crls(path: &Path) -> Result<Vec<Vec<u8>>, String> {
     crls.filter(|c| !c.is_empty()).ok_or_else(|| format!("cannot load CRL \"{}\": PEM_read_bio_X509_CRL() failed", path.display()))
 }
 
+/// A cache of sessions that keeps a session a TLS 1.3 client resumes, as
+/// OpenSSL's does without early data, where rustls's would let it go.
+#[derive(Debug)]
+struct Kept(Arc<dyn rustls::server::StoresServerSessions>);
+
+impl rustls::server::StoresServerSessions for Kept {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        self.0.put(key, value)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(key)
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(key)
+    }
+
+    fn can_cache(&self) -> bool {
+        self.0.can_cache()
+    }
+}
+
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
@@ -545,7 +568,7 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     config.ignore_client_order = options.prefer;
     config.cert_compressors = if options.compress { vec![rustls::compress::ZLIB_COMPRESSOR] } else { Vec::new() };
     let sessions = options.sessions;
-    config.session_storage = if sessions.cache { rustls::server::ServerSessionMemoryCache::new(20480) } else { Arc::new(rustls::server::NoServerSessionStorage {}) };
+    config.session_storage = if sessions.cache { Arc::new(Kept(rustls::server::ServerSessionMemoryCache::new(20480))) } else { Arc::new(rustls::server::NoServerSessionStorage {}) };
     let file = options.ticket_keys.iter().map(|f| TicketKey::load(f)).collect::<Result<Vec<_>, _>>()?;
     let keys = Rotated { rotate: sessions.shared.then_some(sessions.timeout), file, keys: Mutex::new(None) };
     if sessions.tickets { config.ticketer = Arc::new(Timed(keys, sessions.timeout)); }
@@ -1204,6 +1227,16 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert!(!host_matches("f*o.example.com", "bar.example.com"));
         assert!(!host_matches("**.example.com", "foo.example.com"));
         assert!(!host_matches("*.example.com", "localhost"));
+    }
+
+    #[test]
+    fn resumed_sessions_are_kept() {
+        use rustls::server::StoresServerSessions;
+        let kept = Kept(rustls::server::ServerSessionMemoryCache::new(4));
+        assert!(kept.can_cache() && kept.put(b"id".to_vec(), b"session".to_vec()));
+        for _ in 0..3 { assert_eq!(kept.take(b"id").as_deref(), Some(&b"session"[..])); }
+        assert_eq!(kept.get(b"id").as_deref(), Some(&b"session"[..]));
+        assert!(kept.take(b"other").is_none());
     }
 
     #[test]
