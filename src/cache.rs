@@ -132,7 +132,14 @@ pub struct Refresh<'a>(&'a Zone, String);
 
 impl Drop for Refresh<'_> {
     fn drop(&mut self) {
-        self.0.refreshing.lock().unwrap().remove(&self.1);
+        self.0.release(&self.1);
+    }
+}
+
+impl Refresh<'_> {
+    /// Leaves the key noted as being updated until release() is called for it.
+    pub fn hand_over(self) {
+        std::mem::forget(self);
     }
 }
 
@@ -178,6 +185,11 @@ impl Zone {
     /// already does (the node's updating flag of nginx): None then.
     pub fn refresh(&self, key: &str) -> Option<Refresh<'_>> {
         self.refreshing.lock().unwrap().insert(key.to_string()).then(|| Refresh(self, key.to_string()))
+    }
+
+    /// Notes that no request asks the server to update what is kept for a key any longer.
+    pub fn release(&self, key: &str) {
+        self.refreshing.lock().unwrap().remove(key);
     }
 
     /// Counts one more request for a key, and gives how many asked for it so far.
@@ -429,6 +441,18 @@ mod tests {
         assert_eq!((e.length, e.relative), (None, false));
         assert!(decode(&encode("k", &e)[..20]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refreshes_handed_over_last_until_released() {
+        let z = Zone::default();
+        let first = z.refresh("k").unwrap();
+        assert!(z.refresh("k").is_none());
+        drop(first);
+        z.refresh("k").unwrap().hand_over();
+        assert!(z.refresh("k").is_none());
+        z.release("k");
+        assert!(z.refresh("k").is_some());
     }
 
     #[test]

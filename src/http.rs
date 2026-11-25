@@ -2392,13 +2392,20 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // once, and the server is asked for the update by a request of its own.
     let updating = |e: &crate::cache::Entry| e.updating() || level.proxy_cache_use_stale.iter().any(|c| c == "updating");
     // While another request asks the server to update it, what is kept is given as it may be then.
-    let refresh = cache.filter(|_| stale.is_some()).map(|z| z.refresh(&key));
+    // The request of proxy_cache_background_update has it noted already.
+    let refresh = cache.filter(|_| stale.is_some() && !r.shared.updater).map(|z| z.refresh(&key));
     if let Some(e) = stale.clone().filter(|e| matches!(refresh, Some(None)) && updating(e)) { noted("UPDATING"); return hit(e) }
     if let Some(e) = stale.clone().filter(|e| level.proxy_cache_background_update && !r.shared.updater && updating(e)) {
         noted("STALE");
         let (p, level, mut update, prefix) = (p.clone(), level.clone(), r.clone(), prefix.to_string());
         update.shared = Arc::new(crate::vars::Shared { number: r.shared.number, updater: true, ..Default::default() });
-        tokio::task::spawn_local(async move { Box::pin(proxy(&p, &level, &update, &prefix, None)).await });
+        // The key stays noted as being updated until that request ends.
+        if let Some(Some(noted)) = refresh { noted.hand_over(); }
+        let (zone, key) = (cache.cloned(), key.clone());
+        tokio::task::spawn_local(async move {
+            Box::pin(proxy(&p, &level, &update, &prefix, None)).await;
+            if let Some(zone) = zone { zone.release(&key); }
+        });
         return hit(e);
     }
     noted(if bypass { "BYPASS" } else if stale.is_some() { "EXPIRED" } else { "MISS" });
