@@ -1869,8 +1869,8 @@ fn cache_path(args: &[String]) -> Result<(String, Vec<usize>), String> {
             }
             "inactive" => crate::expires::parse_time(value).is_some(),
             "max_size" | "min_free" => offset(value).is_ok(),
-            "loader_files" | "manager_files" => value.parse::<u32>().is_ok(),
-            "loader_sleep" | "loader_threshold" | "manager_sleep" | "manager_threshold" => millis(value).is_ok(),
+            // The loader's and the manager's: numbers of files, and times.
+            _ if ["loader_files", "loader_sleep", "loader_threshold", "manager_files", "manager_sleep", "manager_threshold"].contains(&name) => if name.ends_with("files") { value.parse::<u32>().is_ok() } else { millis(value).is_ok() },
             _ => return Err(format!("invalid parameter \"{a}\"")),
         };
         if !ok { return Err(format!("invalid {name} value \"{a}\"")); }
@@ -2031,6 +2031,7 @@ mod tests {
         assert_eq!(refused("proxy_cache_path c keys_zone=A:x;"), "invalid keys zone size \"keys_zone=A:x\" in t.conf:1");
         assert_eq!(refused("proxy_cache_path c keys_zone=A:1k;"), "keys zone \"keys_zone=A:1k\" is too small in t.conf:1");
         assert_eq!(refused("proxy_cache_path c keys_zone=A:1m inactive=x;"), "invalid inactive value \"inactive=x\" in t.conf:1");
+        assert_eq!(refused("proxy_cache_path c keys_zone=A:1m manager_files=x;"), "invalid manager_files value \"manager_files=x\" in t.conf:1");
         assert_eq!(refused("proxy_cache_path c keys_zone=A:1m nosuch;"), "invalid parameter \"nosuch\" in t.conf:1");
         assert_eq!(refused("proxy_cache_path c keys_zone=A:1m nosuch=1;"), "invalid parameter \"nosuch=1\" in t.conf:1");
         assert_eq!(refused("proxy_cache_path c keys_zone=A:1m; proxy_cache_path d keys_zone=A:1m;"), "duplicate zone \"A\" in t.conf:1");
