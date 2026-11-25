@@ -1233,11 +1233,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         if !gzip_ok(r, level) {
             // A file is decompressed piece by piece as it is sent, of a length not known before.
             if streams || resp.told.is_some() || resp.file.is_some() { coded(&mut resp, Coder::gunzip()); }
-            // nginx ends the request with an error then, before it sends the head it made.
-            else if !gunzip(&mut resp) && r.method != "HEAD" && ![204, 304].contains(&resp.status) {
-                error_log(level, r, "inflate() returned -5 on response end");
-                resp.cut = Some(Box::new(Cut { length: None, malformed: true, failed: None }));
-            }
+            else if !gunzip(&mut resp) && r.method != "HEAD" && ![204, 304].contains(&resp.status) { unended(level, r, &mut resp); }
         }
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
@@ -2375,6 +2371,13 @@ fn gunzip(resp: &mut Response) -> bool {
     resp.body = body;
     if let Some(cut) = &mut resp.cut { cut.length = None; }
     ended
+}
+
+/// A gzip body that does not end, of which nothing is sent: nginx ends the request with
+/// an error before it sends the head it made, and closes the connection.
+fn unended(level: &Level, r: &Request, resp: &mut Response) {
+    error_log(level, r, "inflate() returned -5 on response end");
+    resp.cut = Some(Box::new(Cut { length: None, malformed: true, failed: None }));
 }
 
 /// The URI a proxied server is sent when proxy_pass has none: the request line's
