@@ -789,6 +789,8 @@ impl Session {
             "i_dn" => name(cert.issuer(), false),
             "s_dn_legacy" => name(cert.subject(), true),
             "i_dn_legacy" => name(cert.issuer(), true),
+            "serial" => serial(cert.raw_serial()),
+            "fingerprint" => ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, self.cert.as_deref().unwrap_or_default()).as_ref().iter().map(|b| format!("{b:02x}")).collect(),
             "v_start" => time(cert.validity().not_before),
             "v_end" => time(cert.validity().not_after),
             "raw_cert" => pem(self.cert.as_deref().unwrap_or_default()),
@@ -798,6 +800,23 @@ impl Session {
             _ => ((cert.validity().not_after.timestamp() - now() as i64) / 86400).max(0).to_string(),
         }
     }
+}
+
+/// A certificate's serial number as $ssl_client_serial gives it, from the
+/// two's complement bytes of its DER integer: the bytes of its magnitude in
+/// upper case hexadecimal, "-" before a negative one, "00" for zero, as
+/// OpenSSL's i2a_ASN1_INTEGER writes it.
+fn serial(raw: &[u8]) -> String {
+    let negative = raw.first().is_some_and(|b| b & 0x80 != 0);
+    let mut magnitude = raw.to_vec();
+    if negative {
+        // The magnitude of a negative number: invert the bytes and add one.
+        let mut carry = true;
+        for b in magnitude.iter_mut().rev() { (*b, carry) = (!*b).overflowing_add(u8::from(carry)); }
+    }
+    let first = magnitude.iter().position(|b| *b != 0).unwrap_or(magnitude.len());
+    let hex: String = magnitude[first..].iter().map(|b| format!("{b:02X}")).collect();
+    format!("{}{}", if negative { "-" } else { "" }, if hex.is_empty() { "00" } else { &hex })
 }
 
 /// Whether a connection to an address that takes TLS speaks plain HTTP
@@ -1270,6 +1289,13 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert!(verify_chain(&root, &[], &[root.clone()], None, 0, false).is_ok());
         assert_eq!(verify_chain(&root, &[], &[], None, 0, false).map(|_| ()), Err("self-signed certificate"));
         assert_eq!(verify_chain(&int, &[root.clone()], &[], None, 1, false).map(|_| ()), Err("self-signed certificate in certificate chain"));
+    }
+
+    #[test]
+    fn writes_serials_as_openssl() {
+        for (raw, text) in [(&[0x01][..], "01"), (&[0x00, 0x80], "80"), (&[0xff, 0x01], "-FF"), (&[0x80], "-80"), (&[0x00], "00"), (&[0xff], "-01"), (&[0x01, 0x23, 0xab], "0123AB")] {
+            assert_eq!(serial(raw), text, "{raw:02x?}");
+        }
     }
 
     #[test]
