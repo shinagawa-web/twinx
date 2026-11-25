@@ -877,9 +877,9 @@ pub enum End { Whole, #[default] Closed, Failed }
 /// its head ended it; the connection, if it may be used for another request, and
 /// where it goes then, with how long each read of the rest of its answer may wait, once
 /// that is known: whichever comes first waits for the other; and whether the request has
-/// been sent whole, body and all.
+/// been sent whole, body and all, or else when a write of it last went.
 #[derive(Debug, Default)]
-pub struct Ending { pub end: End, pub trailers: Vec<(String, String)>, pub bodiless: bool, conn: Option<Conn>, home: Option<Home>, pub sent: bool }
+pub struct Ending { pub end: End, pub trailers: Vec<(String, String)>, pub bodiless: bool, conn: Option<Conn>, home: Option<Home>, pub sent: bool, pub moved: Option<std::time::Instant> }
 
 /// The upstream whose connection it is, the server's address and the location, and
 /// how long a read may wait.
@@ -988,7 +988,7 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
         if !frames.is_empty() && !deaf {
             tokio::select! {
                 // What the server sent before it took no more is still to be read.
-                sent = within(rest.flatten(), up.write_all(&frames)) => deaf = !matches!(sent, Some(Ok(()))),
+                sent = within(rest.flatten(), up.write_all(&frames)) => { deaf = !matches!(sent, Some(Ok(()))); slot.lock().unwrap().moved = Some(std::time::Instant::now()); }
                 () = unwanted(&mut pipe, &mut buf), if rest.is_none() => return,
             }
             if buf.len() > had { continue }
