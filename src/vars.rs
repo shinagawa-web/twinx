@@ -121,6 +121,15 @@ impl Request {
         (0..caps.len()).for_each(|i| self.set_var(&i.to_string(), value(i)));
         re.capture_names().enumerate().for_each(|(i, name)| if let Some(name) = name { self.set_var(name, value(i)) });
     }
+
+    /// set_captures() of a regular expression that matched bytes, the bytes
+    /// that are not UTF-8 kept as text() keeps them.
+    pub fn set_byte_captures(&self, re: &regex::bytes::Regex, caps: &regex::bytes::Captures) {
+        self.shared.vars.lock().unwrap().retain(|v| !v.0.bytes().all(|c| c.is_ascii_digit()));
+        let value = |i: usize| text(caps.get(i).map_or(&b""[..], |m| m.as_bytes()));
+        (0..caps.len()).for_each(|i| self.set_var(&i.to_string(), value(i)));
+        re.capture_names().enumerate().for_each(|(i, name)| if let Some(name) = name { self.set_var(name, value(i)) });
+    }
 }
 
 /// The limit_rate of a request, once set $limit_rate or X-Accel-Limit-Rate set
