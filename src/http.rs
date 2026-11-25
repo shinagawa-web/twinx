@@ -2264,9 +2264,14 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // A body passed as it comes: the rest of one with a Content-Length, or chunks.
     let mut unread = r.shared.unread.lock().unwrap();
     let chunked = unread.as_ref().is_some_and(|u| u.chunked.is_some());
-    if pass_body && chunked { req += "Transfer-Encoding: chunked\r\n"; }
-    if pass_body && !chunked && framing(r) != Ok(Some(0)) { req += &format!("Content-Length: {}\r\n", body.len() as u64 + unread.as_ref().map_or(0, |u| u.left)); }
-    if set_body.is_some() { req += &format!("Content-Length: {}\r\n", body.len()); }
+    // Those proxy_set_header sets replace them; over HTTP/2 a body is not chunked.
+    let length = match &set_body {
+        Some(b) => Some(b.len() as u64),
+        None => (pass_body && !chunked && framing(r) != Ok(Some(0))).then(|| body.len() as u64 + unread.as_ref().map_or(0, |u| u.left)),
+    };
+    if pass_body && chunked && !is_set("transfer-encoding") && !level.proxy_h2 { req += "Transfer-Encoding: chunked\r\n"; }
+    if let Some(n) = length.filter(|_| !is_set("content-length")) { req += &format!("Content-Length: {n}\r\n"); }
+    let sending = crate::h2::Framing { authority: !is_set("host"), chunked: pass_body && chunked, length: length.unwrap_or(0) };
     let body = if pass_body && chunked && !body.is_empty() { chunk(&body) } else { body };
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
     // With a cache, the server is asked for the whole answer, whatever the client's conditions and ranges.
@@ -2334,7 +2339,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // proxy_http_version 2: the request goes through a pipe, over HTTP/2 beyond it.
         // Its trailers come in a slot of their own.
         let slot = crate::h2::Slot::default();
-        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c, theirs, if p.ssl { "https" } else { "http" }, level.proxy_buffer_size, slot.clone())); Conn::new(Stream::Pipe(ours.into()), connecting) } else { c });
+        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c, theirs, if p.ssl { "https" } else { "http" }, level.proxy_buffer_size, slot.clone(), sending)); Conn::new(Stream::Pipe(ours.into()), connecting) } else { c });
         let begun = conn.is_ok();
         let mut fetched = match conn {
             Ok(conn) => {
@@ -6632,11 +6637,13 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let got = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let n = s.read(&mut buf).unwrap();
-            s.write_all(b"HTTP/1.0 204 No Content\r\n\r\n").unwrap();
-            String::from_utf8_lossy(&buf[..n]).into_owned()
+            (0..2).map(|_| {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let n = s.read(&mut buf).unwrap();
+                s.write_all(b"HTTP/1.0 204 No Content\r\n\r\n").unwrap();
+                String::from_utf8_lossy(&buf[..n]).into_owned()
+            }).collect::<Vec<_>>()
         });
         let upstream = Arc::new(crate::upstream::Upstream::new(vec![crate::upstream::Peer::new(addr)]));
         let p = Proxy { host: "h".into(), ssl: false, upstream, uri: None, url: None, groups: Default::default(), implicit: Default::default() };
@@ -6645,8 +6652,12 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let (_, mut r) = request("POST /a?a=1 HTTP/1.0\nContent-Length: 3\n\n");
         r.body = b"xyz".to_vec();
         assert_eq!(block_on(proxy(&p, &level, &r, "", None)).status, 204);
+        // A Content-Length proxy_set_header sets replaces the one of the body.
+        let level = Level { proxy_set_body: None, proxy_pass_request_body: true, proxy_set_header: vec![("Content-Length".into(), Template::parse("7").unwrap())], ..level };
+        assert_eq!(block_on(proxy(&p, &level, &r, "", None)).status, 204);
         let sent = got.join().unwrap();
-        assert!(sent.contains("Content-Length: 3\r\n") && sent.ends_with("\r\n\r\nb=1"), "{sent}");
+        assert!(sent[0].contains("Content-Length: 3\r\n") && sent[0].ends_with("\r\n\r\nb=1"), "{sent:?}");
+        assert!(sent[1].contains("Content-Length: 7\r\n") && !sent[1].contains("Content-Length: 3") && sent[1].ends_with("\r\n\r\nxyz"), "{sent:?}");
     }
 
     #[test]
