@@ -19,11 +19,13 @@ pub enum Expires {
 pub fn parse_time(s: &str) -> Option<i64> {
     const UNITS: &[(char, i64)] = &[('y', 31_536_000), ('M', 2_592_000), ('w', 604_800), ('d', 86_400), ('h', 3600), ('m', 60), ('s', 1)];
     // The units go from the largest to the smallest, as the steps of ngx_parse_time() do.
-    let (mut total, mut number, mut next) = (0i64, String::new(), 0);
+    // Spaces may follow a unit, as in "1m 30s".
+    let (mut total, mut number, mut next, mut unit) = (0i64, String::new(), 0, false);
     for c in s.chars() {
-        if c.is_ascii_digit() { number.push(c); continue; }
+        if c.is_ascii_digit() { (number, unit) = (number + &c.to_string(), false); continue; }
+        if c == ' ' && unit { continue; }
         let i = UNITS.iter().position(|u| u.0 == c).filter(|i| *i >= next)?;
-        next = i;
+        (next, unit) = (i, true);
         total += std::mem::take(&mut number).parse::<i64>().ok()? * UNITS[i].1;
     }
     let rest = if number.is_empty() { 0 } else { number.parse::<i64>().ok()? };
@@ -126,6 +128,11 @@ mod tests {
         assert_eq!(parse_time("1m1m30"), Some(150));
         assert_eq!(parse_time("30s1m"), None);
         assert_eq!(parse_time("1d1y"), None);
+        // Spaces may follow a unit, not a number.
+        assert_eq!(parse_time("1m 30s"), Some(90));
+        assert_eq!(parse_time("1m  30"), Some(90));
+        assert_eq!(parse_time("1 m"), None);
+        assert_eq!(parse_time(" 1m"), None);
     }
 
     #[test]

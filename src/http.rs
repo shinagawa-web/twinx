@@ -406,7 +406,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         let unread = r.shared.unread.lock().unwrap().take();
         let (unbuffered, cut) = (unread.is_some(), unread.as_ref().is_some_and(|u| u.cut));
         if let Some(mut u) = unread.filter(|u| !u.cut) {
-            if pass_body(&mut u, &mut stream, level.max_body, &mut tokio::io::sink(), None).await.is_none() { return; }
+            if pass_body(&mut u, &mut stream, level.max_body, (&mut tokio::io::sink(), None), None).await.is_err() { return; }
             buf = u.rest;
         }
         if !level.body_in_file_only || level.body_clean { r.body_file.map(std::fs::remove_file); }
@@ -3024,8 +3024,7 @@ const HANDSHAKING: &str = "SSL handshaking to upstream";
 const READING_HEAD: &str = "reading response header from upstream";
 const TIMED_OUT: &str = "upstream timed out (110: Connection timed out)";
 const PREMATURE: &str = "upstream prematurely closed connection";
-/// proxy_send_timeout's default.
-const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+const SENDING: &str = "sending request to upstream";
 const MORE: &str = "upstream sent more data than specified in \"Content-Length\" header";
 
 /// Why reading an answer failed: an end of TLS without its alert is an end.
@@ -3083,19 +3082,18 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let invalid = |msg: &str| Other(format!("{msg} while {READING_HEAD}"));
     let s = &mut conn.stream;
     // proxy_read_timeout: how long each read may wait. Over HTTP/2, as in nginx, it begins once
-    // the request has been sent whole; until then, a server that lets its body wait has
-    // proxy_send_timeout's default.
-    let wait = Some(level.proxy_read_timeout).filter(|t| !t.is_zero());
-    let sending = |waited: &mut Duration| conn.slot.as_ref().is_some_and(|slot| !slot.lock().unwrap().sent) && wait.is_some_and(|w| { *waited += w; *waited < SEND_TIMEOUT });
+    // the request has been sent whole; until then, a read waits for proxy_send_timeout from the
+    // last write of the request, as a server that lets its body wait does.
+    let (wait, send) = (Some(level.proxy_read_timeout).filter(|t| !t.is_zero()), Some(level.proxy_send_timeout).filter(|t| !t.is_zero()));
+    let unsent = || conn.slot.as_ref().and_then(|slot| { let e = slot.lock().unwrap(); (!e.sent).then(|| e.moved.unwrap_or(start)) });
     let (mut answer, mut chunk) = (Vec::new(), vec![0u8; 4096]);
-    let wrote = async { tokio::io::AsyncWriteExt::write_all(s, req).await?; tokio::io::AsyncWriteExt::flush(s).await }.await;
-    wrote.map_err(|e| Closed(format!("writev() failed {} while sending request to upstream", os_error(&e))))?;
+    send_up(s, req, send).await?;
     bytes[2] = req.len() as u64;
     // The rest of a body that is not buffered goes on as the client sends it.
     // An answer that comes meanwhile, on a connection without TLS, ends it; the connection is not kept then.
     let answered = match s { Stream::Tcp(tcp) => std::os::fd::AsFd::as_fd(tcp).try_clone_to_owned().ok().and_then(|fd| TcpStream::from_std(fd.into()).ok()), _ => None };
     let mut cut = false;
-    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other(String::new()))?, max, s, answered.as_ref()).await.ok_or(Other(String::new()))?; cut = u.cut; }
+    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other(String::new()))?, max, (s, send), answered.as_ref()).await?; cut = u.cut; }
     drop(answered);
     let (head, end, status) = loop {
         // A head that does not fit in proxy_buffer_size is too big: the answer is invalid.
@@ -3118,7 +3116,11 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
                     let action = if answer.is_empty() { "sending request to upstream" } else { READING_HEAD };
                     return Err(Gone(client.as_deref().filter(|_| gone).and_then(|c| client_gone(c, action)).unwrap_or_default()))
                 }
-                n = async { let mut waited = Duration::ZERO; loop { match within(wait, s.read(&mut chunk[..room])).await { None if sending(&mut waited) => {} n => break n } } } => match n.ok_or(TimedOut(READING_HEAD))? {
+                n = async { loop {
+                    let last = unsent();
+                    let time = match (last, send) { (Some(at), Some(t)) => Some(t.saturating_sub(at.elapsed())), (Some(_), None) => None, (None, _) => wait };
+                    match within(time, s.read(&mut chunk[..room])).await { None if last.is_some() && unsent() != last => {} None => break Err(if last.is_some() { SENDING } else { READING_HEAD }), Some(n) => break Ok(n) }
+                } } => match n.map_err(TimedOut)? {
                     Ok(0) => return Err(Closed(format!("{PREMATURE} while {READING_HEAD}"))),
                     Ok(n) => n,
                     Err(e) => return Err(Closed(format!("{} while {READING_HEAD}", read_failed("recv", &e)))),
@@ -3349,36 +3351,46 @@ fn chunk(data: &[u8]) -> Vec<u8> {
     [format!("{:x}\r\n", data.len()).as_bytes(), data, b"\r\n"].concat()
 }
 
+/// Writes to a proxied server, each write waiting at most proxy_send_timeout.
+async fn send_up<W: AsyncWrite + Unpin>(to: &mut W, mut data: &[u8], send: Option<Duration>) -> Result<(), NoAnswer> {
+    let failed = |e: std::io::Error| NoAnswer::Closed(format!("writev() failed {} while {SENDING}", os_error(&e)));
+    while !data.is_empty() { data = &data[within(send, tokio::io::AsyncWriteExt::write(to, data)).await.ok_or(NoAnswer::TimedOut(SENDING))?.map_err(failed)?..]; }
+    within(send, tokio::io::AsyncWriteExt::flush(to)).await.ok_or(NoAnswer::TimedOut(SENDING))?.map_err(failed)
+}
+
 /// Reads the rest of a body from the client and writes it as it comes: the
 /// bytes of a body with a Content-Length as they are, the data of a chunked
 /// one in a chunk for each read, with the last chunk once it ends, and returns
-/// how many bytes it wrote ($upstream_bytes_sent). None when
-/// the client closes, the body is invalid or the writing fails. Something
+/// how many bytes it wrote ($upstream_bytes_sent). An error when
+/// the client closes, the body is invalid or the writing fails; a timeout when a
+/// write waits longer than proxy_send_timeout. Something
 /// coming on answered, the server's connection, while it waits for the client
 /// stops it there: the body is cut.
-async fn pass_body<C: AsyncRead + Unpin, W: AsyncWrite + Unpin>(u: &mut Unread, client: &mut C, max: u64, to: &mut W, answered: Option<&TcpStream>) -> Option<u64> {
+async fn pass_body<C: AsyncRead + Unpin, W: AsyncWrite + Unpin>(u: &mut Unread, client: &mut C, max: u64, (to, send): (&mut W, Option<Duration>), answered: Option<&TcpStream>) -> Result<u64, NoAnswer> {
     let (mut buf, mut written) = (vec![0u8; 4096], 0);
+    // A write that fails says nothing of why; one that waits too long is a timeout.
+    let quiet = |e: NoAnswer| if matches!(e, NoAnswer::TimedOut(_)) { e } else { NoAnswer::Other(String::new()) };
     let early = || async { match answered { Some(s) => drop(s.readable().await), None => std::future::pending().await } };
     let Some((raw, sent)) = &mut u.chunked else {
         while u.left > 0 {
-            let got = tokio::select! { biased; got = client.read(&mut buf[..u.left.min(4096) as usize]) => got, () = early() => { u.cut = true; return Some(written) } };
-            let got = got.ok().filter(|g| *g > 0)?;
+            let got = tokio::select! { biased; got = client.read(&mut buf[..u.left.min(4096) as usize]) => got, () = early() => { u.cut = true; return Ok(written) } };
+            let got = got.ok().filter(|g| *g > 0).ok_or(NoAnswer::Other(String::new()))?;
             u.left -= got as u64;
-            if !write_all(to, &buf[..got], None).await { return None }
+            send_up(to, &buf[..got], send).await.map_err(quiet)?;
             written += got as u64;
         }
-        return Some(written);
+        return Ok(written);
     };
     loop {
-        let (data, used) = decode_chunked(raw, max).ok()?;
+        let (data, used) = decode_chunked(raw, max).map_err(|_| NoAnswer::Other(String::new()))?;
         let mut out = if data.len() > *sent { chunk(&data[*sent..]) } else { Vec::new() };
         *sent = data.len();
         if used.is_some() { out.extend_from_slice(b"0\r\n\r\n"); }
-        if !write_all(to, &out, None).await { return None }
+        send_up(to, &out, send).await.map_err(quiet)?;
         written += out.len() as u64;
-        if let Some(used) = used { u.rest = raw.split_off(used); u.chunked = None; return Some(written); }
-        let got = tokio::select! { biased; got = client.read(&mut buf) => got, () = early() => { u.cut = true; return Some(written) } };
-        let got = got.ok().filter(|g| *g > 0)?;
+        if let Some(used) = used { u.rest = raw.split_off(used); u.chunked = None; return Ok(written); }
+        let got = tokio::select! { biased; got = client.read(&mut buf) => got, () = early() => { u.cut = true; return Ok(written) } };
+        let got = got.ok().filter(|g| *g > 0).ok_or(NoAnswer::Other(String::new()))?;
         raw.extend_from_slice(&buf[..got]);
     }
 }
@@ -7564,30 +7576,41 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             let unread = |left: u64, chunked: Option<&[u8]>| Unread { left, chunked: chunked.map(|c| (c.to_vec(), 1)), rest: Vec::new(), cut: false };
             out.write_all(b"abcdef").await.unwrap();
             let (mut to, mut u) = (Vec::new(), unread(4, None));
-            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to, None).await, Some(4));
+            assert_eq!(pass_body(&mut u, &mut client, 100, (&mut to, None), None).await.ok(), Some(4));
             assert_eq!((to.as_slice(), u.left), (&b"abcd"[..], 0));
             // A chunked body: the data that came after the one passed, in one chunk
             // for each read, then the last chunk; what follows it is kept.
             let (mut to, mut u) = (Vec::new(), unread(0, Some(b"3\r\nx")));
             out.write_all(b"\r\n4\r\nmany\r\n0\r\n\r\nGET").await.unwrap();
-            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to, None).await, Some(16));
+            assert_eq!(pass_body(&mut u, &mut client, 100, (&mut to, None), None).await.ok(), Some(16));
             assert_eq!((String::from_utf8_lossy(&to), u.rest.as_slice()), ("6\r\nefmany\r\n0\r\n\r\n".into(), &b"GET"[..]));
             // An invalid chunk, or the client closing before the end, fails it.
-            assert_eq!(pass_body(&mut unread(0, Some(b"z\r\n")), &mut client, 100, &mut to, None).await, None);
+            assert_eq!(pass_body(&mut unread(0, Some(b"z\r\n")), &mut client, 100, (&mut to, None), None).await.ok(), None);
             drop(out);
             let mut u = unread(5, None);
-            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to, None).await, None);
+            assert_eq!(pass_body(&mut u, &mut client, 100, (&mut to, None), None).await.ok(), None);
             assert_eq!(u.left, 5);
             // Something from the server while the client sends nothing cuts it short, as
             // it does a chunked body.
             let ((mut client, _out), (server, mut answer)) = (pair().await, pair().await);
             answer.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
             let mut u = unread(5, None);
-            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to, server.tcp()).await, Some(0));
+            assert_eq!(pass_body(&mut u, &mut client, 100, (&mut to, None), server.tcp()).await.ok(), Some(0));
             assert!(u.cut && u.left == 5);
             let mut u = unread(0, Some(b"3\r\nx"));
-            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to, server.tcp()).await, Some(0));
+            assert_eq!(pass_body(&mut u, &mut client, 100, (&mut to, None), server.tcp()).await.ok(), Some(0));
             assert!(u.cut && u.chunked.is_some());
+            // A write that waits longer than proxy_send_timeout is a timeout; one that fails is not.
+            let ((mut client, mut out), (mut up, _held)) = (pair().await, tokio::io::duplex(2));
+            out.write_all(b"abcd").await.unwrap();
+            let sent = pass_body(&mut unread(4, None), &mut client, 100, (&mut up, Some(Duration::from_millis(50))), None).await;
+            assert!(matches!(sent, Err(NoAnswer::TimedOut(SENDING))));
+            let (mut up, held) = tokio::io::duplex(2);
+            drop(held);
+            out.write_all(b"abcd").await.unwrap();
+            assert!(matches!(send_up(&mut up, b"ab", None).await, Err(NoAnswer::Closed(_))));
+            let sent = pass_body(&mut unread(4, None), &mut client, 100, (&mut up, None), None).await;
+            assert!(matches!(sent, Err(NoAnswer::Other(m)) if m.is_empty()));
         });
     }
 
