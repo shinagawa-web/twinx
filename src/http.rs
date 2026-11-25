@@ -1193,8 +1193,9 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     // An upgraded connection is neither chunked nor kept alive, and has no length.
     let upgraded = resp.tunnel.is_some();
     // An HTTP/2 stream's answer without a length, or with trailers, which the proxied server
-    // may have too, comes to crate::h2 chunked, with its length if it has one, to tell its end and carry them.
-    let passed = resp.proxied && (!r.shared.trailers.lock().unwrap().is_empty() || resp.rest.as_ref().is_some_and(|rest| rest.trailers.is_some())) && r.method != "HEAD" && ![204, 304].contains(&status);
+    // may have too, or one over HTTP/2 whose stream may still fail, comes to crate::h2
+    // chunked, with its length if it has one, to tell its end and carry them.
+    let passed = resp.proxied && (!r.shared.trailers.lock().unwrap().is_empty() || resp.rest.as_ref().is_some_and(|rest| rest.trailers.is_some() || rest.slot.is_some())) && r.method != "HEAD" && ![204, 304].contains(&status);
     let h2 = (unknown || trailing || passed) && !upgraded && r.line.ends_with("HTTP/2.0");
     let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1") && level.chunked && !upgraded || h2;
     let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown) && !upgraded;
@@ -1646,7 +1647,10 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
     let Some(from) = rest.as_mut() else { return Some(true) };
     let (level, time) = (of.0, send_timeout(of.0));
     let (mut size, mut tail, mut lent, mut ending) = (Vec::new(), Vec::new(), Vec::new(), Some(ending));
-    let body = Body::new(from.length.map(|n| n as u64), from.chunked);
+    // Over HTTP/2, the body ends with the pipe, the slot telling how; what came of it
+    // goes on once its length has, without waiting for that.
+    let body = Body::new(from.length.filter(|_| from.slot.is_none()).map(|n| n as u64), from.chunked);
+    let whole_at = from.length.filter(|_| from.slot.is_some());
     let mut buffers = Buffers::new(body, from.slot.is_some(), from.sizes.ok(), from.end, buffer());
     let (mut coder, unbuffered, rate) = (from.coder.take(), from.sizes.is_err(), from.rate);
     // Whether anything came with the head.
@@ -1667,7 +1671,7 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
         // Waits for the next that comes and takes what there is then, up to the size of
         // the buffers, or only one read without them, or with a rate.
         while incoming.buffers.came() == Came::More && !incoming.ended {
-            if incoming.buffers.room() == 0 || incoming.came && (unbuffered || rate > 0) { break }
+            if incoming.buffers.room() == 0 || incoming.came && (unbuffered || rate > 0 || whole_at.is_some_and(|n| *incoming.read >= n)) { break }
             if incoming.came {
                 if !incoming.next(false).await { break }
                 continue
@@ -2776,7 +2780,8 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let keep = status >= 200 && !closes(version, &values("connection")) && !skipped;
     let told = no_body.then_some(length);
     let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
-    if length == Some(0) {
+    // Over HTTP/2, a body the head says is empty has still to end its stream.
+    if length == Some(0) && (no_body || accel || !level.proxy_h2) {
         (bytes[0], bytes[1]) = ((answer.len() - end) as u64, answer.len() as u64);
         return Ok((Response { told, ..resp }, Some(conn).filter(|_| keep && answer.len() == end)));
     }
@@ -2829,7 +2834,7 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 /// before any of the body are as malformed chunks. Last is what is logged of the cut.
 async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>, slot: Option<&crate::h2::Slot>) -> (Vec<u8>, usize, bool, Option<Box<Cut>>, String) {
     let (mut intake, mut chunk, mut failed, mut malformed, mut why) = (Intake::new(rate, after.len()), vec![0u8; 4096], false, false, PREMATURE.to_string());
-    let (mut body, mut data, mut read) = (Body::new(length.map(|n| n as u64), chunked), Vec::new(), after.len());
+    let (mut body, mut data, mut read) = (Body::new(length.filter(|_| slot.is_none()).map(|n| n as u64), chunked), Vec::new(), after.len());
     let mut came = body.take(after, &mut data);
     while came == Came::More {
         let n = match read_piece(s, &mut chunk, (&mut intake, read), wait).await {
