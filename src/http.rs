@@ -856,7 +856,23 @@ struct Cut { length: Option<usize>, malformed: bool, failed: Option<String> }
 /// much is read at once; what compresses or decompresses the body sent as it comes; and
 /// the scheme, the address and the URI the request went to.
 #[derive(Debug)]
-struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, Addr, usize)>, held: Option<Held>, trailers: Option<Trailers>, slot: Option<crate::h2::Slot>, sizes: Result<Sizes, usize>, coder: Option<Box<Coder>>, to: Option<(&'static str, Addr, String)> }
+struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, Addr, usize)>, held: Option<Held>, trailers: Option<Trailers>, slot: Option<crate::h2::Slot>, sizes: Result<Sizes, usize>, coder: Option<Box<Coder>>, to: Option<(&'static str, Addr, String)>, store: Option<Box<Store>> }
+
+/// An answer the cache keeps once its body has come whole, as it is sent: the zone, the
+/// keys, all but the body, what was read of the body after what came with the head, and
+/// the proxy_cache_lock held until then, so that the requests waiting for it find it kept.
+#[derive(Debug)]
+struct Store { zone: Arc<crate::cache::Zone>, keys: (String, String), head: (u16, Option<String>, Vec<(String, String)>), told: (Option<usize>, Option<String>, Vec<(String, String)>), times: (i64, i64, i64), vary: (Vec<String>, Vec<(String, String)>), raw: Vec<u8>, lock: Option<tokio::sync::OwnedMutexGuard<()>> }
+
+impl Store {
+    /// Keeps the answer with its body.
+    fn put(self, body: Vec<u8>) {
+        let (status, ctype, headers) = self.head;
+        self.zone.put((&self.keys.0, &self.keys.1), (status, ctype, headers, body), self.told, self.times, (self.vary.0, &self.vary.1));
+        // Only then do the requests waiting for it go on.
+        drop(self.lock);
+    }
+}
 
 /// The trailers of an answer over HTTP/2 (proxy_pass_trailers): the slot they come
 /// in, the headers proxy_hide_header names and those proxy_pass_header passes, and what they are passed through.
@@ -889,6 +905,7 @@ async fn finish(resp: &mut Response, (level, r): (&Level, &Request)) {
         // They come after a body in chunks, if it has no length of the server's.
         resp.unknown_length |= any && rest.length.is_none();
     }
+    if let Some(store) = rest.store.take().filter(|_| resp.cut.is_none()) { store.put(resp.body.clone()); }
     note(resp, &rest, read);
     if !why.is_empty() { log_at(level, r, "error", &why, &rest.url()); }
     rest.give_back(ended, resp.cut.is_none());
@@ -909,12 +926,32 @@ impl Rest {
 
     /// Gives the connection back for other requests, if the answer ended so that it may be,
     /// or, over HTTP/2, is whole.
-    fn give_back(self, ended: bool, whole: bool) {
-        match (self.home, &self.slot) {
+    fn give_back(mut self, ended: bool, whole: bool) {
+        match (self.home.take(), &self.slot) {
             (Some((up, addr, tag)), Some(slot)) if whole => crate::h2::give_back(slot, (up, addr, tag, self.wait)),
-            (Some((up, addr, tag)), None) if self.keep && ended => up.put(self.conn, addr, tag),
+            (Some((up, addr, tag)), None) if self.keep && ended => up.put(self.taken(), addr, tag),
             _ => {}
         }
+    }
+
+    /// The connection, leaving in its place a pipe that nothing comes from.
+    fn taken(&mut self) -> Conn {
+        std::mem::replace(&mut self.conn, Conn::new(Stream::Pipe(tokio::io::duplex(1).0.into()), self.started))
+    }
+}
+
+impl Drop for Rest {
+    /// An answer being cached whose body is not read whole, as it is not sent, or not all
+    /// of it, is read on by a task of its own and kept once it has come whole, as nginx goes
+    /// on reading what may be cached whatever happens to the request.
+    fn drop(&mut self) {
+        let Some(store) = self.store.take() else { return };
+        let (mut conn, came) = (self.taken(), [&self.answer[self.end..], &store.raw[..]].concat());
+        let (length, chunked, rate, wait, slot) = (self.length, self.chunked, self.rate, self.wait, self.slot.clone());
+        tokio::task::spawn_local(async move {
+            let (body, _, _, cut, _) = read_body(&mut conn.stream, &came, length, chunked, rate, wait, slot.as_ref()).await;
+            if cut.is_none() { store.put(body); }
+        });
     }
 }
 
@@ -1697,6 +1734,7 @@ impl Incoming<'_> {
         if let Err(e) = &got { self.why = read_failed(if self.unbuffered { "recv" } else { "readv" }, e); }
         let n = got.unwrap_or(0);
         *self.read += n;
+        if let Some(store) = from.store.as_mut() { store.raw.extend_from_slice(&part[..n]); }
         self.buffers.take(&part[..n]);
         self.came = true;
         if let Some(slot) = from.slot.as_ref().filter(|_| self.ended && !self.failed) { (self.failed, self.malformed) = ended_over_h2(slot); }
@@ -1724,6 +1762,11 @@ impl Incoming<'_> {
         let Some(from) = self.rest.as_mut() else { return };
         self.resp.cut = self.buffers.cut(self.failed).then(|| Box::new(Cut { length: from.length, malformed: self.malformed, failed: None }));
         if let Some(t) = from.trailers.as_ref().filter(|_| self.resp.cut.is_none()) { t.take(&mut from.conn.stream, Some(from.wait.unwrap_or_default())).await; }
+        if let Some(store) = from.store.take().filter(|_| self.resp.cut.is_none()) {
+            let mut body = Vec::new();
+            Body::new(from.length.filter(|_| from.slot.is_none()).map(|n| n as u64), from.chunked).take(&[&from.answer[from.end..], &store.raw[..]].concat(), &mut body);
+            store.put(body);
+        }
         note(self.resp, from, *self.read);
         self.log();
         if let Some(rest) = self.rest.take() { rest.give_back(self.buffers.came() == Came::Whole { followed: false }, self.resp.cut.is_none()); }
@@ -2424,6 +2467,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let bypass = cache.is_some() && any_set(&level.proxy_cache_bypass);
     // Ranges of what the cache keeps are given when its Accept-Ranges was kept, or with
     // proxy_force_ranges (ngx_http_upstream_copy_allow_ranges()), and its server gave its length.
+    let ignored = |name: &str| level.proxy_ignore_headers.iter().any(|i| i == name);
     let hit = |e: crate::cache::Entry| {
         // With its server's status line, and its headers for $upstream_http_*.
         let status_line = e.line.map(|l| Box::new(crate::vars::bytes(&l).into_boxed_slice()));
@@ -2435,6 +2479,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // One its server gave no length of has none.
         resp.unknown_length = e.length.is_none();
         if level.proxy_force_ranges || has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, false, e.length.is_some()); }
+        // Its X-Accel-Limit-Rate sets the rate it is sent at, as that of the server's answer does.
+        if let Some(rate) = resp.upstream.iter().filter(|_| !ignored("x-accel-limit-rate")).find(|h| h.0.eq_ignore_ascii_case("x-accel-limit-rate")).and_then(|h| h.1.parse().ok()) { r.shared.limit_rate.set(rate); }
         resp
     };
     // $upstream_cache_status: how the cache answered.
@@ -2689,7 +2735,6 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     (resp.upstream_addr, resp.upstream_status, resp.upstream_time, resp.upstream_bytes, resp.proxy_host) = (upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host);
     // X-Accel-Limit-Rate sets the rate the answer is sent at; X-Accel-Redirect
     // replaces the answer with an internal redirect to its URI.
-    let ignored = |name: &str| level.proxy_ignore_headers.iter().any(|i| i == name);
     let accel = |name: &str| resp.upstream.iter().filter(|_| !ignored(name)).find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     if let Some(rate) = accel("x-accel-limit-rate").and_then(|v| v.parse().ok()) { r.shared.limit_rate.set(rate); }
     // It keeps Content-Type and the headers below; an unsafe URI is 404.
@@ -2719,7 +2764,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let valid = said.and_then(|(until, updating)| until.or_else(|| crate::cache::validity(&level.proxy_cache_valid, resp.status).map(|t| now.saturating_add(t.as_secs() as i64))).map(|u| (u, updating)));
     // Nor one the not modified filter answers with 412, which ends the request.
     if let Some((zone, valid)) = cache.zip(valid).filter(|_| !precondition_fails(r, &resp)) {
-        finish(&mut resp, (level, r)).await;
+        // It is sent as it comes and kept once it has come whole; one a range is asked of
+        // is read whole first, as is that of a background update, which is sent to no one.
+        if header(r, "range").is_some() || r.shared.updater { finish(&mut resp, (level, r)).await; }
         let length = resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case("content-length")).and_then(|h| h.1.parse().ok());
         // One range of what is being cached may be given, read whole as it is, when it
         // has Accept-Ranges and its server gave its length.
@@ -2729,7 +2776,10 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // Nor one the range filter answers with 416, which ends the request too.
         let unsatisfiable = resp.ranges && resp.status == 200 && ranges_asked(r, &resp).is_some_and(|(_, asked)| asked.is_err());
         let line = resp.status_line.as_deref().map(|l| crate::vars::text(l));
-        if resp.cut.is_none() && !unsatisfiable { zone.put((&main, &key), (resp.status, kept.0, kept.1, resp.body.clone()), (length, line, resp.upstream.clone()), (valid.0, valid.1, crate::cache::stale_if_error(&resp.upstream, &level.proxy_ignore_headers)), (vary.unwrap_or_default(), &r.headers)); }
+        let lock = locked.flatten().flatten();
+        let store = Store { zone: zone.clone(), keys: (main, key), head: (resp.status, kept.0, kept.1), told: (length, line, resp.upstream.clone()), times: (valid.0, valid.1, crate::cache::stale_if_error(&resp.upstream, &level.proxy_ignore_headers)), vary: (vary.unwrap_or_default(), r.headers.clone()), raw: Vec::new(), lock };
+        // What is still to be read of it is kept once it has been; what has been read, now.
+        if unsatisfiable {} else if let Some(rest) = resp.rest.as_mut() { rest.store = Some(Box::new(store)); } else if resp.cut.is_none() { store.put(resp.body.clone()); }
     }
     // proxy_force_ranges: one range of any other answer is given too, whatever its Accept-Ranges
     // says, read whole for it.
@@ -3052,7 +3102,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         // It is passed as it is, its status 200, until the server closes the connection.
         let Some(end) = end else {
             time[1] = Some(start.elapsed().as_millis());
-            let rest = Rest { conn, answer, end: 0, length: None, chunked: false, rate: 0, started: start, wait, keep: false, home: None, held: None, trailers: None, slot: None, sizes: Err(level.proxy_buffer_size), coder: None, to: None };
+            let rest = Rest { conn, answer, end: 0, length: None, chunked: false, rate: 0, started: start, wait, keep: false, home: None, held: None, trailers: None, slot: None, sizes: Err(level.proxy_buffer_size), coder: None, to: None, store: None };
             return Ok((Response { status: 200, proxied: true, http09: true, unbuffered: true, rest: Some(Box::new(rest)), ..Response::default() }, None));
         };
         let head = crate::vars::text(&answer[..end]);
@@ -3116,7 +3166,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let sizes = if buffering { Ok(Sizes { first, count, size, busy: level.proxy_busy_buffers_size.unwrap_or(2 * first.max(size)) }) } else { Err(first) };
     // proxy_limit_rate is for answers that are buffered.
     let rate = if buffering { rate(&resp) } else { 0 };
-    Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None, held: None, trailers: None, slot: None, sizes, coder: None, to: None })), unbuffered: !buffering, ..resp }, None))
+    Ok((Response { rest: Some(Box::new(Rest { conn, answer, end, length, chunked, rate, started: start, wait, keep, home: None, held: None, trailers: None, slot: None, sizes, coder: None, to: None, store: None })), unbuffered: !buffering, ..resp }, None))
 }
 
 /// Whether a header of a proxied server's answer is hidden, as those of
@@ -5454,6 +5504,70 @@ pub(crate) mod tests {
         let came = came.lock().unwrap();
         assert!(came[0].1.starts_with("POST ") && came[0].1.contains("\r\nIf-Match: \"d\"\r\n") && came[0].1.contains("\r\nRange: bytes=0-1\r\n"), "{}", came[0].1);
         assert!(came[1].1.starts_with("GET ") && !came[1].1.contains("If-Match") && !came[1].1.contains("Range"), "{}", came[1].1);
+    }
+
+    /// A server that caches for a minute what the server at that address answers, kept
+    /// in a directory of that name, and what each of the URIs gets of it in turn, with the
+    /// milliseconds that took.
+    fn cached_as_asked(addr: SocketAddr, name: &str, uris: &[&str]) -> Vec<(u128, String)> {
+        let dir = log_path(name);
+        let text = format!("http {{ proxy_cache_path {} keys_zone=z:1m; proxy_cache z; proxy_cache_valid 200 1m; server {{ location / {{ proxy_pass http://{addr}; }} }} }}", dir.display());
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {text}"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        let got = block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let to = listener.local_addr().unwrap();
+            let tasks = accept(config, &[(listener, to)]).unwrap();
+            let mut got = Vec::new();
+            for uri in uris {
+                let mut client = tokio::net::TcpStream::connect(to).await.unwrap();
+                client.write_all(format!("GET {} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", uri.trim_end_matches('!')).as_bytes()).await.unwrap();
+                let (started, mut text, mut buf) = (Instant::now(), Vec::new(), [0; 4096]);
+                // One that ends with "!" goes away once the first part of the body has come.
+                let first = |text: &[u8]| text.windows(2).any(|w| w == b"ab");
+                while !(uri.ends_with('!') && first(&text)) {
+                    match within(Some(Duration::from_secs(4)), client.read(&mut buf)).await.unwrap().unwrap() { 0 => break, n => text.extend_from_slice(&buf[..n]) }
+                    if first(&text) && got.is_empty() { got.push((started.elapsed().as_millis(), String::new())); }
+                }
+                got.push((started.elapsed().as_millis(), undated(&text)));
+                // The server may still be read meanwhile.
+                if uri.ends_with('!') { drop(client); tokio::time::sleep(Duration::from_millis(800)).await; }
+            }
+            tasks.iter().for_each(JoinHandle::abort);
+            got
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        got
+    }
+
+    #[test]
+    fn answers_being_cached_are_sent_as_they_come() {
+        let _busy = serving_on();
+        let (addr, counts) = plays(&after_head("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", &["2\r\nab\r\n", "2\r\ncd\r\n0\r\n\r\n"], 500), true);
+        let got = cached_as_asked(addr, "streamed-cache", &["/", "/"]);
+        // The first part comes before the rest has, and what is kept is all of it.
+        assert!(got[0].0 < 400 && got[1].0 >= 500 && got[1].1.ends_with("\r\n\r\n2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n"), "{got:?}");
+        assert!(got[2].1.ends_with("\r\n\r\n4\r\nabcd\r\n0\r\n\r\n") && got[2].0 < 400, "{got:?}");
+        assert_eq!(counts.lock().unwrap()[0], 1);
+    }
+
+    #[test]
+    fn answers_being_cached_are_kept_when_the_client_goes_away() {
+        let _busy = serving_on();
+        let (addr, counts) = plays(&after_head("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", &["2\r\nab\r\n", "2\r\ncd\r\n0\r\n\r\n"], 300), true);
+        let got = cached_as_asked(addr, "gone-cache-body", &["/!", "/"]);
+        assert!(got[2].1.contains("\r\n\r\n4\r\nabcd\r\n0\r\n\r\n"), "{got:?}");
+        assert_eq!(counts.lock().unwrap()[0], 1);
+    }
+
+    #[test]
+    fn kept_answers_are_sent_at_their_x_accel_limit_rate() {
+        let _busy = serving_on();
+        let body = "x".repeat(2000);
+        let (addr, counts) = plays(&vec![(0, format!("HTTP/1.1 200 OK\r\nX-Accel-Limit-Rate: 1000\r\nContent-Length: 2000\r\n\r\nab{}", &body[2..]).into_bytes())], true);
+        let got = cached_as_asked(addr, "rate-cache", &["/", "/"]);
+        let hit = got.last().unwrap();
+        assert!(hit.0 >= 700 && hit.1.ends_with(&body[2..]), "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
+        assert_eq!(counts.lock().unwrap()[0], 1);
     }
 
     #[test]
