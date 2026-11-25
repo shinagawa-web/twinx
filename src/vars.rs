@@ -531,12 +531,8 @@ impl Var {
 /// $gzip_ratio: the bytes taken for each byte made, with two decimals rounded as nginx
 /// rounds them; None for an answer that made none.
 fn ratio((taken, made): (u64, u64)) -> Option<String> {
-    let (mut whole, mut frac) = (taken.checked_div(made)?, taken * 100 / made % 100);
-    if taken * 1000 / made % 10 > 4 {
-        frac += 1;
-        if frac > 99 { (whole, frac) = (whole + 1, 0); }
-    }
-    Some(format!("{whole}.{frac:02}"))
+    let hundredths = taken.checked_mul(100)?.checked_div(made)? + u64::from(taken * 1000 / made % 10 > 4);
+    Some(format!("{}.{:02}", hundredths / 100, hundredths % 100))
 }
 
 /// Text read from the network, its bytes that are not UTF-8 kept as nginx
@@ -948,7 +944,7 @@ mod tests {
         *r.shared.gzip.lock().unwrap() = Some((800, 44));
         r.shared.trailers.lock().unwrap().push(("X-A".into(), "b".into()));
         assert_eq!(t.render(&r, &Sent::default()), "[18.18][b]");
-        assert_eq!([(1000, 3), (2000, 1001), (1999, 1000), (1, 0)].map(ratio), [Some("333.33".into()), Some("2.00".into()), Some("2.00".into()), None]);
+        assert_eq!([(1000, 3), (2000, 1001), (1999, 1000), (1, 0), (2, 3)].map(ratio), [Some("333.33".into()), Some("2.00".into()), Some("2.00".into()), None, Some("0.67".into())]);
     }
 
     #[test]
