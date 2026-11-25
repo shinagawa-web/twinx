@@ -904,10 +904,13 @@ impl Builder<'_> {
         // Named captures of server names are variables everywhere, so they are known first.
         let names = block.iter().filter(|d| d.name == "server").flat_map(|d| d.block.iter().flatten()).filter(|d| d.name == "server_name");
         names.flat_map(|d| d.args.iter()).filter(|n| n.starts_with('~')).for_each(|n| drop(server_name(n)));
-        // So are the variables set gives values to, wherever it is.
+        // So are the variables set gives values to, wherever it is, and the
+        // named captures of the other regular expressions.
         fn declare(block: &[Directive]) {
+            const REGEXES: &[&str] = &["location", "if", "rewrite", "proxy_redirect", "proxy_cookie_domain", "proxy_cookie_path", "proxy_cookie_flags"];
             for d in block {
                 if let Some(name) = d.args.first().and_then(|a| a.strip_prefix('$')).filter(|_| d.name == "set") { crate::vars::add_user(name); }
+                if REGEXES.contains(&d.name.as_str()) { d.args.iter().flat_map(|a| capture_names(a)).for_each(crate::vars::add_user); }
                 declare(d.block.as_deref().unwrap_or_default());
             }
         }
@@ -1657,6 +1660,13 @@ fn server_name(n: &str) -> Result<Vec<ServerName>, String> {
 }
 
 /// A PCRE pattern in the syntax of the regex crate: "\Q...\E" quotes text.
+/// The names of the named captures of a regular expression, (?<name>...) and (?P<name>...).
+fn capture_names(p: &str) -> Vec<&str> {
+    let starts = p.match_indices("(?<").map(|(i, _)| i + 3).chain(p.match_indices("(?P<").map(|(i, _)| i + 4));
+    let name = |i: usize| p[i..].split_once('>').map(|(n, _)| n).filter(|n| n.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'));
+    starts.filter_map(name).collect()
+}
+
 fn pcre(p: &str) -> String {
     let (mut out, mut rest) = (String::new(), p);
     while let Some(i) = rest.find("\\Q") {
@@ -1710,11 +1720,11 @@ fn flag(d: &Directive) -> Result<bool, String> {
     found.ok_or_else(|| format!("invalid value \"{value}\" in \"{name}\" directive, it must be \"on\" or \"off\""))
 }
 
-/// set $variable value: a variable of its own, or $limit_rate; the other
+/// set $variable value: a variable of its own, $limit_rate or $args; the other
 /// variables twinx makes cannot be set.
 fn set(args: &[String]) -> Result<Op, String> {
     let name = args[0].strip_prefix('$').ok_or_else(|| format!("invalid variable name \"{}\"", args[0]))?;
-    if name != "limit_rate" && crate::vars::builtin(name) { return Err(format!("the duplicate \"{name}\" variable")); }
+    if name != "limit_rate" && name != "args" && crate::vars::builtin(name) { return Err(format!("the duplicate \"{name}\" variable")); }
     Ok(Op::Set(name.to_string(), Template::parse(&args[1])?))
 }
 
@@ -1880,6 +1890,11 @@ fn listen(arg: &str) -> Result<SocketAddr, String> {
 mod tests {
     use super::*;
     use crate::config::parse;
+
+    #[test]
+    fn names_of_captures() {
+        assert_eq!(capture_names("^/(?<a>x)(?P<b_1>y)(?<=z)(?<1c>w)(?<d"), ["a", "b_1"]);
+    }
 
     fn return_code(level: &Level) -> u16 {
         level.script.iter().find_map(|s| if let Op::Return(code, _) = s { Some(*code) } else { None }).unwrap()
