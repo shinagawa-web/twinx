@@ -2711,8 +2711,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     if let (Some(zone), Some(a), Some(e)) = (cache, answer.as_ref().filter(|a| a.status == 304 && !a.generated), stale.as_ref().filter(|_| revalidate)) {
         noted("REVALIDATED");
         let now = crate::clock::seconds();
-        let said = crate::cache::said(&a.upstream, &level.proxy_ignore_headers, now).and_then(|(until, updating)| until.map(|u| (u, updating)));
-        let valid = said.or_else(|| crate::cache::validity(&level.proxy_cache_valid, e.status).map(|t| (now.saturating_add(t.as_secs() as i64), 0)));
+        // When it says nothing of the time, what is kept says it, as if it came now.
+        let said = |headers: &[(String, String)]| crate::cache::said(headers, &level.proxy_ignore_headers, now).and_then(|(until, updating)| until.map(|u| (u, updating)));
+        let valid = said(&a.upstream).or_else(|| said(&e.upstream)).or_else(|| crate::cache::validity(&level.proxy_cache_valid, e.status).map(|t| (now.saturating_add(t.as_secs() as i64), 0)));
         let vary = a.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("vary")).then(|| crate::cache::vary(&a.upstream)).flatten().filter(|_| !level.proxy_ignore_headers.iter().any(|i| i == "vary"));
         if let Some(valid) = valid { zone.renew(&key, valid, vary.map(|v| (v, &r.headers[..]))); }
         let mut kept = hit(e.clone());
@@ -3129,8 +3130,8 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         let (lower, value) = (name.to_ascii_lowercase(), value.to_string());
         resp.upstream.push((name.to_string(), value.clone()));
         if lower == "content-type" { resp.ctype = Some(value.into()); continue; }
-        // A second Expires is ignored.
-        let again = lower == "expires" && resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("expires"));
+        // A second Expires, ETag or Last-Modified is ignored.
+        let again = ["expires", "etag", "last-modified"].contains(&lower.as_str()) && resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case(&lower));
         if !again && !HOP.contains(&lower.as_str()) { resp.headers.push((name.to_string(), value)); }
     }
     // 101 to a request with Upgrade: what came after the head goes to the client first.
@@ -5557,6 +5558,16 @@ pub(crate) mod tests {
         let got = cached_as_asked(addr, "gone-cache-body", &["/!", "/"]);
         assert!(got[2].1.contains("\r\n\r\n4\r\nabcd\r\n0\r\n\r\n"), "{got:?}");
         assert_eq!(counts.lock().unwrap()[0], 1);
+    }
+
+    #[test]
+    fn second_etags_and_last_modified_times_are_ignored() {
+        let _busy = serving_on();
+        let (addr, _counts) = plays(&vec![(0, b"HTTP/1.1 200 OK\r\nETag: \"e\"\r\nETag: \"f\"\r\nLast-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\nLast-Modified: Mon, 07 Nov 1994 08:49:37 GMT\r\nContent-Length: 2\r\n\r\nab".to_vec())], true);
+        let got = cached_as_asked(addr, "etags-cache", &["/", "/"]);
+        for (_, text) in &got[1..] {
+            assert!(text.contains("\r\nETag: \"e\"\r\n") && !text.contains("\"f\"") && text.contains("06 Nov") && !text.contains("07 Nov"), "{text}");
+        }
     }
 
     #[test]

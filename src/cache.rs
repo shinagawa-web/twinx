@@ -39,7 +39,7 @@ impl Entry {
         if !matches!(self.status, 200 | 206) { return Vec::new(); }
         let header = |name: &str| self.headers.iter().rev().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
         let modified = header("last-modified").and_then(|v| crate::expires::http_time(&v)).map(|t| ("If-Modified-Since", crate::expires::http_date(t)));
-        modified.into_iter().chain(header("etag").map(|e| ("If-None-Match", e))).collect()
+        modified.into_iter().chain(header("etag").filter(|e| !e.is_empty()).map(|e| ("If-None-Match", e))).collect()
     }
 
     /// Whether it may still be given when its server fails (c->stale_error).
@@ -111,18 +111,29 @@ fn seconds(s: &str) -> Option<i64> {
     digits.bytes().try_fold(0i64, |n, c| c.is_ascii_digit().then(|| n.saturating_mul(10).saturating_add((c - b'0') as i64)))
 }
 
-/// The request headers a Vary names, lowercase (none without one); None for "*",
-/// which no other request matches, so that the answer is not cached.
+/// The request headers a Vary names, lowercase (none without one), as nginx reads its
+/// lines joined by ", ": names apart by spaces and commas. None for a line that is "*",
+/// which no other request matches, or for more than NGX_HTTP_CACHE_VARY_LEN (128) bytes,
+/// so that the answer is not cached.
 pub fn vary(headers: &[(String, String)]) -> Option<Vec<String>> {
-    let names: Vec<String> = headers.iter().filter(|h| h.0.eq_ignore_ascii_case("vary")).flat_map(|h| h.1.split(',')).map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()).collect();
-    (!names.contains(&"*".to_string())).then_some(names)
+    let lines: Vec<&str> = headers.iter().filter(|h| h.0.eq_ignore_ascii_case("vary")).map(|h| h.1.as_str()).collect();
+    let all = lines.join(", ");
+    if lines.contains(&"*") || all.len() > 128 { return None }
+    Some(words(&all).map(str::to_ascii_lowercase).collect())
 }
 
-/// The values of the headers a Vary names in a request, which tell its variant: those of
-/// a header are joined by "," without the spaces and empty ones between them.
+/// What is between spaces and commas.
+fn words(s: &str) -> impl Iterator<Item = &str> {
+    s.split([' ', ',']).filter(|w| !w.is_empty())
+}
+
+/// The values of the headers a Vary names in a request, which tell its variant, as
+/// ngx_http_file_cache_vary_header() takes them: those of a header joined by ",", and
+/// for Accept-Charset, Accept-Encoding and Accept-Language, the words of them.
 pub fn variant(names: &[String], request: &[(String, String)]) -> String {
     names.iter().map(|n| {
-        let values: Vec<&str> = request.iter().filter(|h| h.0.eq_ignore_ascii_case(n)).flat_map(|h| h.1.split(',')).map(|v| v.trim_matches([' ', '\t'])).filter(|v| !v.is_empty()).collect();
+        let values = request.iter().filter(|h| h.0.eq_ignore_ascii_case(n)).map(|h| h.1.as_str());
+        let values: Vec<&str> = if ["accept-charset", "accept-encoding", "accept-language"].contains(&n.as_str()) { values.flat_map(words).collect() } else { values.collect() };
         format!("{n}:{}\n", values.join(","))
     }).collect()
 }
@@ -432,6 +443,7 @@ mod tests {
         assert_eq!(entry(206, &both[1..]).conditions(), [("If-None-Match", "\"x\"".to_string())]);
         assert!(entry(201, &both).conditions().is_empty());
         assert!(entry(200, &[("Last-Modified", "never")]).conditions().is_empty());
+        assert!(entry(200, &[("ETag", "")]).conditions().is_empty());
         let z = Zone::default();
         z.put(("k", "k"), (200, None, Vec::new(), Vec::new()), (None, None, Vec::new()), (0, 0, 0), (Vec::new(), &[]));
         assert!(z.get("k").is_none());
@@ -446,8 +458,20 @@ mod tests {
     #[test]
     fn variants_by_vary() {
         assert_eq!(vary(&h(&[("Vary", ",, Accept-encoding , ,"), ("vary", "Foo")])), Some(vec!["accept-encoding".to_string(), "foo".to_string()]));
-        assert_eq!(vary(&h(&[("Vary", "Foo, *")])), None);
+        // Only a line that is "*" is no name: in a list, it is one.
+        assert_eq!(vary(&h(&[("Vary", "Foo, *")])), Some(vec!["foo".to_string(), "*".to_string()]));
+        assert_eq!(vary(&h(&[("Vary", "*"), ("Vary", "Foo")])), None);
+        // Spaces part names too, and tabs are in them.
+        assert_eq!(vary(&h(&[("Vary", "Foo Bar\t,\tBaz")])), Some(vec!["foo".to_string(), "bar\t".to_string(), "\tbaz".to_string()]));
+        // Up to 128 bytes, its lines joined by ", ".
+        assert!(vary(&h(&[("Vary", "Foo"), ("Vary", &"a".repeat(123))])).is_some());
+        assert_eq!(vary(&h(&[("Vary", "Foo"), ("Vary", &"a".repeat(124))])), None);
         assert_eq!(vary(&[]), Some(Vec::new()));
+        // The values of other headers are taken as they are.
+        let foo = vec!["foo".to_string()];
+        assert_ne!(variant(&foo, &h(&[("Foo", "a, b")])), variant(&foo, &h(&[("Foo", "a,b")])));
+        assert_eq!(variant(&foo, &h(&[("Foo", "a"), ("Foo", "b")])), variant(&foo, &h(&[("Foo", "a,b")])));
+        assert_eq!(variant(&foo, &h(&[("Foo", "")])), variant(&foo, &[]));
         let names = vec!["accept-encoding".to_string()];
         let v = |value| variant(&names, &h(&[("Accept-Encoding", value)]));
         assert_eq!(v("foo, bar"), v("foo,,  ,bar , "));
