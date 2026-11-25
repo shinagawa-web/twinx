@@ -89,6 +89,13 @@ impl Request {
     /// The URI as the request line has it, also after an internal redirect.
     pub fn request_uri(&self) -> &str { self.shared.unparsed.get().unwrap_or(&self.target) }
 
+    /// Where the arguments start in the target, at its "?": once a rewrite or
+    /// an internal redirect set it, right after the URI, which may have a "?" of its own.
+    pub fn args_at(&self) -> Option<usize> {
+        let after = self.shared.unparsed.get().and(self.target.strip_prefix(self.uri.as_str()));
+        match after { Some(a) if a.is_empty() || a.starts_with('?') => (!a.is_empty()).then_some(self.uri.len()), _ => self.target.find('?') }
+    }
+
     /// Replaces the URI and the arguments, as a rewrite or an internal redirect does.
     pub fn redirect(&mut self, uri: String, target: String) {
         let old = std::mem::replace(&mut self.target, target);
@@ -353,7 +360,7 @@ impl Var {
             Var::ProxyPort => s.proxy_host.as_ref()?.rsplit_once(':').map_or("80", |(_, p)| p).to_string(),
             Var::ProxyAddXForwardedFor => joined(&r.headers, "x-forwarded-for", ", ").map_or_else(|| r.peer.ip().to_string(), |x| format!("{x}, {}", r.peer.ip())),
             // Empty arguments, with "?" or without, are not found.
-            Var::Args => r.target.split_once('?').map(|(_, a)| a).filter(|a| !a.is_empty())?.to_string(),
+            Var::Args => r.target.get(r.args_at()? + 1..).filter(|a| !a.is_empty())?.to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
             Var::Arg(name) => {

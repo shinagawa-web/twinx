@@ -589,7 +589,8 @@ struct Response {
     upstream: Vec<(String, String)>,
     /// The URI and arguments to redirect to internally: the index module's, with
     /// "index.html" added, or the last parameter of try_files.
-    internal: Option<String>,
+    /// With the URI apart when it is not what comes before the first "?": that of a rewrite.
+    internal: Option<Box<(String, Option<String>)>>,
     /// The proxied servers tried ($upstream_addr), and how long each took ($upstream_response_time).
     upstream_addr: Option<String>,
     /// The status each of them answered with ($upstream_status).
@@ -949,13 +950,15 @@ async fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Fo
             None => String::new(),
         };
         if rw.redirect { return redirect(rw.status, format!("{uri}{args}")); }
+        if uri.is_empty() { error_log(level, &to, "the rewritten URI has a zero length"); return special(500); }
         let target = format!("{uri}{args}");
         to.to_mut().redirect(uri, target);
         (changed, moved) = (rw.flag != Flag::Break, true);
         if rw.flag != Flag::Next { break; }
     }
     // A URI changed without "break" is looked for again among the locations.
-    if changed { return Response { internal: Some(to.into_owned().target), ..Response::default() }; }
+    // The URI goes apart from the arguments: a "?" it has is a part of it.
+    if changed { let to = to.into_owned(); return Response { internal: Some(Box::new((to.target, Some(to.uri)))), ..Response::default() }; }
     // Stopped by break, the location goes on with the new URI, and proxy_pass
     // passes it whole, without the URI it has (r->valid_location is 0).
     match level.proxy.as_deref().filter(|p| moved && p.uri.is_some() && level.try_files.is_none()) {
@@ -988,9 +991,11 @@ fn replacement(rw: &Rewrite, r: &Request) -> (String, Option<String>) {
     (uri, args)
 }
 
-/// Escapes what NGX_ESCAPE_ARGS does: control characters, space, "#%&+;?" and bytes above 0x7e.
+/// Escapes what NGX_ESCAPE_ARGS does in nginx 1.30: control characters, space,
+/// `"#%&+;<>?\^`{|}` and bytes above 0x7e.
 fn escape_args(s: &str) -> String {
-    s.bytes().map(|c| if c > 0x20 && c < 0x7f && !b"#%&+;?".contains(&c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
+    let plain = |c: u8| c > 0x20 && c < 0x7f && !b"\"#%&+;<>?\\^`{|}".contains(&c);
+    crate::vars::bytes(s).into_iter().map(|c| if plain(c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
 }
 
 /// The answer of return, else of proxy_pass, else of the static module.
@@ -1027,7 +1032,7 @@ async fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str, clie
     }
     match &tf.fallback {
         Fallback::Status(code) => special(*code),
-        Fallback::Uri(uri) => Response { internal: Some(uri.render(r, &Sent::default())), ..Response::default() },
+        Fallback::Uri(uri) => Response { internal: Some(Box::new((uri.render(r, &Sent::default()), None))), ..Response::default() },
     }
 }
 
@@ -1052,7 +1057,7 @@ fn unescape_redirect(url: &str) -> String {
 
 /// "?" and the arguments of the request, or "" when it has none or they are empty.
 fn args(r: &Request) -> &str {
-    r.target.find('?').map(|i| &r.target[i..]).filter(|a| a.len() > 1).unwrap_or_default()
+    r.args_at().map(|i| &r.target[i..]).filter(|a| a.len() > 1).unwrap_or_default()
 }
 
 /// Answers one request; when the connection stays open for the next one, how
@@ -1944,7 +1949,8 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
     if parsed.is_ok() { level = run(r, &level.script, run(r, &level.server_script, level, &mut proxied), &mut proxied); }
     let mut resp = if proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration", ""); special(500) } else { respond(r, parsed, (prefix, level, auto), client.as_deref_mut()).await };
     let (mut redirects, mut to) = (0, Cow::Borrowed(r));
-    while let Some(target) = resp.internal.take() {
+    while let Some(internal) = resp.internal.take() {
+        let (target, uri) = *internal;
         // nginx gives up after 10 internal redirects.
         redirects += 1;
         // After X-Accel-Redirect the proxied answer's headers stay ($upstream_http_*),
@@ -1955,7 +1961,7 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
         let (prefix, found, auto) = if let Some(l) = named { (l.path.as_str(), &l.level, false) } else {
             let next = to.to_mut();
             if resp.as_get && next.method != "HEAD" { next.method = "GET".to_string(); }
-            next.redirect(target.split('?').next().unwrap_or_default().to_string(), target.clone());
+            next.redirect(uri.unwrap_or_else(|| target.split('?').next().unwrap_or_default().to_string()), target.clone());
             located(server, &to, &to.uri)
         };
         let proxied = &mut false;
@@ -2035,10 +2041,10 @@ fn index(level: &Level, r: &Request, dir: &std::path::Path) -> Response {
     use std::io::ErrorKind::{InvalidFilename, NotADirectory, NotFound, PermissionDenied};
     let mut dir_tested = false;
     for name in level.index.iter().map(|t| t.render(r, &Sent::default())) {
-        if name.starts_with('/') { return Response { internal: Some(format!("{name}{}", args(r))), ..Response::default() }; }
+        if name.starts_with('/') { return Response { internal: Some(Box::new((format!("{name}{}", args(r)), None))), ..Response::default() }; }
         let file = dir.join(&name);
         let err = match std::fs::metadata(&file) {
-            Ok(_) => return Response { internal: Some(format!("{}{name}{}", r.uri, args(r))), ..Response::default() },
+            Ok(_) => return Response { internal: Some(Box::new((format!("{}{name}{}", r.uri, args(r)), None))), ..Response::default() },
             Err(e) => e,
         };
         if matches!(err.kind(), NotADirectory | InvalidFilename | PermissionDenied) { return index_error(level, r, &file, &err); }
@@ -2453,7 +2459,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let named = to.starts_with('@');
         // As in nginx, the 404 of an unsafe URI has the headers kept too.
         let Some((uri, args)) = (if named { Some((to, None)) } else { unsafe_uri(&to) }) else { return Response { headers: resp.headers, ..special(404) } };
-        return Response { internal: Some(args.map_or_else(|| uri.clone(), |a| format!("{uri}?{a}"))), as_get: !named, ..resp };
+        return Response { internal: Some(Box::new((args.map_or_else(|| uri.clone(), |a| format!("{uri}?{a}")), None))), as_get: !named, ..resp };
     }
     let hidden = |name: &str| hidden(&level.proxy_hide_header, &level.proxy_pass_header, name);
     resp.headers.retain(|h| !hidden(&h.0));
@@ -3083,7 +3089,8 @@ fn decode(s: &str) -> Option<String> {
         out.push(if b[i] == b'%' { i += 2; hex(s.get(i - 1..i + 1)?)? } else { b[i] });
         i += 1;
     }
-    Some(String::from_utf8_lossy(&out).into_owned())
+    // Bytes that are not UTF-8 stay as they are (crate::vars::text()).
+    Some(crate::vars::text(&out))
 }
 
 /// An X-Accel-Redirect URI as ngx_http_parse_unsafe_uri() takes it: its path,
@@ -6216,7 +6223,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (_, r) = request("POST /a HTTP/1.0\n\n");
         let resp = block_on(proxy(&p, &level, &r, "", None));
-        assert_eq!((resp.internal.as_deref(), resp.as_get, r.shared.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
+        assert_eq!((resp.internal.as_ref().map(|i| i.0.as_str()), resp.as_get, r.shared.limit_rate.get()), (Some("/b?c=1"), true, Some(13000)));
         assert!(resp.upstream_time.unwrap()[0][2].unwrap() < 1000);
     }
 
@@ -6606,6 +6613,28 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         // In a redirect, the URL is unescaped again as far as its "?".
         assert_eq!(get("/r/a+b").2.unwrap(), "http://e/a+b?/a%2Bb");
         assert_eq!(escape_args("a b#%&+;?\x7f"), "a%20b%23%25%26%2B%3B%3F%7F");
+        assert_eq!(escape_args("\"<>\\^`{|}'\u{10FFFF}"), "%22%3C%3E%5C%5E%60%7B%7C%7D'%FF");
+    }
+
+    #[test]
+    fn rewrites_keep_a_question_mark_of_the_uri() {
+        let text = "http { server { location /a { rewrite ^/a(.*) /s$1 last; } location /e { rewrite ^/e(.*) $1; return 200 x; } \
+                    location /s { return 200 $uri:$args; } } }";
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            let resp = block_on(answer(s, &r, Ok(()), location(s, &r.uri), None)).0;
+            (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
+        };
+        // A "?" captured is a part of the URI, not the start of the arguments.
+        assert_eq!(get("/a/b%3Fc"), (200, "/s/b?c:".to_string()));
+        assert_eq!(get("/a/b%3Fc?d=e"), (200, "/s/b?c:d=e".to_string()));
+        // An empty URI is an error.
+        assert_eq!(get("/e").0, 500);
+        assert_eq!(get("/e/").1, "x");
+        // A byte that is not UTF-8 stays as it is.
+        assert_eq!(crate::vars::bytes(&decode("/%C3%A9%FF").unwrap()), b"/\xc3\xa9\xff");
     }
 
     #[test]
@@ -6973,7 +7002,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         // A directory with "/" goes to its index, or is forbidden without one.
         let (_, r) = request("GET /w/ HTTP/1.0\n\n");
         let level = location(s, &r.uri).1;
-        assert_eq!(block_on(super::try_files(level.try_files.as_deref().unwrap(), level, &r, "/w/", None)).internal.as_deref(), Some("/w/index.html"));
+        assert_eq!(block_on(super::try_files(level.try_files.as_deref().unwrap(), level, &r, "/w/", None)).internal.map(|i| i.0), Some("/w/index.html".to_string()));
         assert_eq!(answer("/w/e/").0, 403);
     }
 
