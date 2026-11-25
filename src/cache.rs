@@ -233,11 +233,11 @@ impl Zone {
     /// for so long after (a 304 of proxy_cache_revalidate). The Vary of the 304, if it has
     /// one, replaces what was kept, with the variant of the request it answered.
     pub fn renew(&self, key: &str, (until, updating): (i64, i64), vary: Option<(Vec<String>, &[(String, String)])>) {
-        if let Some(e) = self.entries.lock().unwrap().get_mut(key) {
-            (e.until, e.updating) = (until, updating);
-            if let Some((names, request)) = vary { e.variant = variant(&names, request); e.vary = names; }
-            self.save(key, e);
-        }
+        let mut entries = self.entries.lock().unwrap();
+        let Some(e) = entries.get_mut(key) else { return };
+        (e.until, e.updating) = (until, updating);
+        if let Some((names, request)) = vary { e.variant = variant(&names, request); e.vary = names; }
+        self.save(key, e);
     }
 
     /// Keeps an answer for a key, valid until then, and given while it is updated for so long after.
