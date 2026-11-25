@@ -30,13 +30,14 @@ pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
 const REASONS: &[(u16, &str)] = &[
     (200, "OK"), (201, "Created"), (202, "Accepted"), (204, "No Content"), (206, "Partial Content"),
     (301, "Moved Permanently"), (302, "Moved Temporarily"), (303, "See Other"), (304, "Not Modified"),
-    (307, "Temporary Redirect"), (308, "Permanent Redirect"), (400, "Bad Request"), (401, "Unauthorized"),
-    (403, "Forbidden"), (404, "Not Found"), (405, "Not Allowed"), (406, "Not Acceptable"),
+    (307, "Temporary Redirect"), (308, "Permanent Redirect"), (400, "Bad Request"), (401, "Unauthorized"), (402, "Payment Required"),
+    (403, "Forbidden"), (404, "Not Found"), (405, "Not Allowed"), (406, "Not Acceptable"), (407, "Proxy Authentication Required"),
     (408, "Request Time-out"), (409, "Conflict"), (410, "Gone"), (411, "Length Required"),
     (412, "Precondition Failed"), (413, "Request Entity Too Large"), (414, "Request-URI Too Large"),
     (415, "Unsupported Media Type"), (416, "Requested Range Not Satisfiable"), (421, "Misdirected Request"), (429, "Too Many Requests"),
     (500, "Internal Server Error"), (501, "Not Implemented"), (502, "Bad Gateway"),
     (503, "Service Temporarily Unavailable"), (504, "Gateway Time-out"), (505, "HTTP Version Not Supported"),
+    (507, "Insufficient Storage"),
 ];
 
 /// Opens the listening sockets: the master does this, so that bind errors stop it and every worker shares them.
@@ -901,7 +902,11 @@ fn special(status: u16) -> Response {
         494 => (400, page_with(400, "Request Header Or Cookie Too Large", "<center>Request Header Or Cookie Too Large</center>\r\n")),
         // A client's certificate that did not verify (495), or none (496).
         495 | 496 => { let text = ["The SSL certificate error", "No required SSL certificate was sent"][usize::from(status == 496)]; (400, page_with(400, text, &format!("<center>{text}</center>\r\n"))) }
-        _ => (status, page(status)),
+        // 498, a request canceled, has the page of 404.
+        498 => (498, page(404)),
+        301..=303 | 307 | 308 | 400..=416 | 421 | 429 | 497 | 500..=505 | 507 => (status, page(status)),
+        // nginx has no page for any other status: its answer is empty, without a type.
+        _ => return Response { status, generated: true, ..Response::default() },
     };
     Response { status, ctype, body: body.into_bytes(), generated: true, ..Response::default() }
 }
@@ -1174,7 +1179,8 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     if r.method != "HEAD" && resp.len() as u64 <= once && !coded { load(r, level, &mut resp); }
     let status = resp.status;
     // 444 closes the connection without an answer; 499 is the status of a client that closed it.
-    let silent = [444, 499].contains(&status);
+    // So does 408: nginx ends such a request as it ends one that timed out.
+    let silent = [408, 444, 499].contains(&status);
     // An answer cut off has the length it would have whole, and the connection
     // closes after it, so that the client can tell. Without a body to send, it is not one.
     let mut cut = resp.cut.is_some() && r.method != "HEAD" && !silent && ![204, 304].contains(&status);
@@ -7441,5 +7447,15 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     #[test]
     fn error_page() {
         assert!(page(404).contains("<title>404 Not Found</title>"));
+        for (status, title) in [(402, "402 Payment Required"), (407, "407 Proxy Authentication Required"), (507, "507 Insufficient Storage"), (498, "404 Not Found")] {
+            let resp = special(status);
+            assert_eq!((resp.status, resp.ctype.as_deref()), (status, Some("text/html")));
+            assert!(String::from_utf8(resp.body).unwrap().contains(&format!("<title>{title}</title>")), "{status}");
+        }
+        // A status nginx has no page for is answered empty, without a type, and with no reason.
+        for status in [417, 418, 422, 506, 508, 599, 999] {
+            let resp = special(status);
+            assert_eq!((resp.status, resp.ctype, resp.body.len(), reason(status)), (status, None, 0, ""));
+        }
     }
 }
