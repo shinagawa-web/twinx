@@ -1596,7 +1596,8 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
 /// If-Range differs from its ETag (a quoted value, compared exactly) or its Last-Modified time;
 /// Err when none of them can be given (416).
 fn ranges_asked(r: &Request, resp: &Response) -> Option<(u64, Result<Option<Vec<(u64, u64)>>, ()>)> {
-    let spec = header(r, "range").filter(|v| v.len() > 6 && v[..6].eq_ignore_ascii_case("bytes=")).map(|v| v[6..].trim())?;
+    // A value whose bytes are not UTF-8 is looked at byte by byte too: "bytes=" is not cut in a character.
+    let spec = header(r, "range").filter(|v| v.len() > 6 && v.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("bytes="))).map(|v| v[6..].trim())?;
     let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     let same = |v: &str| if v.len() >= 2 && v.ends_with('"') { sent("etag").as_deref() == Some(v) } else { sent("last-modified").and_then(|t| expires::http_time(&t)).is_some_and(|t| expires::http_time(v) == Some(t)) };
     if !header(r, "if-range").is_none_or(same) { return None; }
@@ -6962,6 +6963,10 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(asked("Range: bytes=x"), Some((4, Err(()))));
         assert_eq!(asked("Range: bytes=1-2\nIf-Range: \"x\""), None);
         assert_eq!(asked("Accept: a"), None);
+        // A value with bytes that are not UTF-8, before "=" or after it.
+        let raw = |v: &[u8]| { let mut r = request("GET / HTTP/1.0\n\n").1; r.headers.push(("Range".into(), crate::vars::text(v))); ranges_asked(&r, &file) };
+        assert_eq!((raw(b"bytes\xff=0-3"), raw(b"bytes\xc3\xa9=0-3"), raw(b"\xff\xff")), (None, None, None));
+        assert_eq!(raw(b"bytes=\xff"), Some((4, Err(()))));
     }
 
     #[test]
