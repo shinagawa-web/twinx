@@ -784,13 +784,15 @@ struct Builder<'a> {
     /// The addresses servers listen on, with whether one is the default server of
     /// it and whether one gave options of its socket.
     listens: HashMap<(SocketAddr, bool), (bool, bool)>,
+    /// The sizes of the shared memory zones of ssl_session_cache, by name.
+    ssl_zones: HashMap<String, u64>,
 }
 
 /// Interprets the main block. Errors are nginx's messages, with the place.
 pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
-    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), zones: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new(), location_no_uri: false, listens: HashMap::new() };
+    let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), zones: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new(), location_no_uri: false, listens: HashMap::new(), ssl_zones: HashMap::new() };
     let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
@@ -918,6 +920,7 @@ impl Builder<'_> {
         self.level(block, HTTP, &mut level)?;
         let servers = block.iter().filter(|d| d.name == "server");
         let servers: Vec<Server> = servers.map(|d| self.server(d.block.as_deref().unwrap_or_default(), &level)).collect::<Result<_, _>>()?;
+        certified(&servers, &block.iter().filter(|d| d.name == "server").map(|d| d.at.as_str()).collect::<Vec<_>>())?;
         // nginx merges the levels of the proxy module once all of the block is read. Those of
         // if and limit_except, where none of these directives may be, are as the one around them.
         // The default directories are those of servers without directives of their own or inherited.
@@ -970,7 +973,17 @@ impl Builder<'_> {
         }
         if s.listen.is_empty() { s.listen.push(SocketAddr::from(([0, 0, 0, 0], 80))); }
         let l = &s.level;
-        let trust: Vec<&Path> = [&l.ssl_trusted_certificate, &l.ssl_client_certificate].into_iter().flatten().map(PathBuf::as_path).collect();
+        // As ngx_http_ssl_merge_srv_conf() checks a server with certificates or rejecting handshakes.
+        if let Some(cert) = l.ssl_certificate.get(l.ssl_certificate_key.len()) {
+            return Err(format!("no \"ssl_certificate_key\" is defined for certificate \"{}\"", cert.strip_prefix(self.prefix).unwrap_or(cert).display()));
+        }
+        if !l.ssl_certificate.is_empty() || l.ssl_reject_handshake {
+            if [1, 2].contains(&l.ssl_verify_client) && l.ssl_client_certificate.is_none() && l.ssl_trusted_certificate.is_none() { return Err("no ssl_client_certificate or ssl_trusted_certificate for ssl_verify_client".into()) }
+            if l.ssl_ocsp.is_some() && l.ssl_verify_client == 3 { return Err("\"ssl_ocsp\" is incompatible with \"ssl_verify_client optional_no_ca\"".into()) }
+        }
+        // The CA of clients' certificates is loaded only to verify them.
+        let client_ca = l.ssl_client_certificate.as_ref().filter(|_| l.ssl_verify_client > 0);
+        let trust: Vec<&Path> = [l.ssl_trusted_certificate.as_ref(), client_ca].into_iter().flatten().map(PathBuf::as_path).collect();
         let mut options = crate::tls::Options { verify: l.ssl_verify_client > 0, sessions: l.ssl_sessions, compress: l.ssl_certificate_compression, ciphers: l.ssl_ciphers.clone(), protocols: l.ssl_protocols, prefer: l.ssl_prefer_server_ciphers, curves: l.ssl_ecdh_curve.clone(), crl: l.ssl_crl.clone(), depth: l.ssl_verify_depth, ocsp: l.ssl_ocsp.map(|leaf| crate::ocsp::Ocsp { leaf, responder: l.ssl_ocsp_responder.clone(), cache: l.ssl_ocsp_cache.clone() }), ticket_keys: l.ssl_session_ticket_key.clone(), stapling: l.ssl_stapling.then(|| crate::tls::Stapling { verify: l.ssl_stapling_verify, responder: l.ssl_stapling_responder.clone(), file: l.ssl_stapling_file.clone() }), client_ca: l.ssl_client_certificate.clone() };
         let extra = conf_commands(&l.ssl_conf_command, &mut options)?;
         let pairs = l.ssl_certificate.iter().zip(&l.ssl_certificate_key).chain(extra[0].iter().zip(&extra[1]));
@@ -1105,6 +1118,13 @@ impl Builder<'_> {
                 // The sessions are kept in memory of each server, whatever the cache.
                 "ssl_session_cache" => {
                     if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
+                    // A shared zone takes at least eight pages, and has one size wherever it is named.
+                    for (a, (name, n)) in d.args.iter().filter_map(|a| Some((a, a.strip_prefix("shared:")?.split_once(':')?))) {
+                        let n = size(n).map_err(|_| at(format!("invalid session cache \"{a}\"")))?;
+                        if n < 8 * page_size() { return Err(at(format!("session cache \"{a}\" is too small"))); }
+                        let declared = *self.ssl_zones.entry(name.to_string()).or_insert(n);
+                        if declared != n { return Err(at(format!("the size {n} of shared memory zone \"{name}\" conflicts with already declared size {declared}"))); }
+                    }
                     level.ssl_sessions.cache = d.args.iter().all(|a| a != "off" && a != "none");
                     level.ssl_sessions.shared = level.ssl_sessions.cache && d.args.iter().any(|a| a.starts_with("shared:"));
                 }
@@ -1804,6 +1824,26 @@ fn temp_levels(args: &[String]) -> Option<Vec<usize>> {
 }
 
 /// A size such as "512", "8k" or "1m".
+/// The size of a page of memory, as ngx_pagesize.
+fn page_size() -> u64 {
+    // SAFETY: sysconf only reads a value of the system.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
+/// Checks that each address taking TLS has a certificate in its default
+/// server, or when that one rejects handshakes, in each of its servers that
+/// does not, as ngx_http_ssl_init() does; at says where each server is.
+fn certified(servers: &[Server], at: &[&str]) -> Result<(), String> {
+    let has = |s: &Server| !s.level.ssl_certificate.is_empty();
+    for addr in servers.iter().flat_map(|s| &s.ssl) {
+        let on: Vec<usize> = (0..servers.len()).filter(|&i| servers[i].listen.contains(addr)).collect();
+        let default = on.iter().copied().find(|&i| servers[i].defaults.contains(addr)).unwrap_or(on[0]);
+        let missing = if has(&servers[default]) { None } else if !servers[default].level.ssl_reject_handshake { Some(default) } else { on.into_iter().find(|&i| !has(&servers[i]) && !servers[i].level.ssl_reject_handshake) };
+        if let Some(i) = missing { return Err(format!("no \"ssl_certificate\" is defined for the \"listen ... ssl\" directive in {}", at[i])) }
+    }
+    Ok(())
+}
+
 pub fn size(s: &str) -> Result<u64, String> {
     scaled(s, &[("", 1), ("k", 1 << 10), ("K", 1 << 10), ("m", 1 << 20), ("M", 1 << 20)])
 }
@@ -2630,7 +2670,7 @@ mod tests {
         // a regular expression in any location, options for one server of an address.
         assert!(http("upstream u { server 127.0.0.1:8081 down; } error_page 404 /a; error_page 404 /b;").is_none());
         assert!(server("server_name a a *.b c.*; location ~ ^/a { location ~ y { } location ^/a/x { } } location ~ ^/a { } location @a { } location @a { proxy_pass http://127.0.0.1:8081; } location /b { location /bc { } } location /p { proxy_pass http://127.0.0.1:8081/p; }").is_none());
-        assert!(http("server { listen 127.0.0.1:8080 default_server backlog=10 ssl http2 deferred; } server { listen 127.0.0.1:8080; }").is_none());
+        assert!(http("ssl_reject_handshake on; server { listen 127.0.0.1:8080 default_server backlog=10 ssl http2 deferred; } server { listen 127.0.0.1:8080; }").is_none());
     }
 
     #[test]
@@ -2657,7 +2697,7 @@ mod tests {
 
     #[test]
     fn https_and_limit_except() {
-        let c = build_text("http { server { listen 127.0.0.1:8443 ssl; location / { proxy_pass https://127.0.0.1/u; } \
+        let c = build_text("http { server { listen 127.0.0.1:8443 ssl; ssl_reject_handshake on; location / { proxy_pass https://127.0.0.1/u; } \
                             location /l { limit_except GET { } } } }").unwrap();
         let s = &c.servers[0];
         assert_eq!(s.ssl, ["127.0.0.1:8443".parse().unwrap()]);
@@ -2672,6 +2712,26 @@ mod tests {
         let level = &c.servers[0].locations[0].level;
         assert_eq!(level.script.len(), 1);
         assert!(level.limit_except.as_ref().unwrap().1.script.is_empty());
+    }
+
+    #[test]
+    fn ssl_refused() {
+        let refused = |text: &str| build_text(&format!("http {{ {text} }}")).unwrap_err();
+        let pair = "ssl_certificate c.crt; ssl_certificate_key c.key;";
+        assert_eq!(refused("server { listen 127.0.0.1:8080; ssl_certificate c.crt; }"), "no \"ssl_certificate_key\" is defined for certificate \"c.crt\"");
+        assert_eq!(refused(&format!("server {{ {pair} ssl_certificate d.crt; }}")), "no \"ssl_certificate_key\" is defined for certificate \"d.crt\"");
+        assert_eq!(refused(&format!("server {{ {pair} ssl_verify_client optional; }}")), "no ssl_client_certificate or ssl_trusted_certificate for ssl_verify_client");
+        assert_eq!(refused("server { ssl_reject_handshake on; ssl_verify_client optional_no_ca; ssl_ocsp on; }"), "\"ssl_ocsp\" is incompatible with \"ssl_verify_client optional_no_ca\"");
+        // A certificate is needed in the default server of a TLS address, or in each server of it when that one rejects handshakes.
+        assert_eq!(refused("server { listen 127.0.0.1:8443 ssl; }"), "no \"ssl_certificate\" is defined for the \"listen ... ssl\" directive in t.conf:1");
+        assert_eq!(refused("server { listen 127.0.0.1:8443 ssl; ssl_reject_handshake on; }\nserver { listen 127.0.0.1:8443; }"), "no \"ssl_certificate\" is defined for the \"listen ... ssl\" directive in t.conf:2");
+        assert_eq!(refused("server { listen 127.0.0.1:8443 ssl; ssl_reject_handshake on; }\nserver { listen 127.0.0.1:8443 default_server; }"), "no \"ssl_certificate\" is defined for the \"listen ... ssl\" directive in t.conf:2");
+        assert!(build_text("http { server { listen 127.0.0.1:8443 ssl; ssl_reject_handshake on; } server { listen 127.0.0.1:8443; ssl_reject_handshake on; } }").is_ok());
+        // A shared session cache takes eight pages at least, and one size.
+        assert_eq!(refused("ssl_session_cache shared:S:1k;"), "session cache \"shared:S:1k\" is too small in t.conf:1");
+        assert_eq!(refused("ssl_session_cache shared:S:1x;"), "invalid session cache \"shared:S:1x\" in t.conf:1");
+        assert_eq!(refused("ssl_session_cache shared:S:1m; server { ssl_session_cache builtin shared:S:2m; }"), "the size 2097152 of shared memory zone \"S\" conflicts with already declared size 1048576 in t.conf:1");
+        assert!(build_text("http { ssl_session_cache shared:S:1m; server { ssl_session_cache shared:S:1m; } }").is_ok());
     }
 
     #[test]
