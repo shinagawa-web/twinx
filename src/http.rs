@@ -2354,7 +2354,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         },
     };
     // proxy_cache: a GET or HEAD is answered with what the cache keeps for its key
-    // ($scheme$proxy_host$request_uri) while that is valid.
+    // while that is valid.
     // One with variables names the zone for each request; nothing, or "off", is none.
     let get = matches!(r.method.as_str(), "GET" | "HEAD");
     let cache = match level.proxy_cache.as_ref().filter(|_| get) {
@@ -2366,7 +2366,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         None => None,
     };
     let to_host = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
-    let main = level.proxy_cache_key.as_ref().map_or_else(|| format!("{}://{host}{}", if r.ssl.is_some() { "https" } else { "http" }, r.request_uri()), |k| k.render(r, &to_host));
+    // Without proxy_cache_key, that of the URL the request is passed to: the proxied
+    // server's scheme and name, and the URI it is sent, with the arguments.
+    let main = level.proxy_cache_key.as_ref().map_or_else(|| format!("{}://{host}{uri}", if p.ssl { "https" } else { "http" }), |k| k.render(r, &to_host));
     // That of the variant of the request when what the key keeps has a Vary it does not match.
     let key = cache.map_or_else(|| main.clone(), |z| z.resolve(&main, &r.headers));
     // proxy_cache_bypass: the server is asked whatever the cache keeps.
@@ -5304,6 +5306,30 @@ pub(crate) mod tests {
             assert!(took >= at_least && (cache || took < 400), "{cache} {took}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn locations_passing_to_the_same_url_share_what_is_kept() {
+        let _busy = serving_on();
+        let (addr, counts) = plays(&vec![(0, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec())], true);
+        let dir = log_path("key-cache");
+        let at = |l: &str| format!("location /{l}/ {{ proxy_pass http://{addr}/x/; }}");
+        let text = format!("http {{ proxy_cache_path {} keys_zone=z:1m; proxy_cache z; proxy_cache_valid 200 1m; server {{ {} {} location / {{ proxy_pass http://{addr}; }} }} }}", dir.display(), at("one"), at("two"));
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {text}"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let to = listener.local_addr().unwrap();
+            let tasks = accept(config, &[(listener, to)]).unwrap();
+            for uri in ["/one/a", "/two/a", "/x/a", "/two/a?b", "/one/a?b"] {
+                let mut client = tokio::net::TcpStream::connect(to).await.unwrap();
+                client.write_all(format!("GET {uri} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                within(Some(Duration::from_secs(2)), client.read_to_end(&mut Vec::new())).await.unwrap().unwrap();
+            }
+            tasks.iter().for_each(JoinHandle::abort);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        // The server is asked once for /x/a and once for /x/a?b.
+        assert_eq!(counts.lock().unwrap()[0], 2);
     }
 
     #[test]

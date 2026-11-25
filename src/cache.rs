@@ -284,9 +284,10 @@ pub fn valid(args: &[String], time: Duration) -> Result<Vec<(Option<u16>, Durati
     }).collect()
 }
 
-/// For how long an answer of a status is valid, if it is cached at all.
+/// For how long an answer of a status is valid, if it is cached at all: as the first of
+/// the statuses that is its own or "any" says (ngx_http_file_cache_valid()).
 pub fn validity(valid: &[(Option<u16>, Duration)], status: u16) -> Option<Duration> {
-    valid.iter().find(|v| v.0 == Some(status)).or_else(|| valid.iter().find(|v| v.0.is_none())).map(|v| v.1).filter(|t| !t.is_zero())
+    valid.iter().find(|v| v.0.is_none_or(|s| s == status)).map(|v| v.1).filter(|t| !t.is_zero())
 }
 
 #[cfg(test)]
@@ -313,6 +314,11 @@ mod tests {
         assert_eq!(validity(&v, 404), None);
         let any = valid(&strings(&["404", "any"]), m).unwrap();
         assert_eq!(validity(&any, 500), Some(m));
+        // The first that is the status or "any" says.
+        let zero = Duration::ZERO;
+        assert_eq!(validity(&[(None, m), (Some(404), zero)], 404), Some(m));
+        assert_eq!(validity(&[(Some(404), zero), (None, m)], 404), None);
+        assert_eq!(validity(&[(None, zero), (Some(200), m)], 200), None);
         assert!(valid(&strings(&["abc"]), m).is_err());
     }
 
