@@ -104,13 +104,16 @@ baseline() {
   git archive HEAD | tar -x -C "$tree"
   if [ -f "$tree/Cargo.toml" ]; then
     build "$tree" "$RUSTFLAGS_COVERAGE" "$binary" || true
-    unit_tests "$tree" "$OUT/unit-main.json" || true
   fi
   python3 "$HARNESS/run_tests.py" --nginx --out "$OUT/reference.json"
   # Nothing reads these profiles: main is built and run as a pull request is.
-  local profiles="$JUDGE_DIR/main-profiles"
+  local profiles="$JUDGE_DIR/main-profiles" status=0
   rm -rf "$profiles" && mkdir -p "$profiles" && chmod 0777 "$profiles"
-  python3 "$HARNESS/run_tests.py" --profiles "$profiles" --twinx "$binary" --out "$OUT/baseline.json"
+  start_unit_tests "$tree" "$OUT/unit-main.json"
+  python3 "$HARNESS/run_tests.py" --profiles "$profiles" --twinx "$binary" --out "$OUT/baseline.json" \
+    || status=$?
+  finish_unit_tests || true
+  return "$status"
 }
 
 fail_merge() {
