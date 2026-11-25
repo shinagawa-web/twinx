@@ -2375,7 +2375,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // Ranges of what the cache keeps are given when its Accept-Ranges was kept, or with
     // proxy_force_ranges (ngx_http_upstream_copy_allow_ranges()), and its server gave its length.
     let hit = |e: crate::cache::Entry| {
-        let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, relative: e.relative, proxy_host: Some(host.clone()), ..Response::default() };
+        // With its server's status line, and its headers for $upstream_http_*.
+        let status_line = e.line.map(|l| Box::new(crate::vars::bytes(&l).into_boxed_slice()));
+        let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, relative: e.relative, proxy_host: Some(host.clone()), status_line, upstream: e.upstream, ..Response::default() };
         // An answer to HEAD is kept without its body, with the length it was told.
         if let Some(n) = e.length.filter(|&n| n != resp.body.len()) { resp.told = Some(Some(n)); }
         // One its server gave no length of has none.
@@ -2613,7 +2615,13 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     }
     // proxy_cache_use_stale: what the cache keeps is given when the server failed so.
     let condition = answer.as_ref().map_or_else(|| failed.to_string(), |a| if a.generated { "timeout".to_string() } else { format!("http_{}", a.status) });
-    if let Some(e) = stale.filter(|_| level.proxy_cache_use_stale.contains(&condition)) { noted("STALE"); return hit(e) }
+    // With what is known of the servers asked.
+    if let Some(e) = stale.filter(|_| level.proxy_cache_use_stale.contains(&condition)) {
+        noted("STALE");
+        let mut kept = hit(e);
+        (kept.upstream_addr, kept.upstream_status, kept.upstream_time, kept.upstream_bytes) = (Some(addrs.join(", ")), Some(statuses.join(", ")), Some(times), Some(bytes));
+        return kept;
+    }
     let (upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host) = (Some(addrs.join(", ")), Some(statuses.join(", ")), Some(times), Some(bytes), Some(host));
     let Some(mut resp) = answer else { return Response { upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host, ..special(502) } };
     (resp.upstream_addr, resp.upstream_status, resp.upstream_time, resp.upstream_bytes, resp.proxy_host) = (upstream_addr, upstream_status, upstream_time, upstream_bytes, proxy_host);
@@ -2659,9 +2667,12 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // One range of what is being cached may be given, read whole as it is, when it
         // has Accept-Ranges and its server gave its length.
         if has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, true, length.is_some()); }
+        // Read whole, it is sent as its server sent it: without a length when that gave none.
+        resp.unknown_length |= length.is_none();
         // Nor one the range filter answers with 416, which ends the request too.
         let unsatisfiable = resp.ranges && resp.status == 200 && ranges_asked(r, &resp).is_some_and(|(_, asked)| asked.is_err());
-        if resp.cut.is_none() && !unsatisfiable { zone.put((&main, &key), (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), (length, resp.relative), valid, (vary.unwrap_or_default(), &r.headers)); }
+        let line = resp.status_line.as_deref().map(|l| crate::vars::text(l));
+        if resp.cut.is_none() && !unsatisfiable { zone.put((&main, &key), (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), (length, resp.relative, line, resp.upstream.clone()), valid, (vary.unwrap_or_default(), &r.headers)); }
     }
     // proxy_force_ranges: one range of any other answer is given too, whatever its Accept-Ranges
     // says, read whole for it.
@@ -5296,11 +5307,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn what_is_kept_without_a_length_has_none() {
+    fn what_is_kept_is_given_as_it_came() {
         let _busy = serving_on();
-        let (addr, _counts) = plays(&vec![(0, format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}0\r\n\r\n", chunk_of("ok")).into_bytes())], true);
+        let (addr, _counts) = plays(&vec![(0, format!("HTTP/1.1 200 All Fine\r\nX-A: a\r\nTransfer-Encoding: chunked\r\n\r\n{}0\r\n\r\n", chunk_of("ok")).into_bytes())], true);
         let dir = log_path("unknown-cache");
-        let text = format!("http {{ proxy_cache_path {} keys_zone=z:1m; {} }}", dir.display(), passing(addr, "proxy_cache z; proxy_cache_valid 200 1m;"));
+        let text = format!("http {{ proxy_cache_path {} keys_zone=z:1m; {} }}", dir.display(), passing(addr, "proxy_cache z; proxy_cache_valid 200 1m; add_header X-U $upstream_http_x_a;"));
         let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {text}"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
         let answers = block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5318,8 +5329,9 @@ pub(crate) mod tests {
             answers
         });
         let _ = std::fs::remove_dir_all(&dir);
-        // The answer that is kept is given chunked, without Content-Length.
-        assert!(answers[1..].iter().all(|a| a.contains("Transfer-Encoding: chunked\r\n") && !a.contains("Content-Length") && a.ends_with(&format!("{}0\r\n\r\n", chunk_of("ok")))), "{answers:?}");
+        // The answer that is kept is given as it came, chunked, without Content-Length,
+        // with its server's status line and headers.
+        assert!(answers.iter().all(|a| a.starts_with("HTTP/1.1 200 All Fine\r\n") && a.contains("X-U: a\r\n") && a.contains("Transfer-Encoding: chunked\r\n") && !a.contains("Content-Length") && a.ends_with(&format!("{}0\r\n\r\n", chunk_of("ok")))), "{answers:?}");
     }
 
     #[test]
