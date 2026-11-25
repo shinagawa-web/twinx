@@ -1814,11 +1814,11 @@ mod tests {
             ("the end with the head, and a ping", "GET", |i| ([ping(), head(i, 200, END_STREAM)].concat(), None), kept_none),
             ("the end with the head, and a ping after it", "GET", |i| ([head(i, 200, END_STREAM), ping()].concat(), None), kept_none),
         ];
-        for (case, method, plays, connections) in cases {
+        at_once(cases, |(case, method, plays, connections)| {
             let (statuses, came) = kept(plays, method, ("", ""));
             assert!(statuses.iter().all(|s| *s < 300), "{case} {statuses:?}");
             assert_eq!(came, connections, "{case}");
-        }
+        });
         // One that is closed when the second request comes is tried again on another, once; with a reset, or
         // when it goes away before the stream, it is not.
         let second: Plays = |i| if i == 1 { (ok(i), None) } else { (Vec::new(), Some(Vec::new())) };
