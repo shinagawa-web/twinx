@@ -270,3 +270,5 @@ Kinds:
 | 2026-11-25 | After stage 5 | decision | Keep the Fixer running and have it fix what the tests of stage 5 leave unchecked | Stage 6, twinx's own tests of what was found by comparing with nginx; files are added to it in several pull requests |
 | 2026-11-25 | After stage 5 | decision | What is judged of comments | Not judged: it would slow development. A line in docs/fixer.md only (#326); the human's limit is 1% of the lines of src/ (#325) |
 | 2026-11-25 | After stage 5 | decision | Performance comes after stage 6, from 2026-11-26 | Judgement is needed, the human decides what is done |
+| 2026-11-25 | Stage 6 | approval | Put the rest of the found behaviours into stage 6 as well, worded neutrally | The human sees the text of those that matter before they are published |
+| 2026-11-25 | Stage 6 | decision | Performance of v0.5.0 was measured | 63 of 66 scenarios use more CPU than v0.4.1 (one run); it is the material for the performance work |
