@@ -263,3 +263,6 @@ Kinds:
 | 2026-11-25 | Stage 5 | approval | Auto-merge for the agent's pull requests all of 2026-11-25 | Also for the judge's changes |
 | 2026-11-25 | Stage 5 | approval | After #300 the CI work stops, the Fixer's own time comes next | #302, #303 |
 | 2026-11-25 | Stage 5 | decision | The Fixer runs only the file and what the change may touch before a push | The judge runs every file and fails on a lost subtest (#305) |
+| 2026-11-25 | Stage 5 | decision | Code regions are not judged, only recorded (#12) | In the 41 merged stage 5 pull requests two thirds of the unrun regions are error returns or error branches. A threshold of 90% would have rejected 5, one of them for `?` only, and not the two whose unrun branch was moved onto a run line |
+| 2026-11-25 | Stage 5 | correction | The agent was waiting and started nothing between 11:38 and 12:52 | Every open issue that can be worked on is given out; two are left as the human said (#182, #189: performance is judged elsewhere; #228: later) |
+| 2026-11-25 | Stage 5 | decision | Do not add "fetch before reading docs/" to the routine's prompt | Too obvious to say; the run of 12:33 had read an older docs/ when it started |
