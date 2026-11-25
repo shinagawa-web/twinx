@@ -3467,6 +3467,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "holds only with optimization")]
     fn the_future_of_a_connection_is_small() {
         let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", "http { server { } }"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         block_on(async {
