@@ -33,6 +33,78 @@ pub struct Shared {
     pub updater: bool,
     /// The status of the error that error_page redirected the request for ($status meanwhile).
     pub err_status: std::sync::atomic::AtomicU16,
+    /// The settings of the location of the request that name its files, once
+    /// it is found, when a variable takes them (files_used()).
+    pub files: std::sync::Mutex<Option<Files>>,
+    /// $request_id, made when it is first asked for.
+    pub id: std::sync::OnceLock<String>,
+    /// The socket of the connection, for $tcpinfo_*; None for a stream of HTTP/2.
+    pub fd: Option<i32>,
+}
+
+/// What $document_root, $realpath_root and $request_filename take from the
+/// location of a request: its root or alias, and its prefix.
+#[derive(Debug, Clone, Default)]
+pub struct Files {
+    pub root: PathBuf,
+    pub root_vars: Option<Template>,
+    pub alias: Option<PathBuf>,
+    pub alias_vars: Option<Template>,
+    pub alias_len: Option<usize>,
+    pub prefix: String,
+}
+
+impl Files {
+    /// $document_root: the root, or the alias, with its variables.
+    fn root(&self, r: &Request, s: &Sent) -> String {
+        match &self.alias {
+            Some(alias) => self.alias_vars.as_ref().map_or_else(|| alias.display().to_string(), |t| t.render(r, s)),
+            None => self.root_vars.as_ref().map_or_else(|| self.root.display().to_string(), |t| t.render(r, s)),
+        }
+    }
+
+    /// $request_filename: the URI after the root, or after the alias in place
+    /// of the location's prefix; the alias whole in a regular expression location.
+    fn filename(&self, r: &Request, s: &Sent) -> String {
+        let whole = self.alias_vars.is_some() && self.alias_len.is_none();
+        let rest = if self.alias.is_none() { &r.uri[..] } else if whole { "" } else { r.uri.get(self.prefix.len()..).unwrap_or_default() };
+        format!("{}{rest}", self.root(r, s))
+    }
+}
+
+/// Whether a variable takes the files of a location (Shared::files).
+static FILES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn files_used() -> bool {
+    FILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// $hostname: the name of the machine, as gethostname() gives it.
+fn hostname() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let mut buf = [0u8; 256];
+        // SAFETY: the buffer is as long as the length given.
+        let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+        if ok { String::from_utf8_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]).into_owned() } else { String::new() }
+    })
+}
+
+/// $tcpinfo_rtt, $tcpinfo_rttvar, $tcpinfo_snd_cwnd and $tcpinfo_rcv_space,
+/// from the TCP_INFO of the socket; None when it cannot be read.
+fn tcpinfo(fd: i32, which: u8) -> Option<u32> {
+    // SAFETY: tcp_info is plain data, and the length given is its size.
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let got = unsafe { libc::getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_INFO, (&raw mut info).cast(), &mut len) };
+    (got == 0).then_some(match which { 0 => info.tcpi_rtt, 1 => info.tcpi_rttvar, 2 => info.tcpi_snd_cwnd, _ => info.tcpi_rcv_space })
+}
+
+/// $request_id: 16 random bytes in hexadecimal.
+fn request_id() -> String {
+    let mut id = [0u8; 16];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut id).ok();
+    id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// What a request carries, as the variables see it.
@@ -192,6 +264,8 @@ pub struct Sent {
     pub upstream_bytes: Option<Vec<[u64; 3]>>,
     /// The host of the proxy_pass URL ($proxy_host, $proxy_port).
     pub proxy_host: Option<String>,
+    /// Whether the whole answer was sent ($request_completion).
+    pub complete: bool,
 }
 
 /// The time a string's variables show: read once, when the first of them asks for it.
@@ -264,6 +338,18 @@ pub enum Var {
     SslClientSigalg,
     SslCurves,
     SslAlpnProtocol,
+    DocumentRoot,
+    RealpathRoot,
+    RequestFilename,
+    RequestId,
+    IsArgs,
+    NginxVersion,
+    Hostname,
+    /// $tcpinfo_rtt (0), $tcpinfo_rttvar (1), $tcpinfo_snd_cwnd (2), $tcpinfo_rcv_space (3).
+    TcpInfo(u8),
+    RequestCompletion,
+    /// $proxy_protocol_addr and the others: twinx takes no PROXY protocol header, so none is found.
+    NotFound,
     /// $ssl_early_data, $ssl_ech_status and $ssl_ech_outer_server_name: twinx
     /// takes no early data and no ECH, so they are empty on a TLS connection.
     SslNone,
@@ -308,6 +394,12 @@ impl Var {
             ("ssl_client_i_dn", Var::SslClient("i_dn")), ("ssl_client_s_dn_legacy", Var::SslClient("s_dn_legacy")), ("ssl_client_i_dn_legacy", Var::SslClient("i_dn_legacy")),
             ("ssl_client_v_start", Var::SslClient("v_start")), ("ssl_client_v_end", Var::SslClient("v_end")), ("ssl_client_v_remain", Var::SslClient("v_remain")),
             ("ssl_client_raw_cert", Var::SslClient("raw_cert")), ("ssl_client_cert", Var::SslClient("cert")), ("ssl_client_escaped_cert", Var::SslClient("escaped_cert")),
+            ("document_uri", Var::Uri), ("query_string", Var::Args), ("is_args", Var::IsArgs),
+            ("document_root", Var::DocumentRoot), ("realpath_root", Var::RealpathRoot), ("request_filename", Var::RequestFilename),
+            ("request_id", Var::RequestId), ("nginx_version", Var::NginxVersion), ("hostname", Var::Hostname), ("request_completion", Var::RequestCompletion),
+            ("tcpinfo_rtt", Var::TcpInfo(0)), ("tcpinfo_rttvar", Var::TcpInfo(1)), ("tcpinfo_snd_cwnd", Var::TcpInfo(2)), ("tcpinfo_rcv_space", Var::TcpInfo(3)),
+            ("proxy_protocol_addr", Var::NotFound), ("proxy_protocol_port", Var::NotFound), ("proxy_protocol_server_addr", Var::NotFound),
+            ("proxy_protocol_server_port", Var::NotFound), ("proxy_protocol_tlv_alpn", Var::NotFound),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
@@ -319,7 +411,9 @@ impl Var {
         let found = prefixed.into_iter().find_map(|(p, var, dashes)| name.strip_prefix(p).map(|n| var(if dashes { n.replace('_', "-") } else { n.to_string() })));
         let capture = || CAPTURES.lock().unwrap().iter().any(|c| c == name).then(|| Var::Capture(name.to_string()));
         let user = || (name.bytes().all(|c| c.is_ascii_digit()) || USER.lock().unwrap().iter().any(|u| u == name)).then(|| Var::User(name.to_string()));
-        found.or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v)).or_else(capture).or_else(user)
+        let var = found.or_else(|| known.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v)).or_else(capture).or_else(user);
+        if matches!(var, Some(Var::DocumentRoot | Var::RealpathRoot | Var::RequestFilename)) { FILES.store(true, std::sync::atomic::Ordering::Relaxed); }
+        var
     }
 
     /// The value, or None when the variable is "not found" (no such header, no user).
@@ -370,6 +464,16 @@ impl Var {
             Var::SslCurves => r.ssl.as_ref()?.curves.clone(),
             Var::SslAlpnProtocol => r.ssl.as_ref()?.alpn.clone(),
             Var::SslNone => { r.ssl.as_ref()?; String::new() }
+            Var::DocumentRoot => r.shared.files.lock().unwrap().clone()?.root(r, s),
+            Var::RealpathRoot => std::fs::canonicalize(r.shared.files.lock().unwrap().clone()?.root(r, s)).ok()?.display().to_string(),
+            Var::RequestFilename => r.shared.files.lock().unwrap().clone()?.filename(r, s),
+            Var::RequestId => r.shared.id.get_or_init(request_id).clone(),
+            Var::IsArgs => (if Var::Args.value(r, s, now).is_some() { "?" } else { "" }).to_string(),
+            Var::NginxVersion => env!("CARGO_PKG_VERSION").to_string(),
+            Var::Hostname => hostname().to_string(),
+            Var::TcpInfo(which) => tcpinfo(r.shared.fd?, *which)?.to_string(),
+            Var::RequestCompletion => (if s.complete { "OK" } else { "" }).to_string(),
+            Var::NotFound => return None,
             Var::SslClient(var) => r.ssl.as_ref()?.client_var(var),
             Var::LimitRate => r.shared.limit_rate.get().unwrap_or(0).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
@@ -644,6 +748,28 @@ mod tests {
         let fixed = Template::parse("ok").unwrap();
         assert_eq!((fixed.fixed(), fixed.value(&request(), &s).as_ref(), Template::default().fixed()), (Some("ok"), "ok", Some("")));
         assert_eq!(t.log_line(&request(), &s, Escape::Default), b"/a 200x p 39 x\\x22y");
+    }
+
+    #[test]
+    fn variables_of_files_and_the_request() {
+        let r = request();
+        let t = Template::parse("[$document_root][$request_filename][$realpath_root]").unwrap();
+        assert_eq!(t.render(&r, &Sent::default()), "[][][]");
+        *r.shared.files.lock().unwrap() = Some(Files { root: "/no/such/root".into(), ..Files::default() });
+        assert_eq!(t.render(&r, &Sent::default()), "[/no/such/root][/no/such/root/a][]");
+        let alias = |alias_vars: Option<Template>, alias_len| Files { alias: Some("/al/".into()), alias_vars, alias_len, prefix: "/".into(), ..Files::default() };
+        *r.shared.files.lock().unwrap() = Some(alias(None, Some(1)));
+        assert_eq!(t.render(&r, &Sent::default()), "[/al/][/al/a][]");
+        *r.shared.files.lock().unwrap() = Some(alias(Some(Template::parse("/x$uri").unwrap()), None));
+        assert_eq!(t.render(&r, &Sent::default()), "[/x/a][/x/a][]");
+        *r.shared.files.lock().unwrap() = Some(Files { root: "/".into(), ..Files::default() });
+        assert_eq!(Template::parse("$realpath_root").unwrap().render(&r, &Sent::default()), "/");
+        let t = Template::parse("$request_id $request_id").unwrap().render(&r, &Sent::default());
+        assert!(t.len() == 65 && t[..32] == t[33..] && t[..32] != *request_id(), "{t}");
+        let t = Template::parse("$is_args|$document_uri|$query_string|$request_completion|$proxy_protocol_addr|$tcpinfo_rtt").unwrap();
+        assert_eq!(t.render(&r, &Sent { complete: true, ..Sent::default() }), "?|/a|b|OK||");
+        assert_eq!(tcpinfo(-1, 0), None);
+        assert!(!hostname().is_empty() && Template::parse("$nginx_version").unwrap().render(&r, &Sent::default()) == env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
