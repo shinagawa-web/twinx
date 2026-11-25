@@ -56,6 +56,8 @@ const PREREAD: i64 = 65536;
 const CONCURRENT: usize = 128;
 /// How much of an answer's body may wait for the client's windows before no more of it is taken.
 const WAITING: usize = 65536;
+/// client_header_timeout's default: how long a connection waits for its first request.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 /// The largest HPACK table nginx keeps of what the client sends.
 const TABLE_SIZE: usize = 4096;
 
@@ -241,12 +243,16 @@ impl Table {
     /// of a buffer of large_client_header_buffers, and all of them the size of
     /// all those buffers.
     fn decode(&mut self, block: &[u8], length: usize, limits: (usize, usize)) -> Result<Fields, u32> {
-        self.block(block, length, limits).map(|b| b.fields().map(|(n, v)| (n.to_vec(), v.to_vec())).collect())
+        self.block(block, length, limits, None).map(|b| b.fields().map(|(n, v)| (n.to_vec(), v.to_vec())).collect())
     }
 
-    /// The fields of a header block, as decode() gives them.
-    fn block(&mut self, block: &[u8], length: usize, (number, size): (usize, usize)) -> Result<Block, u32> {
+    /// The fields of a header block, as decode() gives them. Of a request's, given where to
+    /// tell it, a field may make nginx answer the request with 400 at once, and read the rest of
+    /// the block as for no stream: then it skips the name of a field it does not add to the
+    /// table, and takes for it the length of the last string it kept, which must not be 0.
+    fn block(&mut self, block: &[u8], length: usize, (number, size): (usize, usize), mut dropped: Option<&mut bool>) -> Result<Block, u32> {
         let (mut fields, mut at, mut left) = (Block { bytes: Vec::with_capacity(256), ends: Vec::with_capacity(16) }, 0, number * size);
+        let (mut seen, mut last) = ([false; 4], usize::MAX);
         let string = |at: &mut usize, to: &mut Vec<u8>| -> Result<(), u32> {
             let huff = block.get(*at).ok_or(if *at < length { AGAIN } else { FRAME_SIZE_ERROR })? & 0x80 != 0;
             let len = integer(block, at, 7, length)?;
@@ -267,18 +273,34 @@ impl Table {
                 continue;
             }
             let (to, start) = (&mut fields.bytes, fields.ends.last().map_or(0, |e| e.1));
-            if index == 0 && bits != 7 { string(&mut at, to)?; } else { to.extend_from_slice(self.field(index).ok_or(COMPRESSION_ERROR)?.0); }
+            let skip = dropped.as_deref() == Some(&true) && !add;
+            if index == 0 && bits != 7 {
+                string(&mut at, to)?;
+                if skip && last == 0 { return Err(PROTOCOL_ERROR) }
+                last = if skip { last } else { to.len() - start };
+            } else { to.extend_from_slice(self.field(index).ok_or(COMPRESSION_ERROR)?.0); }
             let name = to.len();
             if bits == 7 { to.extend_from_slice(self.field(index).ok_or(COMPRESSION_ERROR)?.1); } else {
                 if name == start { return Err(PROTOCOL_ERROR) }
                 string(&mut at, to)?;
+                last = if skip { last } else { to.len() - name };
             }
             left = left.checked_sub(to.len() - start).ok_or(ENHANCE_YOUR_CALM)?;
             if add { self.add(&to[start..name], &to[name..]); }
+            if let Some(d) = dropped.as_deref_mut().filter(|d| !**d) { *d = drops(&to[start..name], &to[name..], &mut seen); }
             fields.ends.push((name, to.len()));
         }
         Ok(fields)
     }
+}
+
+/// Whether a field of a request makes nginx answer it with 400 as soon as it comes: a
+/// character it refuses, or a pseudo-header field it does not know, has had, or that is
+/// empty. Those it has had are kept in seen.
+fn drops(name: &[u8], value: &[u8], seen: &mut [bool; 4]) -> bool {
+    let Some(own) = name.strip_prefix(b":") else { return refused(name, value) };
+    let Some(i) = [&b"method"[..], b"scheme", b"path", b"authority"].iter().position(|p| *p == own) else { return true };
+    refused(name, value) || std::mem::replace(&mut seen[i], true) || value.is_empty()
 }
 
 /// Whether a field has a character in its name or value that nginx refuses.
@@ -423,6 +445,10 @@ struct Open {
     declared: Option<u64>, got: u64, chunked: bool, bad: bool,
     answer: Option<Vec<u8>>, sent: usize, end: Option<Ended>, closed: bool, taken: Option<watch::Sender<usize>>, untold: usize,
     number: u64, exchange: u32, block: usize,
+    /// When its body ended before how it is read was known: whether more came after the end.
+    early: Option<bool>,
+    /// Whether it is answered with 400 at once, as its request is refused.
+    at_once: bool,
 }
 
 /// The state of an HTTP/2 connection.
@@ -524,7 +550,7 @@ impl Connection {
         let length = len.saturating_sub(skip + if flags & PADDED != 0 { usize::from(p[0]) } else { 0 });
         // A field may go on in a CONTINUATION frame when this one does not end the block.
         let whole = if flags & END_HEADERS != 0 { length } else { usize::MAX };
-        match self.table.clone().decode(&p[skip..p.len().min(skip + length)], whole, self.limits) {
+        match self.table.clone().block(&p[skip..p.len().min(skip + length)], whole, self.limits, Some(&mut false)) {
             Err(code) if code != AGAIN => { self.last_sid = sid; Err(code) }
             _ => Ok(()),
         }
@@ -593,7 +619,10 @@ impl Connection {
     /// Takes a request once its header block has come whole.
     fn headers_done(&mut self) -> Result<(), u32> {
         let Some((sid, flags, block, refused)) = self.block.take() else { return Ok(()) };
-        let fields = self.table.block(&block, block.len(), self.limits)?;
+        let mut dropped = false;
+        let fields = self.table.block(&block, block.len(), self.limits, Some(&mut dropped));
+        // A request nginx answered with 400 before an error later in its block is still answered so.
+        let (fields, error) = match fields { Err(code) if dropped && !refused => (Block::default(), Some(code)), fields => (fields?, None) };
         if refused { self.rst(sid, REFUSED_STREAM); return Ok(()) }
         let ended = flags & END_STREAM != 0;
         // As nginx does, the request is passed on once its head has come, and its body as it comes.
@@ -601,9 +630,9 @@ impl Connection {
         let declared = fields.fields().find(|f| f.0 == b"content-length").and_then(|f| std::str::from_utf8(f.1).ok()?.parse().ok());
         let chunked = head.as_ref().is_some_and(|h| !h.1) && !ended;
         let (body, taker) = (!ended).then(tokio::sync::mpsc::unbounded_channel).unzip();
-        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, head, ended, body, taker, declared, chunked, number: self.requests, block: block.len(), ..Open::default() });
+        self.streams.insert(sid, Open { send: self.window, recv: PREREAD, at_once: head.is_none(), head, ended, body, taker, declared, chunked, number: self.requests, block: block.len(), ..Open::default() });
         self.ready.push(sid);
-        Ok(())
+        error.map_or(Ok(()), Err)
     }
 
     fn data(&mut self, flags: u8, sid: u32, p: &[u8]) -> Result<(), u32> {
@@ -615,9 +644,13 @@ impl Connection {
         if self.recv < MAX_WINDOW / 4 { frame(&mut self.out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - self.recv) as u32).to_be_bytes()); self.recv = MAX_WINDOW; }
         let Some(s) = self.streams.get_mut(&sid) else { return Ok(()) };
         if size > s.recv { self.rst(sid, FLOW_CONTROL_ERROR); return Ok(()) }
+        // What comes after the end waits until how the body is read is known: nginx, which
+        // answers a stream whose body it discards before it reads on, does not see it.
+        if s.ended && s.early.is_some() { s.early = Some(true); return Ok(()) }
         if s.ended { self.rst(sid, STREAM_CLOSED); return Ok(()) }
         let data = &p[usize::from(padding > 0)..p.len() - padding.saturating_sub(1)];
         (s.ended, s.got) = (flags & END_STREAM != 0, s.got + data.len() as u64);
+        if s.ended && s.reading.is_none() { s.early = Some(false); }
         // A body longer than declared, or one that ends shorter, is answered with 400, as nginx does; one discarded is not looked at.
         if !s.bad && s.reading != Some(Reading::Discarded) && s.declared.is_some_and(|n| s.got > n || s.ended && s.got < n) { (s.bad, s.body, s.exchange) = (true, None, s.exchange + 1); self.bad.push(sid); }
         // Without a length, each frame's data is a chunk; the end, the last chunk.
@@ -644,6 +677,9 @@ impl Connection {
     fn reading(&mut self, sid: u32, reading: Reading) {
         let Some(s) = self.streams.get_mut(&sid) else { return };
         s.reading = Some(reading);
+        // A body discarded did not end, for nginx, before the stream was answered; one read
+        // that went on after its end closes the stream.
+        match s.early.take() { Some(_) if reading == Reading::Discarded => s.ended = false, Some(true) => return self.rst(sid, STREAM_CLOSED), _ => {} }
         let to = match reading { Reading::Buffered => MAX_WINDOW, Reading::Unbuffered => PREREAD, Reading::Discarded => return };
         if !s.ended && s.recv < to { frame(&mut self.out, WINDOW_UPDATE, 0, sid, &((to - s.recv) as u32).to_be_bytes()); s.recv = to; }
     }
@@ -768,12 +804,13 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
     frame(&mut c.out, SETTINGS, 0, 0, &[0, 3, 0, 0, 0, CONCURRENT as u8, 0, 4, 0, 1, 0, 0, 0, 5, 0, 0xff, 0xff, 0xff]);
     frame(&mut c.out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut preface = false;
+    // The connection error that ends the connection once the requests refused at once are answered.
+    let (mut preface, mut failed) = (false, None);
     // As in nginx (tcp_nodelay), what is written does not wait for the client to acknowledge what was before.
     if let Some(tcp) = stream.tcp().filter(|_| level.tcp_nodelay) { let _ = tcp.set_nodelay(true); }
     loop {
         if crate::http::shutting() && !c.goaway { c.goaway(); }
-        let read = if preface { c.read(&mut buf) } else if buf.len() < PREFACE.len() { Ok(()) } else if buf.starts_with(PREFACE) { preface = true; buf.drain(..PREFACE.len()); c.read(&mut buf) } else { Err(PROTOCOL_ERROR) };
+        let read = if failed.is_some() { Ok(()) } else if preface { c.read(&mut buf) } else if buf.len() < PREFACE.len() { Ok(()) } else if buf.starts_with(PREFACE) { preface = true; buf.drain(..PREFACE.len()); c.read(&mut buf) } else { Err(PROTOCOL_ERROR) };
         // One answered in part already is reset, as nginx does.
         let (bad, answered): (Vec<u32>, Vec<u32>) = std::mem::take(&mut c.bad).into_iter().partition(|sid| c.streams.get(sid).is_none_or(|s| s.answer.is_none()));
         answered.into_iter().for_each(|sid| c.rst(sid, INTERNAL_ERROR));
@@ -800,7 +837,9 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
             tokio::task::spawn_local(exchange(config, request, taker, addrs, origin, tell, sent));
         }
         c.send_data();
-        if let Err(code) = read {
+        // As nginx answers a request it refuses before it reads on, that answer comes before the error.
+        failed = failed.or(read.err());
+        if let Some(code) = failed.filter(|_| !c.streams.values().any(|s| s.at_once)) {
             frame(&mut c.out, GOAWAY, 0, 0, &[c.last_sid.to_be_bytes(), code.to_be_bytes()].concat());
             let _ = stream.write_all(&c.out).await;
             let _ = stream.shutdown().await;
@@ -813,7 +852,7 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
         // After GOAWAY, the connection closes once its streams are answered.
         if c.goaway && c.streams.is_empty() { return crate::http::close(&mut stream, lingers).await }
         tokio::select! {
-            n = stream.read_buf(&mut buf) => if n.unwrap_or(0) == 0 { return },
+            n = stream.read_buf(&mut buf), if failed.is_none() => if n.unwrap_or(0) == 0 { return },
             Some(told) = rx.recv() => {
                 c.out = buffer();
                 c.told(told);
@@ -821,8 +860,9 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
                 while c.out.len() < 16384 && let Ok(told) = rx.try_recv() { c.told(told); }
             }
             () = crate::http::SHUTDOWN.notified() => {}
-            // A connection without streams for keepalive_timeout is closed with GOAWAY, as nginx does.
-            () = tokio::time::sleep(c.keepalive.1), if c.streams.is_empty() && c.block.is_none() && !c.keepalive.1.is_zero() => c.goaway(),
+            // A connection without streams for keepalive_timeout is closed with GOAWAY, as nginx does;
+            // before its first request, it has client_header_timeout from when it was made.
+            () = tokio::time::sleep(if c.requests == 0 { HEADER_TIMEOUT.saturating_sub(c.started.elapsed()) } else { c.keepalive.1 }), if c.streams.is_empty() && c.block.is_none() && !c.keepalive.1.is_zero() => c.goaway(),
         }
     }
 }
@@ -892,18 +932,19 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
         if let Some(n) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break n }
         if pipe.read_buf(&mut buf).await.unwrap_or(0) == 0 { return }
     };
-    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
-    let mut lines = head.split("\r\n");
-    let mut line = lines.next().unwrap_or_default().split(' ');
-    let (method, path) = (line.next().unwrap_or_default(), line.next().unwrap_or_default());
-    let mut fields = vec![(b":method".to_vec(), method.as_bytes().to_vec()), (b":scheme".to_vec(), scheme.as_bytes().to_vec()), (b":path".to_vec(), path.as_bytes().to_vec())];
+    // The head is bytes: what is not UTF-8 in a header goes as it came.
+    let head = buf[..end].to_vec();
+    let mut lines = head.split(|&c| c == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let mut line = lines.next().unwrap_or_default().split(|&c| c == b' ');
+    let (method, path) = (std::str::from_utf8(line.next().unwrap_or_default()).unwrap_or_default(), line.next().unwrap_or_default());
+    let mut fields = vec![(b":method".to_vec(), method.as_bytes().to_vec()), (b":scheme".to_vec(), scheme.as_bytes().to_vec()), (b":path".to_vec(), path.to_vec())];
     // The headers go as they are, those proxy_set_header sets that only HTTP/1 has too, as in
     // nginx; the Host it gives of its own is :authority. How the body comes is told apart.
     let mut body = if framing.chunked { Body::Chunked(0, false) } else { Body::Length(framing.length) };
-    for (name, value) in lines.filter_map(|l| l.split_once(':')).map(|(n, v)| (n.to_ascii_lowercase(), v.trim())) {
-        match name.as_str() {
-            "host" if framing.authority => fields.insert(2, (b":authority".to_vec(), value.as_bytes().to_vec())),
-            _ => fields.push((name.into_bytes(), value.as_bytes().to_vec())),
+    for (name, value) in lines.filter_map(|l| l.iter().position(|&c| c == b':').map(|at| (l[..at].to_ascii_lowercase(), l[at + 1..].trim_ascii()))) {
+        match &name[..] {
+            b"host" if framing.authority => fields.insert(2, (b":authority".to_vec(), value.to_vec())),
+            _ => fields.push((name, value.to_vec())),
         }
     }
     buf.drain(..end + 4);
@@ -1202,7 +1243,9 @@ impl Reply {
 /// It is all one task: an answer that does not wait for anything comes and is told the
 /// first time that runs.
 async fn exchange(config: Arc<Config>, request: Vec<u8>, body: Option<UnboundedReceiver<Vec<u8>>>, (listen, local, peer, ssl): Addrs, origin: Origin, tell: impl Fn(Part), mut sent: watch::Receiver<usize>) {
-    let ((ours, end), (reads, reader)) = (tokio::io::duplex(65536), watch::channel(()));
+    // The pipe holds a head of the answer of up to 16 KB besides as much of its body as may wait,
+    // so that one that does not wait for anything comes whole up to that, as nginx makes it at once.
+    let ((ours, end), (reads, reader)) = (tokio::io::duplex(WAITING + 16384), watch::channel(()));
     let theirs = Stream::Pipe(Pipe { end, reader: Some(Box::new(reader)) });
     let connection = Box::pin(crate::http::connection(&config, theirs, (listen, local, peer, ssl), Busy::new(), Some(Box::new(origin))));
     let (mut reply, mut part, mut told) = (Reply { buf: buffer(), bodiless: request.starts_with(b"HEAD "), comes: None }, Part::default(), 0);
@@ -1395,7 +1438,7 @@ mod tests {
             let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
             let bridge = upstream_framed(Stream::Pipe(up.into()), theirs, ("http", 4096, Default::default()), Framing { chunked: true, ..GET });
             let test = async {
-                ours.write_all(b"POST /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\nX-A: b\r\n\r\n").await.unwrap();
+                ours.write_all(b"POST /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\nX-A: b\r\nX-C: \xff\xc3\r\n\r\n").await.unwrap();
                 // The server lets only a byte of the body go at first.
                 let mut out = Vec::new();
                 frame(&mut out, SETTINGS, 0, 0, &[0, 4, 0, 0, 0, 1, 0, 9, 0, 0, 0, 0]);
@@ -1417,7 +1460,9 @@ mod tests {
                 let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
                 let fields = t.decode(&sent[2].2, sent[2].2.len(), (100, 100)).unwrap();
                 let text: Vec<_> = fields.iter().map(|(n, v)| format!("{}: {}", String::from_utf8_lossy(n), String::from_utf8_lossy(v))).collect();
-                assert_eq!(text, [":method: POST", ":scheme: http", ":authority: h", ":path: /x", "connection: close", "x-a: b"]);
+                assert_eq!(text[..6], [":method: POST", ":scheme: http", ":authority: h", ":path: /x", "connection: close", "x-a: b"]);
+                // Bytes that are not UTF-8 go as they came.
+                assert_eq!(fields[6], (b"x-c".to_vec(), b"\xff\xc3".to_vec()));
                 // The answer, padded, in parts.
                 out.clear();
                 let block = header_block(200, &[(b"x-b".to_vec(), b"c".to_vec())], false);
@@ -2684,6 +2729,56 @@ mod tests {
             assert_eq!(c.frame(HEADERS, END_HEADERS, 1, &[0x82]), Ok(()));
             assert_eq!(c.out, goaway(1));
         }
+    }
+
+    #[test]
+    fn fields_after_a_refused_one() {
+        // A literal field that names its pseudo-header field, with an empty value; one more field; a literal added to the table.
+        let plain = |name: &[u8], value: &[u8]| [&[0, name.len() as u8][..], name, &[value.len() as u8], value].concat();
+        let added = |name: &[u8], value: &[u8]| [&[0x40, name.len() as u8][..], name, &[value.len() as u8], value].concat();
+        let decode = |block: &[u8]| { let mut dropped = false; let got = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE }.block(block, block.len(), (4, 8192), Some(&mut dropped)); (got.map(|b| b.ends.len()), dropped) };
+        // An empty one is the last string nginx kept when it skips the next name.
+        assert_eq!(decode(&[plain(b":method", b""), plain(b":path", b"/")].concat()), (Err(PROTOCOL_ERROR), true));
+        assert_eq!(decode(&[plain(b":method", b""), added(b":path", b"/")].concat()), (Ok(2), true));
+        assert_eq!(decode(&[plain(b":method", b"G"), plain(b":method", b"G"), plain(b"x", b"y")].concat()), (Ok(3), true));
+        assert_eq!(decode(&[plain(b":method", b"G"), plain(b"x", b"")].concat()), (Ok(2), false));
+        let mut seen = [false; 4];
+        assert_eq!([drops(b":method", b"G", &mut seen), drops(b":path", b"", &mut seen), drops(b":method", b"G", &mut seen), drops(b":x", b"G", &mut seen), drops(b"a\x01", b"b", &mut seen)], [false, true, true, true, true]);
+        // The request is answered with 400 before the error.
+        let mut c = connection();
+        let mut buf = Vec::new();
+        frame(&mut buf, HEADERS, END_HEADERS | END_STREAM, 1, &[plain(b":method", b""), plain(b":path", b"/")].concat());
+        assert_eq!(c.read(&mut buf), Err(PROTOCOL_ERROR));
+        assert_eq!((c.ready.clone(), c.streams[&1].at_once, c.streams[&1].head.is_none()), (vec![1], true, true));
+    }
+
+    #[test]
+    fn bodies_that_end_before_they_are_read() {
+        let open = |c: &mut Connection, late: bool| {
+            let mut buf = Vec::new();
+            frame(&mut buf, HEADERS, END_HEADERS, 1, &[0x83, 0x86, 0x84, 0x41, 0x01, b'h']);
+            frame(&mut buf, DATA, END_STREAM, 1, b"ab");
+            if late { frame(&mut buf, DATA, END_STREAM, 1, b"c"); }
+            assert_eq!(c.read(&mut buf), Ok(()));
+            c.out.clear();
+        };
+        // Discarded: it had not ended when nginx answered, which resets it without an error.
+        for late in [false, true] {
+            let mut c = connection();
+            open(&mut c, late);
+            assert_eq!(c.streams[&1].early, Some(late));
+            c.reading(1, Reading::Discarded);
+            assert!(!c.streams[&1].ended && c.out.is_empty());
+        }
+        // Read: what came after the end closes it.
+        let mut c = connection();
+        open(&mut c, true);
+        c.reading(1, Reading::Buffered);
+        assert!(c.streams.is_empty() && c.out.ends_with(&STREAM_CLOSED.to_be_bytes()));
+        let mut c = connection();
+        open(&mut c, false);
+        c.reading(1, Reading::Buffered);
+        assert!(c.streams[&1].ended && c.streams[&1].early.is_none());
     }
 
     #[test]
