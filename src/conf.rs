@@ -1146,7 +1146,8 @@ impl Builder<'_> {
                 "ssl_verify_client" => level.ssl_verify_client = ["off", "on", "optional", "optional_no_ca"].iter().position(|v| *v == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_verify_client\" directive, it must be \"on\", \"off\", \"optional\" or \"optional_no_ca\"", d.args[0])))? as u8,
                 "ssl_ocsp" => level.ssl_ocsp = [("off", None), ("on", Some(false)), ("leaf", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"ssl_ocsp\" directive, it must be \"on\", \"off\" or \"leaf\"", d.args[0])))?.1,
                 "ssl_ocsp_responder" | "ssl_stapling_responder" => {
-                    let url = Some(d.args[0].clone()).filter(|u| u.starts_with("http://")).ok_or_else(|| at(format!("invalid URL prefix in OCSP responder \"{}\" in resolver", d.args[0])))?;
+                    // That of stapling is looked at only for a certificate whose issuer is known.
+                    let url = Some(d.args[0].clone()).filter(|u| u.starts_with("http://") || d.name == "ssl_stapling_responder").ok_or_else(|| at(format!("invalid URL prefix in OCSP responder \"{}\" in resolver", d.args[0])))?;
                     if d.name == "ssl_ocsp_responder" { level.ssl_ocsp_responder = Some(url) } else { level.ssl_stapling_responder = Some(url) }
                 }
                 "ssl_stapling" => level.ssl_stapling = flag(d).map_err(at)?,
@@ -1680,6 +1681,9 @@ fn seconds(s: &str) -> Result<Duration, String> {
 fn server_name(n: &str) -> Result<Vec<ServerName>, String> {
     if n.starts_with('*') && (n.len() < 3 || !n[1..].starts_with('.')) || n == "." { return Err(format!("server name \"{n}\" is invalid")); }
     if n == "~" { return Err(format!("empty regex in server name \"{n}\"")); }
+    // As ngx_hash_add_key() takes a wildcard: one "*", at the start before "." or at the end after it.
+    let star = n.matches('*').count();
+    if !n.starts_with('~') && (star > 1 || star == 1 && !(n.len() > 1 && n.starts_with('.') || n.len() > 2 && (n.starts_with("*.") || n.ends_with(".*")))) { return Err(format!("invalid server name or wildcard \"{n}\"")); }
     let lower = n.to_lowercase();
     if let Some(re) = n.strip_prefix('~') {
         let re = regex::Regex::new(&format!("(?i){}", pcre(re))).map_err(|e| format!("invalid regular expression \"{re}\": {e}"))?;
@@ -1793,8 +1797,9 @@ fn condition(args: &[String]) -> Result<Condition, String> {
     let last = words.len() - 1;
     words[0] = words[0].strip_prefix('(').ok_or(invalid.clone())?;
     words[last] = words[last].strip_suffix(')').ok_or(invalid.clone())?;
-    words.retain(|w| !w.is_empty());
-    match words[..] {
+    // Only what was "(" or ")" alone goes: an empty string ("") is a value.
+    let (open, close) = (words[0].is_empty(), last > 0 && words[last].is_empty());
+    match words[usize::from(open)..words.len() - usize::from(close)] {
         [var] if var.starts_with('$') => Ok(Condition::Var(Template::parse(var)?)),
         [var, op @ ("=" | "!="), value] if var.starts_with('$') => Ok(Condition::Equal(Template::parse(var)?, Template::parse(value)?, op == "!=")),
         [var, op @ ("~" | "~*" | "!~" | "!~*"), re] if var.starts_with('$') => {
@@ -2006,6 +2011,21 @@ mod tests {
 
     fn return_code(level: &Level) -> u16 {
         level.script.iter().find_map(|s| if let Op::Return(code, _) = s { Some(*code) } else { None }).unwrap()
+    }
+
+    #[test]
+    fn wildcards_and_empty_strings_as_nginx_takes_them() {
+        for name in ["www.*.com", "www.example.*com", "a.*.*", "*.example.*", "a*"] {
+            assert!(build_text(&format!("http {{ server {{ server_name {name}; }} }}")).unwrap_err().starts_with(&format!("invalid server name or wildcard \"{name}\"")), "{name}");
+        }
+        for name in [".example.*", "www.example.*", "*.example.com", ".example.com", "www.example.com.", "~^a*$"] {
+            assert!(build_text(&format!("http {{ server {{ server_name {name}; }} }}")).is_ok(), "{name}");
+        }
+        for (args, value) in [(&["($arg_a", "=", "", ")"][..], ""), (&["(", "$arg_a", "!=", "x", ")"][..], "x"), (&["($arg_a", "=", "x)"][..], "x")] {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            assert!(matches!(condition(&args), Ok(Condition::Equal(_, v, _)) if v.0.iter().map(|p| match p { Part::Text(t) => t.as_str(), _ => "?" }).collect::<String>() == value), "{args:?}");
+        }
+        assert!(condition(&["($arg_a".to_string(), "=)".to_string()]).is_err());
     }
 
     fn build_text(text: &str) -> Result<Config, String> {
@@ -2917,7 +2937,7 @@ mod tests {
         let l = &c.servers[0].level;
         assert_eq!((l.ssl_stapling, l.ssl_stapling_verify, l.ssl_stapling_responder.as_deref()), (true, true, Some("http://127.0.0.1:8081/")));
         assert!(l.ssl_stapling_file.as_ref().unwrap().ends_with("resp.der"));
-        assert!(build_text("http { ssl_stapling_responder https://a; }").unwrap_err().starts_with("invalid URL prefix in OCSP responder \"https://a\""));
+        assert!(build_text("http { ssl_stapling_responder https://a; }").is_ok());
     }
 
     #[test]
