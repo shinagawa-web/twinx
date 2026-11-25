@@ -503,7 +503,7 @@ impl Var {
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
             Var::Arg(name) => {
-                let args = r.target.split_once('?').map_or("", |(_, a)| a).split('&');
+                let args = r.target.get(r.args_at()? + 1..)?.split('&');
                 args.filter_map(|a| a.split_once('=')).find(|(n, _)| n.eq_ignore_ascii_case(name))?.1.to_string()
             }
             // Cookie headers are joined with "; ", the others with ", ".
@@ -793,6 +793,11 @@ mod tests {
         let mut r = request();
         r.target = "/a?x=1&E=2".into();
         assert_eq!(Template::parse("[$arg_e][$arg_y]").unwrap().render(&r, &Sent::default()), "[2][]");
+        // After an internal redirect to a URI with a "?" of its own, the arguments are those after it.
+        r.redirect("/a?x=3".into(), "/a?x=3?x=4".into());
+        assert_eq!(Template::parse("[$arg_x][$args]").unwrap().render(&r, &Sent::default()), "[4][x=4]");
+        r.redirect("/a?x=3".into(), "/a?x=3".into());
+        assert_eq!(Template::parse("[$arg_x][$args]").unwrap().render(&r, &Sent::default()), "[][]");
     }
 
     #[test]

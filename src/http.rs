@@ -2763,7 +2763,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let named = to.starts_with('@');
         // As in nginx, the 404 of an unsafe URI has the headers kept too.
         let Some((uri, args)) = (if named { Some((to, None)) } else { unsafe_uri(&to) }) else { return Response { headers: resp.headers, ..special(404) } };
-        return Response { internal: Some(Box::new((args.map_or_else(|| uri.clone(), |a| format!("{uri}?{a}")), None))), as_get: !named, ..resp };
+        // The URI goes apart from the arguments: a "?" it has is a part of it.
+        let target = args.map_or_else(|| uri.clone(), |a| format!("{uri}?{a}"));
+        return Response { internal: Some(Box::new((target, (!named).then_some(uri)))), as_get: !named, ..resp };
     }
     // What the cache keeps is as the server sent it, without what the location does to it.
     let kept = (resp.ctype.as_deref().map(str::to_string), resp.headers.clone());
@@ -3508,14 +3510,14 @@ fn decode(s: &str) -> Option<String> {
 }
 
 /// An X-Accel-Redirect URI as ngx_http_parse_unsafe_uri() takes it: its path,
-/// unescaped, and its arguments; None when it is empty, has no path, has a NUL
-/// or a ".." segment, before or after unescaping.
+/// unescaped once, and its arguments, those after its first "?" as they are; None when
+/// its path is empty, or has a NUL or a ".." segment, before or after unescaping.
 fn unsafe_uri(value: &str) -> Option<(String, Option<String>)> {
-    let (path, args) = value.split_once('?').map_or((value, None), |(p, a)| (p, Some(a)));
-    if path.is_empty() || value.contains('\0') || path.split('/').any(|s| s == "..") { return None; }
-    // An unescaped path is looked at again; arguments it has replace the others.
-    if let Some(d) = decode(path).filter(|d| d != path) { return unsafe_uri(&d).map(|(p, a)| (p, a.or(args.map(String::from)))); }
-    Some((path.to_string(), args.map(String::from)))
+    let (path, args) = value.split_once('?').map_or((value, None), |(p, a)| (p, Some(a.to_string())));
+    let safe = |p: &str| !p.is_empty() && !p.contains('\0') && !p.split('/').any(|s| s == "..");
+    // A "?" the unescaping gives is part of the path, and a "%" it gives is not unescaped again.
+    let decoded = decode(path).unwrap_or_else(|| path.to_string());
+    (safe(path) && safe(&decoded)).then_some((decoded, args))
 }
 
 /// The path with each run of slashes made one, as merge_slashes does.
@@ -6904,7 +6906,9 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     #[test]
     fn unsafe_uris() {
         assert_eq!(unsafe_uri("/a%20b?c=1"), Some(("/a b".into(), Some("c=1".into()))));
-        assert_eq!(unsafe_uri("/a%3Fd?c"), Some(("/a".into(), Some("d".into()))));
+        assert_eq!(unsafe_uri("/a%3Fd?c"), Some(("/a?d".into(), Some("c".into()))));
+        assert_eq!(unsafe_uri("/a%253F%2Fb?c%2F?d"), Some(("/a%3F/b".into(), Some("c%2F?d".into()))));
+        assert_eq!(unsafe_uri("/a?"), Some(("/a".into(), Some(String::new()))));
         for u in ["", "?a", "..", "../a", "/a/..", "/a/../b", "/a/.%2e", "/a\0"] { assert_eq!(unsafe_uri(u), None, "{u}"); }
     }
 
