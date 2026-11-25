@@ -43,6 +43,10 @@ pub struct Shared {
     pub id: std::sync::OnceLock<String>,
     /// The socket of the connection, for $tcpinfo_*; None for a stream of HTTP/2.
     pub fd: Option<i32>,
+    /// $request_completion as it was first asked for, which it stays, as nginx keeps it.
+    pub completion: std::sync::OnceLock<bool>,
+    /// The bytes gzip took and made of the answer, once it has ended ($gzip_ratio).
+    pub gzip: std::sync::Mutex<Option<(u64, u64)>>,
 }
 
 /// What $document_root, $realpath_root and $request_filename take from the
@@ -376,6 +380,8 @@ pub enum Var {
     SentTrailer(String),
     UpstreamHttp(String),
     UpstreamCookie(String),
+    UpstreamTrailer(String),
+    GzipRatio,
 }
 
 impl Var {
@@ -405,17 +411,17 @@ impl Var {
             ("ssl_client_raw_cert", Var::SslClient("raw_cert")), ("ssl_client_cert", Var::SslClient("cert")), ("ssl_client_escaped_cert", Var::SslClient("escaped_cert")),
             ("document_uri", Var::Uri), ("query_string", Var::Args), ("is_args", Var::IsArgs),
             ("document_root", Var::DocumentRoot), ("realpath_root", Var::RealpathRoot), ("request_filename", Var::RequestFilename),
-            ("request_id", Var::RequestId), ("nginx_version", Var::NginxVersion), ("hostname", Var::Hostname), ("request_completion", Var::RequestCompletion),
+            ("request_id", Var::RequestId), ("nginx_version", Var::NginxVersion), ("hostname", Var::Hostname), ("request_completion", Var::RequestCompletion), ("gzip_ratio", Var::GzipRatio),
             ("tcpinfo_rtt", Var::TcpInfo(0)), ("tcpinfo_rttvar", Var::TcpInfo(1)), ("tcpinfo_snd_cwnd", Var::TcpInfo(2)), ("tcpinfo_rcv_space", Var::TcpInfo(3)),
             ("proxy_protocol_addr", Var::NotFound), ("proxy_protocol_port", Var::NotFound), ("proxy_protocol_server_addr", Var::NotFound),
             ("proxy_protocol_server_port", Var::NotFound), ("proxy_protocol_tlv_alpn", Var::NotFound),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
         // Header names have "-" where the variable has "_"; cookie names are as they are.
-        let prefixed: [(&str, fn(String) -> Var, bool); 7] = [
+        let prefixed: [(&str, fn(String) -> Var, bool); 8] = [
             ("http_", Var::Http, true), ("sent_http_", Var::SentHttp, true), ("sent_trailer_", Var::SentTrailer, true),
             ("upstream_http_", Var::UpstreamHttp, true), ("arg_", Var::Arg, false), ("cookie_", Var::Cookie, false),
-            ("upstream_cookie_", Var::UpstreamCookie, false),
+            ("upstream_cookie_", Var::UpstreamCookie, false), ("upstream_trailer_", Var::UpstreamTrailer, true),
         ];
         let found = prefixed.into_iter().find_map(|(p, var, dashes)| name.strip_prefix(p).map(|n| var(if dashes { n.replace('_', "-") } else { n.to_string() })));
         let capture = || CAPTURES.lock().unwrap().iter().any(|c| c == name).then(|| Var::Capture(name.to_string()));
@@ -428,6 +434,8 @@ impl Var {
     /// The value, or None when the variable is "not found" (no such header, no user).
     pub fn value(&self, r: &Request, s: &Sent, now: &Now) -> Option<Vec<u8>> {
         Some(bytes(match self {
+            // Neither is found of a request whose line could not be read.
+            Var::Uri | Var::RequestMethod if r.method.is_empty() => return None,
             Var::Uri => r.uri.clone(),
             Var::RequestMethod => r.method.clone(),
             Var::Status => format!("{:03}", if s.status == 0 { r.shared.err_status.load(std::sync::atomic::Ordering::Relaxed) } else { s.status }),
@@ -450,7 +458,8 @@ impl Var {
             Var::ConnectionRequests => r.requests.to_string(),
             Var::ConnectionTime => { let ms = r.connected.elapsed().as_millis(); format!("{}.{:03}", ms / 1000, ms % 1000) }
             Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
-            Var::RequestUri => r.request_uri().to_string(),
+            // Nor is it of one whose URI could not be read.
+            Var::RequestUri => Some(r.request_uri()).filter(|u| !u.is_empty())?.to_string(),
             Var::RequestPort => request_port(r).to_string(),
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
             Var::Pid => std::process::id().to_string(),
@@ -481,7 +490,8 @@ impl Var {
             Var::NginxVersion => env!("CARGO_PKG_VERSION").to_string(),
             Var::Hostname => hostname().to_string(),
             Var::TcpInfo(which) => tcpinfo(r.shared.fd?, *which)?.to_string(),
-            Var::RequestCompletion => (if s.complete { "OK" } else { "" }).to_string(),
+            Var::RequestCompletion => (if *r.shared.completion.get_or_init(|| s.complete) { "OK" } else { "" }).to_string(),
+            Var::GzipRatio => ratio((*r.shared.gzip.lock().unwrap())?)?,
             Var::NotFound => return None,
             Var::SslClient(var) => r.ssl.as_ref()?.client_var(var),
             Var::LimitRate => r.shared.limit_rate.get().unwrap_or(0).to_string(),
@@ -513,8 +523,20 @@ impl Var {
             Var::SentTrailer(name) => joined(&s.trailers, name, ", ")?,
             Var::UpstreamHttp(name) => joined(if s.upstream.is_empty() { &r.upstream } else { &s.upstream }, name, ", ")?,
             Var::UpstreamCookie(name) => set_cookie(if s.upstream.is_empty() { &r.upstream } else { &s.upstream }, name)?,
+            Var::UpstreamTrailer(name) => joined(&r.shared.trailers.lock().unwrap(), name, ", ")?,
         }.as_str()))
     }
+}
+
+/// $gzip_ratio: the bytes taken for each byte made, with two decimals rounded as nginx
+/// rounds them; None for an answer that made none.
+fn ratio((taken, made): (u64, u64)) -> Option<String> {
+    let (mut whole, mut frac) = (taken.checked_div(made)?, taken * 100 / made % 100);
+    if taken * 1000 / made % 10 > 4 {
+        frac += 1;
+        if frac > 99 { (whole, frac) = (whole + 1, 0); }
+    }
+    Some(format!("{whole}.{frac:02}"))
 }
 
 /// Text read from the network, its bytes that are not UTF-8 kept as nginx
@@ -912,5 +934,29 @@ mod tests {
         let line = t.render(&request(), &Sent::default());
         let parts: Vec<&str> = line.split('|').collect();
         assert!(parts[0].contains('.') && parts[1].contains('T') && parts[2].contains('/'));
+    }
+
+    #[test]
+    fn variables_of_what_ended() {
+        let r = request();
+        let t = Template::parse("[$request_completion]").unwrap();
+        assert_eq!(t.render(&r, &Sent::default()), "[]");
+        // Once asked for, it keeps its value.
+        assert_eq!(t.render(&r, &Sent { complete: true, ..Sent::default() }), "[]");
+        let t = Template::parse("[$gzip_ratio][$upstream_trailer_x_a]").unwrap();
+        assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"[-][-]");
+        *r.shared.gzip.lock().unwrap() = Some((800, 44));
+        r.shared.trailers.lock().unwrap().push(("X-A".into(), "b".into()));
+        assert_eq!(t.render(&r, &Sent::default()), "[18.18][b]");
+        assert_eq!([(1000, 3), (2000, 1001), (1999, 1000), (1, 0)].map(ratio), [Some("333.33".into()), Some("2.00".into()), Some("2.00".into()), None]);
+    }
+
+    #[test]
+    fn variables_of_a_request_not_read() {
+        let r = Request { method: String::new(), target: String::new(), uri: String::new(), ..request() };
+        let t = Template::parse("$request_method $request_uri $uri").unwrap();
+        assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"- - -");
+        let r = Request { target: String::new(), uri: String::new(), ..request() };
+        assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"GET - ");
     }
 }

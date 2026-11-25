@@ -22,11 +22,14 @@ enum State {
 /// Takes a body piece by piece. It keeps nothing of what came but where it is, with
 /// the bytes left of the length or of the chunk, or the size of a chunk read so far.
 #[derive(Debug)]
-pub struct Body { state: State, left: u64, followed: bool }
+pub struct Body { state: State, left: u64, followed: bool, kept: Option<Vec<u8>> }
 
 /// NGX_MAX_OFF_T_VALUE: nginx takes nothing, not even the end of the line, after a
 /// size larger than a 16th of it, and at no time one larger than it less 9.
 const MAX: u64 = i64::MAX as u64;
+
+/// The most bytes of trailer fields kept.
+const KEPT: usize = 64 << 10;
 
 impl Body {
     /// A body in chunks, or else of the length; without one, up to the end of the connection.
@@ -37,7 +40,20 @@ impl Body {
             Some(_) => State::Length,
             None => State::Connection,
         };
-        Body { state, left: length.filter(|_| !chunked).unwrap_or(0), followed: false }
+        Body { state, left: length.filter(|_| !chunked).unwrap_or(0), followed: false, kept: None }
+    }
+
+    /// Keeps the trailer fields of a body in chunks, as proxy_pass_trailers does, up to
+    /// so many bytes of them.
+    pub fn keep_trailers(self, keep: bool) -> Body {
+        Body { kept: keep.then(Vec::new), ..self }
+    }
+
+    /// The trailer fields kept, once the body is whole.
+    pub fn trailers(&self) -> Vec<(String, String)> {
+        let Some(kept) = self.kept.as_ref().filter(|_| self.state == State::Whole) else { return Vec::new() };
+        let lines = crate::vars::text(kept);
+        lines.split('\n').filter_map(|l| l.trim_end_matches('\r').split_once(':')).map(|(n, v)| (n.to_string(), v.trim_matches([' ', '\t']).to_string())).collect()
     }
 
     /// Takes the next piece of what comes and appends the body's data in it.
@@ -56,7 +72,11 @@ impl Body {
                 State::Connection => { data.extend_from_slice(piece); break }
                 State::Whole => { self.followed = true; break }
                 State::Malformed => break,
-                _ => self.state = self.next(c),
+                _ => {
+                    self.state = self.next(c);
+                    let field = matches!(self.state, State::Trailer | State::TrailerHeader | State::TrailerHeaderLf);
+                    if let Some(kept) = self.kept.as_mut().filter(|k| field && k.len() < KEPT) { kept.push(c); }
+                }
             }
             at += 1;
         }
@@ -178,6 +198,11 @@ impl Buffers {
     /// What is known of the body from what has gone on of it, or that it is whole.
     pub fn came(&self) -> Came {
         self.came
+    }
+
+    /// The trailer fields of the body, as Body::trailers() gives them.
+    pub fn trailers(&self) -> Vec<(String, String)> {
+        self.body.trailers()
     }
 
     /// Whether the body is cut off, as Body::cut() tells.
@@ -530,8 +555,8 @@ mod tests {
         let (data, came, _) = taken(&mut Body::new(None, true), sent.chunks(4096));
         assert_eq!((data.len(), came), (sent.len() / chunk.len() * 1000, WHOLE));
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        // Whatever came, it keeps as much.
-        assert!(size_of::<Body>() <= 16);
+        // Whatever came, it keeps as much, but the trailer fields kept, which are bounded.
+        assert!(size_of::<Body>() <= 40);
     }
 
     #[test]
@@ -724,5 +749,20 @@ mod tests {
         assert_eq!((parts(&mut b, b"5\r\na"), parts(&mut b, b"b"), b.came()), (vec![1], vec![1], Came::More));
         b.take(b"cde\r\nzz");
         assert_eq!(b.came(), Came::Malformed);
+    }
+
+    #[test]
+    fn trailers_are_kept() {
+        let mut body = Body::new(None, true).keep_trailers(true);
+        assert_eq!(body.take(b"2\r\nab\r\n0\r\nX-A: b \r\nX-B:c", &mut Vec::new()), MORE);
+        assert_eq!(body.trailers(), Vec::new());
+        assert_eq!(body.take(b"\r\nbad\r\n\r\n", &mut Vec::new()), WHOLE);
+        assert_eq!(body.trailers(), [("X-A".to_string(), "b".to_string()), ("X-B".to_string(), "c".to_string())]);
+        let mut body = Body::new(None, true);
+        body.take(b"0\r\nX-A: b\r\n\r\n", &mut Vec::new());
+        assert_eq!(body.trailers(), Vec::new());
+        let mut body = Body::new(None, true).keep_trailers(true);
+        body.take(&[b"0\r\nX-A: ".as_slice(), &vec![b'a'; KEPT * 2], b"\r\n\r\n"].concat(), &mut Vec::new());
+        assert_eq!(body.trailers()[0].1.len(), KEPT - "\nX-A: ".len());
     }
 }
