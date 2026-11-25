@@ -2378,6 +2378,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, relative: e.relative, proxy_host: Some(host.clone()), ..Response::default() };
         // An answer to HEAD is kept without its body, with the length it was told.
         if let Some(n) = e.length.filter(|&n| n != resp.body.len()) { resp.told = Some(Some(n)); }
+        // One its server gave no length of has none.
+        resp.unknown_length = e.length.is_none();
         if level.proxy_force_ranges || has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, false, e.length.is_some()); }
         resp
     };
@@ -2413,6 +2415,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // conditions and ranges, and the answer is not cached.
     let scarce = cache.is_some() && !bypass && uses < level.proxy_cache_min_uses;
     let far = cache.is_some() && !bypass && !scarce && !range_cacheable(r, level.proxy_cache_max_range_offset);
+    // What may be cached is asked for whatever the client does (u->cacheable).
+    let cacheable = cache.is_some() && !bypass && !scarce && !far && !matches!(locked, Some(None));
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     // proxy_set_body replaces the client's body, whatever proxy_pass_request_body
@@ -2519,10 +2523,13 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let mut fetched = match conn {
             Ok(conn) => {
                 time[0] = Some(connecting.elapsed().as_millis());
-                fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints)).await
+                fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints, !cacheable)).await
             }
             Err(e) => Err(e),
         };
+        // The client of one whose answer may be cached that went away meanwhile has none:
+        // nginx sends nothing to a connection that failed, and so caches nothing.
+        if cacheable && fetched.is_ok() && client.as_deref().is_some_and(went) { fetched = Err(NoAnswer::Gone(String::new())); }
         // proxy_pass_trailers: those of an answer without a body are taken now.
         let trailers = (level.proxy_pass_trailers && level.proxy_h2).then(|| Trailers { slot: slot.clone(), hide: level.proxy_hide_header.clone(), pass: level.proxy_pass_header.clone(), to: r.shared.clone() });
         if let (Some(t), Ok((_, Some(c)))) = (&trailers, &mut fetched) { t.take(&mut c.stream, Some(level.proxy_read_timeout)).await; }
@@ -2875,6 +2882,11 @@ fn read_failed(call: &str, e: &std::io::Error) -> String {
     }
 }
 
+/// Whether a client has gone already.
+fn went(client: &Stream) -> bool {
+    std::pin::pin!(crate::stream::gone(client)).as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())).is_ready()
+}
+
 /// What is logged of a client that went away meanwhile; not of one of HTTP/2.
 fn client_gone(client: &Stream, action: &str) -> Option<String> {
     let error = client.tcp()?.take_error().ok().flatten().map_or_else(String::new, |e| format!(" {}", os_error(&e)));
@@ -2910,7 +2922,7 @@ fn invalid_length(headers: &[(String, String)]) -> String {
 /// connection comes with it only when it may be used for another request: the
 /// server does not close it, and nothing came after the head.
 #[allow(clippy::too_many_arguments)]
-async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, (upgrade, hints): (bool, bool)) -> Result<(Response, Option<Conn>), NoAnswer> {
+async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, (upgrade, hints, watch): (bool, bool, bool)) -> Result<(Response, Option<Conn>), NoAnswer> {
     use NoAnswer::{Closed, Gone, Other, TimedOut};
     let invalid = |msg: &str| Other(format!("{msg} while {READING_HEAD}"));
     let s = &mut conn.stream;
@@ -2928,7 +2940,8 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
             let buf = &answer[..answer.len().min(level.proxy_buffer_size)];
             if let Some(end) = line_end(buf).and_then(|at| lines_end(buf, at)) { break end; }
             if answer.len() >= level.proxy_buffer_size { return Err(invalid("upstream sent too big header")); }
-            let closed = async { match client.as_deref() { Some(c) => crate::stream::gone(c).await, None => std::future::pending().await } };
+            // Not that of a request whose answer may be cached, which goes on without the client.
+            let closed = async { match client.as_deref().filter(|_| watch) { Some(c) => crate::stream::gone(c).await, None => std::future::pending().await } };
             // So does the worker_shutdown_timeout of a worker shutting down.
             let closed = async { tokio::select! { () = closed => true, () = halted() => false } };
             let n = tokio::select! {
@@ -4084,7 +4097,7 @@ pub(crate) mod tests {
         let start = Instant::now();
         let s = connect(&(*addr).into(), socket, level).await.ok()?;
         time[0] = Some(start.elapsed().as_millis());
-        fetch(Conn::new(Stream::Tcp(s), start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, (false, false)).await.ok().map(|(resp, _)| resp)
+        fetch(Conn::new(Stream::Tcp(s), start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, (false, false, true)).await.ok().map(|(resp, _)| resp)
     }
 
     #[test]
@@ -5252,6 +5265,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn clients_of_what_may_be_cached_do_not_end_the_wait() {
+        let _busy = serving_on();
+        let answer = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".as_bytes().to_vec();
+        for (cache, at_least) in [(true, 400), (false, 0)] {
+            let (addr, _counts) = plays(&vec![(400, answer.clone())], true);
+            let dir = log_path("gone-cache");
+            let directives = if cache { "proxy_cache z; proxy_cache_valid 200 1m;" } else { "" };
+            let http = format!("proxy_cache_path {} keys_zone=z:1m; {}", dir.display(), passing(addr, directives));
+            let took = block_on(async {
+                let (mut client, task) = served_by(&http).await;
+                let started = Instant::now();
+                client.write_all(HTTP11.as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(client);
+                within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
+                started.elapsed().as_millis()
+            });
+            // The head is waited for, and nothing is sent or kept then.
+            assert!(took >= at_least && (cache || took < 400), "{cache} {took}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn what_is_kept_without_a_length_has_none() {
+        let _busy = serving_on();
+        let (addr, _counts) = plays(&vec![(0, format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}0\r\n\r\n", chunk_of("ok")).into_bytes())], true);
+        let dir = log_path("unknown-cache");
+        let text = format!("http {{ proxy_cache_path {} keys_zone=z:1m; {} }}", dir.display(), passing(addr, "proxy_cache z; proxy_cache_valid 200 1m;"));
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {text}"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        let answers = block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let to = listener.local_addr().unwrap();
+            let tasks = accept(config, &[(listener, to)]).unwrap();
+            let mut answers = Vec::new();
+            for _ in 0..2 {
+                let mut client = tokio::net::TcpStream::connect(to).await.unwrap();
+                client.write_all(HTTP11.as_bytes()).await.unwrap();
+                let mut text = Vec::new();
+                within(Some(Duration::from_secs(2)), client.read_to_end(&mut text)).await.unwrap().unwrap();
+                answers.push(undated(&text));
+            }
+            tasks.iter().for_each(JoinHandle::abort);
+            answers
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        // The answer that is kept is given chunked, without Content-Length.
+        assert!(answers[1..].iter().all(|a| a.contains("Transfer-Encoding: chunked\r\n") && !a.contains("Content-Length") && a.ends_with(&format!("{}0\r\n\r\n", chunk_of("ok")))), "{answers:?}");
+    }
+
+    #[test]
     fn connections_have_numbers_in_the_log() {
         let _busy = serving_on();
         let errors = log_path("numbers");
@@ -5810,7 +5874,7 @@ pub(crate) mod tests {
             let req = format!("{method} / HTTP/1.1\r\n\r\n");
             let back = block_on(async {
                 let s = connect(&addr.into(), None, &level).await.ok()?;
-                let (mut resp, conn) = fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, (false, false)).await.ok()?;
+                let (mut resp, conn) = fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, (false, false, true)).await.ok()?;
                 let mut up = Upstream::new(vec![crate::upstream::Peer::new(addr)]);
                 up.keepalive = Some(Default::default());
                 let up = Arc::new(up);
