@@ -80,19 +80,21 @@ impl Default for Keepalive {
 }
 
 /// A connection to a server, with when it was opened and how many requests it
-/// was used for; and the state of HTTP/2 on it, once it was used for that.
+/// was used for; and the state of HTTP/2 on it, once it was used for that. The pipe to a
+/// stream of HTTP/2 has what is known of that stream.
 #[derive(Debug)]
 pub struct Conn {
     pub stream: Stream,
     pub h2: Option<Box<crate::h2::Session>>,
     opened: Instant,
     requests: u64,
+    pub slot: Option<crate::h2::Slot>,
 }
 
 impl Conn {
     /// A new connection; the request it is opened for counts, as in nginx's c->requests.
     pub fn new(stream: Stream, opened: Instant) -> Conn {
-        Conn { stream, h2: None, opened, requests: 1 }
+        Conn { stream, h2: None, opened, requests: 1, slot: None }
     }
 
     /// Whether there is nothing to read from it, not even its end: bytes a server
