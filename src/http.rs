@@ -2335,7 +2335,13 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // proxy_cache_bypass: the server is asked whatever the cache keeps.
     let any_set = |t: &[Template]| t.iter().any(|t| !matches!(t.render(r, &to_host).as_str(), "" | "0"));
     let bypass = cache.is_some() && any_set(&level.proxy_cache_bypass);
-    let hit = |e: crate::cache::Entry| Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, ranges: true, proxy_host: Some(host.clone()), ..Response::default() };
+    // Ranges of what the cache keeps are given when its Accept-Ranges was kept, or with
+    // proxy_force_ranges (ngx_http_upstream_copy_allow_ranges()).
+    let hit = |e: crate::cache::Entry| {
+        let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, proxy_host: Some(host.clone()), ..Response::default() };
+        if level.proxy_force_ranges || has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, false); }
+        resp
+    };
     // $upstream_cache_status: how the cache answered.
     let noted = |status| { if cache.is_some() { *r.shared.cache_status.lock().unwrap() = Some(status); } };
     if let Some(e) = cache.filter(|_| !bypass).and_then(|z| z.get(&key)) { noted("HIT"); return hit(e) }
@@ -2584,26 +2590,39 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let no_cache = any_set(&level.proxy_no_cache);
     // Nor one whose Vary is "*", unless proxy_ignore_headers has Vary.
     let vary = if ignored("vary") { Some(Vec::new()) } else { crate::cache::vary(&resp.upstream) };
-    let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !far && !no_cache && vary.is_some();
+    // Nor one that is not buffered.
+    let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !far && !no_cache && vary.is_some() && !resp.unbuffered;
     // X-Accel-Expires, Cache-Control and Expires say for how long, before proxy_cache_valid.
     let now = crate::clock::seconds();
     let said = cache.filter(|_| cacheable).and_then(|_| crate::cache::said(&resp.upstream, &level.proxy_ignore_headers, now));
     let valid = said.and_then(|(until, updating)| until.or_else(|| crate::cache::validity(&level.proxy_cache_valid, resp.status).map(|t| now.saturating_add(t.as_secs() as i64))).map(|u| (u, updating)));
     if let Some((zone, valid)) = cache.zip(valid) {
         finish(&mut resp, (level, r)).await;
-        // One range of what is being cached may be given, read whole as it is.
-        (resp.ranges, resp.single_range) = (true, true);
+        // One range of what is being cached may be given, read whole as it is, when it
+        // has Accept-Ranges.
+        if has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, true); }
         if resp.cut.is_none() { zone.put((&main, &key), (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid, (vary.unwrap_or_default(), &r.headers)); }
     }
     // proxy_force_ranges: one range of any other answer is given too, whatever its Accept-Ranges
     // says, read whole for it.
     if level.proxy_force_ranges && !resp.ranges {
-        resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
-        if resp.status == 200 { resp.headers.push(("Accept-Ranges".to_string(), "bytes".to_string())); }
         if resp.status == 200 && header(r, "range").is_some() { finish(&mut resp, (level, r)).await; }
-        (resp.ranges, resp.single_range) = (true, true);
+        allow_ranges(&mut resp, true);
     }
     resp
+}
+
+/// Whether a proxied answer has a header of that name.
+fn has_header(resp: &Response, name: &str) -> bool {
+    resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case(name))
+}
+
+/// A proxied answer whose ranges are given (r->allow_ranges): the range filter says
+/// "Accept-Ranges: bytes" for a 200, in place of what the server said.
+fn allow_ranges(resp: &mut Response, single: bool) {
+    resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
+    if resp.status == 200 { resp.headers.push(("Accept-Ranges".to_string(), "bytes".to_string())); }
+    (resp.ranges, resp.single_range) = (true, single);
 }
 
 /// proxy_cache_max_range_offset, as ngx_http_upstream_cache_check_range() reads a
@@ -2935,7 +2954,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         return Ok((Response { told, ..resp }, Some(conn).filter(|_| keep && answer.len() == end)));
     }
     // X-Accel-Buffering, the last of them that is "yes" or "no", comes before proxy_buffering.
-    let buffering = values("x-accel-buffering").iter().rev().find_map(|v| match v.to_ascii_lowercase().as_str() { "yes" => Some(true), "no" => Some(false), _ => None }).unwrap_or(level.proxy_buffering);
+    let buffering = values("x-accel-buffering").iter().filter(|_| !level.proxy_ignore_headers.iter().any(|i| i == "x-accel-buffering")).rev().find_map(|v| match v.to_ascii_lowercase().as_str() { "yes" => Some(true), "no" => Some(false), _ => None }).unwrap_or(level.proxy_buffering);
     let (first, (count, size)) = (level.proxy_buffer_size, level.proxy_buffers);
     let sizes = if buffering { Ok(Sizes { first, count, size, busy: level.proxy_busy_buffers_size.unwrap_or(2 * first.max(size)) }) } else { Err(first) };
     // proxy_limit_rate is for answers that are buffered.
@@ -6419,6 +6438,18 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert!(!ranged("Range: bytes=2-", Some(2)) && !ranged("Range: BYTES=-1", Some(2)) && !ranged("Range: bytes=0-0", Some(0)));
         // No Range, one that is not of bytes, or no offset in it, may be cached.
         assert!(ranged("Accept: a", Some(0)) && ranged("Range: items=5-", Some(2)) && ranged("Range: bytes=x", Some(2)) && ranged("Range: bytes=99999999999999999999-", Some(2)));
+    }
+
+    #[test]
+    fn allows_ranges() {
+        // What the server said of its ranges is replaced, for a 200 only.
+        let mut resp = Response { status: 200, headers: vec![("Accept-Ranges".into(), "none".into()), ("ETag".into(), "\"e\"".into())], ..Response::default() };
+        assert!(has_header(&resp, "ACCEPT-RANGES") && !has_header(&resp, "vary"));
+        allow_ranges(&mut resp, true);
+        assert_eq!((resp.headers, resp.ranges, resp.single_range), (vec![("ETag".into(), "\"e\"".into()), ("Accept-Ranges".into(), "bytes".into())], true, true));
+        let mut resp = Response { status: 404, headers: vec![("Accept-Ranges".into(), "bytes".into())], ..Response::default() };
+        allow_ranges(&mut resp, false);
+        assert_eq!((resp.headers.len(), resp.ranges, resp.single_range), (0, true, false));
     }
 
     #[test]
