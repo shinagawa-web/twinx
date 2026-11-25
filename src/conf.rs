@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::config::Directive;
 use crate::log::{AccessLog, Cache, Format, Target};
 use crate::resolver::Resolver;
-use crate::upstream::{Addr, Keepalive, Peer, Upstream};
+use crate::upstream::{Addr, Balance, Keepalive, Peer, Upstream};
 use crate::vars::{Escape, Part, Template};
 
 const MAIN: u16 = 1;
@@ -49,6 +49,8 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("upstream", HTTP, 1, 1, true),
     ("server", UPS, 1, usize::MAX, false),
     ("keepalive", UPS, 1, 2, false),
+    ("ip_hash", UPS, 0, 0, false),
+    ("least_conn", UPS, 0, 0, false),
     ("keepalive_requests", UPS, 1, 1, false),
     ("keepalive_time", UPS, 1, 1, false),
     ("keepalive_timeout", UPS, 1, 1, false),
@@ -131,6 +133,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_ssl_verify_depth", HSL, 1, 1, false),
     ("proxy_ssl_name", HSL, 1, 1, false),
     ("proxy_ssl_server_name", HSL, 1, 1, false),
+    ("proxy_ssl_protocols", HSL, 1, usize::MAX, false),
     ("proxy_pass_trailers", HSL, 1, 1, false),
     ("proxy_method", HSL, 1, 1, false),
     ("early_hints", HSL, 1, usize::MAX, false),
@@ -159,6 +162,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_buffer_size", HSL, 1, 1, false),
     ("proxy_buffering", HSL, 1, 1, false),
     ("proxy_ignore_client_abort", HSL, 1, 1, false),
+    ("proxy_socket_keepalive", HSL, 1, 1, false),
     ("proxy_cache_path", HTTP, 2, usize::MAX, false),
     ("proxy_cache", HSL, 1, 1, false),
     ("proxy_cache_valid", HSL, 1, usize::MAX, false),
@@ -212,8 +216,8 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
 /// The directives that may be given more than once at a level; those that have rules of
 /// their own for it are checked where they are read.
 const REPEATED: &[&str] = &[
-    "error_log", "index", "server", "upstream", "listen", "server_name", "location", "return", "break", "set", "if", "rewrite", "log_format", "access_log", "add_header", "add_trailer", "keepalive_disable", "error_page",
-    "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_pass_header", "proxy_next_upstream",
+    "error_log", "index", "server", "upstream", "listen", "server_name", "location", "return", "break", "set", "if", "rewrite", "log_format", "access_log", "add_header", "add_trailer", "keepalive_disable", "error_page", "ip_hash", "least_conn",
+    "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "proxy_ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_pass_header", "proxy_next_upstream",
     "proxy_cookie_domain", "proxy_cookie_path", "proxy_redirect", "proxy_cookie_flags", "gzip_types", "proxy_cache_path", "proxy_cache_valid",
     "proxy_no_cache", "proxy_cache_bypass", "proxy_ignore_headers",
 ];
@@ -671,6 +675,12 @@ pub struct Level {
     /// proxy_ssl_server_name is on; $proxy_host when not set.
     pub proxy_ssl_name: Option<Template>,
     pub proxy_ssl_server_name: bool,
+    /// proxy_ignore_client_abort: a request to a proxied server goes on when its client goes away.
+    pub proxy_ignore_client_abort: bool,
+    /// proxy_socket_keepalive: connections to proxied servers have SO_KEEPALIVE.
+    pub proxy_socket_keepalive: bool,
+    /// proxy_ssl_protocols: whether TLS 1.2 and TLS 1.3 are offered, in that order.
+    pub proxy_ssl_protocols: [bool; 2],
     /// What connections to proxied servers over TLS are made with, made again
     /// at a level that sets one of the proxy_ssl_* directives above.
     pub proxy_tls: Option<Arc<rustls::ClientConfig>>,
@@ -893,7 +903,7 @@ impl Builder<'_> {
         // Without root, files come from html under the prefix, as nginx's default root is.
         let mut level = Level { error_log: self.errors.clone(), root: self.path("html"), default_type: "text/plain".into(), gzip_http_11: true, gzip_min_length: 20, proxy_cache_min_uses: 1, proxy_cache_lock_timeout: crate::cache::LOCK_TIMEOUT, proxy_cache_lock_age: crate::cache::LOCK_TIMEOUT, proxy_cache_convert_head: true, max_body: 1 << 20, max_headers: 1000, header_buffer: 1 << 10, proxy_http_11: true, proxy_buffer_size: 4 << 10, proxy_buffering: true, proxy_buffers: (8, 4 << 10), proxy_max_temp_file_size: 1 << 30, proxy_temp_path: proxy_temp, proxy_temp_levels: vec![1, 2], large_header_buffers: (4, 8 << 10), ignore_invalid_headers: true, merge_slashes: true, if_modified_since: Some(false), log_not_found: true, index: vec![Template::parse("index.html")?], body_buffer: 16 << 10, body_temp_path: temp, absolute_redirect: true, server_tokens: true, chunked: true, port_in_redirect: true,
             keepalive_requests: 1000, keepalive_timeout: Duration::from_secs(75), keepalive_time: Duration::from_secs(3600), keepalive_disable_msie6: true, lingering_close: Some(false),
-            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), sendfile_max_chunk: 2 << 20, tcp_nodelay: true, ..Level::default() };
+            resolver_timeout: Duration::from_secs(30), proxy_connect_timeout: Duration::from_secs(60), proxy_pass_request_headers: true, proxy_pass_request_body: true, proxy_request_buffering: true, proxy_redirect: Some(Vec::new()), proxy_ssl_session_reuse: true, proxy_ssl_verify_depth: 1, ssl_verify_depth: 1, ssl_protocols: [true, true], proxy_ssl_protocols: [true, true], proxy_tls: Some(crate::tls::client((true, false, [true, true]), None, None)?), proxy_next_upstream: vec!["error".into(), "timeout".into()], proxy_read_timeout: Duration::from_secs(60), send_timeout: Duration::from_secs(60), sendfile_max_chunk: 2 << 20, tcp_nodelay: true, ..Level::default() };
         for d in block.iter().filter(|d| d.name == "upstream") {
             let block = d.block.as_deref().unwrap_or_default();
             if self.upstreams.keys().any(|u| u.eq_ignore_ascii_case(&d.args[0])) { return Err(format!("duplicate upstream \"{}\" in {}", d.args[0], d.at)); }
@@ -904,6 +914,9 @@ impl Builder<'_> {
             if peers.iter().all(|p| p.backup) { return Err(format!("no servers in upstream \"{}\" in {}", d.args[0], d.at)); }
             let mut upstream = Upstream::new(peers);
             upstream.keepalive = upstream_keepalive(block)?;
+            // The last balancing method given is used, wherever keepalive is.
+            let balancing = block.iter().rfind(|d| matches!(d.name.as_str(), "ip_hash" | "least_conn")).map(|d| d.name.as_str());
+            upstream.balance = match balancing { Some("ip_hash") => Balance::IpHash, Some(_) => Balance::LeastConn, None => Balance::RoundRobin };
             self.upstreams.insert(d.args[0].clone(), Arc::new(upstream));
         }
         // The zones of proxy_cache_path are known before proxy_cache names them.
@@ -1177,6 +1190,7 @@ impl Builder<'_> {
                 "proxy_ssl_verify_depth" => (level.proxy_ssl_verify_depth, own_tls) = (d.args[0].parse().map_err(|_| at(format!("invalid value \"{}\" in \"proxy_ssl_verify_depth\" directive", d.args[0])))?, true),
                 "proxy_pass_trailers" => level.proxy_pass_trailers = flag(d).map_err(at)?,
                 "proxy_ssl_server_name" => (level.proxy_ssl_server_name, own_tls) = (flag(d).map_err(at)?, true),
+                "proxy_ssl_protocols" => (level.proxy_ssl_protocols, own_tls) = (protocols(&d.args).map_err(at)?, true),
                 "proxy_ssl_name" => level.proxy_ssl_name = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_redirect" => {
                     let rule = if d.args == ["default"] {
@@ -1216,8 +1230,8 @@ impl Builder<'_> {
                 "proxy_busy_buffers_size" => level.proxy_busy_buffers_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
                 "proxy_temp_file_write_size" => level.proxy_temp_file_write_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
                 "proxy_buffering" => level.proxy_buffering = flag(d).map_err(at)?,
-                // Only checked: twinx does not act on it.
-                "proxy_ignore_client_abort" => { flag(d).map_err(at)?; }
+                "proxy_ignore_client_abort" => level.proxy_ignore_client_abort = flag(d).map_err(at)?,
+                "proxy_socket_keepalive" => level.proxy_socket_keepalive = flag(d).map_err(at)?,
                 // "off" caches nothing.
                 "proxy_cache" => level.proxy_cache = match Template::parse(&d.args[0]).map_err(at)? {
                     t if t.fixed().is_none() => Some(CacheZone::Named(t, Arc::new(self.zones.clone()))),
@@ -1369,7 +1383,7 @@ impl Builder<'_> {
             // Without trusted certificates nothing verifies; a location that proxies over TLS must have them.
             if level.proxy_ssl_verify && level.proxy_ssl_trusted_certificate.is_none() && level.proxy.as_ref().is_some_and(|p| p.ssl) { return Err("no proxy_ssl_trusted_certificate for proxy_ssl_verify".into()) }
             let verify = level.proxy_ssl_verify.then(|| crate::tls::verify(level.proxy_ssl_trusted_certificate.as_deref(), level.proxy_ssl_crl.as_deref(), level.proxy_ssl_verify_depth)).transpose()?;
-            level.proxy_tls = Some(crate::tls::client((level.proxy_ssl_session_reuse, level.proxy_ssl_server_name), cert, verify)?);
+            level.proxy_tls = Some(crate::tls::client((level.proxy_ssl_session_reuse, level.proxy_ssl_server_name, level.proxy_ssl_protocols), cert, verify)?);
         }
         // Without rules of its own or inherited, a location with proxy_pass has "proxy_redirect default".
         if level.proxy_redirect.as_ref().is_some_and(Vec::is_empty) && own_proxy {
@@ -2436,6 +2450,33 @@ mod tests {
         }
         let c = build_text("http { server { location / { proxy_pass http://127.0.0.1:8081; } } }").unwrap();
         assert_eq!(c.servers[0].locations[0].level.proxy.as_ref().unwrap().upstream.keepalive, None);
+    }
+
+    #[test]
+    fn balancing_methods() {
+        let up = |block: &str| {
+            let c = build_text(&format!("http {{ upstream u {{ server 127.0.0.1:8081; {block} }} server {{ location / {{ proxy_pass http://u; }} }} }}")).unwrap();
+            let up = c.servers[0].locations[0].level.proxy.as_ref().unwrap().upstream.clone();
+            (up.balance, up.keepalive.is_some())
+        };
+        assert_eq!(up("keepalive 0;"), (Balance::RoundRobin, false));
+        assert_eq!(up("ip_hash; keepalive 2;"), (Balance::IpHash, true));
+        assert_eq!(up("least_conn; keepalive 2;"), (Balance::LeastConn, true));
+        // keepalive before the method is kept; the last method is used.
+        assert_eq!(up("keepalive 2; ip_hash;"), (Balance::IpHash, true));
+        assert_eq!(up("ip_hash; least_conn; keepalive 0;"), (Balance::LeastConn, false));
+        assert_eq!(build_text("http { upstream u { server 127.0.0.1:1; ip_hash x; } }").unwrap_err(), "invalid number of arguments in \"ip_hash\" directive in t.conf:1");
+        assert!(build_text("http { ip_hash; }").is_err());
+    }
+
+    #[test]
+    fn proxy_socket_options() {
+        let c = build_text("http { proxy_socket_keepalive on; proxy_ignore_client_abort on; proxy_ssl_protocols TLSv1.2; server { location /a { proxy_socket_keepalive off; proxy_ssl_protocols TLSv1 TLSv1.3; } location /b { } } }").unwrap();
+        let l = &c.servers[0].locations;
+        let of = |l: &Location| (l.level.proxy_socket_keepalive, l.level.proxy_ignore_client_abort, l.level.proxy_ssl_protocols);
+        assert_eq!((of(&l[0]), of(&l[1])), ((false, true, [false, true]), (true, true, [true, false])));
+        assert_eq!(build_text("http { proxy_ssl_protocols TLSv2; }").unwrap_err(), "invalid value \"TLSv2\" in t.conf:1");
+        assert!(build_text("http { proxy_socket_keepalive yes; }").is_err());
     }
 
     #[test]

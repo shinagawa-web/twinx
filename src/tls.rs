@@ -1116,19 +1116,23 @@ fn host_matches(pattern: &str, name: &str) -> bool {
 /// connections when proxy_ssl_session_reuse is on; with the certificate of
 /// proxy_ssl_certificate, proxy_ssl_certificate_key and proxy_ssl_password_file, if any;
 /// verifying their certificates with verify, if any (proxy_ssl_verify on).
-pub fn client((reuse, sni): (bool, bool), cert: Option<(&Path, &Path, Option<&Path>)>, verify: Option<Verify>) -> Result<Arc<ClientConfig>, String> {
+pub fn client((reuse, sni, protocols): (bool, bool, [bool; 2]), cert: Option<(&Path, &Path, Option<&Path>)>, verify: Option<Verify>) -> Result<Arc<ClientConfig>, String> {
+    let builder = proxied(verify, protocols)?;
     let mut c = match cert.map(|(c, k, p)| load(c, k, p, true)).transpose()? {
-        Some((chain, key)) => proxied(verify).with_client_auth_cert(chain, key).map_err(|e| e.to_string())?,
-        None => proxied(verify).with_no_client_auth(),
+        Some((chain, key)) => builder.with_client_auth_cert(chain, key).map_err(|e| e.to_string())?,
+        None => builder.with_no_client_auth(),
     };
     c.enable_sni = sni;
     if !reuse { c.resumption = rustls::client::Resumption::disabled(); }
     Ok(Arc::new(c))
 }
 
-fn proxied(verify: Option<Verify>) -> rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert> {
+/// What connections to proxied servers are made with: the verifier, and the
+/// protocols of proxy_ssl_protocols, TLS 1.2 and TLS 1.3 in that order.
+fn proxied(verify: Option<Verify>, protocols: [bool; 2]) -> Result<rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert>, String> {
     let verifier = Arc::new(Proxied(provider().signature_verification_algorithms, verify));
-    ClientConfig::builder().dangerous().with_custom_certificate_verifier(verifier)
+    let versions: Vec<_> = [&rustls::version::TLS12, &rustls::version::TLS13].into_iter().zip(protocols).filter_map(|(v, on)| on.then_some(v)).collect();
+    Ok(ClientConfig::builder_with_provider(provider()).with_protocol_versions(&versions).map_err(|e| e.to_string())?.dangerous().with_custom_certificate_verifier(verifier))
 }
 
 /// What one connection to a proxied server is made with when variables name
@@ -1136,7 +1140,7 @@ fn proxied(verify: Option<Verify>) -> rustls::ConfigBuilder<ClientConfig, rustls
 /// settings, with the certificate and key of those files, taken from the
 /// cache when there is one.
 pub fn client_cert(base: &Arc<ClientConfig>, files: (&Path, &Path, Option<&Path>), cache: Option<&CertCache>) -> Result<Arc<ClientConfig>, String> {
-    let config = cached(files, cache, &|chain, pkey| proxied(None).with_client_auth_cert(chain, pkey))?;
+    let config = cached(files, cache, &|chain, pkey| proxied(None, [true, true]).expect("TLS 1.2 and 1.3 are both had").with_client_auth_cert(chain, pkey))?;
     let mut c = (**base).clone();
     c.client_auth_cert_resolver = config.map_err(|e| format!("SSL_use_PrivateKey(\"{}\") failed ({e})", files.1.display()))?.client_auth_cert_resolver;
     Ok(Arc::new(c))
@@ -1634,7 +1638,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                 for _ in 0..2 { names.push(accept(l.accept().await.unwrap().0, &config, addr).await.map(|a| a.1.server_name)); }
                 names
             });
-            let tls = client((false, true), None, None).unwrap();
+            let tls = client((false, true, [true, true]), None, None).unwrap();
             let ok = connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), Some("virtual1")), Duration::from_secs(5), &tls).await.unwrap();
             drop(ok);
             let refused = connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), Some("virtual2")), Duration::from_secs(5), &tls).await.err().unwrap();
@@ -1654,7 +1658,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             assert_eq!(config.servers[0].ssl, [addr]);
             let accepted = tokio::task::spawn_local(async move { accept(l.accept().await.unwrap().0, &config, addr).await.unwrap() });
             let c = dir.join("c.pem");
-            let tls = client((false, true), Some((&c, &dir.join("k.pem"), None)), None).unwrap();
+            let tls = client((false, true, [true, true]), Some((&c, &dir.join("k.pem"), None)), None).unwrap();
             let mut client = connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), Some("localhost")), Duration::from_secs(5), &tls).await.unwrap();
             let (mut server, session) = accepted.await.unwrap();
             assert!(matches!(server, Stream::Server(_)) && matches!(client, Stream::Client(_)));
@@ -1689,7 +1693,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                 for _ in 0..2 { alpn.push(accept(l.accept().await.unwrap().0, &config, addr).await.unwrap().1.alpn); }
                 alpn
             });
-            let mut tls = (*client((false, true), None, None).unwrap()).clone();
+            let mut tls = (*client((false, true, [true, true]), None, None).unwrap()).clone();
             tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             let tls = Arc::new(tls);
             // The server with http2 on takes h2; the one without is left with HTTP/1.1.
@@ -1701,8 +1705,24 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     }
 
     #[test]
+    fn a_client_offers_the_protocols_of_proxy_ssl_protocols() {
+        assert!(client((true, false, [false, false]), None, None).is_err());
+        let dir = dir();
+        crate::stream::block_on(async {
+            let (l, addr) = listener().await;
+            let text = format!("http {{ server {{ listen {addr} ssl; server_name localhost; ssl_certificate c.pem; ssl_certificate_key k.pem; ssl_protocols TLSv1.3; }} }}");
+            let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), Path::new("t")).unwrap(), &dir).unwrap());
+            tokio::task::spawn_local(async move { loop { let s = l.accept().await.unwrap().0; drop(accept(s, &config, addr).await) } });
+            let connected = |protocols| async move { connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_secs(5), &client((true, false, protocols), None, None).unwrap()).await.is_ok() };
+            assert!(connected([false, true]).await);
+            assert!(connected([true, true]).await);
+            assert!(!connected([true, false]).await);
+        });
+    }
+
+    #[test]
     fn a_client_for_http2_offers_h2_alone() {
-        let base = client((true, false), None, None).unwrap();
+        let base = client((true, false, [true, true]), None, None).unwrap();
         assert!(base.alpn_protocols.is_empty());
         assert_eq!(h2(&base).alpn_protocols, [b"h2".to_vec()]);
         let dir = dir();
@@ -1720,7 +1740,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     fn a_handshake_that_does_not_end_in_time_times_out() {
         crate::stream::block_on(async {
             let (_l, addr) = listener().await;
-            let e = connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_millis(100), &client((true, false), None, None).unwrap()).await.unwrap_err();
+            let e = connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_millis(100), &client((true, false, [true, true]), None, None).unwrap()).await.unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
         });
     }
@@ -1730,7 +1750,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         crate::stream::block_on(async {
             let (l, addr) = listener().await;
             let peer = tokio::task::spawn_local(async move { let mut s = l.accept().await.unwrap().0; s.write_all(b"HTTP/1.0 400\r\n\r\n").await.unwrap(); });
-            assert!(connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_secs(5), &client((true, false), None, None).unwrap()).await.is_err());
+            assert!(connect(TcpStream::connect(addr).await.unwrap(), (addr.ip(), None), Duration::from_secs(5), &client((true, false, [true, true]), None, None).unwrap()).await.is_err());
             peer.await.unwrap();
             // A client that closes before its ClientHello, or sends what is not TLS, is no connection.
             let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", "http { }"), Path::new("t")).unwrap(), &dir()).unwrap();
@@ -1791,7 +1811,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = dir();
         // A key that is not the certificate's.
         std::fs::write(dir.join("other.pem"), "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwQWPnC2Jx/3u3hdA\njGUmqcD72PuhGmag3j4c7dVV64OhRANCAATANLzVnsMiRvhgpGBwTwrnsEsESgL3\nwQJBCIlLunPAFCk9taxLVaqjkHBX5E7184ZLnPSc8ZVLhpB/saEm9hMD\n-----END PRIVATE KEY-----\n").unwrap();
-        let (base, cache) = (client((true, false), None, None).unwrap(), CertCache::new(4, 60, 10));
+        let (base, cache) = (client((true, false, [true, true]), None, None).unwrap(), CertCache::new(4, 60, 10));
         let (cert, key, other) = (dir.join("c.pem"), dir.join("k.pem"), dir.join("other.pem"));
         assert!(client_cert(&base, (&cert, &key, None), Some(&cache)).is_ok());
         assert!(client_cert(&base, (&cert, &key, None), None).is_ok());
