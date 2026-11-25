@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 
 use crate::body::{Body, Buffers, Came, Sizes};
 use crate::coding::Coder;
-use crate::conf::{Condition, Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, Step, TryFiles};
+use crate::conf::{Condition, Config, CookieFlags, CookiePattern, CookieRewrite, Fallback, Flag, Level, Match, Op, Proxy, Rewrite, Server, ServerName, TryFiles};
 use crate::vars::{Part, Template};
 use crate::expires;
 use crate::upstream::{Addr, Conn, Held, Peer, Upstream};
@@ -322,7 +322,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         let framing = parsed.and_then(|()| framing(&r)).and_then(|n| if n.unwrap_or(0) > level.max_body { Err(413) } else { Ok(n) });
         let expect = header(&r, "expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue"));
         if framing.is_ok() && expect && r.line.ends_with("HTTP/1.1") { write_all(&mut stream, b"HTTP/1.1 100 Continue\r\n\r\n", send_timeout(level)).await; }
-        let reading = if !reads_body(level) { Reading::Discarded } else if level.proxy.is_some() && !level.proxy_request_buffering { Reading::Unbuffered } else { Reading::Buffered };
+        let reading = if !reads_body(level, &server.level.script) { Reading::Discarded } else if level.proxy.is_some() && !level.proxy_request_buffering { Reading::Unbuffered } else { Reading::Buffered };
         if framing.is_ok() { if let Some(tell) = origin.as_mut().and_then(|o| o.reading.take()) { tell(reading); } }
         // A stream of HTTP/2 whose body is discarded is answered without waiting for it.
         let discarded = origin.is_some() && reading == Reading::Discarded;
@@ -557,10 +557,11 @@ fn unbuffered(level: &Level, chunked: bool) -> bool {
 /// Whether a location may read the request body: it proxies, or its rewrite
 /// module directives or try_files may lead elsewhere. Otherwise its content
 /// handler (static files) discards the body, as nginx's does.
-fn reads_body(level: &Level) -> bool {
+/// Those of the server count, which run before it.
+fn reads_body(level: &Level, server: &[Op]) -> bool {
     // One that returns before anything else discards it.
-    let returns = matches!(level.rewrite.first(), Some(Step::Return(..))) && level.script.is_empty() && level.server_script.is_empty();
-    !returns && (level.proxy.is_some() || !level.rewrite.is_empty() || !level.script.is_empty() || !level.server_script.is_empty() || level.try_files.is_some() || level.post_action.is_some())
+    let returns = matches!(level.script.first(), Some(Op::Return(..))) && server.is_empty();
+    !returns && (level.proxy.is_some() || !level.script.is_empty() || !server.is_empty() || level.try_files.is_some() || level.post_action.is_some())
 }
 
 fn header<'a>(r: &'a Request, name: &str) -> Option<&'a str> {
@@ -604,6 +605,9 @@ struct Response {
     /// Whether the internal redirect makes the request a GET, unless it is a
     /// HEAD (X-Accel-Redirect).
     as_get: bool,
+    /// Whether the internal redirect is that of a rewrite in a location, after
+    /// which the server's rewrite module directives do not run again.
+    rewritten: bool,
     /// Whether the length is not known when the head is sent (the gzip filter
     /// compresses as it goes): the body is chunked, or the connection closed after it.
     unknown_length: bool,
@@ -922,49 +926,95 @@ fn redirect(status: u16, location: String) -> Response {
     resp
 }
 
-/// The answer the location gives, before error_page and the headers every answer gets.
-async fn respond(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found<'_>, client: Option<&mut Stream>) -> Response {
-    match parsed {
-        Err(status) => return special(status),
-        Ok(()) if auto => return redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))),
-        Ok(()) => {}
-    }
-    // The rewrite module's directives, in order, as ngx_http_rewrite_handler() runs them.
-    let (mut to, mut changed, mut moved) = (Cow::Borrowed(r), false, false);
-    for step in &level.rewrite {
-        let rw = match step {
-            Step::Return(code, text) => return serve(&to, level, prefix, Some((*code, text)), client).await,
-            Step::Break => { changed = false; break }
-            Step::Rewrite(rw) => rw,
+/// Where the rewrite module's directives of a level have got to: the settings
+/// of the last if block whose condition held, else the level's own; whether
+/// the URI changed so that its location is looked for again, and whether a
+/// rewrite changed it at all; and whether one of those settings had proxy_pass.
+struct Script<'a> {
+    level: &'a Level,
+    changed: bool,
+    moved: bool,
+    proxied: bool,
+}
+
+/// How the directives ended: run through, stopped (break, or rewrite with
+/// "last" or "break"), by return, or with an answer of their own.
+enum Stop<'a> {
+    No,
+    Yes,
+    Return(u16, &'a Template),
+    Answer(Response),
+}
+
+/// Runs the rewrite module's directives in the order they are written, as
+/// ngx_http_rewrite_handler() runs the codes they are compiled to: the
+/// directives of an if block whose condition holds run where it is, and those
+/// after it go on.
+fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> Stop<'a> {
+    for op in ops {
+        let rw = match op {
+            // set $limit_rate: a value that is not a size leaves it as it was.
+            Op::Set(name, value) if name == "limit_rate" => { if let Ok(rate) = crate::conf::size(&value.render(to, &Sent::default())) { to.shared.limit_rate.set(rate); } continue }
+            Op::Set(name, value) => { to.set_var(name, value.render(to, &Sent::default())); continue }
+            Op::If(cond, body, level) => {
+                if !holds(to, cond) { continue }
+                s.level = level;
+                s.proxied |= level.proxy.is_some();
+                match script(to, body, s) { Stop::No => continue, stop => return stop }
+            }
+            Op::Return(code, text) => return Stop::Return(*code, text),
+            Op::Break => { s.changed = false; return Stop::Yes }
+            Op::Rewrite(rw) => rw,
         };
         let Some(caps) = rw.regex.captures(&to.uri) else { continue };
         to.set_captures(&caps);
-        let (uri, new_args) = replacement(rw, &to);
+        let (uri, new_args) = replacement(rw, to);
         let uri = if rw.redirect { unescape_redirect(&uri) } else { uri };
         // The request's arguments follow those of the replacement, "&" between them.
-        let old = &args(&to).get(1..).unwrap_or_default().to_string();
+        let old = &args(to).get(1..).unwrap_or_default().to_string();
         let args = match new_args {
             Some(a) if rw.add_args && !old.is_empty() => format!("?{a}&{old}"),
             Some(a) => format!("?{a}"),
             None if rw.add_args && !old.is_empty() => format!("?{old}"),
             None => String::new(),
         };
-        if rw.redirect { return redirect(rw.status, format!("{uri}{args}")); }
-        if uri.is_empty() { error_log(level, &to, "the rewritten URI has a zero length"); return special(500); }
+        if rw.redirect { return Stop::Answer(redirect(rw.status, format!("{uri}{args}"))); }
+        if uri.is_empty() { error_log(s.level, to, "the rewritten URI has a zero length"); return Stop::Answer(special(500)); }
         let target = format!("{uri}{args}");
         to.to_mut().redirect(uri, target);
-        (changed, moved) = (rw.flag != Flag::Break, true);
-        if rw.flag != Flag::Next { break; }
+        (s.changed, s.moved) = (rw.flag != Flag::Break, true);
+        if rw.flag != Flag::Next { return Stop::Yes; }
     }
+    Stop::No
+}
+
+/// The answer the location gives, before error_page and the headers every
+/// answer gets, and the settings that gave it.
+async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Response, &'a Level) {
+    match parsed {
+        Err(status) => return (special(status), level),
+        Ok(()) if auto => return (redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))), level),
+        Ok(()) => {}
+    }
+    let mut to = Cow::Borrowed(r);
+    let mut s = Script { level, changed: false, moved: false, proxied: level.proxy.is_some() };
+    let stop = script(&mut to, &level.script, &mut s);
+    let (level, moved) = (s.level, s.moved);
+    // Once the location or an if block that applied has proxy_pass, the request
+    // is proxied: when the last if block that applied has no proxy_pass to
+    // inherit, nginx has no upstream for it and answers 500.
+    if s.proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration", ""); return (special(500), level); }
+    if let Some(resp) = ended(&to, level, prefix, stop, client.as_deref_mut()).await { return (resp, level); }
     // A URI changed without "break" is looked for again among the locations.
     // The URI goes apart from the arguments: a "?" it has is a part of it.
-    if changed { let to = to.into_owned(); return Response { internal: Some(Box::new((to.target, Some(to.uri)))), ..Response::default() }; }
+    if s.changed { let to = to.into_owned(); return (Response { internal: Some(Box::new((to.target, Some(to.uri)))), rewritten: true, ..Response::default() }, level); }
     // Stopped by break, the location goes on with the new URI, and proxy_pass
     // passes it whole, without the URI it has (r->valid_location is 0).
-    match level.proxy.as_deref().filter(|p| moved && p.uri.is_some() && level.try_files.is_none()) {
+    let resp = match level.proxy.as_deref().filter(|p| moved && p.uri.is_some() && level.try_files.is_none()) {
         Some(p) => Box::pin(async { proxy(&Proxy { uri: None, ..p.clone() }, level, &to, prefix, client).await }).await,
         None => serve(&to, level, prefix, None, client).await,
-    }
+    };
+    (resp, level)
 }
 
 /// The replacement of a rewrite, as the URI and the arguments after its "?".
@@ -1941,14 +1991,17 @@ fn browser(ua: &str) -> (bool, bool) {
 
 /// The answer of the location found, after the internal redirects of the
 /// index module, and the settings of the location that gave it.
-async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u16>, (prefix, mut level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Response, &'a Level, Cow<'r, Request>) {
-    // Once the location or an if block that applied has proxy_pass, the request
-    // is proxied: when the last if block that applied has no proxy_pass to
-    // inherit, nginx has no upstream for it and answers 500.
-    let mut proxied = level.proxy.is_some();
-    if parsed.is_ok() { level = run(r, &level.script, run(r, &level.server_script, level, &mut proxied), &mut proxied); }
-    let mut resp = if proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration", ""); special(500) } else { respond(r, parsed, (prefix, level, auto), client.as_deref_mut()).await };
-    let (mut redirects, mut to) = (0, Cow::Borrowed(r));
+async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u16>, found: Found<'a>, mut client: Option<&mut Stream>) -> (Response, &'a Level, Cow<'r, Request>) {
+    let mut to = Cow::Borrowed(r);
+    let named = server.locations.iter().any(|l| matches!(l.kind, Match::Named) && std::ptr::eq(&l.level, found.1));
+    let (mut resp, mut level) = match parsed {
+        Ok(()) if !named => match Box::pin(server_rewrite(server, &mut to, found, client.as_deref_mut())).await {
+            Ok(found) => Box::pin(respond(&to, parsed, found, client.as_deref_mut())).await,
+            Err(answered) => answered,
+        },
+        _ => Box::pin(respond(&to, parsed, found, client.as_deref_mut())).await,
+    };
+    let mut redirects = 0;
     while let Some(internal) = resp.internal.take() {
         let (target, uri) = *internal;
         // nginx gives up after 10 internal redirects.
@@ -1958,15 +2011,21 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
         let kept = resp.proxied.then(|| { to.to_mut().upstream = std::mem::take(&mut resp.upstream); (std::mem::take(&mut resp.headers), resp.ctype.take()) });
         // A named location answers the request as it is, without the server's rewrites.
         let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == target);
-        let (prefix, found, auto) = if let Some(l) = named { (l.path.as_str(), &l.level, false) } else {
+        // After a rewrite of a location the location is looked for again, but
+        // any other internal redirect runs the server's directives first.
+        let rewritten = std::mem::take(&mut resp.rewritten);
+        let found = if let Some(l) = named { Ok((l.path.as_str(), &l.level, false)) } else {
             let next = to.to_mut();
             if resp.as_get && next.method != "HEAD" { next.method = "GET".to_string(); }
             next.redirect(uri.unwrap_or_else(|| target.split('?').next().unwrap_or_default().to_string()), target.clone());
-            located(server, &to, &to.uri)
+            let found = located(server, &to, &to.uri);
+            if rewritten || redirects > 10 { Ok(found) } else { Box::pin(server_rewrite(server, &mut to, found, client.as_deref_mut())).await }
         };
-        let proxied = &mut false;
-        level = run(&to, &found.script, if named.is_some() { found } else { run(&to, &found.server_script, found, proxied) }, proxied);
-        resp = if redirects > 10 || (target.starts_with('@') && named.is_none()) { special(500) } else { respond(&to, Ok(()), (prefix, level, auto), client.as_deref_mut()).await };
+        (resp, level) = match found {
+            _ if redirects > 10 || (target.starts_with('@') && named.is_none()) => (special(500), level),
+            Ok(found) => Box::pin(respond(&to, Ok(()), found, client.as_deref_mut())).await,
+            Err(answered) => answered,
+        };
         if let Some((headers, ctype)) = kept {
             resp.headers.splice(0..0, headers);
             if let Some(ctype) = ctype.filter(|_| resp.status < 300) { resp.ctype = Some(ctype); }
@@ -1976,23 +2035,28 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
     (resp, level, to)
 }
 
-/// Runs set and if in order, and gives the settings the request goes on with:
-/// those of the last if block whose condition held, else the level's own.
-/// Notes whether one of those had proxy_pass.
-fn run<'a>(r: &Request, ops: &'a [Op], mut level: &'a Level, proxied: &mut bool) -> &'a Level {
-    for op in ops {
-        match op {
-            // set $limit_rate: a value that is not a size leaves it as it was.
-            Op::Set(name, value) if name == "limit_rate" => if let Ok(rate) = crate::conf::size(&value.render(r, &Sent::default())) { r.shared.limit_rate.set(rate); },
-            Op::Set(name, value) => r.set_var(name, value.render(r, &Sent::default())),
-            Op::If(cond, body, to) => if holds(r, cond) {
-                level = to.as_deref().unwrap_or(level);
-                *proxied |= level.proxy.is_some();
-                level = run(r, body, level, proxied);
-            },
-        }
+/// The server's rewrite module directives, which run before the location is
+/// looked for (NGX_HTTP_SERVER_REWRITE_PHASE): the location of the URI they
+/// leave, the one found already when they did not change it, or the answer
+/// of a return or a redirect among them, and the settings that gave it.
+async fn server_rewrite<'a>(server: &'a Server, to: &mut Cow<'_, Request>, found: Found<'a>, client: Option<&mut Stream>) -> Result<Found<'a>, (Response, &'a Level)> {
+    if server.level.script.is_empty() { return Ok(found); }
+    let mut s = Script { level: &server.level, changed: false, moved: false, proxied: false };
+    let stop = script(to, &server.level.script, &mut s);
+    match ended(to, s.level, "", stop, client).await {
+        Some(resp) => Err((resp, s.level)),
+        None if s.moved => Ok(located(server, to, &to.uri)),
+        None => Ok(found),
     }
-    level
+}
+
+/// The answer of a return or a redirect that ended the rewrite module's directives, if one did.
+async fn ended(to: &Request, level: &Level, prefix: &str, stop: Stop<'_>, client: Option<&mut Stream>) -> Option<Response> {
+    match stop {
+        Stop::Return(code, text) => Some(serve(to, level, prefix, Some((code, text)), client).await),
+        Stop::Answer(resp) => Some(resp),
+        Stop::No | Stop::Yes => None,
+    }
 }
 
 /// Whether the condition of an if holds; a regular expression that matches
@@ -6451,9 +6515,12 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn locations_that_read_bodies() {
-        assert!(!reads_body(&Level::default()));
-        assert!(reads_body(&Level { try_files: Some(Arc::new(TryFiles { files: Vec::new(), fallback: Fallback::Status(404) })), ..Level::default() }));
-        assert!(reads_body(&Level { post_action: Some("/a".into()), ..Level::default() }));
+        assert!(!reads_body(&Level::default(), &[]));
+        assert!(reads_body(&Level { try_files: Some(Arc::new(TryFiles { files: Vec::new(), fallback: Fallback::Status(404) })), ..Level::default() }, &[]));
+        assert!(reads_body(&Level { post_action: Some("/a".into()), ..Level::default() }, &[]));
+        let returns = Level { script: vec![Op::Return(204, Template::default())], ..Level::default() };
+        assert!(!reads_body(&returns, &[]));
+        assert!(reads_body(&returns, &[Op::Break]));
     }
 
     #[test]
@@ -6578,7 +6645,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let s = &config.servers[0];
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
-            let resp = block_on(respond(&r, Ok(()), location(s, &r.uri), None));
+            let resp = block_on(respond(&r, Ok(()), location(s, &r.uri), None)).0;
             (resp.status, resp.headers[0].1.clone())
         };
         assert_eq!(answer("/a?x=1"), (302, "http://e/1?x=1".to_string()));
@@ -6638,6 +6705,31 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     }
 
     #[test]
+    fn rewrite_directives_run_in_order() {
+        let text = "http { server { listen 127.0.0.1:8080; set $x 1; rewrite ^/a /b; set $y $uri; rewrite ^/l /last last; \
+                    if ($arg_r) { return 200 server; } if ($arg_b) { break; } set $x ${x}2; \
+                    location / { return 200 \"$uri x=$x y=$y\"; } } \
+                    server { listen 127.0.0.1:8081; location /t { if ($arg_a) { return 200 first; } set $z 1; if ($arg_c) { set $z 2; } \
+                    if ($arg_b) { return 200 z=$z; } return 200 after; break; } } }";
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let get = |i: usize, target: &str| {
+            let s = &config.servers[i];
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            String::from_utf8(block_on(answer(s, &r, Ok(()), location(s, &r.uri), None)).0.body).unwrap()
+        };
+        // The server's directives run before the location is looked for, once.
+        assert_eq!(get(0, "/a"), "/b x=12 y=/b");
+        assert_eq!(get(0, "/l"), "/last x=1 y=/l");
+        assert_eq!(get(0, "/x?r=1"), "server");
+        assert_eq!(get(0, "/x?b=1"), "/x x=1 y=/x");
+        // Those after an if block go on after it, whether its condition held or not.
+        assert_eq!(get(1, "/t?a=1&b=1"), "first");
+        assert_eq!(get(1, "/t?b=1&c=1"), "z=2");
+        assert_eq!(get(1, "/t?b=1"), "z=1");
+        assert_eq!(get(1, "/t"), "after");
+    }
+
+    #[test]
     fn rewrites_with_break_and_named_locations() {
         let text = "http { server { location /a { rewrite ^/a(.*) /b break; return 403; } location @n { return 200 n$uri; } } }";
         let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
@@ -6645,9 +6737,9 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert!(location(s, "@n").0.is_empty());
         let (_, r) = request("GET /a?x=1 HTTP/1.0\n\n");
         // break skips return; the new URI keeps the arguments and is looked for under root.
-        assert_eq!(block_on(respond(&r, Ok(()), location(s, &r.uri), None)).status, 404);
+        assert_eq!(block_on(respond(&r, Ok(()), location(s, &r.uri), None)).0.status, 404);
         let named = (s.locations[1].path.as_str(), &s.locations[1].level, false);
-        assert_eq!(block_on(respond(&r, Ok(()), named, None)).body, b"n/a");
+        assert_eq!(block_on(respond(&r, Ok(()), named, None)).0.body, b"n/a");
     }
 
     #[test]
