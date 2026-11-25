@@ -71,12 +71,14 @@ fn read(path: &Path, kept: bool) -> std::io::Result<Vec<u8>> {
 /// The certificates of PEM, as OpenSSL's PEM_read_bio_X509_AUX reads them:
 /// those of "CERTIFICATE" blocks and those of "TRUSTED CERTIFICATE" blocks,
 /// whose trust settings after the certificate are left out. Other blocks
-/// are skipped.
+/// are skipped; one that does not hold a certificate fails them all.
 fn certificates(pem: &[u8]) -> Option<Vec<CertificateDer<'static>>> {
     let mut certs = Vec::new();
     for block in x509_parser::pem::Pem::iter_from_buffer(pem) {
         let block = block.ok()?;
-        let rest = match block.label.as_str() { "CERTIFICATE" => 0, "TRUSTED CERTIFICATE" => X509Certificate::from_der(&block.contents).ok()?.0.len(), _ => continue };
+        if !["CERTIFICATE", "TRUSTED CERTIFICATE"].contains(&block.label.as_str()) { continue }
+        let rest = X509Certificate::from_der(&block.contents).ok()?.0.len();
+        let rest = if block.label == "CERTIFICATE" { 0 } else { rest };
         certs.push(CertificateDer::from(block.contents[..block.contents.len() - rest].to_vec()));
     }
     Some(certs)
@@ -191,16 +193,20 @@ impl CertCache {
     }
 }
 
-/// The certificates of a file, in PEM, that clients' certificates are verified with.
+/// The certificates of a file, in PEM, that certificates are verified with:
+/// at least one, as nginx's cache of SSL objects loads them.
 fn trusted(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let certs = read(path, true).ok().and_then(|pem| certificates(&pem));
-    certs.ok_or_else(|| format!("SSL_CTX_load_verify_locations(\"{}\") failed", path.display()))
+    let pem = read(path, true).map_err(|_| format!("cannot load certificate \"{}\": BIO_new_file() failed", path.display()))?;
+    let certs = certificates(&pem).filter(|c| !c.is_empty());
+    certs.ok_or_else(|| format!("cannot load certificate \"{}\": PEM_read_bio_X509_AUX() failed", path.display()))
 }
 
-/// The CRLs of a file, in PEM (ssl_crl, proxy_ssl_crl).
+/// The CRLs of a file, in PEM (ssl_crl, proxy_ssl_crl): at least one, each
+/// a CRL, as nginx's cache of SSL objects loads them.
 fn crls(path: &Path) -> Result<Vec<Vec<u8>>, String> {
-    let crls = read(path, true).ok().and_then(|pem| CertificateRevocationListDer::pem_slice_iter(&pem).map(|c| c.map(|c| c.to_vec())).collect::<Result<_, _>>().ok());
-    crls.ok_or_else(|| format!("X509_LOOKUP_load_file(\"{}\") failed", path.display()))
+    let pem = read(path, true).map_err(|_| format!("cannot load CRL \"{}\": BIO_new_file() failed", path.display()))?;
+    let crls: Option<Vec<Vec<u8>>> = CertificateRevocationListDer::pem_slice_iter(&pem).map(|c| c.ok().filter(|c| CertificateRevocationList::from_der(c).is_ok()).map(|c| c.to_vec())).collect();
+    crls.filter(|c| !c.is_empty()).ok_or_else(|| format!("cannot load CRL \"{}\": PEM_read_bio_X509_CRL() failed", path.display()))
 }
 
 fn provider() -> Arc<CryptoProvider> {
@@ -1210,7 +1216,18 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert!(v.check(&der(END), &[der(INT)], &name("END")).is_ok());
         assert_eq!(v.check(&der(END), &[der(INT)], &name("int")).unwrap_err().to_string(), "unexpected error: upstream SSL certificate does not match \"int\"");
         assert!(v.check(&der(END), &[der(INT)], &name("127.0.0.1")).is_err());
-        assert!(verify(None, Some(&dir.join("none")), 1).unwrap_err().starts_with("X509_LOOKUP_load_file("));
+        assert!(verify(None, Some(&dir.join("none")), 1).unwrap_err().starts_with("cannot load CRL \""));
+        assert!(verify(Some(&dir.join("none")), None, 1).unwrap_err().ends_with("\": BIO_new_file() failed"));
+        // Files with no certificate or CRL, or broken ones, are refused.
+        std::fs::write(dir.join("empty"), "").unwrap();
+        std::fs::write(dir.join("broken"), "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(dir.join("broken.crl"), "-----BEGIN X509 CRL-----\nAAAA\n-----END X509 CRL-----\n").unwrap();
+        for file in ["empty", "broken", "chain.crl"] {
+            assert_eq!(verify(Some(&dir.join(file)), None, 1).unwrap_err(), format!("cannot load certificate \"{}\": PEM_read_bio_X509_AUX() failed", dir.join(file).display()));
+        }
+        for file in ["empty", "broken.crl", "root.crt"] {
+            assert_eq!(verify(None, Some(&dir.join(file)), 1).unwrap_err(), format!("cannot load CRL \"{}\": PEM_read_bio_X509_CRL() failed", dir.join(file).display()));
+        }
         assert!(verify(None, None, 1).unwrap().check(&der(END), &[der(INT)], &name("end")).is_err());
     }
 
