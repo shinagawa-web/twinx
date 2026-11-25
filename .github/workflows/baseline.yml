@@ -84,3 +84,41 @@ jobs:
             ${{ runner.temp }}/judge/out/baseline.json
             ${{ runner.temp }}/judge/out/unit-main.json
           key: nginx-tests-unit-${{ steps.base.outputs.sha }}
+
+      - name: Name the dependencies
+        id: deps
+        if: steps.baseline-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          hash=$({ cat Cargo.lock Cargo.toml rust-toolchain.toml \
+            && PYTHONPATH=harness python3 -c 'import run_tests; print(run_tests.RUST_IMAGE)' \
+            && grep '^RUSTFLAGS_COVERAGE=' harness/judge.sh; } | sha256sum | cut -d ' ' -f 1)
+          echo "key=deps-$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Look for the dependencies
+        id: deps-cache
+        if: steps.baseline-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/deps
+          key: ${{ steps.deps.outputs.key }}
+          lookup-only: true
+
+      # In a directory of their own, since the judge's tree is another one and judge.sh
+      # empties it. Moved, because cargo compares the files' times.
+      - name: Set the dependencies apart from twinx
+        if: steps.baseline-cache.outputs.cache-hit != 'true' && steps.deps-cache.outputs.cache-hit != 'true'
+        run: |
+          deps="$RUNNER_TEMP/deps"
+          mkdir -p "$deps/target/release" "$deps/cargo"
+          cd "$JUDGE_DIR/main/target/release"
+          rm -rf .fingerprint/twinx-* build/twinx-* deps/twinx-*
+          mv .fingerprint build deps "$deps/target/release/"
+          mv "$JUDGE_DIR/cargo/registry" "$deps/cargo/"
+
+      - name: Save the dependencies
+        if: steps.baseline-cache.outputs.cache-hit != 'true' && steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/deps
+          key: ${{ steps.deps.outputs.key }}
