@@ -1254,7 +1254,7 @@ impl<F: Fn(Part)> Drop for Telling<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::tests::{CHUNKED, DELIMITED, GZ, LENGTH, Pieces, after_head, files, letters, listening, log_path, logged, member, passing, pieces_after, plays, sends, served_by, serves_files, serving_on, with_length};
+    use crate::http::tests::{CHUNKED, DELIMITED, GZ, LENGTH, Pieces, after_head, at_once, files, letters, listening, log_path, logged, member, passing, pieces_after, plays, sends, served_by, serves_files, serving_on, with_length};
     use crate::stream::within;
 
     /// A string written Huffman encoded or not, and one decoded.
@@ -2193,14 +2193,14 @@ mod tests {
     fn parts_of_answers_arrive_as_they_come() {
         let _busy = serving_on();
         let length = LENGTH.replace("30000", "4");
-        for (head, parts, closes, directives, want) in [
+        at_once([
             (length.as_str(), &["ab", "c", "d"][..], false, "proxy_buffering off;", vec![OK4, "ab", "c", "d|"]),
             (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], false, "", vec![OK, "ab", "cd", "|"]),
             (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], false, "chunked_transfer_encoding off;", vec![OK, "ab", "cd", "|"]),
             (DELIMITED, &["ab", "cd", ""], true, "proxy_buffering off;", vec![OK, "ab", "cd", "|"]),
             (&length, &["ab", "c", "d"], false, "proxy_buffering off; add_trailer X $upstream_response_length;", vec![OK4, "ab", "c", "d", "x: 4;|"]),
             (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], false, "add_trailer X 1;", vec![OK, "ab", "cd", "x: 1;|"]),
-        ] {
+        ], |(head, parts, closes, directives, want)| {
             let all = got(&after_head(head, parts, 200), closes, directives, "GET");
             assert_eq!(texts(&all), want, "{directives}");
             // The head and the first part come at once, and so do the end of a body and its trailers.
@@ -2209,12 +2209,12 @@ mod tests {
                 let due = start + 200 * (i as u128 - 1).min(2);
                 assert!(part.0 + 20 >= due && part.0 < due + 150, "{i} {all:?}");
             }
-        }
+        });
         // With proxy_buffering on, the head does not wait for the body, which waits for a full buffer or its end.
-        for (head, parts, closes, directives, want) in [(length.as_str(), &["ab", "c", "d"][..], false, "", vec![OK4, "abcd|"]), (DELIMITED, &["ab", "cd", ""], true, "", vec![OK, "abcd|"]), (&length, &["", "ab", "cd"], false, "proxy_buffering off;", vec![OK4, "ab", "cd|"])] {
+        at_once([(length.as_str(), &["ab", "c", "d"][..], false, "", vec![OK4, "abcd|"]), (DELIMITED, &["ab", "cd", ""], true, "", vec![OK, "abcd|"]), (&length, &["", "ab", "cd"], false, "proxy_buffering off;", vec![OK4, "ab", "cd|"])], |(head, parts, closes, directives, want)| {
             let all = got(&after_head(head, parts, 200), closes, directives, "GET");
             assert!(texts(&all) == want && all[0].0 < 150 && all[1].0 >= 180, "{all:?}");
-        }
+        });
     }
 
     #[test]
@@ -2337,7 +2337,7 @@ mod tests {
     fn answers_cut_off_or_malformed_are_reset() {
         let _busy = serving_on();
         let (long, reset) = (":status: 200;content-length: 30000;", "reset 2");
-        for (head, pieces, closes, directives, want) in [
+        at_once([
             (LENGTH, &["ab", "cd", ""][..], true, "", vec![long, "abcd", reset]),
             (LENGTH, &["ab", "cd", ""], true, "proxy_buffering off;", vec![long, "ab", "cd", reset]),
             (LENGTH, &["ab"], true, "", vec![long, "ab", reset]),
@@ -2352,10 +2352,10 @@ mod tests {
             (CHUNKED, &["2\r\nab\r\n", "zz\r\nz"], false, "", vec![OK, "ab", reset]),
             (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\nzz"], false, "", vec![OK, "ab", reset]),
             (CHUNKED, &["2\r\nab\r\nzz"], false, "", vec![reset]),
-        ] {
+        ], |(head, pieces, closes, directives, want)| {
             let all = got(&after_head(head, pieces, 60), closes, directives, "GET");
             assert_eq!(texts(&all), want, "{head} {pieces:?}");
-        }
+        });
     }
 
     #[test]
@@ -2549,11 +2549,11 @@ mod tests {
         let (length, data) = (LENGTH.replace("30000", "5000"), "x".repeat(2500));
         let to_log = format!("access_log {} f;", log.display());
         // 2000 bytes, the head's with them, in each second of the clock, so 4000 at most when it ticks meanwhile.
-        for directives in ["limit_rate 2000;", "limit_rate 2000; proxy_limit_rate 1m;"] {
+        at_once(["limit_rate 2000;", "limit_rate 2000; proxy_limit_rate 1m;"], |directives| {
             let all = got(&after_head(&length, &[&data, &data], 100), false, &format!("{directives} {to_log}"), "GET");
             let last = all.last().unwrap().0;
             assert!((600..3500).contains(&last) && all[1].0 < 300, "{:?}", all.iter().map(|f| (f.0, f.1.len())).collect::<Vec<_>>());
-        }
+        });
         let _ = logged(&log);
         let body = |text: &str| text.split(' ').take(3).map(|n| n.parse::<usize>().unwrap()).collect::<Vec<_>>();
         let mut bytes = Vec::new();
