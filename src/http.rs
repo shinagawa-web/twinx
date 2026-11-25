@@ -917,11 +917,13 @@ fn special(status: u16) -> Response {
     // 494, a header line too long, is answered as 400 with a page of its own.
     let (status, body) = match status {
         494 => (400, page_with(400, "Request Header Or Cookie Too Large", "<center>Request Header Or Cookie Too Large</center>\r\n")),
-        // A client's certificate that did not verify (495), or none (496).
-        495 | 496 => { let text = ["The SSL certificate error", "No required SSL certificate was sent"][usize::from(status == 496)]; (400, page_with(400, text, &format!("<center>{text}</center>\r\n"))) }
+        // A client's certificate that did not verify (495), none (496), and a
+        // plain request to an address that takes TLS (497) keep their status for
+        // error_page, and are answered as 400 with a page of their own.
+        495..=497 => { let text = ["The SSL certificate error", "No required SSL certificate was sent", TO_HTTPS][usize::from(status - 495)]; (status, page_with(400, text, &format!("<center>{text}</center>\r\n"))) }
         // 498, a request canceled, has the page of 404.
         498 => (498, page(404)),
-        301..=303 | 307 | 308 | 400..=416 | 421 | 429 | 497 | 500..=505 | 507 => (status, page(status)),
+        301..=303 | 307 | 308 | 400..=416 | 421 | 429 | 500..=505 | 507 => (status, page(status)),
         // nginx has no page for any other status: its answer is empty, without a type.
         _ => return Response { status, generated: true, ..Response::default() },
     };
@@ -1172,8 +1174,8 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             resp = if url.starts_with('@') { special(500) } else { redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url) };
         }
     }
-    // 497, a plain request to an address that takes TLS, is answered as 400 with a page of its own when error_page does not take it.
-    if resp.status == 497 && resp.generated { (resp.status, resp.body) = (400, page_with(400, TO_HTTPS, &format!("<center>{TO_HTTPS}</center>\r\n")).into_bytes()); }
+    // The errors of TLS that error_page did not take are answered as 400.
+    if (495..=497).contains(&resp.status) && resp.generated { resp.status = 400; }
     // The headers and the log see the request as the last internal redirect left it ($uri).
     let r = &*last;
     not_modified(r, level, &mut resp);
@@ -4019,7 +4021,9 @@ pub(crate) mod tests {
         assert_eq!(cert_error(2, ssl("NONE").as_ref()), Ok(()));
         assert_eq!(cert_error(0, ssl("FAILED:certificate revoked").as_ref()), Ok(()));
         assert_eq!(cert_error(1, None), Ok(()));
-        assert_eq!(special(495).status, 400);
+        // Kept for error_page; exchange() answers them as 400.
+        assert_eq!(special(495).status, 495);
+        assert!(String::from_utf8(special(495).body).unwrap().starts_with("<html>\r\n<head><title>400 The SSL certificate error</title>"));
         assert!(String::from_utf8(special(496).body).unwrap().contains("<center>No required SSL certificate was sent</center>"));
     }
 
