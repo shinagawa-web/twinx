@@ -42,11 +42,12 @@ cargo_in() {
 }
 
 # Run cargo test in the tree at $1 with coverage; succeeds only when the tests do.
-# Writes the share of src/ the unit tests run to $2 (recorded, not judged).
+# Writes the share of src/ the unit tests run and their time to $2 (recorded, not judged).
 unit_tests() {
-  local tree=$1 out=$2 profiles="$JUDGE_DIR/unit-profiles"
+  local tree=$1 out=$2 profiles="$JUDGE_DIR/unit-profiles" seconds=$SECONDS
   rm -rf "$profiles" && mkdir -p "$profiles" && chmod 0777 "$profiles"
   UNIT_PROFILES="$profiles" cargo_in "$tree" none "$RUSTFLAGS_COVERAGE" test --release --offline || return 1
+  seconds=$((SECONDS - seconds))
   local objects=()
   mapfile -t objects < <(cargo_in "$tree" none "$RUSTFLAGS_COVERAGE" test --release --offline --no-run \
     --message-format=json 2>/dev/null | python3 -I -c '
@@ -65,7 +66,8 @@ for line in sys.stdin:
         "$bin/llvm-cov" export "$first" $(for o in "$@"; do printf -- "-object %s " "$o"; done) \
           -instr-profile=/tmp/merged.profdata -format=lcov --ignore-filename-regex="/registry/src/|/rustc/"' \
       sh "${objects[@]}" > "$out.lcov" \
-      && python3 "$HARNESS/unit_coverage.py" --lcov "$out.lcov" --tree "$tree" --out "$out" || true
+      && python3 "$HARNESS/unit_coverage.py" --lcov "$out.lcov" --tree "$tree" \
+        --seconds "$seconds" --out "$out" || true
   fi
 }
 

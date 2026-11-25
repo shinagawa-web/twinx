@@ -44,6 +44,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--lcov", required=True, help="LCOV exported from cargo test's profiles")
     parser.add_argument("--tree", required=True, help="the source tree the tests were built from")
+    parser.add_argument("--seconds", type=int, help="how long cargo test took")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -68,7 +69,8 @@ def main():
             total += 1
             covered += count > 0
     result = {"lines": total, "covered": covered,
-              "percent": round(100.0 * covered / total, 2) if total else None}
+              "percent": round(100.0 * covered / total, 2) if total else None,
+              "seconds": args.seconds}
     Path(args.out).write_text(json.dumps(result, indent=2))
     print(json.dumps(result))
     return 0

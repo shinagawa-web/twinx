@@ -73,6 +73,10 @@ def load_json(path):
     return json.loads(Path(path).read_text()) if path and Path(path).exists() else None
 
 
+def unit_time(unit):
+    return f", in {unit['seconds']} s" if unit.get("seconds") is not None else ""
+
+
 def markdown(verdict):
     lines = [f"## judge: {'pass' if verdict['passed'] else 'fail'}", ""]
     if verdict["problems"]:
@@ -98,9 +102,9 @@ def markdown(verdict):
     unit, unit_main = verdict.get("unit"), verdict.get("unit_main")
     if unit and unit.get("percent") is not None:
         # Recorded, not judged: the whole of src/ the unit tests run, against main.
-        main_part = f"; main: {unit_main['percent']}%" if unit_main and unit_main.get("percent") is not None else ""
+        main_part = f"; main: {unit_main['percent']}%{unit_time(unit_main)}" if unit_main and unit_main.get("percent") is not None else ""
         lines.append(f"- src/ lines run by the unit tests (recorded, not judged): {unit['covered']} of "
-                     f"{unit['lines']} ({unit['percent']}%){main_part}")
+                     f"{unit['lines']} ({unit['percent']}%){unit_time(unit)}{main_part}")
     lines += ["", f"main `{verdict['base'][:7]}`, pull request head `{verdict['head'][:7]}`"]
     return "\n".join(lines) + "\n"
 
