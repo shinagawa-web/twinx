@@ -900,10 +900,15 @@ impl Builder<'_> {
             self.upstreams.insert(d.args[0].clone(), Arc::new(upstream));
         }
         // The zones of proxy_cache_path are known before proxy_cache names them.
+        let mut cache_paths: Vec<(PathBuf, String)> = Vec::new();
         for d in block.iter().filter(|d| d.name == "proxy_cache_path") {
             self.check(d, HTTP)?;
-            let name = crate::cache::zone_name(&d.args[1..]).ok_or_else(|| format!("\"{}\" must have \"keys_zone\" parameter in {}", d.name, d.at))?;
-            self.zones.insert(name.to_string(), Arc::new(crate::cache::Zone::at(self.path(&d.args[0]))));
+            let (name, levels) = cache_path(&d.args[1..]).map_err(|e| format!("{e} in {}", d.at))?;
+            if self.zones.contains_key(&name) { return Err(format!("duplicate zone \"{name}\" in {}", d.at)); }
+            let path = self.path(d.args[0].strip_suffix('/').unwrap_or(&d.args[0]));
+            if let Some((_, first)) = cache_paths.iter().find(|p| p.0 == path) { return Err(format!("the same path name \"{}\" used in {first} and in {at} in {at}", path.display(), at = d.at)); }
+            cache_paths.push((path.clone(), d.at.clone()));
+            self.zones.insert(name, Arc::new(crate::cache::Zone::at(path, &levels)));
         }
         // Named captures of server names are variables everywhere, so they are known first.
         let names = block.iter().filter(|d| d.name == "server").flat_map(|d| d.block.iter().flatten()).filter(|d| d.name == "server_name");
@@ -1216,7 +1221,7 @@ impl Builder<'_> {
                 "proxy_cache_min_uses" => level.proxy_cache_min_uses = d.args[0].parse().map_err(|_| at("invalid number".into()))?,
                 "proxy_cache_max_range_offset" => level.proxy_cache_max_range_offset = Some(offset(&d.args[0]).map_err(|_| invalid())?),
                 "proxy_cache_use_stale" => {
-                    const VALUES: &[&str] = &["error", "timeout", "invalid_header", "updating", "http_500", "http_502", "http_503", "http_504", "http_403", "http_404", "http_429", "off"];
+                    const VALUES: &[&str] = &["error", "timeout", "invalid_header", "updating", "http_500", "http_502", "http_503", "http_504", "http_403", "http_404", "http_429", "non_idempotent", "off"];
                     if let Some(a) = d.args.iter().find(|a| !VALUES.contains(&a.as_str())) { return Err(at(format!("invalid value \"{a}\""))); }
                     level.proxy_cache_use_stale = if d.args.iter().any(|a| a == "off") { Vec::new() } else { d.args.clone() };
                 }
@@ -1841,6 +1846,38 @@ fn check_proxy_buffers(l: &Level) -> Result<(), String> {
     Ok(())
 }
 
+/// The parameters of proxy_cache_path after its path, as ngx_http_file_cache_set_slot() reads
+/// them: the name of its zone, and the levels of its subdirectories.
+fn cache_path(args: &[String]) -> Result<(String, Vec<usize>), String> {
+    let (mut zone, mut levels) = (None, Vec::new());
+    for a in args {
+        let Some((name, value)) = a.split_once('=') else { return Err(format!("invalid parameter \"{a}\"")) };
+        let ok = match name {
+            // One to three levels of one or two characters.
+            "levels" => {
+                let parsed: Option<Vec<usize>> = if value.is_empty() { Some(Vec::new()) } else { value.split(':').map(|l| matches!(l, "1" | "2").then(|| l.parse().unwrap())).collect() };
+                levels = parsed.filter(|l| l.len() <= 3).ok_or_else(|| format!("invalid \"levels\" \"{a}\""))?;
+                true
+            }
+            "use_temp_path" => matches!(value, "on" | "off"),
+            "keys_zone" => {
+                let (n, s) = value.split_once(':').ok_or_else(|| format!("invalid keys zone size \"{a}\""))?;
+                let s = size(s).map_err(|_| format!("invalid keys zone size \"{a}\""))?;
+                if s < 2 * page_size() { return Err(format!("keys zone \"{a}\" is too small")); }
+                zone = Some(n.to_string()).filter(|n| !n.is_empty());
+                true
+            }
+            "inactive" => crate::expires::parse_time(value).is_some(),
+            "max_size" | "min_free" => offset(value).is_ok(),
+            // The loader's and the manager's: numbers of files, and times.
+            _ if ["loader_files", "loader_sleep", "loader_threshold", "manager_files", "manager_sleep", "manager_threshold"].contains(&name) => if name.ends_with("files") { value.parse::<u32>().is_ok() } else { millis(value).is_ok() },
+            _ => return Err(format!("invalid parameter \"{a}\"")),
+        };
+        if !ok { return Err(format!("invalid {name} value \"{a}\"")); }
+    }
+    Ok((zone.ok_or("\"proxy_cache_path\" must have \"keys_zone\" parameter")?, levels))
+}
+
 /// The levels of a temporary path: each a number above 0, ten digits at most in all.
 fn temp_levels(args: &[String]) -> Option<Vec<usize>> {
     let levels: Vec<usize> = args.iter().map(|a| a.parse().ok().filter(|&n| n > 0 && a.bytes().all(|c| c.is_ascii_digit()))).collect::<Option<_>>()?;
@@ -1987,6 +2024,19 @@ mod tests {
         let c = build_text("http { proxy_cache_path c keys_zone=Z:1m; proxy_cache_lock on; server { listen 127.0.0.1:8080; location / { } location /off { proxy_cache_lock off; } } }").unwrap();
         assert_eq!(c.servers[0].locations.iter().map(|l| l.level.proxy_cache_lock).collect::<Vec<_>>(), [true, false]);
         assert!(build_text("http { proxy_cache_lock yes; }").is_err());
+        let refused = |paths: &str| build_text(&format!("http {{ {paths} }}")).unwrap_err();
+        assert_eq!(refused("proxy_cache_path c levels=3 keys_zone=A:1m;"), "invalid \"levels\" \"levels=3\" in t.conf:1");
+        assert_eq!(refused("proxy_cache_path c levels=1:1:1:1 keys_zone=A:1m;"), "invalid \"levels\" \"levels=1:1:1:1\" in t.conf:1");
+        assert_eq!(refused("proxy_cache_path c keys_zone=A;"), "invalid keys zone size \"keys_zone=A\" in t.conf:1");
+        assert_eq!(refused("proxy_cache_path c keys_zone=A:x;"), "invalid keys zone size \"keys_zone=A:x\" in t.conf:1");
+        assert_eq!(refused("proxy_cache_path c keys_zone=A:1k;"), "keys zone \"keys_zone=A:1k\" is too small in t.conf:1");
+        assert_eq!(refused("proxy_cache_path c keys_zone=A:1m inactive=x;"), "invalid inactive value \"inactive=x\" in t.conf:1");
+        assert_eq!(refused("proxy_cache_path c keys_zone=A:1m manager_files=x;"), "invalid manager_files value \"manager_files=x\" in t.conf:1");
+        assert_eq!(refused("proxy_cache_path c keys_zone=A:1m nosuch;"), "invalid parameter \"nosuch\" in t.conf:1");
+        assert_eq!(refused("proxy_cache_path c keys_zone=A:1m nosuch=1;"), "invalid parameter \"nosuch=1\" in t.conf:1");
+        assert_eq!(refused("proxy_cache_path c keys_zone=A:1m; proxy_cache_path d keys_zone=A:1m;"), "duplicate zone \"A\" in t.conf:1");
+        assert!(refused("proxy_cache_path c keys_zone=A:1m; proxy_cache_path c/ keys_zone=B:1m;").starts_with("the same path name"));
+        assert!(build_text("http { proxy_cache_path c levels= keys_zone=A:1m use_temp_path=off inactive=1h max_size=1g min_free=1m loader_files=10 manager_sleep=50ms; proxy_cache_use_stale error non_idempotent; }").is_ok());
         let c = build_text("http { proxy_cache_lock_timeout 200ms; server { listen 127.0.0.1:8080; location / { } location /s { proxy_cache_lock_timeout 2s; } } server { listen 127.0.0.1:8081; } }").unwrap();
         assert_eq!(c.servers[0].locations.iter().map(|l| l.level.proxy_cache_lock_timeout).collect::<Vec<_>>(), [Duration::from_millis(200), Duration::from_secs(2)]);
         assert_eq!(build_text("http { server { listen 127.0.0.1:8080; } }").unwrap().servers[0].level.proxy_cache_lock_timeout, crate::cache::LOCK_TIMEOUT);

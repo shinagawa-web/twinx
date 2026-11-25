@@ -120,6 +120,8 @@ pub fn variant(names: &[String], request: &[(String, String)]) -> String {
 #[derive(Debug, Default)]
 pub struct Zone {
     dir: Option<std::path::PathBuf>,
+    /// The lengths of the subdirectories its files are in (levels=).
+    levels: Vec<usize>,
     entries: Mutex<HashMap<String, Entry>>,
     /// proxy_cache_lock: what a request that asks the server for a key holds meanwhile.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -151,17 +153,42 @@ impl Refresh<'_> {
 pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Zone {
-    /// A zone that keeps its answers in files under a path, with those already there.
-    pub fn at(dir: std::path::PathBuf) -> Zone {
-        let files = std::fs::read_dir(&dir).into_iter().flatten().flatten();
-        let entries = files.filter_map(|f| decode(&std::fs::read(f.path()).ok()?)).collect();
-        Zone { dir: Some(dir), entries: Mutex::new(entries), ..Zone::default() }
+    /// A zone that keeps its answers in files under a path, in subdirectories of these levels,
+    /// with those already there.
+    pub fn at(dir: std::path::PathBuf, levels: &[usize]) -> Zone {
+        fn files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for f in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                if f.file_type().is_ok_and(|t| t.is_dir()) { files(&f.path(), found) } else { found.push(f.path()) }
+            }
+        }
+        let mut found = Vec::new();
+        files(&dir, &mut found);
+        let entries = found.iter().filter_map(|f| decode(&std::fs::read(f).ok()?)).collect();
+        Zone { dir: Some(dir), levels: levels.to_vec(), entries: Mutex::new(entries), ..Zone::default() }
+    }
+
+    /// The file of a key: the MD5 of the key in hex, in subdirectories named by the levels,
+    /// each taken from the end of the name (levels=1:2: c/29/b7f54b2df7773722d382f4809d65029c).
+    fn file(&self, dir: &std::path::Path, key: &str) -> std::path::PathBuf {
+        use md5::Digest;
+        let name = md5::Md5::digest(key.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let (mut path, mut end) = (dir.to_path_buf(), name.len());
+        for &l in &self.levels { path.push(&name[end - l..end]); end -= l; }
+        path.join(name)
+    }
+
+    /// What is kept for a key, as long as its file still holds it: one whose file was removed,
+    /// or holds something else, is no longer kept, as nginx no longer finds it.
+    fn kept<'a>(&self, entries: &'a mut HashMap<String, Entry>, key: &str) -> Option<&'a Entry> {
+        let Some(dir) = &self.dir else { return entries.get(key) };
+        if entries.contains_key(key) && std::fs::read(self.file(dir, key)).ok().and_then(|b| decode(&b)).is_none_or(|(k, _)| k != key) { entries.remove(key); }
+        entries.get(key)
     }
 
     /// The key an answer to a request is kept by: that of the variant of the request when
     /// what the key keeps has a Vary its headers do not match.
     pub fn resolve(&self, key: &str, request: &[(String, String)]) -> String {
-        match self.entries.lock().unwrap().get(key).map(|e| (variant(&e.vary, request), e)) {
+        match self.kept(&mut self.entries.lock().unwrap(), key).map(|e| (variant(&e.vary, request), e)) {
             Some((v, e)) if !e.vary.is_empty() && v != e.variant => format!("{key}\n{v}"),
             _ => key.to_string(),
         }
@@ -170,19 +197,19 @@ impl Zone {
     /// Writes what is kept for a key to its file.
     fn save(&self, key: &str, e: &Entry) {
         let Some(dir) = &self.dir else { return };
-        let name = ring::digest::digest(&ring::digest::SHA256, key.as_bytes()).as_ref()[..16].iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let (file, temp) = (dir.join(&name), dir.join(format!("{name}.tmp")));
-        let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&temp, encode(key, e))).and_then(|()| std::fs::rename(&temp, &file));
+        let file = self.file(dir, key);
+        let temp = file.with_extension("tmp");
+        let _ = std::fs::create_dir_all(file.parent().unwrap_or(dir)).and_then(|()| std::fs::write(&temp, encode(key, e))).and_then(|()| std::fs::rename(&temp, &file));
     }
 
     /// The answer kept for a key, while it is valid.
     pub fn get(&self, key: &str) -> Option<Entry> {
-        self.entries.lock().unwrap().get(key).filter(|e| e.until >= crate::clock::seconds()).cloned()
+        self.kept(&mut self.entries.lock().unwrap(), key).filter(|e| e.until >= crate::clock::seconds()).cloned()
     }
 
     /// The answer kept for a key, also once it is no longer valid (proxy_cache_use_stale).
     pub fn stale(&self, key: &str) -> Option<Entry> {
-        self.entries.lock().unwrap().get(key).cloned()
+        self.kept(&mut self.entries.lock().unwrap(), key).cloned()
     }
 
     /// Notes that a request asks the server to update what is kept for a key, unless another
@@ -267,13 +294,6 @@ fn decode(b: &[u8]) -> Option<(String, Entry)> {
     Some((key, Entry { status: status.parse().ok()?, ctype: (typed == "true").then_some(ctype), headers, body, length: length.parse().ok(), relative: relative == "true", line: (lined == "true").then_some(line), upstream, until: until.parse().ok()?, updating: updating.parse().ok()?, vary, variant }))
 }
 
-/// The zone of a proxy_cache_path's parameters: the name keys_zone= gives it.
-pub fn zone_name(args: &[String]) -> Option<&str> {
-    let zone = args.iter().find_map(|a| a.strip_prefix("keys_zone="))?;
-    let (name, size) = zone.split_once(':')?;
-    Some(name).filter(|n| !n.is_empty() && !size.is_empty())
-}
-
 /// proxy_cache_valid: the statuses an answer is cached with (none: 200, 301 and 302;
 /// "any": all of them), and for how long.
 pub fn valid(args: &[String], time: Duration) -> Result<Vec<(Option<u16>, Duration)>, String> {
@@ -296,13 +316,6 @@ mod tests {
 
     fn strings(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn zone_names() {
-        assert_eq!(zone_name(&strings(&["/tmp/c", "levels=1:2", "keys_zone=NAME:1m"])), Some("NAME"));
-        assert_eq!(zone_name(&strings(&["/tmp/c", "keys_zone=NAME"])), None);
-        assert_eq!(zone_name(&strings(&["/tmp/c"])), None);
     }
 
     #[test]
@@ -437,14 +450,14 @@ mod tests {
     fn kept_in_files() {
         let dir = std::env::temp_dir().join(format!("twinx-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let z = Zone::at(dir.clone());
+        let z = Zone::at(dir.clone(), &[1, 2]);
         let valid = (crate::clock::seconds() + 60, 5);
         let headers = h(&[("ETag", "\"x\""), ("Vary", "Foo")]);
         z.put(("k", "k"), (200, Some("text/plain".into()), headers.clone(), b"body".to_vec()), (None, false, None, Vec::new()), valid, (vec!["foo".into()], &h(&[("Foo", "1")])));
         z.put(("n", "n"), (404, None, Vec::new(), Vec::new()), (Some(3), true, Some("404 Gone".into()), h(&[("X-A", "a"), ("X-A", "b")])), valid, (Vec::new(), &[]));
         z.renew("n", (valid.0 + 1, 0));
         std::fs::write(dir.join("junk"), b"x").unwrap();
-        let again = Zone::at(dir.clone());
+        let again = Zone::at(dir.clone(), &[1, 2]);
         let e = again.get("k").unwrap();
         assert_eq!((e.status, e.ctype.as_deref(), e.headers.clone(), e.body.clone(), e.updating), (200, Some("text/plain"), headers, b"body".to_vec(), 5));
         assert_eq!(again.resolve("k", &h(&[("Foo", "2")])), "k\nfoo:2\n");
@@ -452,6 +465,14 @@ mod tests {
         assert_eq!(again.get("n").map(|e| (e.line, e.upstream)), Some((Some("404 Gone".into()), h(&[("X-A", "a"), ("X-A", "b")]))));
         assert_eq!((e.length, e.relative), (None, false));
         assert!(decode(&encode("k", &e)[..20]).is_none());
+        // Named by the MD5 of the key, under its levels; one whose file is gone or holds
+        // something else is no longer kept.
+        let file = dir.join("1/3a/7b8b965ad4bca0e41ab51de7b31363a1");
+        assert!(file.is_file() && again.file(&dir, "n") == file);
+        std::fs::write(&file, b"garbage").unwrap();
+        assert!(again.get("n").is_none() && again.stale("n").is_none());
+        std::fs::remove_file(again.file(&dir, "k")).unwrap();
+        assert!(again.stale("k").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
