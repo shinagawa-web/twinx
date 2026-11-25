@@ -4743,11 +4743,10 @@ pub(crate) mod tests {
     #[test]
     fn clients_may_go_away_at_any_point() {
         let _busy = serving_on();
-        let log = log_path("gone");
         let length = LENGTH.replace("30000", "60000000");
         let big = "x".repeat(8 << 20);
-        for resets in [false, true] {
-            for (pieces, directives, reads, status) in [
+        at_once([false, true], |resets| {
+            at_once([
                 // Before the body, after the first of it, in it, while it is paced, and while the client takes no more.
                 (vec![(0, length.clone().into_bytes())], "", 0, "499"),
                 (vec![(0, length.clone().into_bytes())], OFF, 1, "200"),
@@ -4757,7 +4756,8 @@ pub(crate) mod tests {
                 (after_head(&length, &["ab", &"x".repeat(5000)], 0), "limit_rate 500;", 1, "200"),
                 (after_head(&length, &["ab", &big, &big], 0), "proxy_max_temp_file_size 0;", 1, "200"),
                 (after_head(CHUNKED, &["2\r\nab\r\n"], 0), "", 1, "200"),
-            ] {
+            ], |(pieces, directives, reads, status)| {
+                let log = log_path("gone");
                 let (addr, count) = plays(&pieces, false);
                 block_on(async {
                     let (mut client, task) = served_by(&passing(addr, &format!("{directives} access_log {} f;", log.display()))).await;
@@ -4776,8 +4776,8 @@ pub(crate) mod tests {
                 // The server's connection is closed at once.
                 let started = Instant::now();
                 while count.lock().unwrap()[1] == 0 { assert!(started.elapsed() < Duration::from_secs(2)); thread::sleep(Duration::from_millis(1)); }
-            }
-        }
+            });
+        });
         // One that closes its side only has gone away too; one that takes nothing for send_timeout as well.
         let (addr, count) = plays(&after_head(&length, &["ab"], 0), false);
         block_on(async {
@@ -4884,7 +4884,7 @@ pub(crate) mod tests {
         let (got, whole) = data_of(&block_on(got_late(&http, HTTP11, || true)));
         assert!(got == long.as_bytes() && whole, "{} {} {:?}", got.len(), long.len(), got.iter().zip(long.as_bytes()).position(|(a, b)| a != b));
         // Without a file, or with a small one, it is held back, and so it is without buffering.
-        for directives in ["proxy_max_temp_file_size 0;", "proxy_max_temp_file_size 16k;", OFF] {
+        at_once(["proxy_max_temp_file_size 0;", "proxy_max_temp_file_size 16k;", OFF], |directives| {
             let (addr, count) = plays(&vec![(0, with_length.clone())], false);
             let http = passing(addr, &format!("proxy_temp_path {}; {directives}", dir.display()));
             let started = Instant::now();
@@ -4897,7 +4897,7 @@ pub(crate) mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 assert_eq!(*count.lock().unwrap(), [1, 0, 0], "{directives}");
             });
-        }
+        });
         // The directories are left, with no file in them.
         assert!(dir.exists());
         fn files(dir: &std::path::Path) -> usize {
@@ -5570,16 +5570,13 @@ pub(crate) mod tests {
             // After a whole body nothing more is read.
             (format!("{}ab", LENGTH.replace("30000", "2")), http10, "", format!("{}ab", head("Content-Length: 2\r\n", "close"))),
         ];
-        block_on(async {
-            // At once, as each waits for the timeout.
-            for rate in RATES {
-                let all: Vec<_> = [false, true].into_iter().flat_map(|resets| cases.iter().cloned().map(move |c| (c, resets))).map(|((answer, request, directives, want), resets)| tokio::task::spawn_local(async move {
-                    let directives = format!("{directives} {rate}");
-                    assert_eq!(failed_on(&answer, resets, &directives, request).await, want, "{answer} {resets} {directives}");
-                })).collect();
-                for task in all { task.await.unwrap(); }
-            }
-        });
+        at_once(RATES, |rate| block_on(async {
+            let all: Vec<_> = [false, true].into_iter().flat_map(|resets| cases.iter().cloned().map(move |c| (c, resets))).map(|((answer, request, directives, want), resets)| tokio::task::spawn_local(async move {
+                let directives = format!("{directives} {rate}");
+                assert_eq!(failed_on(&answer, resets, &directives, request).await, want, "{answer} {resets} {directives}");
+            })).collect();
+            for task in all { task.await.unwrap(); }
+        }));
     }
 
     #[test]
@@ -7574,10 +7571,12 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     /// Sends a file with the directives to a client, until what ends that.
     fn sent_until(name: &str, cases: &[(&str, &str)]) {
-        let (dir, data) = (files(name), letters(16 << 20));
-        std::fs::write(dir.join("f"), &data).unwrap();
-        for &(directives, ends) in cases {
-            let _ = std::fs::remove_file(dir.join("log"));
+        let (all, data) = (files(name), letters(16 << 20));
+        std::fs::write(all.join("f"), &data).unwrap();
+        let one = |(i, &(directives, ends)): (usize, &(&str, &str))| {
+            let dir = all.join(i.to_string());
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::hard_link(all.join("f"), dir.join("f")).unwrap();
             block_on(async {
                 let (mut client, task) = served_by(&serves_files(&dir, directives)).await;
                 client.write_all(b"GET /f HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
@@ -7599,8 +7598,10 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                 let line: Vec<usize> = log.trim_end().split(' ').map(|n| n.parse().unwrap()).collect();
                 assert!(line[0] == 200 && line[1] >= came && line[2] < line[1] && line[1] < data.len(), "{directives} {ends} {log}");
             });
-        }
-        std::fs::remove_dir_all(dir).unwrap();
+        };
+        // What halts one of them halts all.
+        if cases[0].1 == "halt" { cases.iter().enumerate().for_each(one) } else { at_once(cases.iter().enumerate(), one) }
+        std::fs::remove_dir_all(all).unwrap();
     }
 
     #[test]
