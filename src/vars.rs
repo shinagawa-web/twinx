@@ -31,6 +31,9 @@ pub struct Shared {
     pub cache_status: std::sync::Mutex<Option<&'static str>>,
     /// Whether the request updates the cache in the background (proxy_cache_background_update).
     pub updater: bool,
+    /// The request that updates the cache in the background, which the connection waits
+    /// for before it reads the next request, as nginx's does for its subrequest.
+    pub background: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The status of the error that error_page redirected the request for ($status meanwhile).
     pub err_status: std::sync::atomic::AtomicU16,
     /// The settings of the location of the request that name its files, once

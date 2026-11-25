@@ -171,6 +171,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("proxy_cache_key", HSL, 1, 1, false),
     ("proxy_cache_background_update", HSL, 1, 1, false),
     ("proxy_cache_convert_head", HSL, 1, 1, false),
+    ("proxy_cache_methods", HSL, 1, usize::MAX, false),
     ("proxy_cache_revalidate", HSL, 1, 1, false),
     ("proxy_force_ranges", HSL, 1, 1, false),
     ("max_ranges", HSL, 1, 1, false),
@@ -501,6 +502,8 @@ pub struct Level {
     pub proxy_cache_background_update: bool,
     /// proxy_cache_convert_head: a HEAD that may be cached asks the server with GET (on by default).
     pub proxy_cache_convert_head: bool,
+    /// proxy_cache_methods: whether a POST may be cached too, as GET and HEAD always may.
+    pub proxy_cache_post: bool,
     /// proxy_cache_revalidate: what is kept but no longer valid is asked for with the
     /// conditions of its Last-Modified and ETag, and kept again when the server says 304.
     pub proxy_cache_revalidate: bool,
@@ -1232,6 +1235,10 @@ impl Builder<'_> {
                 "proxy_cache_key" => level.proxy_cache_key = Some(Template::parse(&d.args[0]).map_err(at)?),
                 "proxy_cache_background_update" => level.proxy_cache_background_update = flag(d).map_err(at)?,
                 "proxy_cache_convert_head" => level.proxy_cache_convert_head = flag(d).map_err(at)?,
+                "proxy_cache_methods" => {
+                    if let Some(a) = d.args.iter().find(|a| !["GET", "HEAD", "POST"].iter().any(|m| m.eq_ignore_ascii_case(a))) { return Err(at(format!("invalid value \"{a}\""))); }
+                    level.proxy_cache_post = d.args.iter().any(|a| a.eq_ignore_ascii_case("POST"));
+                }
                 "proxy_cache_revalidate" => level.proxy_cache_revalidate = flag(d).map_err(at)?,
                 "proxy_force_ranges" => level.proxy_force_ranges = flag(d).map_err(at)?,
                 "max_ranges" => level.max_ranges = Some(d.args[0].parse().map_err(|_| at("invalid number".into()))?),
@@ -2024,6 +2031,9 @@ mod tests {
         let c = build_text("http { proxy_cache_path c keys_zone=Z:1m; proxy_cache_lock on; server { listen 127.0.0.1:8080; location / { } location /off { proxy_cache_lock off; } } }").unwrap();
         assert_eq!(c.servers[0].locations.iter().map(|l| l.level.proxy_cache_lock).collect::<Vec<_>>(), [true, false]);
         assert!(build_text("http { proxy_cache_lock yes; }").is_err());
+        let c = build_text("http { proxy_cache_methods get; server { listen 127.0.0.1:8080; location / { } location /post { proxy_cache_methods POST; } } }").unwrap();
+        assert_eq!(c.servers[0].locations.iter().map(|l| l.level.proxy_cache_post).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(build_text("http { proxy_cache_methods PUT; }").unwrap_err(), "invalid value \"PUT\" in t.conf:1");
         let refused = |paths: &str| build_text(&format!("http {{ {paths} }}")).unwrap_err();
         assert_eq!(refused("proxy_cache_path c levels=3 keys_zone=A:1m;"), "invalid \"levels\" \"levels=3\" in t.conf:1");
         assert_eq!(refused("proxy_cache_path c levels=1:1:1:1 keys_zone=A:1m;"), "invalid \"levels\" \"levels=1:1:1:1\" in t.conf:1");

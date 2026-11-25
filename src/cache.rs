@@ -25,6 +25,8 @@ pub struct Entry {
     pub upstream: Vec<(String, String)>,
     until: i64,
     updating: i64,
+    /// For how long after that it may be given when its server fails (stale-if-error).
+    error: i64,
     /// The request headers its Vary names, lowercase, and their values in the request it answered.
     vary: Vec<String>,
     variant: String,
@@ -38,6 +40,11 @@ impl Entry {
         let header = |name: &str| self.headers.iter().rev().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
         let modified = header("last-modified").and_then(|v| crate::expires::http_time(&v)).map(|t| ("If-Modified-Since", crate::expires::http_date(t)));
         modified.into_iter().chain(header("etag").map(|e| ("If-None-Match", e))).collect()
+    }
+
+    /// Whether it may still be given when its server fails (c->stale_error).
+    pub fn erring(&self) -> bool {
+        self.until.saturating_add(self.error) >= crate::clock::seconds()
     }
 
     /// Whether it may still be given while it is being updated (c->stale_updating).
@@ -88,6 +95,13 @@ pub fn said(headers: &[(String, String)], ignored: &[String], now: i64) -> Optio
         }
     }
     (!no_cache && !expired).then_some((valid.filter(|&v| v != 0), updating))
+}
+
+/// For how long after an answer is no longer valid it may be given when its server fails, as
+/// the stale-if-error of its Cache-Control says, unless proxy_ignore_headers has Cache-Control.
+pub fn stale_if_error(headers: &[(String, String)], ignored: &[String]) -> i64 {
+    let controls = headers.iter().filter(|h| h.0.eq_ignore_ascii_case("cache-control") && !ignored.iter().any(|i| i == "cache-control"));
+    controls.filter_map(|h| { let lower = h.1.to_ascii_lowercase(); lower.find("stale-if-error=").and_then(|i| seconds(&lower[i + 15..])) }).last().unwrap_or(0)
 }
 
 /// The seconds a directive of Cache-Control gives, up to ",", ";" or " " (as many as
@@ -243,10 +257,10 @@ impl Zone {
     /// Keeps an answer for a key, valid until then, and given while it is updated for so long after.
     /// One looked up by the key of a variant is kept by it when its Vary gives the same variant,
     /// and else by the key itself, as nginx does (ngx_http_file_cache_update_variant()).
-    pub fn put(&self, (key, at): (&str, &str), (status, ctype, headers, body): (u16, Option<String>, Vec<(String, String)>, Vec<u8>), (length, line, upstream): (Option<usize>, Option<String>, Vec<(String, String)>), (until, updating): (i64, i64), (vary, request): (Vec<String>, &[(String, String)])) {
+    pub fn put(&self, (key, at): (&str, &str), (status, ctype, headers, body): (u16, Option<String>, Vec<(String, String)>, Vec<u8>), (length, line, upstream): (Option<usize>, Option<String>, Vec<(String, String)>), (until, updating, error): (i64, i64, i64), (vary, request): (Vec<String>, &[(String, String)])) {
         let variant = variant(&vary, request);
         let key = if at == key || (!vary.is_empty() && at == format!("{key}\n{variant}")) { at } else { key };
-        let e = Entry { status, ctype, headers, body, length, line, upstream, until, updating, vary, variant };
+        let e = Entry { status, ctype, headers, body, length, line, upstream, until, updating, error, vary, variant };
         self.save(key, &e);
         self.entries.lock().unwrap().insert(key.to_string(), e);
     }
@@ -273,7 +287,7 @@ impl Zone {
 
 /// What the file of a kept answer holds: its key and fields, each after its length.
 fn encode(key: &str, e: &Entry) -> Vec<u8> {
-    let mut fields = vec![key.to_string(), e.status.to_string(), e.until.to_string(), e.updating.to_string(), e.vary.join(","), e.variant.clone(), e.ctype.is_some().to_string(), e.ctype.clone().unwrap_or_default(), e.length.map_or_else(String::new, |n| n.to_string()), e.line.is_some().to_string(), e.line.clone().unwrap_or_default(), e.headers.len().to_string()];
+    let mut fields = vec![key.to_string(), e.status.to_string(), e.until.to_string(), e.updating.to_string(), e.error.to_string(), e.vary.join(","), e.variant.clone(), e.ctype.is_some().to_string(), e.ctype.clone().unwrap_or_default(), e.length.map_or_else(String::new, |n| n.to_string()), e.line.is_some().to_string(), e.line.clone().unwrap_or_default(), e.headers.len().to_string()];
     fields.extend(e.headers.iter().chain(&e.upstream).flat_map(|(n, v)| [n.clone(), v.clone()]));
     let mut out = (fields.len() as u64).to_le_bytes().to_vec();
     for f in fields.iter().map(String::as_bytes).chain([e.body.as_slice()]) {
@@ -290,11 +304,11 @@ fn decode(b: &[u8]) -> Option<(String, Entry)> {
     let mut field = || { let n = u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?) as usize; let f = b.get(at + 8..(at + 8).checked_add(n)?)?; at += 8 + n; Some(f) };
     let strings = (0..count).map(|_| field().and_then(|f| String::from_utf8(f.to_vec()).ok())).collect::<Option<Vec<String>>>()?;
     let body = field()?.to_vec();
-    let [key, status, until, updating, vary, variant, typed, ctype, length, lined, line, count] = <[String; 12]>::try_from(strings.get(..12)?.to_vec()).ok()?;
-    let mut headers: Vec<(String, String)> = strings[12..].chunks_exact(2).map(|h| (h[0].clone(), h[1].clone())).collect();
+    let [key, status, until, updating, error, vary, variant, typed, ctype, length, lined, line, count] = <[String; 13]>::try_from(strings.get(..13)?.to_vec()).ok()?;
+    let mut headers: Vec<(String, String)> = strings[13..].chunks_exact(2).map(|h| (h[0].clone(), h[1].clone())).collect();
     let upstream = headers.split_off(count.parse::<usize>().ok()?.min(headers.len()));
     let vary = vary.split(',').filter(|n| !n.is_empty()).map(str::to_string).collect();
-    Some((key, Entry { status: status.parse().ok()?, ctype: (typed == "true").then_some(ctype), headers, body, length: length.parse().ok(), line: (lined == "true").then_some(line), upstream, until: until.parse().ok()?, updating: updating.parse().ok()?, vary, variant }))
+    Some((key, Entry { status: status.parse().ok()?, ctype: (typed == "true").then_some(ctype), headers, body, length: length.parse().ok(), line: (lined == "true").then_some(line), upstream, until: until.parse().ok()?, updating: updating.parse().ok()?, error: error.parse().ok()?, vary, variant }))
 }
 
 /// proxy_cache_valid: the statuses an answer is cached with (none: 200, 301 and 302;
@@ -403,20 +417,23 @@ mod tests {
         assert_eq!(said(&[("X-Accel-Expires", "@1"), ("Cache-Control", "no-cache, stale-while-revalidate=50")]), Some((Some(1), 50)));
         assert_eq!(said(&[("Cache-Control", "stale-while-revalidate=50"), ("X-Accel-Expires", "@1")]), Some((Some(1), 50)));
         assert_eq!(said(&[("Set-Cookie", "a"), ("Cache-Control", "max-age=60")]), None);
+        assert_eq!(stale_if_error(&h(&[("Cache-Control", "max-age=1, stale-if-error=60")]), none), 60);
+        assert_eq!(stale_if_error(&h(&[("Cache-Control", "stale-if-error=60")]), &["cache-control".to_string()]), 0);
+        assert_eq!(stale_if_error(&h(&[("Expires", "0")]), none), 0);
         let ignored = ["set-cookie".to_string(), "cache-control".to_string()];
         assert_eq!(super::said(&h(&[("Set-Cookie", "a"), ("Cache-Control", "no-cache")]), &ignored, 1000), Some((None, 0)));
     }
 
     #[test]
     fn conditions_of_what_is_kept() {
-        let entry = |status, headers: &[(&str, &str)]| Entry { status, ctype: None, headers: h(headers), body: Vec::new(), length: None, line: None, upstream: Vec::new(), until: 0, updating: 0, vary: Vec::new(), variant: String::new() };
+        let entry = |status, headers: &[(&str, &str)]| Entry { status, ctype: None, headers: h(headers), body: Vec::new(), length: None, line: None, upstream: Vec::new(), until: 0, updating: 0, error: 0, vary: Vec::new(), variant: String::new() };
         let both = [("Last-Modified", "Mon, 02 Mar 2015 17:20:58 GMT"), ("ETag", "\"x\"")];
         assert_eq!(entry(200, &both).conditions(), [("If-Modified-Since", "Mon, 02 Mar 2015 17:20:58 GMT".to_string()), ("If-None-Match", "\"x\"".to_string())]);
         assert_eq!(entry(206, &both[1..]).conditions(), [("If-None-Match", "\"x\"".to_string())]);
         assert!(entry(201, &both).conditions().is_empty());
         assert!(entry(200, &[("Last-Modified", "never")]).conditions().is_empty());
         let z = Zone::default();
-        z.put(("k", "k"), (200, None, Vec::new(), Vec::new()), (None, None, Vec::new()), (0, 0), (Vec::new(), &[]));
+        z.put(("k", "k"), (200, None, Vec::new(), Vec::new()), (None, None, Vec::new()), (0, 0, 0), (Vec::new(), &[]));
         assert!(z.get("k").is_none());
         z.renew("k", (crate::clock::seconds() + 60, 0), None);
         z.renew("other", (0, 0), None);
@@ -439,7 +456,7 @@ mod tests {
         let z = Zone::default();
         let (gzip, deflate) = (h(&[("Accept-Encoding", "gzip")]), h(&[("Accept-Encoding", "deflate")]));
         let answer = |body: &str| (200, None, Vec::new(), body.as_bytes().to_vec());
-        let valid = (crate::clock::seconds() + 60, 0);
+        let valid = (crate::clock::seconds() + 60, 0, 0);
         assert_eq!(z.resolve("k", &gzip), "k");
         z.put(("k", "k"), answer("g"), (None, None, Vec::new()), valid, (names.clone(), &gzip));
         assert_eq!(z.resolve("k", &gzip), "k");
@@ -457,7 +474,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("twinx-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let z = Zone::at(dir.clone(), &[1, 2]);
-        let valid = (crate::clock::seconds() + 60, 5);
+        let valid = (crate::clock::seconds() + 60, 5, 7);
         let headers = h(&[("ETag", "\"x\""), ("Vary", "Foo")]);
         z.put(("k", "k"), (200, Some("text/plain".into()), headers.clone(), b"body".to_vec()), (None, None, Vec::new()), valid, (vec!["foo".into()], &h(&[("Foo", "1")])));
         z.put(("n", "n"), (404, None, Vec::new(), Vec::new()), (Some(3), Some("404 Gone".into()), h(&[("X-A", "a"), ("X-A", "b")])), valid, (Vec::new(), &[]));
@@ -465,7 +482,7 @@ mod tests {
         std::fs::write(dir.join("junk"), b"x").unwrap();
         let again = Zone::at(dir.clone(), &[1, 2]);
         let e = again.get("k").unwrap();
-        assert_eq!((e.status, e.ctype.as_deref(), e.headers.clone(), e.body.clone(), e.updating), (200, Some("text/plain"), headers, b"body".to_vec(), 5));
+        assert_eq!((e.status, e.ctype.as_deref(), e.headers.clone(), e.body.clone(), e.updating, e.error), (200, Some("text/plain"), headers, b"body".to_vec(), 5, 7));
         assert_eq!(again.resolve("k", &h(&[("Foo", "2")])), "k\nfoo:2\n");
         assert_eq!(again.get("n").map(|e| (e.status, e.ctype, e.until, e.length)), Some((404, None, valid.0 + 1, Some(3))));
         assert_eq!(again.get("n").map(|e| (e.line, e.upstream)), Some((Some("404 Gone".into()), h(&[("X-A", "a"), ("X-A", "b")]))));
@@ -504,14 +521,16 @@ mod tests {
     fn kept_while_valid() {
         let z = Zone::default();
         let now = crate::clock::seconds();
-        z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (None, None, Vec::new()), (now + 60, 0), (Vec::new(), &[]));
+        z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (None, None, Vec::new()), (now + 60, 0, 0), (Vec::new(), &[]));
         assert_eq!(z.get("k").unwrap().body, b"x");
-        z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (None, None, Vec::new()), (now - 10, 0), (Vec::new(), &[]));
+        z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (None, None, Vec::new()), (now - 10, 0, 0), (Vec::new(), &[]));
         assert!(z.get("k").is_none());
         assert_eq!(z.stale("k").unwrap().body, b"x");
         assert!(!z.stale("k").unwrap().updating());
-        z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (None, None, Vec::new()), (now - 10, 60), (Vec::new(), &[]));
-        assert!(z.stale("k").unwrap().updating());
+        z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (None, None, Vec::new()), (now - 10, 60, 0), (Vec::new(), &[]));
+        assert!(z.stale("k").unwrap().updating() && !z.stale("k").unwrap().erring());
+        z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (None, None, Vec::new()), (now - 10, 0, 60), (Vec::new(), &[]));
+        assert!(z.stale("k").unwrap().erring() && !z.stale("k").unwrap().updating());
         assert!(z.stale("other").is_none());
         assert!(z.get("other").is_none());
     }
