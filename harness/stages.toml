@@ -124,7 +124,9 @@ files = [
 # (harness/nginx-tests/extra).
 [stage6]
 files = [
-  "twinx_cache_buffering.t", "twinx_cache_fields.t", "twinx_cache_hit.t",
-  "twinx_cache_key.t", "twinx_cache_path.t", "twinx_cache_stale.t",
-  "twinx_header_inherit.t", "twinx_keepalive_options.t", "twinx_proxy_pass_request.t",
+  "twinx_cache_answers.t", "twinx_cache_buffering.t", "twinx_cache_control.t",
+  "twinx_cache_fields.t", "twinx_cache_h2.t", "twinx_cache_hit.t", "twinx_cache_key.t",
+  "twinx_cache_path.t", "twinx_cache_stale.t", "twinx_cache_updating.t",
+  "twinx_cache_vary.t", "twinx_header_inherit.t", "twinx_keepalive_options.t",
+  "twinx_proxy_pass_request.t",
 ]
