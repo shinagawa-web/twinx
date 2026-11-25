@@ -33,7 +33,7 @@ Every change reaches main through a pull request that the `judge` check passes. 
 - Open the pull request against main with squash auto-merge turned on, so it merges as soon as the judge passes. If auto-merge cannot be turned on, merge it with squash yourself once the check passes.
 - Wait, for up to 20 minutes, until it is merged.
 - When the judge fails, it comments the reasons on the pull request (as `github-actions[bot]`; see above). Fix them and push to the same branch; the judge runs again. Never close the pull request.
-- When main moved and the branch is behind, update the branch and keep waiting.
+- When the branch conflicts with main, update the branch and keep waiting; not when it is only behind.
 
 ## Blocked
 
