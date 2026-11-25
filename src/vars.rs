@@ -254,6 +254,10 @@ pub enum Var {
     SslSigalg,
     SslClientSigalg,
     SslCurves,
+    SslAlpnProtocol,
+    /// $ssl_early_data, $ssl_ech_status and $ssl_ech_outer_server_name: twinx
+    /// takes no early data and no ECH, so they are empty on a TLS connection.
+    SslNone,
     /// $ssl_client_i_dn and the others of the client's certificate, by what follows "ssl_client_".
     SslClient(&'static str),
     LimitRate,
@@ -290,6 +294,8 @@ impl Var {
             ("ssl_client_verify", Var::SslClientVerify), ("ssl_client_s_dn", Var::SslClientSDn),
             ("ssl_session_id", Var::SslSessionId), ("ssl_cipher", Var::SslCipher), ("ssl_ciphers", Var::SslCiphers),
             ("ssl_curve", Var::SslCurve), ("ssl_curves", Var::SslCurves), ("ssl_sigalg", Var::SslSigalg), ("ssl_client_sigalg", Var::SslClientSigalg),
+            ("ssl_alpn_protocol", Var::SslAlpnProtocol), ("ssl_early_data", Var::SslNone), ("ssl_ech_status", Var::SslNone), ("ssl_ech_outer_server_name", Var::SslNone),
+            ("ssl_client_serial", Var::SslClient("serial")), ("ssl_client_fingerprint", Var::SslClient("fingerprint")),
             ("ssl_client_i_dn", Var::SslClient("i_dn")), ("ssl_client_s_dn_legacy", Var::SslClient("s_dn_legacy")), ("ssl_client_i_dn_legacy", Var::SslClient("i_dn_legacy")),
             ("ssl_client_v_start", Var::SslClient("v_start")), ("ssl_client_v_end", Var::SslClient("v_end")), ("ssl_client_v_remain", Var::SslClient("v_remain")),
             ("ssl_client_raw_cert", Var::SslClient("raw_cert")), ("ssl_client_cert", Var::SslClient("cert")), ("ssl_client_escaped_cert", Var::SslClient("escaped_cert")),
@@ -353,6 +359,8 @@ impl Var {
             Var::SslSigalg => r.ssl.as_ref()?.sigalg.clone(),
             Var::SslClientSigalg => r.ssl.as_ref()?.client_sigalg.clone(),
             Var::SslCurves => r.ssl.as_ref()?.curves.clone(),
+            Var::SslAlpnProtocol => r.ssl.as_ref()?.alpn.clone(),
+            Var::SslNone => { r.ssl.as_ref()?; String::new() }
             Var::SslClient(var) => r.ssl.as_ref()?.client_var(var),
             Var::LimitRate => r.shared.limit_rate.get().unwrap_or(0).to_string(),
             Var::Capture(name) => r.captures.iter().find(|c| c.0 == *name)?.1.clone(),
