@@ -262,3 +262,4 @@ Kinds:
 | 2026-11-25 | Stage 5 | decision | main's ruleset no longer asks for a branch up to date with main | The human said so after the agent named what it exposes: two pull requests that pass apart can break main together |
 | 2026-11-25 | Stage 5 | approval | Auto-merge for the agent's pull requests all of 2026-11-25 | Also for the judge's changes |
 | 2026-11-25 | Stage 5 | approval | After #300 the CI work stops, the Fixer's own time comes next | #302, #303 |
+| 2026-11-25 | Stage 5 | decision | The Fixer runs only the file and what the change may touch before a push | The judge runs every file and fails on a lost subtest (#305) |
