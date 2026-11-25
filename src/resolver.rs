@@ -289,24 +289,37 @@ mod tests {
         assert_eq!(parse(&["ipv4=off", "ipv6=off"]), Err("\"ipv4\" and \"ipv6\" cannot both be \"off\"".into()));
     }
 
-    /// A server that answers each query it gets with what `answer` gives for its type (A or AAAA).
-    fn server(answer: fn(u16) -> Vec<u8>) -> Resolver { server_with(answer, &[]) }
+    /// A resolver, and the server it asks, which ends when this is dropped.
+    struct Asking(Resolver, SocketAddr);
 
-    fn server_with(answer: fn(u16) -> Vec<u8>, params: &[&str]) -> Resolver {
+    impl std::ops::Deref for Asking {
+        type Target = Resolver;
+        fn deref(&self) -> &Resolver { &self.0 }
+    }
+
+    impl Drop for Asking {
+        fn drop(&mut self) { let _ = std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| s.send_to(&[], self.1)); }
+    }
+
+    /// A server that answers each query it gets with what `answer` gives for its type (A or AAAA).
+    fn server(answer: fn(u16) -> Vec<u8>) -> Asking { server_with(answer, &[]) }
+
+    fn server_with(answer: fn(u16) -> Vec<u8>, params: &[&str]) -> Asking {
         let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut args = vec![server.local_addr().unwrap().to_string()];
+        let addr = server.local_addr().unwrap();
+        let mut args = vec![addr.to_string()];
         args.extend(params.iter().map(|p| p.to_string()));
         let r = Resolver::parse(&args).unwrap();
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            while let Ok((n, from)) = server.recv_from(&mut buf) {
+            while let Ok((n @ 1.., from)) = server.recv_from(&mut buf) {
                 let mut reply = answer(u16::from_be_bytes([buf[n - 4], buf[n - 3]]));
                 reply[..2].copy_from_slice(&buf[..2]);
                 reply[17..19].copy_from_slice(&buf[n - 4..n - 2]);
                 server.send_to(&reply[..], from).unwrap();
             }
         });
-        r
+        Asking(r, addr)
     }
 
     #[test]
