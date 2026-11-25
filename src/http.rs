@@ -4475,24 +4475,64 @@ pub(crate) mod tests {
     /// and the steps something came in, with how many bytes of the body, as sent, did.
     type Steps = (String, Vec<String>, bool, &'static str, &'static str, Vec<(u128, usize)>);
 
-    /// What comes of the cases in each step, as long as the time between their pieces.
+    /// A client that sent the request, what serves it, and the server it was passed to.
+    async fn asked_through(directives: &str, request: &str) -> (tokio::net::TcpStream, JoinHandle<()>, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, task) = served_by(&passing(listener.local_addr().unwrap(), directives)).await;
+        client.write_all(request.as_bytes()).await.unwrap();
+        let (mut server, mut got) = (listener.accept().await.unwrap().0, Vec::new());
+        while head_end(&got).is_none() { assert!(server.read_buf(&mut got).await.unwrap() > 0); }
+        (client, task, server)
+    }
+
+    /// Whether all that the server sent has come to the other side's socket.
+    fn arrived(server: &tokio::net::TcpStream) -> bool {
+        let mut waiting: libc::c_int = 0;
+        // SAFETY: TIOCOUTQ writes an int.
+        assert_eq!(unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(server), libc::TIOCOUTQ, &mut waiting) }, 0);
+        waiting == 0
+    }
+
+    /// What the client gets: until that is due, what the server sent has arrived and
+    /// nothing more comes, or, of the last, until the connection is closed.
+    async fn comes(client: &tokio::net::TcpStream, server: &tokio::net::TcpStream, last: bool, due: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+        let (mut text, mut idle) = (Vec::new(), 0);
+        while idle < 5 {
+            match client.try_read_buf(&mut text) {
+                Ok(0) if last => break,
+                Ok(n) => { assert!(n > 0, "closed"); idle = 0 }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => idle = if !last && due(&text) && arrived(server) { idle + 1 } else { 0 },
+                Err(e) => panic!("{e}"),
+            }
+            // A turn of the event loop, which twinx runs in too and finds there what has arrived.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        text
+    }
+
+    /// What comes of the cases after each of their pieces, sent when the one before has had its effect.
     fn steps(cases: Vec<Steps>) {
         let _busy = serving_on();
         block_on(async {
             let all: Vec<_> = cases.into_iter().map(|(head, pieces, closes, directives, request, want)| {
-                let (addr, count) = plays(&after_head(&head, &pieces.iter().map(String::as_str).collect::<Vec<_>>(), 200), closes);
-                let (http, name) = (passing(addr, directives), format!("{head} {:?} {directives} {request}", pieces.iter().map(String::len).collect::<Vec<_>>()));
+                let name = format!("{head} {:?} {directives} {request}", pieces.iter().map(String::len).collect::<Vec<_>>());
                 tokio::task::spawn_local(async move {
-                    let (_count, got) = (count, arrivals(&http, request).await);
+                    let (client, task, mut server) = asked_through(directives, request).await;
                     let mut steps: Vec<(u128, usize)> = Vec::new();
-                    let mut head = true;
-                    for (ms, text) in got {
-                        // Those of one step may come in parts.
-                        assert!((ms + 20) % 200 < 190, "{name} {ms}");
-                        let body = if std::mem::take(&mut head) { text.len() - head_end(text.as_bytes()).unwrap() } else { text.len() };
-                        match steps.last_mut().filter(|s| s.0 == (ms + 20) / 200) { Some(s) => s.1 += body, None => steps.push(((ms + 20) / 200, body)) }
+                    let pieces = after_head(&head, &pieces.iter().map(String::as_str).collect::<Vec<_>>(), 0);
+                    for (i, (_, piece)) in (0..).zip(&pieces) {
+                        let last = i as usize + 1 == pieces.len();
+                        server.write_all(piece).await.unwrap();
+                        if last && closes { server.shutdown().await.unwrap(); }
+                        let body = |text: &[u8]| if steps.is_empty() { head_end(text).map(|end| text.len() - end) } else { Some(text.len()) };
+                        let due = |text: &[u8]| want.iter().find(|w| w.0 == i).is_none_or(|w| body(text).is_some_and(|n| n >= w.1));
+                        let text = within(Some(Duration::from_secs(30)), comes(&client, &server, last, due)).await.unwrap_or_else(|| panic!("{name} {i} {steps:?}"));
+                        let n = body(&text);
+                        if !text.is_empty() { steps.push((i, n.unwrap())); }
                     }
                     assert_eq!(steps, want, "{name}");
+                    drop(client);
+                    within(Some(Duration::from_secs(10)), task).await.unwrap().unwrap();
                 })
             }).collect();
             for task in all { task.await.unwrap(); }
@@ -5386,21 +5426,21 @@ pub(crate) mod tests {
     fn answers_being_passed_end_when_the_time_to_shut_down_has_passed() {
         let _busy = alone();
         let log = log_path("halted");
-        let head_only = vec![(0, LENGTH.as_bytes().to_vec())];
-        for (pieces, directives, line) in [(after_head(LENGTH, &["ab"], 0), OFF, "200 2 "), (after_head(LENGTH, &["ab"], 0), "", "200 0 0 "), (head_only, "", "200 0 0 ")] {
-            let (addr, count) = plays(&pieces, false);
+        let with_body = format!("{LENGTH}ab");
+        for (answer, directives, line) in [(&*with_body, OFF, "200 2 "), (&*with_body, "", "200 0 0 "), (LENGTH, "", "200 0 0 ")] {
             block_on(async {
-                let (mut client, task) = served_by(&passing(addr, &format!("{directives} access_log {} f;", log.display()))).await;
-                client.write_all(HTTP11.as_bytes()).await.unwrap();
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                let (client, task, mut server) = asked_through(&format!("{directives} access_log {} f;", log.display()), HTTP11).await;
+                server.write_all(answer.as_bytes()).await.unwrap();
+                within(Some(Duration::from_secs(30)), comes(&client, &server, false, |text| directives != OFF || text.ends_with(b"ab"))).await.unwrap();
                 HALTED.store(true, Ordering::SeqCst);
                 HALT.notify_waiters();
-                within(Some(Duration::from_secs(1)), task).await.unwrap().unwrap();
+                within(Some(Duration::from_secs(10)), task).await.unwrap().unwrap();
                 HALTED.store(false, Ordering::SeqCst);
+                let closed = within(Some(Duration::from_secs(10)), server.read(&mut [0; 1])).await.unwrap();
+                assert!(!closed.is_ok_and(|n| n > 0));
             });
             let text = logged(&log);
             assert!(text.starts_with(line), "{text}");
-            while count.lock().unwrap()[1] == 0 { thread::sleep(Duration::from_millis(1)); }
         }
     }
 
