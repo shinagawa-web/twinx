@@ -538,7 +538,67 @@ fn cached<T>((cert, key, passwords): (&Path, &Path, Option<&Path>), cache: Optio
 }
 
 fn certified(chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<Arc<rustls::sign::CertifiedKey>, rustls::Error> {
-    rustls::sign::CertifiedKey::from_der(chain, key, &provider()).map(Arc::new)
+    let certified = rustls::sign::CertifiedKey::from_der(chain, key, &provider())?;
+    Ok(Arc::new(rustls::sign::CertifiedKey { key: Arc::new(Told(certified.key.clone())), ..certified }))
+}
+
+tokio::task_local! {
+    /// The schemes the server and the client signed the handshake of the
+    /// connection being taken with ($ssl_sigalg, $ssl_client_sigalg).
+    static SIGNED: std::cell::Cell<[Option<SignatureScheme>; 2]>;
+}
+
+/// Tells which of the server's and the client's (1) signature was made with scheme.
+fn signed(side: usize, scheme: SignatureScheme) {
+    let _ = SIGNED.try_with(|s| { let mut both = s.get(); both[side] = Some(scheme); s.set(both) });
+}
+
+/// A server's key whose signatures tell the scheme they are made with.
+#[derive(Debug)]
+struct Told(Arc<dyn rustls::sign::SigningKey>);
+
+impl rustls::sign::SigningKey for Told {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn rustls::sign::Signer>> {
+        // The first scheme the client offers that the key signs with, as OpenSSL takes it.
+        Some(Box::new(ToldSigner(offered.iter().find_map(|s| self.0.choose_scheme(&[*s]))?)))
+    }
+
+    fn public_key(&self) -> Option<rustls::pki_types::SubjectPublicKeyInfoDer<'_>> {
+        self.0.public_key()
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        self.0.algorithm()
+    }
+}
+
+/// A signer of Told's.
+#[derive(Debug)]
+struct ToldSigner(Box<dyn rustls::sign::Signer>);
+
+impl rustls::sign::Signer for ToldSigner {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        signed(0, self.0.scheme());
+        self.0.sign(message)
+    }
+
+    fn scheme(&self) -> SignatureScheme {
+        self.0.scheme()
+    }
+}
+
+/// The names OpenSSL gives signature schemes, those of TLS (RFC 8446), in
+/// the order it prefers them.
+const SIGALGS: &[(u16, &str)] = &[
+    (0x0403, "ecdsa_secp256r1_sha256"), (0x0503, "ecdsa_secp384r1_sha384"), (0x0603, "ecdsa_secp521r1_sha512"), (0x0807, "ed25519"), (0x0808, "ed448"),
+    (0x0809, "rsa_pss_pss_sha256"), (0x080a, "rsa_pss_pss_sha384"), (0x080b, "rsa_pss_pss_sha512"),
+    (0x0804, "rsa_pss_rsae_sha256"), (0x0805, "rsa_pss_rsae_sha384"), (0x0806, "rsa_pss_rsae_sha512"),
+    (0x0401, "rsa_pkcs1_sha256"), (0x0501, "rsa_pkcs1_sha384"), (0x0601, "rsa_pkcs1_sha512"), (0x0203, "ecdsa_sha1"), (0x0201, "rsa_pkcs1_sha1"),
+];
+
+/// The name of a signature scheme; one without a name is "0x" and its number.
+fn sigalg(scheme: Option<SignatureScheme>) -> String {
+    scheme.map(u16::from).map_or_else(String::new, |id| SIGALGS.iter().find(|s| s.0 == id).map_or_else(|| format!("0x{id:04x}"), |s| s.1.to_string()))
 }
 
 /// The files of ssl_certificate and ssl_certificate_key, in pairs, and of
@@ -617,6 +677,10 @@ pub struct Session {
     pub curves: String,
     /// The protocol the client and server agreed on with ALPN ($ssl_alpn_protocol).
     pub alpn: String,
+    /// The schemes the server and the client signed the handshake with
+    /// ($ssl_sigalg, $ssl_client_sigalg), by OpenSSL's names.
+    pub sigalg: String,
+    pub client_sigalg: String,
 }
 
 /// OpenSSL's names of cipher suites, as $ssl_cipher and $ssl_ciphers give them.
@@ -755,7 +819,10 @@ pub async fn plain(tcp: &TcpStream) -> Option<bool> {
 /// variables tell of it.
 pub async fn accept(tcp: TcpStream, config: &Config, listen: SocketAddr) -> Option<(Stream, Session)> {
     let addrs = (tcp.peer_addr().ok()?, tcp.local_addr().ok()?);
-    let (stream, tls, mut session) = tokio::time::timeout(HANDSHAKE, handshake(tcp, config, listen, addrs)).await.ok()??;
+    let taken = async { (tokio::time::timeout(HANDSHAKE, handshake(tcp, config, listen, addrs)).await.ok().flatten(), SIGNED.with(std::cell::Cell::get)) };
+    let (taken, [server, client]) = SIGNED.scope(std::cell::Cell::new([None; 2]), taken).await;
+    let (stream, tls, mut session) = taken?;
+    (session.sigalg, session.client_sigalg) = (sigalg(server), sigalg(client));
     let chain = stream.get_ref().1.peer_certificates().map(<[_]>::to_vec).unwrap_or_default();
     // An OCSP responder is asked over the network, which may take long, so not on the event loop.
     session.verify = match tls.ocsp.clone().filter(|_| !chain.is_empty()) {
@@ -878,14 +945,18 @@ impl ClientCertVerifier for AnyClient {
     }
 
     // Only a client that does not take TLS 1.3 has this called.
-    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> { rustls::crypto::verify_tls12_signature(m, c, d, &self.0) }
+    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> { signed(1, d.scheme); rustls::crypto::verify_tls12_signature(m, c, d, &self.0) }
 
     fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        signed(1, dss.scheme);
         rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
     }
 
+    // Asked for in the order OpenSSL prefers them, which clients take.
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.supported_schemes()
+        let mut schemes = self.0.supported_schemes();
+        schemes.sort_by_key(|s| SIGALGS.iter().position(|a| a.0 == u16::from(*s)).unwrap_or(usize::MAX));
+        schemes
     }
 }
 
@@ -1230,6 +1301,19 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
     }
 
     #[test]
+    fn sigalgs() {
+        assert_eq!(sigalg(None), "");
+        assert_eq!(sigalg(Some(SignatureScheme::RSA_PSS_SHA256)), "rsa_pss_rsae_sha256");
+        assert_eq!(sigalg(Some(SignatureScheme::ED25519)), "ed25519");
+        assert_eq!(sigalg(Some(SignatureScheme::Unknown(0x0102))), "0x0102");
+        let asked = AnyClient(provider().signature_verification_algorithms, Vec::new()).supported_verify_schemes();
+        assert_eq!(asked[..2], [SignatureScheme::ECDSA_NISTP256_SHA256, SignatureScheme::ECDSA_NISTP384_SHA384]);
+        assert!(asked.iter().position(|s| *s == SignatureScheme::RSA_PSS_SHA256) < asked.iter().position(|s| *s == SignatureScheme::RSA_PSS_SHA512));
+        // Outside a connection being taken, nothing is told.
+        signed(0, SignatureScheme::ED25519);
+    }
+
+    #[test]
     fn resumed_sessions_are_kept() {
         use rustls::server::StoresServerSessions;
         let kept = Kept(rustls::server::ServerSessionMemoryCache::new(4));
@@ -1545,7 +1629,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
             assert_eq!((session.id.len(), session.cipher.as_str(), session.cert.as_ref()), (64, "TLS_AES_256_GCM_SHA384", Some(&der(CERT))));
             assert!(session.ciphers.starts_with("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:"), "{}", session.ciphers);
             let session = Session { id: String::new(), cipher: String::new(), ciphers: String::new(), cert: None, ..session };
-            assert_eq!(session, Session { protocol: "TLSv1.3".into(), server_name: "localhost".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()), curve: "X25519".into(), curves: "X25519:prime256v1:secp384r1".into(), ..Session::default() });
+            assert_eq!(session, Session { protocol: "TLSv1.3".into(), server_name: "localhost".into(), reused: false, verify: "SUCCESS".into(), subject: Some("CN=localhost".into()), curve: "X25519".into(), curves: "X25519:prime256v1:secp384r1".into(), sigalg: "ecdsa_secp256r1_sha256".into(), client_sigalg: "ecdsa_secp256r1_sha256".into(), ..Session::default() });
             let mut buf = [0u8; 4];
             assert!(crate::stream::write_all(&mut client, b"ping", None).await);
             server.read_exact(&mut buf).await.unwrap();
