@@ -156,6 +156,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("send_timeout", HSL, 1, 1, false),
     ("proxy_buffer_size", HSL, 1, 1, false),
     ("proxy_buffering", HSL, 1, 1, false),
+    ("proxy_ignore_client_abort", HSL, 1, 1, false),
     ("proxy_cache_path", HTTP, 2, usize::MAX, false),
     ("proxy_cache", HSL, 1, 1, false),
     ("proxy_cache_valid", HSL, 1, usize::MAX, false),
@@ -1197,6 +1198,8 @@ impl Builder<'_> {
                 "proxy_busy_buffers_size" => level.proxy_busy_buffers_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
                 "proxy_temp_file_write_size" => level.proxy_temp_file_write_size = Some(size(&d.args[0]).map_err(|_| invalid())? as usize),
                 "proxy_buffering" => level.proxy_buffering = flag(d).map_err(at)?,
+                // Only checked: twinx does not act on it.
+                "proxy_ignore_client_abort" => { flag(d).map_err(at)?; }
                 // "off" caches nothing.
                 "proxy_cache" => level.proxy_cache = match Template::parse(&d.args[0]).map_err(at)? {
                     t if t.fixed().is_none() => Some(CacheZone::Named(t, Arc::new(self.zones.clone()))),
@@ -2334,6 +2337,8 @@ mod tests {
         }
         assert!(build_text("http { proxy_max_temp_file_size 0; server { proxy_max_temp_file_size 4k; } }").is_ok());
         assert!(build_text("http { proxy_buffering of; }").is_err());
+        assert!(build_text("http { proxy_ignore_client_abort on; server { location / { proxy_ignore_client_abort off; } } }").is_ok());
+        assert!(build_text("http { proxy_ignore_client_abort yes; }").is_err());
         let c = build_text("http { proxy_buffers 4 8k; server { location /a { proxy_buffering off; proxy_busy_buffers_size 16k; } location /b { proxy_buffers 16 2k; } location /c { proxy_buffering on; } } }").unwrap();
         let settings: Vec<_> = c.servers[0].locations.iter().map(|l| (l.level.proxy_buffering, l.level.proxy_buffers, l.level.proxy_busy_buffers_size)).collect();
         assert_eq!(settings, [(false, (4, 8192), Some(16384)), (true, (16, 2048), None), (true, (4, 8192), None)]);

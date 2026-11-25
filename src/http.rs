@@ -1146,6 +1146,8 @@ fn args(r: &Request) -> &str {
 async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found<'_>, local: SocketAddr, ahead: &[u8]) -> Option<Duration> {
     let redirected;
     let (mut resp, mut level, mut last) = answer(server, r, parsed, found, Some(&mut *stream)).await;
+    // The 412 of the not modified filter is an error error_page takes.
+    if precondition_fails(r, &resp) { resp = special(412); }
     let intercepted = !resp.proxied || level.proxy_intercept_errors;
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)).filter(|_| intercepted) {
         // An intercepted 401 keeps the proxied server's WWW-Authenticate headers,
@@ -1263,7 +1265,15 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             gzip(r, level, &mut resp);
         }
     }
+    let ranged = resp.status;
     range(r, level, &mut resp);
+    // Its 416 is another answer, to which add_header adds those that are "always" again.
+    if ranged != 416 && resp.status == 416 {
+        for (name, value, _) in level.add_header.iter().filter(|h| h.2) {
+            let value = value.render(r, &at_head(&resp));
+            if !value.is_empty() { resp.headers.push((name.clone(), value)); }
+        }
+    }
     // What is read at once is written with the head. With sendfile, less is: one write of both costs less than two up to about there.
     let once = if level.sendfile && matches!(stream, Stream::Tcp(_)) { PIECE / 2 } else { PIECE };
     // One that is decompressed as it is sent stays in its file.
@@ -1439,15 +1449,25 @@ async fn post_action(server: &Server, r: &Request, level: &Level, client: Option
 fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
     const CONDITIONS: &[&str] = &["if-match", "if-modified-since", "if-none-match", "if-unmodified-since"];
     if resp.status != 200 || resp.unconditional || !r.headers.iter().any(|h| CONDITIONS.iter().any(|c| h.0.eq_ignore_ascii_case(c))) { return; }
+    if precondition_fails(r, resp) { return *resp = special(412); }
     let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     let (modified, etag) = (sent("last-modified").and_then(|t| expires::http_time(&t)), sent("etag"));
-    if header(r, "if-unmodified-since").is_some_and(|t| !modified.zip(expires::http_time(t)).is_some_and(|(m, t)| t >= m)) { return *resp = special(412); }
-    if header(r, "if-match").is_some_and(|v| !etag_match(v, etag.as_deref(), false)) { return *resp = special(412); }
     let (ims, inm) = (header(r, "if-modified-since"), header(r, "if-none-match"));
     let same = |t: &str| level.if_modified_since.zip(modified).is_some_and(|(before, m)| expires::http_time(t).is_some_and(|t| t == m || before && t > m));
     if (ims.is_none() && inm.is_none()) || ims.is_some_and(|t| !same(t)) || inm.is_some_and(|v| !etag_match(v, etag.as_deref(), true)) { return; }
     (resp.status, resp.ctype, resp.body, resp.file, resp.rest, resp.cut, resp.told) = (304, None, Vec::new(), None, None, None, None);
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges") && !h.0.eq_ignore_ascii_case("content-encoding"));
+}
+
+/// Whether the not modified filter answers a 200 answer it does not leave as it is with
+/// 412: its If-Unmodified-Since is before its Last-Modified (or it has none), or its
+/// If-Match fails.
+fn precondition_fails(r: &Request, resp: &Response) -> bool {
+    if resp.status != 200 || resp.unconditional { return false; }
+    let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
+    let (modified, etag) = (sent("last-modified").and_then(|t| expires::http_time(&t)), sent("etag"));
+    header(r, "if-unmodified-since").is_some_and(|t| !modified.zip(expires::http_time(t)).is_some_and(|(m, t)| t >= m))
+        || header(r, "if-match").is_some_and(|v| !etag_match(v, etag.as_deref(), false))
 }
 
 /// The range filter, as ngx_http_range_header_filter() is: a 200 answer of a
@@ -1460,15 +1480,18 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
     let ok = resp.status == 200 && resp.ranges && resp.cut.is_none() && !resp.unknown_length && !http09(r.line.as_bytes());
     // max_ranges 0: none, and no Accept-Ranges either.
     if ok && level.max_ranges == Some(0) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges")); return; }
-    let Some(spec) = header(r, "range").filter(|v| ok && v.len() > 6 && v[..6].eq_ignore_ascii_case("bytes=")).map(|v| v[6..].trim()) else { return };
-    let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
-    let same = |v: &str| if v.len() >= 2 && v.ends_with('"') { sent("etag").as_deref() == Some(v) } else { sent("last-modified").and_then(|t| expires::http_time(&t)).is_some_and(|t| expires::http_time(v) == Some(t)) };
-    if !header(r, "if-range").is_none_or(same) { return; }
-    let len = resp.len() as u64;
-    let ranges = match byte_ranges(spec, len) {
+    let Some((len, asked)) = ranges_asked(r, resp).filter(|_| ok) else { return };
+    let ranges = match asked {
         Ok(Some(ranges)) if !(resp.single_range && ranges.len() > 1) && level.max_ranges.is_none_or(|max| ranges.len() <= max) => ranges,
         Ok(_) => return,
-        Err(()) => { *resp = Response { headers: vec![("Content-Range".into(), format!("bytes */{len}"))], ..special(416) }; return }
+        // The answer's other headers stay, but those that told of its body.
+        Err(()) => {
+            let mut headers = std::mem::take(&mut resp.headers);
+            headers.retain(|h| !["etag", "last-modified", "accept-ranges", "content-range"].contains(&h.0.to_ascii_lowercase().as_str()));
+            headers.push(("Content-Range".into(), format!("bytes */{len}")));
+            *resp = Response { headers, ..special(416) };
+            return
+        }
     };
     resp.status = 206;
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
@@ -1480,6 +1503,7 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
         resp.headers.insert(given.unwrap_or(resp.headers.len()), ("Content-Range".into(), format!("bytes {start}-{}/{len}", end - 1)));
         match &mut resp.file {
             Some(file) => (file.start, file.len) = (file.start + start, end - start),
+            None if resp.told.is_some() => resp.told = Some(Some((end - start) as usize)),
             None => resp.body = resp.body[start as usize..end as usize].to_vec(),
         }
         return;
@@ -1495,6 +1519,19 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
     }
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     (resp.body, resp.ctype) = (body, Some(format!("multipart/byteranges; boundary={boundary}").into()));
+}
+
+/// The length of an answer and the ranges of it a request's "bytes=" Range asks for, unless an
+/// If-Range differs from its ETag (a quoted value, compared exactly) or its Last-Modified time;
+/// Err when none of them can be given (416).
+fn ranges_asked(r: &Request, resp: &Response) -> Option<(u64, Result<Option<Vec<(u64, u64)>>, ()>)> {
+    let spec = header(r, "range").filter(|v| v.len() > 6 && v[..6].eq_ignore_ascii_case("bytes=")).map(|v| v[6..].trim())?;
+    let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
+    let same = |v: &str| if v.len() >= 2 && v.ends_with('"') { sent("etag").as_deref() == Some(v) } else { sent("last-modified").and_then(|t| expires::http_time(&t)).is_some_and(|t| expires::http_time(v) == Some(t)) };
+    if !header(r, "if-range").is_none_or(same) { return None; }
+    // That of an answer to HEAD is the one it was told.
+    let len = resp.told.flatten().unwrap_or(resp.len()) as u64;
+    Some((len, byte_ranges(spec, len)))
 }
 
 /// The boundaries of multipart/byteranges bodies are numbered, from 1.
@@ -2335,7 +2372,17 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // proxy_cache_bypass: the server is asked whatever the cache keeps.
     let any_set = |t: &[Template]| t.iter().any(|t| !matches!(t.render(r, &to_host).as_str(), "" | "0"));
     let bypass = cache.is_some() && any_set(&level.proxy_cache_bypass);
-    let hit = |e: crate::cache::Entry| Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, ranges: true, proxy_host: Some(host.clone()), ..Response::default() };
+    // Ranges of what the cache keeps are given when its Accept-Ranges was kept, or with
+    // proxy_force_ranges (ngx_http_upstream_copy_allow_ranges()), and its server gave its length.
+    let hit = |e: crate::cache::Entry| {
+        let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, relative: e.relative, proxy_host: Some(host.clone()), ..Response::default() };
+        // An answer to HEAD is kept without its body, with the length it was told.
+        if let Some(n) = e.length.filter(|&n| n != resp.body.len()) { resp.told = Some(Some(n)); }
+        // One its server gave no length of has none.
+        resp.unknown_length = e.length.is_none();
+        if level.proxy_force_ranges || has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, false, e.length.is_some()); }
+        resp
+    };
     // $upstream_cache_status: how the cache answered.
     let noted = |status| { if cache.is_some() { *r.shared.cache_status.lock().unwrap() = Some(status); } };
     if let Some(e) = cache.filter(|_| !bypass).and_then(|z| z.get(&key)) { noted("HIT"); return hit(e) }
@@ -2344,11 +2391,21 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // proxy_cache_background_update: what may be given while it is updated is given at
     // once, and the server is asked for the update by a request of its own.
     let updating = |e: &crate::cache::Entry| e.updating() || level.proxy_cache_use_stale.iter().any(|c| c == "updating");
+    // While another request asks the server to update it, what is kept is given as it may be then.
+    // The request of proxy_cache_background_update has it noted already.
+    let refresh = cache.filter(|_| stale.is_some() && !r.shared.updater).map(|z| z.refresh(&key));
+    if let Some(e) = stale.clone().filter(|e| matches!(refresh, Some(None)) && updating(e)) { noted("UPDATING"); return hit(e) }
     if let Some(e) = stale.clone().filter(|e| level.proxy_cache_background_update && !r.shared.updater && updating(e)) {
         noted("STALE");
         let (p, level, mut update, prefix) = (p.clone(), level.clone(), r.clone(), prefix.to_string());
         update.shared = Arc::new(crate::vars::Shared { number: r.shared.number, updater: true, ..Default::default() });
-        tokio::task::spawn_local(async move { Box::pin(proxy(&p, &level, &update, &prefix, None)).await });
+        // The key stays noted as being updated until that request ends.
+        if let Some(Some(noted)) = refresh { noted.hand_over(); }
+        let (zone, key) = (cache.cloned(), key.clone());
+        tokio::task::spawn_local(async move {
+            Box::pin(proxy(&p, &level, &update, &prefix, None)).await;
+            if let Some(zone) = zone { zone.release(&key); }
+        });
         return hit(e);
     }
     noted(if bypass { "BYPASS" } else if stale.is_some() { "EXPIRED" } else { "MISS" });
@@ -2365,6 +2422,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // conditions and ranges, and the answer is not cached.
     let scarce = cache.is_some() && !bypass && uses < level.proxy_cache_min_uses;
     let far = cache.is_some() && !bypass && !scarce && !range_cacheable(r, level.proxy_cache_max_range_offset);
+    // What may be cached is asked for whatever the client does (u->cacheable).
+    let cacheable = cache.is_some() && !bypass && !scarce && !far && !matches!(locked, Some(None));
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     // proxy_set_body replaces the client's body, whatever proxy_pass_request_body
@@ -2471,10 +2530,13 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let mut fetched = match conn {
             Ok(conn) => {
                 time[0] = Some(connecting.elapsed().as_millis());
-                fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints)).await
+                fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints, !cacheable)).await
             }
             Err(e) => Err(e),
         };
+        // The client of one whose answer may be cached that went away meanwhile has none:
+        // nginx sends nothing to a connection that failed, and so caches nothing.
+        if cacheable && fetched.is_ok() && client.as_deref().is_some_and(went) { fetched = Err(NoAnswer::Gone(String::new())); }
         // proxy_pass_trailers: those of an answer without a body are taken now.
         let trailers = (level.proxy_pass_trailers && level.proxy_h2).then(|| Trailers { slot: slot.clone(), hide: level.proxy_hide_header.clone(), pass: level.proxy_pass_header.clone(), to: r.shared.clone() });
         if let (Some(t), Ok((_, Some(c)))) = (&trailers, &mut fetched) { t.take(&mut c.stream, Some(level.proxy_read_timeout)).await; }
@@ -2577,33 +2639,52 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         if let Some(cookie) = rewrite_cookie(r, &h.1, level) { h.1 = cookie; }
     }
     resp.relative = !rewrite_redirect(r, level, &mut resp.headers);
-    // Conditions are only for what the cache may keep.
-    resp.unconditional = cache.is_none();
+    // Conditions are only for what the cache may keep, not before proxy_cache_min_uses requests.
+    resp.unconditional = cache.is_none() || scarce;
     // An answer whose status proxy_cache_valid names is read whole and kept.
     // Not before proxy_cache_min_uses requests asked for it, nor when proxy_no_cache says so.
     let no_cache = any_set(&level.proxy_no_cache);
     // Nor one whose Vary is "*", unless proxy_ignore_headers has Vary.
     let vary = if ignored("vary") { Some(Vec::new()) } else { crate::cache::vary(&resp.upstream) };
-    let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !far && !no_cache && vary.is_some();
+    // Nor one that is not buffered.
+    let cacheable = !matches!(locked, Some(None)) && uses >= level.proxy_cache_min_uses && !far && !no_cache && vary.is_some() && !resp.unbuffered;
     // X-Accel-Expires, Cache-Control and Expires say for how long, before proxy_cache_valid.
     let now = crate::clock::seconds();
     let said = cache.filter(|_| cacheable).and_then(|_| crate::cache::said(&resp.upstream, &level.proxy_ignore_headers, now));
     let valid = said.and_then(|(until, updating)| until.or_else(|| crate::cache::validity(&level.proxy_cache_valid, resp.status).map(|t| now.saturating_add(t.as_secs() as i64))).map(|u| (u, updating)));
-    if let Some((zone, valid)) = cache.zip(valid) {
+    // Nor one the not modified filter answers with 412, which ends the request.
+    if let Some((zone, valid)) = cache.zip(valid).filter(|_| !precondition_fails(r, &resp)) {
         finish(&mut resp, (level, r)).await;
-        // One range of what is being cached may be given, read whole as it is.
-        (resp.ranges, resp.single_range) = (true, true);
-        if resp.cut.is_none() { zone.put((&main, &key), (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid, (vary.unwrap_or_default(), &r.headers)); }
+        let length = resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case("content-length")).and_then(|h| h.1.parse().ok());
+        // One range of what is being cached may be given, read whole as it is, when it
+        // has Accept-Ranges and its server gave its length.
+        if has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, true, length.is_some()); }
+        // Nor one the range filter answers with 416, which ends the request too.
+        let unsatisfiable = resp.ranges && resp.status == 200 && ranges_asked(r, &resp).is_some_and(|(_, asked)| asked.is_err());
+        if resp.cut.is_none() && !unsatisfiable { zone.put((&main, &key), (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), (length, resp.relative), valid, (vary.unwrap_or_default(), &r.headers)); }
     }
     // proxy_force_ranges: one range of any other answer is given too, whatever its Accept-Ranges
     // says, read whole for it.
     if level.proxy_force_ranges && !resp.ranges {
-        resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
-        if resp.status == 200 { resp.headers.push(("Accept-Ranges".to_string(), "bytes".to_string())); }
         if resp.status == 200 && header(r, "range").is_some() { finish(&mut resp, (level, r)).await; }
-        (resp.ranges, resp.single_range) = (true, true);
+        allow_ranges(&mut resp, true, true);
     }
     resp
+}
+
+/// Whether a proxied answer has a header of that name.
+fn has_header(resp: &Response, name: &str) -> bool {
+    resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case(name))
+}
+
+/// A proxied answer whose ranges are given (r->allow_ranges): the range filter says
+/// "Accept-Ranges: bytes" for a 200, in place of what the server said, when its length
+/// is known; when it is not, nothing is said and no range is given.
+fn allow_ranges(resp: &mut Response, single: bool, known: bool) {
+    resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
+    if !known { return; }
+    if resp.status == 200 { resp.headers.push(("Accept-Ranges".to_string(), "bytes".to_string())); }
+    (resp.ranges, resp.single_range) = (true, single);
 }
 
 /// proxy_cache_max_range_offset, as ngx_http_upstream_cache_check_range() reads a
@@ -2808,6 +2889,11 @@ fn read_failed(call: &str, e: &std::io::Error) -> String {
     }
 }
 
+/// Whether a client has gone already.
+fn went(client: &Stream) -> bool {
+    std::pin::pin!(crate::stream::gone(client)).as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())).is_ready()
+}
+
 /// What is logged of a client that went away meanwhile; not of one of HTTP/2.
 fn client_gone(client: &Stream, action: &str) -> Option<String> {
     let error = client.tcp()?.take_error().ok().flatten().map_or_else(String::new, |e| format!(" {}", os_error(&e)));
@@ -2843,7 +2929,7 @@ fn invalid_length(headers: &[(String, String)]) -> String {
 /// connection comes with it only when it may be used for another request: the
 /// server does not close it, and nothing came after the head.
 #[allow(clippy::too_many_arguments)]
-async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, (upgrade, hints): (bool, bool)) -> Result<(Response, Option<Conn>), NoAnswer> {
+async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, (upgrade, hints, watch): (bool, bool, bool)) -> Result<(Response, Option<Conn>), NoAnswer> {
     use NoAnswer::{Closed, Gone, Other, TimedOut};
     let invalid = |msg: &str| Other(format!("{msg} while {READING_HEAD}"));
     let s = &mut conn.stream;
@@ -2861,7 +2947,8 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
             let buf = &answer[..answer.len().min(level.proxy_buffer_size)];
             if let Some(end) = line_end(buf).and_then(|at| lines_end(buf, at)) { break end; }
             if answer.len() >= level.proxy_buffer_size { return Err(invalid("upstream sent too big header")); }
-            let closed = async { match client.as_deref() { Some(c) => crate::stream::gone(c).await, None => std::future::pending().await } };
+            // Not that of a request whose answer may be cached, which goes on without the client.
+            let closed = async { match client.as_deref().filter(|_| watch) { Some(c) => crate::stream::gone(c).await, None => std::future::pending().await } };
             // So does the worker_shutdown_timeout of a worker shutting down.
             let closed = async { tokio::select! { () = closed => true, () = halted() => false } };
             let n = tokio::select! {
@@ -2935,7 +3022,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         return Ok((Response { told, ..resp }, Some(conn).filter(|_| keep && answer.len() == end)));
     }
     // X-Accel-Buffering, the last of them that is "yes" or "no", comes before proxy_buffering.
-    let buffering = values("x-accel-buffering").iter().rev().find_map(|v| match v.to_ascii_lowercase().as_str() { "yes" => Some(true), "no" => Some(false), _ => None }).unwrap_or(level.proxy_buffering);
+    let buffering = values("x-accel-buffering").iter().filter(|_| !level.proxy_ignore_headers.iter().any(|i| i == "x-accel-buffering")).rev().find_map(|v| match v.to_ascii_lowercase().as_str() { "yes" => Some(true), "no" => Some(false), _ => None }).unwrap_or(level.proxy_buffering);
     let (first, (count, size)) = (level.proxy_buffer_size, level.proxy_buffers);
     let sizes = if buffering { Ok(Sizes { first, count, size, busy: level.proxy_busy_buffers_size.unwrap_or(2 * first.max(size)) }) } else { Err(first) };
     // proxy_limit_rate is for answers that are buffered.
@@ -4017,7 +4104,7 @@ pub(crate) mod tests {
         let start = Instant::now();
         let s = connect(&(*addr).into(), socket, level).await.ok()?;
         time[0] = Some(start.elapsed().as_millis());
-        fetch(Conn::new(Stream::Tcp(s), start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, (false, false)).await.ok().map(|(resp, _)| resp)
+        fetch(Conn::new(Stream::Tcp(s), start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, (false, false, true)).await.ok().map(|(resp, _)| resp)
     }
 
     #[test]
@@ -5185,6 +5272,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn clients_of_what_may_be_cached_do_not_end_the_wait() {
+        let _busy = serving_on();
+        let answer = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".as_bytes().to_vec();
+        for (cache, at_least) in [(true, 400), (false, 0)] {
+            let (addr, _counts) = plays(&vec![(400, answer.clone())], true);
+            let dir = log_path("gone-cache");
+            let directives = if cache { "proxy_cache z; proxy_cache_valid 200 1m;" } else { "" };
+            let http = format!("proxy_cache_path {} keys_zone=z:1m; {}", dir.display(), passing(addr, directives));
+            let took = block_on(async {
+                let (mut client, task) = served_by(&http).await;
+                let started = Instant::now();
+                client.write_all(HTTP11.as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(client);
+                within(Some(Duration::from_secs(2)), task).await.unwrap().unwrap();
+                started.elapsed().as_millis()
+            });
+            // The head is waited for, and nothing is sent or kept then.
+            assert!(took >= at_least && (cache || took < 400), "{cache} {took}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn what_is_kept_without_a_length_has_none() {
+        let _busy = serving_on();
+        let (addr, _counts) = plays(&vec![(0, format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}0\r\n\r\n", chunk_of("ok")).into_bytes())], true);
+        let dir = log_path("unknown-cache");
+        let text = format!("http {{ proxy_cache_path {} keys_zone=z:1m; {} }}", dir.display(), passing(addr, "proxy_cache z; proxy_cache_valid 200 1m;"));
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {text}"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        let answers = block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let to = listener.local_addr().unwrap();
+            let tasks = accept(config, &[(listener, to)]).unwrap();
+            let mut answers = Vec::new();
+            for _ in 0..2 {
+                let mut client = tokio::net::TcpStream::connect(to).await.unwrap();
+                client.write_all(HTTP11.as_bytes()).await.unwrap();
+                let mut text = Vec::new();
+                within(Some(Duration::from_secs(2)), client.read_to_end(&mut text)).await.unwrap().unwrap();
+                answers.push(undated(&text));
+            }
+            tasks.iter().for_each(JoinHandle::abort);
+            answers
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        // The answer that is kept is given chunked, without Content-Length.
+        assert!(answers[1..].iter().all(|a| a.contains("Transfer-Encoding: chunked\r\n") && !a.contains("Content-Length") && a.ends_with(&format!("{}0\r\n\r\n", chunk_of("ok")))), "{answers:?}");
+    }
+
+    #[test]
     fn connections_have_numbers_in_the_log() {
         let _busy = serving_on();
         let errors = log_path("numbers");
@@ -5743,7 +5881,7 @@ pub(crate) mod tests {
             let req = format!("{method} / HTTP/1.1\r\n\r\n");
             let back = block_on(async {
                 let s = connect(&addr.into(), None, &level).await.ok()?;
-                let (mut resp, conn) = fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, (false, false)).await.ok()?;
+                let (mut resp, conn) = fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, (false, false, true)).await.ok()?;
                 let mut up = Upstream::new(vec![crate::upstream::Peer::new(addr)]);
                 up.keepalive = Some(Default::default());
                 let up = Arc::new(up);
@@ -6419,6 +6557,54 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert!(!ranged("Range: bytes=2-", Some(2)) && !ranged("Range: BYTES=-1", Some(2)) && !ranged("Range: bytes=0-0", Some(0)));
         // No Range, one that is not of bytes, or no offset in it, may be cached.
         assert!(ranged("Accept: a", Some(0)) && ranged("Range: items=5-", Some(2)) && ranged("Range: bytes=x", Some(2)) && ranged("Range: bytes=99999999999999999999-", Some(2)));
+    }
+
+    #[test]
+    fn ranges_of_head_and_unsatisfiable() {
+        let ranged = |resp: &mut Response, h: &str| range(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, &Level::default(), resp);
+        // An answer to HEAD has the length it was told, and the part's.
+        let mut resp = Response { status: 200, ranges: true, told: Some(Some(10)), ..Response::default() };
+        ranged(&mut resp, "Range: bytes=2-4");
+        assert_eq!((resp.status, resp.told, resp.headers.last().map(|h| h.1.as_str())), (206, Some(Some(3)), Some("bytes 2-4/10")));
+        // A 416 keeps the other headers, but those of the body.
+        let headers = ["X-Foo", "ETag", "Last-Modified", "Accept-Ranges", "Content-Range"].map(|n| (n.to_string(), "v".to_string())).to_vec();
+        let mut resp = Response { status: 200, ranges: true, body: b"0123".to_vec(), headers, ..Response::default() };
+        ranged(&mut resp, "Range: bytes=9-");
+        assert_eq!((resp.status, resp.headers), (416, vec![("X-Foo".into(), "v".into()), ("Content-Range".into(), "bytes */4".into())]));
+        // What a request asks for, unless If-Range differs.
+        let file = Response { status: 200, body: b"0123".to_vec(), headers: vec![("ETag".into(), "\"e\"".into())], ..Response::default() };
+        let asked = |h: &str| ranges_asked(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, &file);
+        assert_eq!(asked("Range: bytes=1-2"), Some((4, Ok(Some(vec![(1, 3)])))));
+        assert_eq!(asked("Range: bytes=x"), Some((4, Err(()))));
+        assert_eq!(asked("Range: bytes=1-2\nIf-Range: \"x\""), None);
+        assert_eq!(asked("Accept: a"), None);
+    }
+
+    #[test]
+    fn preconditions() {
+        let answer = || Response { status: 200, headers: vec![("ETag".into(), "\"e\"".into()), ("Last-Modified".into(), "Sun, 06 Nov 1994 08:49:37 GMT".into())], ..Response::default() };
+        let resp = answer();
+        let fails = |h: &str, resp: &Response| precondition_fails(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, resp);
+        assert!(fails("If-Match: \"x\"", &resp) && fails("If-Unmodified-Since: Sun, 06 Nov 1994 08:49:36 GMT", &resp));
+        assert!(!fails("If-Match: \"e\"", &resp) && !fails("If-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT", &resp) && !fails("Accept: a", &resp));
+        // Not of another status, nor of an answer the filter leaves as it is.
+        assert!(!fails("If-Match: \"x\"", &Response { status: 404, ..answer() }) && !fails("If-Match: \"x\"", &Response { unconditional: true, ..answer() }));
+    }
+
+    #[test]
+    fn allows_ranges() {
+        // What the server said of its ranges is replaced, for a 200 only.
+        let mut resp = Response { status: 200, headers: vec![("Accept-Ranges".into(), "none".into()), ("ETag".into(), "\"e\"".into())], ..Response::default() };
+        assert!(has_header(&resp, "ACCEPT-RANGES") && !has_header(&resp, "vary"));
+        allow_ranges(&mut resp, true, true);
+        assert_eq!((resp.headers, resp.ranges, resp.single_range), (vec![("ETag".into(), "\"e\"".into()), ("Accept-Ranges".into(), "bytes".into())], true, true));
+        let mut resp = Response { status: 404, headers: vec![("Accept-Ranges".into(), "bytes".into())], ..Response::default() };
+        allow_ranges(&mut resp, false, true);
+        assert_eq!((resp.headers.len(), resp.ranges, resp.single_range), (0, true, false));
+        // Of a length not known, none.
+        let mut resp = Response { status: 200, headers: vec![("Accept-Ranges".into(), "bytes".into())], ..Response::default() };
+        allow_ranges(&mut resp, true, false);
+        assert_eq!((resp.headers.len(), resp.ranges), (0, false));
     }
 
     #[test]
