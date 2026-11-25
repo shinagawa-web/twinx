@@ -3243,10 +3243,27 @@ pub(crate) mod tests {
     use tokio::io::AsyncWriteExt;
     use std::thread;
 
-    /// What the tests that count in BUSY, or wait for it, run one at a time under.
-    fn counted() -> std::sync::MutexGuard<'static, ()> {
-        static COUNTED: Mutex<()> = Mutex::new(());
-        COUNTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    static SERVING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// What tests run under that count in BUSY: meanwhile nothing is shutting down.
+    /// They wait for what happens, not for a while, with timeouts of 200 ms and what can
+    /// run at once so; real seconds are for tests of rates and of the clock only.
+    pub(crate) fn serving_on() -> std::sync::RwLockReadGuard<'static, ()> {
+        SERVING.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What those run under that shut down, or wait for BUSY: none of the others run meanwhile.
+    struct Alone(#[expect(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+
+    fn alone() -> Alone {
+        Alone(SERVING.write().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    impl Drop for Alone {
+        fn drop(&mut self) {
+            SHUTTING.store(false, Ordering::SeqCst);
+            HALTED.store(false, Ordering::SeqCst);
+        }
     }
 
     /// What a test's server tells. It takes no more connections once this is dropped.
@@ -3399,7 +3416,7 @@ pub(crate) mod tests {
 
     #[test]
     fn lingers_only_when_told_to_with_nothing_unread() {
-        let _busy = counted();
+        let _busy = serving_on();
         for (directive, lingers) in [("", false), ("lingering_close on;", false), ("lingering_close off;", false), ("lingering_close always;", true)] {
             block_on(async {
                 let (mut client, mut task) = served(&format!("{directive} location / {{ return 200 ok; }}")).await;
@@ -3419,7 +3436,7 @@ pub(crate) mod tests {
     /// Sends the start of a request, then more, slowly, whatever comes back:
     /// the whole answer does, with the status and the end, and no reset.
     fn answered_while_sending(directives: &str, start: &str, (status, end): (u16, &str)) {
-        let _busy = counted();
+        let _busy = serving_on();
         block_on(async {
             let (mut client, task) = served(directives).await;
             client.write_all(start.as_bytes()).await.unwrap();
@@ -3466,8 +3483,6 @@ pub(crate) mod tests {
     /// many milliseconds: the $request_time of each of its requests, as logged,
     /// and how long the rest of the answers took from the last part on.
     async fn timed(name: &str, parts: &[(u64, &str)]) -> (Vec<f64>, Duration) {
-        // A test of shutting down leaves it set, which closes connections.
-        SHUTTING.store(false, Ordering::SeqCst);
         let log = std::env::temp_dir().join(format!("twinx-timed-{name}-{}", std::process::id()));
         let (file, body) = (log.display(), "b".repeat(2500));
         let (mut client, task) = served_by(&format!("log_format f $request_time; server {{ access_log {file} f; location / {{ return 200 ok; }} location /slow {{ limit_rate 1000; return 200 {body}; }} }}")).await;
@@ -3488,7 +3503,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_clock_of_a_request_starts_at_its_first_bytes() {
-        let _busy = counted();
+        let _busy = serving_on();
         const KEPT: &str = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
         const LAST: &str = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
         block_on(async {
@@ -3512,7 +3527,7 @@ pub(crate) mod tests {
 
     #[test]
     fn limit_rate_does_not_count_the_idle_wait() {
-        let _busy = counted();
+        let _busy = serving_on();
         const SLOW: &str = "GET /slow HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
         block_on(async {
             let (first, idle) = tokio::join!(
@@ -3577,7 +3592,7 @@ pub(crate) mod tests {
 
     #[test]
     fn shutting_down_answers_connections_already_accepted() {
-        let _busy = counted();
+        let _busy = alone();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let text = format!("http {{ server {{ listen {addr}; location / {{ return 200 done; }} }} }}");
@@ -3614,7 +3629,6 @@ pub(crate) mod tests {
             // The timeout passed with a request left: what waits for proxied servers ends.
             assert!(tokio::time::timeout(Duration::from_secs(1), halted()).await.is_ok());
         });
-        HALTED.store(false, Ordering::SeqCst);
     }
 
     fn request(head: &str) -> (Result<(), u16>, Request) {
@@ -3935,10 +3949,7 @@ pub(crate) mod tests {
     /// directives and passes them to a server that sends the answer to each and closes
     /// the connection; and how many requests came to that one.
     fn passed_on(answer: &str, directives: &str, requests: &str) -> (Vec<u8>, usize) {
-        let _busy = counted();
-        // A test of shutting down leaves it set, which closes connections.
-        SHUTTING.store(false, Ordering::SeqCst);
-        HALTED.store(false, Ordering::SeqCst);
+        let _busy = serving_on();
         let (addr, came) = closing(answer.to_string().leak());
         let text = block_on(received(&format!("server {{ location /e {{ return 200 e; }} location / {{ proxy_pass http://{addr}; {directives} }} }}"), requests));
         let came = *came.lock().unwrap();
@@ -4089,7 +4100,7 @@ pub(crate) mod tests {
 
     #[test]
     fn servers_that_send_malformed_chunks_have_not_failed() {
-        let _busy = counted();
+        let _busy = serving_on();
         for (body, rate) in [MALFORMED[0], "zz\r\nz", "2\r\nab\r\n0\r\nX\r: 1\r\n\r\n"].into_iter().flat_map(|body| RATES.map(|rate| (body, rate))) {
             let answer = format!("{CHUNKED}{body}");
             let servers = [failing(&answer, false), failing(&answer, false)];
@@ -4181,14 +4192,6 @@ pub(crate) mod tests {
                 }
             });
         })
-    }
-
-    /// What tests of answers sent as they come run under: nothing is shutting down.
-    pub(crate) fn serving_on() -> std::sync::MutexGuard<'static, ()> {
-        let busy = counted();
-        SHUTTING.store(false, Ordering::SeqCst);
-        HALTED.store(false, Ordering::SeqCst);
-        busy
     }
 
     /// What location / of a server with the directives has for the server it passes to.
@@ -5194,7 +5197,7 @@ pub(crate) mod tests {
 
     #[test]
     fn answers_being_passed_end_when_the_time_to_shut_down_has_passed() {
-        let _busy = serving_on();
+        let _busy = alone();
         let log = log_path("halted");
         let head_only = vec![(0, LENGTH.as_bytes().to_vec())];
         for (pieces, directives, line) in [(after_head(LENGTH, &["ab"], 0), OFF, "200 2 "), (after_head(LENGTH, &["ab"], 0), "", "200 0 0 "), (head_only, "", "200 0 0 ")] {
@@ -5258,9 +5261,7 @@ pub(crate) mod tests {
     /// HTTP/2 to an upstream of two servers that send the pieces so, without its first
     /// lines, the body's framing aside, and how many connections came to both.
     fn over_h2(pieces: &[Vec<u8>], closes: bool, directives: &str, request: &str) -> (String, usize) {
-        let _busy = counted();
-        SHUTTING.store(false, Ordering::SeqCst);
-        HALTED.store(false, Ordering::SeqCst);
+        let _busy = serving_on();
         let ((a, came_a), (b, came_b)) = (sends(pieces, closes), sends(pieces, closes));
         let http = format!("access_log off; upstream u {{ server {a}; server {b}; }} server {{ proxy_read_timeout 1s; location / {{ proxy_http_version 2; proxy_pass http://u; {directives} }} }}");
         let got = String::from_utf8(block_on(received(&http, request))).unwrap();
@@ -5356,10 +5357,7 @@ pub(crate) mod tests {
     fn answers_whose_reading_fails_are_cut_off() {
         let (http11, http10) = ("GET / HTTP/1.1\r\nHost: a\r\n\r\n", "GET / HTTP/1.0\r\n\r\n");
         let (length, chunked) = (head("Content-Length: 30000\r\n", "keep-alive"), head("Transfer-Encoding: chunked\r\n", "keep-alive"));
-        let _busy = counted();
-        // A test of shutting down leaves it set, which closes connections.
-        SHUTTING.store(false, Ordering::SeqCst);
-        HALTED.store(false, Ordering::SeqCst);
+        let _busy = serving_on();
         let (big, delimited) = ("x".repeat(20000), LENGTH.replace("Content-Length: 30000\r\n", ""));
         // What is in the full buffers of 4k, the first of which has the head.
         let full = "x".repeat(4 * 4096 - LENGTH.len());
@@ -5399,7 +5397,7 @@ pub(crate) mod tests {
 
     #[test]
     fn answers_whose_reading_fails_are_logged() {
-        let _busy = counted();
+        let _busy = serving_on();
         let log = std::env::temp_dir().join(format!("twinx-failed-{}", std::process::id()));
         let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n{}", "x".repeat(100));
         for (resets, rate) in [false, true].into_iter().flat_map(|resets| [RATES[0], RATES[1], OFF].map(|rate| (resets, rate))) {
@@ -5815,9 +5813,7 @@ pub(crate) mod tests {
             (&[NEVER, &[OK]], any, "POST", 200, "504, 200"),
             (&[NEVER], "proxy_hide_header Content-Type;", "GET", 504, "504"),
         ];
-        let _busy = counted();
-        // A test of shutting down leaves it set, which ends requests.
-        HALTED.store(false, Ordering::SeqCst);
+        let _busy = serving_on();
         block_on(async {
             // At once, as each waits for the timeout.
             let all: Vec<_> = cases.into_iter().map(|(answers, directives, method, status, statuses)| tokio::task::spawn_local(async move {
@@ -5868,8 +5864,7 @@ pub(crate) mod tests {
         let a = full.local_addr().unwrap().as_socket().unwrap();
         let mut queue = Vec::new();
         while let Ok(s) = std::net::TcpStream::connect_timeout(&a, Duration::from_millis(200)) { queue.push(s); }
-        let _busy = counted();
-        HALTED.store(false, Ordering::SeqCst);
+        let _busy = serving_on();
         for (directives, method, status, statuses) in [
             ("", "GET", 200, "504, 200"), ("proxy_next_upstream error;", "GET", 504, "504"), ("proxy_next_upstream timeout;", "GET", 200, "504, 200"),
             // Nothing was sent to it.
@@ -7278,12 +7273,23 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     #[test]
     fn clients_may_go_away_while_files_are_sent() {
         let _busy = serving_on();
-        let (dir, data) = (files("gone"), letters(16 << 20));
+        // While the client takes no more, while that is paced, and for send_timeout.
+        sent_until("gone", &[("", "close"), ("", "reset"), ("limit_rate 40k;", "close"), ("limit_rate 40k;", "reset"), ("limit_rate 40k;", "shut"), ("send_timeout 1s;", "wait"),
+                             ("sendfile on;", "close"), ("sendfile on;", "reset"), ("sendfile on; sendfile_max_chunk 0;", "shut"), ("sendfile on; tcp_nopush on; limit_rate 40k;", "close"), ("sendfile on; limit_rate 40k;", "reset"),
+                             ("sendfile on; send_timeout 1s;", "wait")]);
+    }
+
+    #[test]
+    fn files_are_sent_until_the_time_to_shut_down_has_passed() {
+        let _busy = alone();
+        sent_until("halted-files", &[("", "halt"), ("limit_rate 40k;", "halt"), ("sendfile on; tcp_nopush on;", "halt"), ("sendfile on; limit_rate 40k;", "halt")]);
+    }
+
+    /// Sends a file with the directives to a client, until what ends that.
+    fn sent_until(name: &str, cases: &[(&str, &str)]) {
+        let (dir, data) = (files(name), letters(16 << 20));
         std::fs::write(dir.join("f"), &data).unwrap();
-        // While the client takes no more, while that is paced, for send_timeout, and until worker_shutdown_timeout has passed.
-        for (directives, ends) in [("", "close"), ("", "reset"), ("limit_rate 40k;", "close"), ("limit_rate 40k;", "reset"), ("limit_rate 40k;", "shut"), ("send_timeout 1s;", "wait"), ("", "halt"), ("limit_rate 40k;", "halt"),
-                                   ("sendfile on;", "close"), ("sendfile on;", "reset"), ("sendfile on; sendfile_max_chunk 0;", "shut"), ("sendfile on; tcp_nopush on; limit_rate 40k;", "close"), ("sendfile on; limit_rate 40k;", "reset"),
-                                   ("sendfile on; send_timeout 1s;", "wait"), ("sendfile on; tcp_nopush on;", "halt"), ("sendfile on; limit_rate 40k;", "halt")] {
+        for &(directives, ends) in cases {
             let _ = std::fs::remove_file(dir.join("log"));
             block_on(async {
                 let (mut client, task) = served_by(&serves_files(&dir, directives)).await;
