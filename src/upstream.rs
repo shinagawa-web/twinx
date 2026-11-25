@@ -1,11 +1,11 @@
-//! Upstream groups and nginx's weighted round-robin balancing, with
-//! max_fails and fail_timeout, and backup servers tried after the others; and
-//! the idle connections kept to their servers.
+//! Upstream groups and nginx's balancing: weighted round-robin, ip_hash and
+//! least_conn, with max_fails and fail_timeout, and backup servers tried after
+//! the others; and the idle connections kept to their servers.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -46,6 +46,24 @@ impl Peer {
     /// A server with nginx's defaults: weight=1 max_fails=1 fail_timeout=10s.
     pub fn new(addr: impl Into<Addr>) -> Peer {
         Peer { addr: addr.into(), weight: 1, max_fails: 1, fail_timeout: 10, backup: false, down: false, max_conns: 0 }
+    }
+}
+
+/// How an upstream chooses its servers: weighted round-robin, ip_hash or least_conn.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Balance { #[default] RoundRobin, IpHash, LeastConn }
+
+/// What a request keeps of how ip_hash chooses its servers, as
+/// ngx_http_upstream_ip_hash_peer_data_t does: the bytes of the client's address
+/// it hashes (the first three of IPv4), the hash so far, and how many servers
+/// it hashed to that could not be tried.
+#[derive(Debug)]
+pub struct Hashed { addr: Vec<u8>, hash: u64, tries: u32 }
+
+impl Hashed {
+    pub fn new(client: IpAddr) -> Hashed {
+        let addr = match client { IpAddr::V4(a) => a.octets()[..3].to_vec(), IpAddr::V6(a) => a.octets().to_vec() };
+        Hashed { addr, hash: 89, tries: 0 }
     }
 }
 
@@ -214,6 +232,7 @@ pub struct Upstream {
     pub peers: Vec<Peer>,
     /// The connections kept to the servers; None means no connection is kept.
     pub keepalive: Option<Keepalive>,
+    pub balance: Balance,
     state: Mutex<Vec<State>>,
     cache: Mutex<Cache>,
 }
@@ -225,7 +244,7 @@ fn now() -> u64 {
 impl Upstream {
     pub fn new(peers: Vec<Peer>) -> Upstream {
         let state = peers.iter().map(|p| State { effective: p.weight, ..State::default() }).collect();
-        Upstream { peers, keepalive: None, state: Mutex::new(state), cache: Mutex::default() }
+        Upstream { peers, keepalive: None, balance: Balance::RoundRobin, state: Mutex::new(state), cache: Mutex::default() }
     }
 
     /// How many servers a request may try: those not marked down, as
@@ -257,6 +276,64 @@ impl Upstream {
             if now - state[b].checked > self.peers[b].fail_timeout { state[b].checked = now; }
             tried[b] = true;
             Some(b)
+        })
+    }
+
+    /// The next server to try as the upstream's balancing method chooses it.
+    pub fn choose(&self, tried: &mut [bool], hashed: &mut Hashed) -> Option<usize> {
+        match self.balance { Balance::IpHash => self.ip_hash(tried, hashed), Balance::LeastConn => self.least_conn(tried), Balance::RoundRobin => self.pick(tried) }
+    }
+
+    /// Whether a server may be tried now: not marked down, nor failed too often
+    /// within fail_timeout, nor with max_conns connections.
+    fn usable(&self, i: usize, s: &State, now: u64) -> bool {
+        let p = &self.peers[i];
+        !p.down && !(p.max_fails > 0 && s.fails >= p.max_fails && now - s.checked <= p.fail_timeout) && !(p.max_conns > 0 && s.conns >= p.max_conns)
+    }
+
+    /// Counts a server chosen for a request, as tried and with one more connection.
+    fn chosen(&self, i: usize, state: &mut [State], tried: &mut [bool], now: u64) -> Option<usize> {
+        state[i].conns += 1;
+        if now - state[i].checked > self.peers[i].fail_timeout { state[i].checked = now; }
+        tried[i] = true;
+        Some(i)
+    }
+
+    /// ip_hash, as ngx_http_upstream_get_ip_hash_peer() chooses: the hash of the
+    /// client's address, by the weights of the primary servers; hashed again while
+    /// it falls on one that cannot be tried, and after 20 times, or with fewer than
+    /// two primary servers, round-robin.
+    fn ip_hash(&self, tried: &mut [bool], h: &mut Hashed) -> Option<usize> {
+        let primary: Vec<usize> = (0..self.peers.len()).filter(|i| !self.peers[*i].backup).collect();
+        if primary.len() < 2 { return self.pick(tried) } let total = primary.iter().map(|i| self.peers[*i].weight).sum::<i64>() as u64;
+        let (mut state, now) = (self.state.lock().unwrap(), now());
+        loop {
+            if h.tries > 20 { drop(state); return self.pick(tried) } h.hash = h.addr.iter().fold(h.hash, |hash, b| (hash * 113 + u64::from(*b)) % 6271);
+            let mut w = (h.hash % total) as i64;
+            let i = primary.iter().copied().find(|i| { w -= self.peers[*i].weight; w < 0 }).unwrap_or(primary[0]);
+            if !tried[i] && self.usable(i, &state[i], now) { return self.chosen(i, &mut state, tried, now) } h.tries += 1;
+        }
+    }
+
+    /// least_conn, as ngx_http_upstream_get_least_conn_peer() chooses: the server
+    /// with the fewest connections for its weight, by weighted round-robin among
+    /// those with as few; the primary servers first, then the backup ones.
+    fn least_conn(&self, tried: &mut [bool]) -> Option<usize> {
+        if self.peers.len() == 1 { return self.pick(tried) } let (mut state, now) = (self.state.lock().unwrap(), now());
+        [false, true].into_iter().find_map(|backup| {
+            let candidates: Vec<usize> = (0..self.peers.len()).filter(|&i| self.peers[i].backup == backup && !tried[i] && self.usable(i, &state[i], now)).collect();
+            let load = |i: usize, of: usize| state[i].conns as i64 * self.peers[of].weight;
+            let first = *candidates.iter().min_by(|&&a, &&b| load(a, b).cmp(&load(b, a)))?;
+            let ties: Vec<usize> = candidates.into_iter().filter(|&i| load(i, first) == load(first, i)).collect();
+            let (mut best, mut total) = (first, 0);
+            for &i in ties.iter().filter(|_| ties.len() > 1) {
+                let (p, s) = (&self.peers[i], &mut state[i]);
+                (s.current, total) = (s.current + s.effective, total + s.effective);
+                s.effective += (s.effective < p.weight) as i64;
+                if state[i].current > state[best].current { best = i; }
+            }
+            state[best].current -= total;
+            self.chosen(best, &mut state, tried, now)
         })
     }
 
@@ -359,6 +436,54 @@ mod tests {
     fn peers(n: usize, max_fails: u64) -> Upstream {
         let peers = (0..n).map(|i| Peer { max_fails, ..Peer::new(SocketAddr::from(([127, 0, 0, 1], 1000 + i as u16))) });
         Upstream::new(peers.collect())
+    }
+
+    #[test]
+    fn ip_hash() {
+        let mut u = peers(3, 1);
+        u.balance = Balance::IpHash;
+        let client = |a: [u8; 4]| Hashed::new(IpAddr::from(a));
+        // The last byte of IPv4 is not hashed.
+        let first = u.choose(&mut [false; 3], &mut client([10, 0, 0, 1])).unwrap();
+        assert_eq!(u.choose(&mut [false; 3], &mut client([10, 0, 0, 2])), Some(first));
+        // 89, then for each byte (hash * 113 + byte) % 6271: 4040, and 4040 % 3 = 2.
+        assert_eq!(u.choose(&mut [false; 3], &mut client([127, 0, 0, 1])), Some(2));
+        // A server tried, down or failed is hashed past: 5510 falls on it again, 4957 on 1.
+        let (mut tried, mut h) = ([false, false, true], client([127, 0, 0, 1]));
+        assert_eq!((u.choose(&mut tried, &mut h), tried, h.hash, h.tries), (Some(1), [false, true, true], 4957, 2));
+        let v6 = Hashed::new("::1".parse().unwrap());
+        assert_eq!((v6.addr.len(), v6.hash), (16, 89));
+        // After 20 times, or with fewer than two servers, round-robin.
+        let mut h = client([127, 0, 0, 1]);
+        h.tries = 21;
+        assert!(u.choose(&mut [false; 3], &mut h).is_some());
+        let mut one = peers(1, 1);
+        one.balance = Balance::IpHash;
+        assert_eq!(one.choose(&mut [false], &mut client([1, 2, 3, 4])), Some(0));
+    }
+
+    #[test]
+    fn least_conn() {
+        let mut u = peers(3, 1);
+        u.balance = Balance::LeastConn;
+        let u = Arc::new(u);
+        let mut h = Hashed::new([127, 0, 0, 1].into());
+        // Ties go round-robin.
+        let picks: Vec<usize> = (0..3).map(|_| { let i = u.choose(&mut [false; 3], &mut h).unwrap(); drop(u.held(i)); i }).collect();
+        assert_eq!(picks, [0, 1, 2]);
+        // The one with the fewest connections, for its weight.
+        let held = [u.held(u.choose(&mut [false; 3], &mut h).unwrap()), u.held(u.choose(&mut [false; 3], &mut h).unwrap())];
+        assert_eq!(u.choose(&mut [false; 3], &mut h), Some(2));
+        drop(held);
+        let mut tried = [true, true, true];
+        assert_eq!(u.choose(&mut tried, &mut h), None);
+        // Backup servers after the others.
+        let mut b = peers(2, 1);
+        (b.balance, b.peers[1].backup) = (Balance::LeastConn, true);
+        assert_eq!(b.choose(&mut [true, false], &mut h), Some(1));
+        let mut one = peers(1, 1);
+        one.balance = Balance::LeastConn;
+        assert_eq!([(); 2].map(|_| one.choose(&mut [false], &mut h)), [Some(0); 2]);
     }
 
     #[test]

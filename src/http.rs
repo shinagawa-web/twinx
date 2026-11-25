@@ -1899,9 +1899,9 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
                 if let Some(tcp) = stream.tcp().filter(|_| level.tcp_nodelay) { let _ = tcp.set_nodelay(true); }
                 head = &[];
             }
-            unless_closed(stream, incoming.next(true)).await?;
+            unless_aborted(level, stream, incoming.next(true)).await?;
         }
-        if incoming.pause() { unless_closed(stream, incoming.finish()).await?; }
+        if incoming.pause() { unless_aborted(level, stream, incoming.finish()).await?; }
         // Nothing is sent of what came in one go with what is malformed.
         if incoming.malformed { return Some(true) }
         // What is in the file is before what is not. A chunk, or what is paced, is a part of
@@ -1980,6 +1980,13 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
     }
     recycle(std::mem::take(&mut incoming.buffers.data));
     Some(true)
+}
+
+/// What a future gives, None when the client goes away before, unless
+/// proxy_ignore_client_abort lets the request go on without it.
+async fn unless_aborted<F: Future>(level: &Level, client: &Stream, f: F) -> Option<F::Output> {
+    if level.proxy_ignore_client_abort { return Some(f.await) }
+    unless_closed(client, f).await
 }
 
 /// The data up to there, or what was lent, is not needed any more.
@@ -2590,9 +2597,10 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let name = ((level.proxy_ssl_verify || level.proxy_ssl_server_name) && p.ssl).then(|| ssl_name(&level.proxy_ssl_name.as_ref().map_or_else(|| host.clone(), |t| t.render(r, &sent))).to_string());
     // What tells the location from others in the cache of connections: its settings live as long as the worker.
     let tag = level as *const Level as usize;
+    let mut hashed = crate::upstream::Hashed::new(r.peer.ip());
     let url = |peer: &dyn std::fmt::Display, uri: &str| format!("{}://{peer}{uri}", if p.ssl { "https" } else { "http" });
     loop {
-        let Some(i) = up.pick(&mut tried) else { log_at(level, r, "error", "no live upstreams while connecting to upstream", &url(&host, &uri)); break };
+        let Some(i) = up.choose(&mut tried, &mut hashed) else { log_at(level, r, "error", "no live upstreams while connecting to upstream", &url(&host, &uri)); break };
         let (addr, mut held) = (up.peers[i].addr.clone(), Some(up.held(i)));
         addrs.push(addr.to_string());
         // A kept connection is used wherever it was bound, as in nginx.
@@ -2634,7 +2642,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let mut fetched = match conn {
             Ok(conn) => {
                 time[0] = Some(connecting.elapsed().as_millis());
-                fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints, !cacheable)).await
+                fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints, !cacheable && !level.proxy_ignore_client_abort)).await
             }
             Err(e) => Err(e),
         };
@@ -2960,6 +2968,7 @@ async fn connect(peer: &Addr, socket: Option<socket2::Socket>, level: &Level) ->
             (Addr::Inet(a), None) => TcpStream::connect(a).await,
         }
     };
+    let connect = async { let s = connect.await?; if level.proxy_socket_keepalive { socket2::SockRef::from(&s).set_keepalive(true)?; } Ok::<_, std::io::Error>(s) };
     tokio::time::timeout(level.proxy_connect_timeout, connect).await.map_err(|_| NoAnswer::TimedOut(CONNECTING))?.map_err(|e: std::io::Error| {
         // Those connect() gives at once, not once the connection is made, as all of a unix-domain socket's.
         let to = if matches!(peer, Addr::Unix(_)) || matches!(e.raw_os_error(), Some(libc::ENETUNREACH | libc::EADDRNOTAVAIL)) { format!(" to {peer}") } else { String::new() };
