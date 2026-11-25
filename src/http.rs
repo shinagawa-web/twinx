@@ -2668,7 +2668,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // Nothing is known of why a stream of HTTP/2 failed.
         if !why.is_empty() && !stream_failed { log_at(level, r, "error", &why, &url(&addr, &uri)); }
         // More than the head of an answer without a body.
-        if counted[0] > 0 && r.method != "HEAD" && answer.as_ref().is_some_and(|a| a.rest.is_none() && !a.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect"))) {
+        if counted[0] > 0 && r.method != "HEAD" && answer.as_ref().is_some_and(|a| a.rest.is_none() && (ignored("x-accel-redirect") || !a.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect")))) {
             log_at(level, r, "warn", &format!("{MORE} while {}", if level.proxy_buffering { "reading upstream" } else { READING_HEAD }), &url(&addr, &uri));
         }
         time[2] = Some(start.elapsed().as_millis());
@@ -3153,8 +3153,8 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         ([], [c]) if c.eq_ignore_ascii_case("chunked") => (None, !level.proxy_h2),
         _ => return Err(invalid(&invalid_length(&resp.upstream))),
     };
-    // The body of an answer that redirects with X-Accel-Redirect is not read.
-    let accel = resp.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect"));
+    // The body of an answer that redirects with X-Accel-Redirect, unless proxy_ignore_headers has it, is not read.
+    let accel = resp.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("x-accel-redirect")) && !level.proxy_ignore_headers.iter().any(|i| i == "x-accel-redirect");
     let no_body = req.starts_with(b"HEAD ") || [204, 304].contains(&status);
     // An informational answer (1xx) has another after it; the body that is not
     // read for X-Accel-Redirect would come before the next answer.
@@ -3178,9 +3178,11 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
 
 /// Whether a header of a proxied server's answer is hidden, as those of
 /// proxy_hide_header and those nginx hides by default are, unless proxy_pass_header passes it.
+/// Of the X-Accel-* fields, nginx hides only those it acts on.
 fn hidden(hide: &[String], pass: &[String], name: &str) -> bool {
+    const HIDDEN: &[&str] = &["date", "server", "x-pad", "x-accel-expires", "x-accel-redirect", "x-accel-limit-rate", "x-accel-buffering", "x-accel-charset"];
     let lower = name.to_ascii_lowercase();
-    (["date", "server", "x-pad"].contains(&lower.as_str()) || lower.starts_with("x-accel-") || hide.contains(&lower)) && !pass.contains(&lower)
+    (HIDDEN.contains(&lower.as_str()) || hide.contains(&lower)) && !pass.contains(&lower)
 }
 
 /// The header lines of the head of a proxied server's answer, up to the empty line that
@@ -4177,7 +4179,7 @@ pub(crate) mod tests {
         assert_eq!(head_end(b"GET / HTTP/1.0\nHost: a\n\nrest"), Some(24));
         assert_eq!(head_end(b"GET / HTTP/1.0\r\n\r\n"), Some(18));
         let level = Level { proxy_hide_header: vec!["x-b".into()], ..Level::default() };
-        assert_eq!(["Date", "X-Accel-A", "x-pad", "X-B", "Link"].map(|n| hidden(&level.proxy_hide_header, &[], n)), [true, true, true, true, false]);
+        assert_eq!(["Date", "X-Accel-Redirect", "x-pad", "X-B", "Link", "X-Accel-A"].map(|n| hidden(&level.proxy_hide_header, &[], n)), [true, true, true, true, false, false]);
         let pass = ["date".to_string(), "x-b".into()];
         assert_eq!(["Date", "Server", "X-B"].map(|n| hidden(&level.proxy_hide_header, &pass, n)), [false, true, false]);
         // A status line without a reason is no HTTP/0.9 request line.
@@ -4288,7 +4290,7 @@ pub(crate) mod tests {
             let (mut s, _) = listener.accept().unwrap();
             let mut buf = [0u8; 1024];
             let _ = s.read(&mut buf).unwrap();
-            s.write_all(b"HTTP/1.1 201 Created\r\nServer: x\r\nContent-Type: a/b\r\nX-A: 1\r\nX-Accel-B: 2\r\n\r\nbody").unwrap();
+            s.write_all(b"HTTP/1.1 201 Created\r\nServer: x\r\nContent-Type: a/b\r\nX-A: 1\r\nX-Accel-Charset: 2\r\n\r\nbody").unwrap();
         });
         let level = Level { proxy_buffer_size: 4096, proxy_connect_timeout: Duration::from_secs(1), proxy_read_timeout: Duration::from_secs(1), ..Level::default() };
         let (mut time, mut bytes) = ([None; 3], [0; 3]);
@@ -4300,11 +4302,11 @@ pub(crate) mod tests {
         });
         assert!(time[0].is_some() && time[1].is_some());
         // The body, the whole answer and the request, in bytes.
-        assert_eq!(resp.upstream_bytes.unwrap(), [[4, 80, 18]]);
+        assert_eq!(resp.upstream_bytes.unwrap(), [[4, 86, 18]]);
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
         // Those nginx hides go only as a location sends the answer, which the cache keeps without.
-        assert_eq!(resp.headers.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "X-A", "X-Accel-B"]);
-        assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
+        assert_eq!(resp.headers.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "X-A", "X-Accel-Charset"]);
+        assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-Charset"]);
         let mut sent = Response { headers: resp.headers.clone(), ctype: resp.ctype.clone(), ..Response::default() };
         location_headers(&request("GET / HTTP/1.1\n\n").1, &level, &mut sent);
         assert_eq!((sent.headers, sent.ctype.as_deref()), (vec![("X-A".to_string(), "1".to_string())], Some("a/b")));
@@ -6285,7 +6287,7 @@ pub(crate) mod tests {
     #[test]
     fn proxy_pass_header_passes_what_is_hidden() {
         let _busy = serving_on();
-        let (addr, _came) = answering("Date: then\r\nX-Pad: pad\r\nX-Accel-A: a\r\n");
+        let (addr, _came) = answering("Date: then\r\nX-Pad: pad\r\nX-Accel-Charset: a\r\n");
         let text = format!("http {{ proxy_hide_header X-A; server {{ location /a {{ proxy_pass http://{addr}; }} location /b {{ proxy_pass http://{addr}; proxy_pass_header Date; proxy_pass_header Server; proxy_pass_header X-Pad; }} }} }}");
         let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let (a, b) = (exchanged(&config.servers[0], "/a"), exchanged(&config.servers[0], "/b"));

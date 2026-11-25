@@ -81,6 +81,8 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("client_max_body_size", HSL, 1, 1, false),
     ("add_header", HSL | LIF, 2, 3, false),
     ("add_trailer", HSL | LIF, 2, 3, false),
+    ("add_header_inherit", HSL | LIF, 1, 1, false),
+    ("add_trailer_inherit", HSL | LIF, 1, 1, false),
     ("chunked_transfer_encoding", HSL, 1, 1, false),
     ("keepalive_requests", HSL, 1, 1, false),
     ("keepalive_timeout", HSL, 1, 2, false),
@@ -366,6 +368,8 @@ pub struct Level {
     pub add_header: Vec<(String, Template, bool)>,
     /// add_trailer: the same, sent as trailers of a chunked answer.
     pub add_trailer: Vec<(String, Template, bool)>,
+    /// add_header_inherit and add_trailer_inherit: how a level takes those of the level around it.
+    pub add_inherit: [Inherit; 2],
     pub error_page: Vec<ErrorPage>,
     /// index: the files looked for in a directory, in order; one that starts
     /// with "/" is a URI redirected to whether it exists or not.
@@ -1101,6 +1105,11 @@ impl Builder<'_> {
                 "access_log" => logs.get_or_insert_default().extend(self.access_log(&d.args).map_err(at)?),
                 "add_header" => headers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
                 "add_trailer" => trailers.get_or_insert_default().push(add_header(&d.args).map_err(at)?),
+                "add_header_inherit" | "add_trailer_inherit" => {
+                    const VALUES: [(&str, Inherit); 3] = [("on", Inherit::On), ("off", Inherit::Off), ("merge", Inherit::Merge)];
+                    let value = VALUES.iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"{}\" directive, it must be \"on\", \"off\" or \"merge\"", d.args[0], d.name)))?.1;
+                    level.add_inherit[usize::from(d.name == "add_trailer_inherit")] = value;
+                }
                 "error_page" => pages.get_or_insert_default().push(error_page(&d.args).map_err(at)?),
                 "proxy_pass" => {
                     let proxy = self.proxy(&d.args[0]).map_err(at)?;
@@ -1335,8 +1344,8 @@ impl Builder<'_> {
         }
         if let Some(logs) = logs { level.access_log = logs; }
         if let Some(errors) = errors { level.error_log = errors; }
-        if let Some(headers) = headers { level.add_header = headers; }
-        if let Some(trailers) = trailers { level.add_trailer = trailers; }
+        level.add_header = inherited(level.add_inherit[0], std::mem::take(&mut level.add_header), headers);
+        level.add_trailer = inherited(level.add_inherit[1], std::mem::take(&mut level.add_trailer), trailers);
         if let Some(pages) = pages { level.error_page = pages; }
         let [certificates, keys] = certs;
         if let Some(c) = certificates { level.ssl_certificate = c; }
@@ -1934,6 +1943,21 @@ fn scaled(s: &str, units: &[(&str, u64)]) -> Result<u64, String> {
     digits.parse::<u64>().ok().zip(scale).and_then(|(n, (_, scale))| n.checked_mul(*scale)).filter(|&n| n <= i64::MAX as u64).ok_or_else(|| format!("\"{s}\" is invalid"))
 }
 
+/// How a level takes the add_header or add_trailer of the level around it, as
+/// add_header_inherit and add_trailer_inherit say: only when it has none of its own (on),
+/// never (off), or before its own (merge). That of the level around it holds too.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Inherit { #[default] On, Off, Merge }
+
+/// The add_header or add_trailer of a level, from those of the level around it and its own.
+fn inherited<T>(how: Inherit, around: Vec<T>, own: Option<Vec<T>>) -> Vec<T> {
+    match (how, own) {
+        (Inherit::On, None) => around,
+        (Inherit::Merge, own) => around.into_iter().chain(own.unwrap_or_default()).collect(),
+        (_, own) => own.unwrap_or_default(),
+    }
+}
+
 fn add_header(args: &[String]) -> Result<(String, Template, bool), String> {
     if let Some(a) = args.get(2).filter(|a| *a != "always") { return Err(format!("invalid parameter \"{a}\"")); }
     let always = args.len() > 2;
@@ -2275,6 +2299,21 @@ mod tests {
         assert_eq!(build_text("http { client_body_in_file_only yes; }").unwrap_err(), "invalid value \"yes\" in t.conf:1");
         assert_eq!(build_text("http { client_body_temp_path /t 0; }").unwrap_err(), "invalid value in t.conf:1");
         assert_eq!(build_text("http { client_body_temp_path /t 5 6; }").unwrap_err(), "invalid value in t.conf:1");
+    }
+
+    #[test]
+    fn headers_inherited() {
+        let c = build_text(
+            "http { add_header A a; add_trailer T t; server { \
+             location /m { add_header_inherit merge; add_header B b; add_trailer U u; } \
+             location /o { add_header_inherit off; add_trailer_inherit merge; } location /n { add_header B b; } } }",
+        )
+        .unwrap();
+        let names = |l: &Level| (l.add_header.iter().map(|h| h.0.as_str()).collect::<Vec<_>>().join(""), l.add_trailer.iter().map(|h| h.0.as_str()).collect::<Vec<_>>().join(""));
+        let [m, o, n] = [0, 1, 2].map(|i| names(&c.servers[0].locations[i].level));
+        assert_eq!((m.0.as_str(), m.1.as_str(), o.0.as_str(), o.1.as_str(), n.0.as_str(), n.1.as_str()), ("AB", "U", "", "T", "B", "T"));
+        assert_eq!(c.servers[0].locations[0].level.add_inherit, [Inherit::Merge, Inherit::On]);
+        assert_eq!(build_text("http { add_header_inherit yes; }").unwrap_err(), "invalid value \"yes\" in \"add_header_inherit\" directive, it must be \"on\", \"off\" or \"merge\" in t.conf:1");
     }
 
     #[test]
