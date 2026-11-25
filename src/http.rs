@@ -1315,7 +1315,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         Some(length) => if length.is_none_or(|n| n as u64 >= level.gzip_min_length) && gzips(level, &resp) {
             resp.vary = true;
             if gzip_ok(r, level) {
-                coded(&mut resp, Coder::gzip());
+                coded(&mut resp, Coder::gzip(Some(r.shared.clone())));
                 resp.headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
             }
         },
@@ -1324,7 +1324,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
                 resp.vary = true;
                 if gzip_ok(r, level) {
                     if resp.len() as u64 > PIECE || r.method == "HEAD" {
-                        coded(&mut resp, Coder::gzip());
+                        coded(&mut resp, Coder::gzip(Some(r.shared.clone())));
                         resp.headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
                     } else { load(r, level, &mut resp); }
                 }
@@ -1405,7 +1405,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     // The trailers are made after the body, each seeing those before it ($sent_trailer_*);
     // those of the proxied server come first.
     let ending = |resp: &Response, to: &mut Vec<u8>| {
-        let mut trailers = std::mem::take(&mut *r.shared.trailers.lock().unwrap());
+        let mut trailers = r.shared.trailers.lock().unwrap().clone();
         trailers.retain(|_| resp.proxied);
         for (name, value, _) in level.add_trailer.iter().filter(|t| t.2 || added) {
             let value = value.render(r, &so_far(copy(resp), trailers.clone()));
@@ -1768,6 +1768,10 @@ impl Incoming<'_> {
         let Some(from) = self.rest.as_mut() else { return };
         self.resp.cut = self.buffers.cut(self.failed).then(|| Box::new(Cut { length: from.length, malformed: self.malformed, failed: None }));
         if let Some(t) = from.trailers.as_ref().filter(|_| self.resp.cut.is_none()) { t.take(&mut from.conn.stream, Some(from.wait.unwrap_or_default())).await; }
+        // Those of a body in chunks over HTTP/1, but those proxy_hide_header names, or that nginx hides.
+        let (level, r) = self.of;
+        let kept = self.buffers.trailers();
+        if !kept.is_empty() { *r.shared.trailers.lock().unwrap() = kept.into_iter().filter(|(n, _)| !hidden(&level.proxy_hide_header, &level.proxy_pass_header, n)).collect(); }
         if let Some(store) = from.store.take().filter(|_| self.resp.cut.is_none()) {
             let mut body = Vec::new();
             Body::new(from.length.filter(|_| from.slot.is_none()).map(|n| n as u64), from.chunked).take(&[&from.answer[from.end..], &store.raw[..]].concat(), &mut body);
@@ -1865,7 +1869,7 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
     let (mut size, mut tail, mut lent, mut ending) = (Vec::new(), Vec::new(), Vec::new(), Some(ending));
     // Over HTTP/2, the body ends with the pipe, the slot telling how; what came of it
     // goes on once its length has, without waiting for that.
-    let body = Body::new(from.length.filter(|_| from.slot.is_none()).map(|n| n as u64), from.chunked);
+    let body = Body::new(from.length.filter(|_| from.slot.is_none()).map(|n| n as u64), from.chunked).keep_trailers(level.proxy_pass_trailers);
     let whole_at = from.length.filter(|_| from.slot.is_some());
     let mut buffers = Buffers::new(body, from.slot.is_some(), from.sizes.ok(), from.end, buffer());
     let (mut coder, unbuffered, rate) = (from.coder.take(), from.sizes.is_err(), from.rate);
@@ -2398,7 +2402,7 @@ fn gzip(r: &Request, level: &Level, resp: &mut Response) {
     if !gzip_ok(r, level) { return; }
     recoded(resp);
     resp.headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
-    let (mut coder, mut body) = (Coder::gzip(), Vec::new());
+    let (mut coder, mut body) = (Coder::gzip(Some(r.shared.clone())), Vec::new());
     loop {
         let all = coder.code(&resp.body, false, false).unwrap_or(true);
         if all { let _ = coder.end(); }
@@ -5825,7 +5829,7 @@ pub(crate) mod tests {
 
     /// Data as a member of gzip, of several blocks, so that what came of it can be decompressed.
     pub(crate) fn member(parts: &[&str]) -> Vec<Vec<u8>> {
-        let mut coder = Coder::gzip();
+        let mut coder = Coder::gzip(None);
         let mut gz: Vec<Vec<u8>> = parts.iter().map(|p| {
             coder.code(p.as_bytes(), true, false).unwrap();
             let part = coder.ready().to_vec();

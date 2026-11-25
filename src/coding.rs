@@ -11,7 +11,7 @@ const ALL: usize = 32 * BUFFER;
 /// the data given it has taken, and whether it has begun with that and is to flush it.
 /// What it holds is bounded, however large the body is or becomes.
 #[derive(Debug)]
-pub struct Coder { coding: Coding, out: Vec<u8>, ready: usize, taken: usize, begun: bool, flush: bool }
+pub struct Coder { coding: Coding, out: Vec<u8>, ready: usize, taken: usize, begun: bool, flush: bool, to: Option<std::sync::Arc<crate::vars::Shared>> }
 
 #[derive(Debug)]
 enum Coding { Gzip(Gzip), Gunzip(Gunzip) }
@@ -31,11 +31,12 @@ struct Gunzip { inflate: Decompress, at: At, came: u32, flags: u8, extra: u32, l
 enum At { Head, ExtraLength, Extra, Name, Comment, HeadSum, Data, Trailer, End }
 
 impl Coder {
-    /// Compresses the body, as ngx_http_gzip_body_filter() does.
-    pub fn gzip() -> Coder {
+    /// Compresses the body, as ngx_http_gzip_body_filter() does, and tells the request
+    /// what it took and made once it ends ($gzip_ratio).
+    pub fn gzip(to: Option<std::sync::Arc<crate::vars::Shared>>) -> Coder {
         // The header of zlib at its lowest level: no name, no time, the fastest, Unix.
         let out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 4, 3];
-        Coder::new(Coding::Gzip(Gzip { deflate: Compress::new(Compression::new(1), false), crc: Crc::new(), held: true, filled: false }), out)
+        Coder { to, ..Coder::new(Coding::Gzip(Gzip { deflate: Compress::new(Compression::new(1), false), crc: Crc::new(), held: true, filled: false }), out) }
     }
 
     /// Decompresses the body, as ngx_http_gunzip_body_filter() does.
@@ -45,7 +46,7 @@ impl Coder {
     }
 
     fn new(coding: Coding, out: Vec<u8>) -> Coder {
-        Coder { coding, out, ready: 0, taken: 0, begun: false, flush: false }
+        Coder { coding, out, ready: 0, taken: 0, begun: false, flush: false, to: None }
     }
 
     /// Codes the data that came, which is flushed, or cut off after that. What is compressed
@@ -81,6 +82,8 @@ impl Coder {
                 gzip.code(&mut self.out, &[], &mut 0, FlushCompress::Finish)?;
                 self.out.extend(gzip.crc.sum().to_le_bytes());
                 self.out.extend(gzip.crc.amount().to_le_bytes());
+                // With the header and the trailer of gzip, as nginx counts them.
+                if let Some(to) = &self.to { *to.gzip.lock().unwrap() = Some((gzip.deflate.total_in(), 10 + gzip.deflate.total_out() + 8)); }
             }
             Coding::Gunzip(gunzip) => if gunzip.at != At::End { return Err("inflate() returned -5 on response end".to_string()) },
         }
@@ -254,7 +257,7 @@ mod tests {
     #[test]
     fn gzip_goes_on_when_a_buffer_is_full_or_flushed() {
         // Nothing but what is flushed, even of nothing: the header and an empty block.
-        let mut coder = Coder::gzip();
+        let mut coder = Coder::gzip(None);
         let mut all = coded(&mut coder, b"", true).unwrap().concat();
         assert_eq!(all, [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0xff, 0xff]);
         assert!(coded(&mut coder, b"", true).unwrap().is_empty());
@@ -275,7 +278,7 @@ mod tests {
         // In whole buffers without it, and the rest at the end.
         for data in [Vec::new(), text(90), text(400_000), noise(400_000)] {
             for size in [1000, 20000, 400_000] {
-                let (mut coder, mut all) = (Coder::gzip(), Vec::new());
+                let (mut coder, mut all) = (Coder::gzip(None), Vec::new());
                 for part in data.chunks(size) {
                     for part in coded(&mut coder, part, false).unwrap() {
                         assert_eq!(part.len() % BUFFER, 0);
@@ -289,9 +292,9 @@ mod tests {
                 assert!(got == data, "{size}");
             }
         }
-        assert_eq!(ended(&mut Coder::gzip()), [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 4, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(ended(&mut Coder::gzip(None)), [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 4, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         // Cut off: what is held is flushed, but there is no end.
-        let mut coder = Coder::gzip();
+        let mut coder = Coder::gzip(None);
         assert!(coded(&mut coder, &text(90), false).unwrap().is_empty());
         assert_eq!(coder.code(&text(90), false, true), Ok(true));
         assert_eq!(so_far(coder.ready()), [text(90), text(90)].concat());
