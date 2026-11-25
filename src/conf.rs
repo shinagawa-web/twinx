@@ -366,6 +366,8 @@ pub struct Level {
     /// open_log_file_cache, for the access logs whose paths have variables.
     pub log_cache: Option<Arc<Cache>>,
     pub root: PathBuf,
+    /// root with variables, under the prefix: the path is made for each request.
+    pub root_vars: Option<Template>,
     /// add_header: name, value, and whether it is added whatever the status ("always").
     pub add_header: Vec<(String, Template, bool)>,
     /// add_trailer: the same, sent as trailers of a chunked answer.
@@ -1059,7 +1061,11 @@ impl Builder<'_> {
                     if rule.is_none() && flags.is_some() || matches!(flags, Some(None)) { return Err(at("\"proxy_cookie_flags\" directive is duplicate".into())); }
                     flags = Some(rule.map(|rule| flags.take().flatten().unwrap_or_default().into_iter().chain([rule]).collect()));
                 }
-                "root" => (level.root, level.alias, level.alias_vars) = (self.path(&d.args[0]), None, None),
+                "root" => {
+                    let path = self.path(&d.args[0]);
+                    let vars = Template::parse(&path.to_string_lossy()).map_err(at)?;
+                    (level.root, level.root_vars, level.alias, level.alias_vars) = (path, vars.0.iter().any(|p| matches!(p, Part::Var(_))).then_some(vars), None, None);
+                }
                 "alias" => {
                     let path = self.path(&d.args[0]);
                     level.alias_vars = d.args[0].contains('$').then(|| Template::parse(&path.to_string_lossy())).transpose().map_err(at)?;
