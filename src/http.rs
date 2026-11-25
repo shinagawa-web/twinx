@@ -359,13 +359,13 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             Ok(Some(n)) if level.proxy.is_some() && !level.proxy_request_buffering && (buf.len() as u64) < n => {
                 r.length += n as usize;
                 r.body = std::mem::take(&mut buf);
-                *r.shared.unread.lock().unwrap() = Some(Unread { left: n - r.body.len() as u64, chunked: None, rest: Vec::new() });
+                *r.shared.unread.lock().unwrap() = Some(Unread { left: n - r.body.len() as u64, chunked: None, rest: Vec::new(), cut: false });
                 Ok(())
             }
             // A chunked body only when passed as HTTP/1.1, its data passed in chunks of what has come.
             Ok(None) if level.proxy.is_some() && !level.proxy_request_buffering && level.proxy_http_11 && matches!(dechunk(&buf, level.max_body), Ok(None)) => {
                 r.body = decode_chunked(&buf, level.max_body).unwrap_or_default().0;
-                *r.shared.unread.lock().unwrap() = Some(Unread { left: 0, chunked: Some((std::mem::take(&mut buf), r.body.len())), rest: Vec::new() });
+                *r.shared.unread.lock().unwrap() = Some(Unread { left: 0, chunked: Some((std::mem::take(&mut buf), r.body.len())), rest: Vec::new(), cut: false });
                 Ok(())
             }
             Ok(length) => {
@@ -402,15 +402,16 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         if let Some(update) = background { let _ = update.await; }
         // What of an unbuffered body was not passed on is read and dropped.
         // What came after a chunked one is the next request.
+        // One cut short by the answer is not: the connection is closed.
         let unread = r.shared.unread.lock().unwrap().take();
-        let unbuffered = unread.is_some();
-        if let Some(mut u) = unread {
-            if pass_body(&mut u, &mut stream, level.max_body, &mut tokio::io::sink()).await.is_none() { return; }
+        let (unbuffered, cut) = (unread.is_some(), unread.as_ref().is_some_and(|u| u.cut));
+        if let Some(mut u) = unread.filter(|u| !u.cut) {
+            if pass_body(&mut u, &mut stream, level.max_body, &mut tokio::io::sink(), None).await.is_none() { return; }
             buf = u.rest;
         }
         if !level.body_in_file_only || level.body_clean { r.body_file.map(std::fs::remove_file); }
         // A stream of HTTP/2 has one request: the rest of the pipe is its body.
-        if idle.is_none() || SHUTTING.load(Ordering::SeqCst) || matches!(stream, Stream::Pipe(_)) {
+        if idle.is_none() || cut || SHUTTING.load(Ordering::SeqCst) || matches!(stream, Stream::Pipe(_)) {
             // As ngx_http_finalize_connection() decides, but with the location
             // first found, not the one an internal redirect ended in.
             let lingers = match level.lingering_close {
@@ -3087,7 +3088,11 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     wrote.map_err(|e| Closed(format!("writev() failed {} while sending request to upstream", os_error(&e))))?;
     bytes[2] = req.len() as u64;
     // The rest of a body that is not buffered goes on as the client sends it.
-    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other(String::new()))?, max, s).await.ok_or(Other(String::new()))?; }
+    // An answer that comes meanwhile, on a connection without TLS, ends it; the connection is not kept then.
+    let answered = match s { Stream::Tcp(tcp) => std::os::fd::AsFd::as_fd(tcp).try_clone_to_owned().ok().and_then(|fd| TcpStream::from_std(fd.into()).ok()), _ => None };
+    let mut cut = false;
+    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other(String::new()))?, max, s, answered.as_ref()).await.ok_or(Other(String::new()))?; cut = u.cut; }
+    drop(answered);
     let (head, end, status) = loop {
         // A head that does not fit in proxy_buffer_size is too big: the answer is invalid.
         let end = loop {
@@ -3168,7 +3173,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     // An informational answer (1xx) has another after it; the body that is not
     // read for X-Accel-Redirect would come before the next answer.
     let skipped = accel && !no_body && length != Some(0);
-    let keep = status >= 200 && !closes(version, &values("connection")) && !skipped;
+    let keep = status >= 200 && !closes(version, &values("connection")) && !skipped && !cut;
     let told = no_body.then_some(length);
     let (length, chunked) = if no_body || accel { (Some(0), false) } else { (length, chunked) };
     // Over HTTP/2, a body the head says is empty has still to end its stream.
@@ -3327,9 +3332,10 @@ fn bound(peer: &SocketAddr, (local, transparent): (SocketAddr, bool)) -> Option<
 /// A body read as it is passed on (proxy_request_buffering off): the
 /// bytes left of a body with a Content-Length, or what
 /// has come of a chunked one and how much of its data was passed; and, once
-/// a chunked body ended, what came after it.
+/// a chunked body ended, what came after it; whether passing it was cut short
+/// by the server's answer, as nginx stops sending a body once it has one.
 #[derive(Debug)]
-pub struct Unread { left: u64, chunked: Option<(Vec<u8>, usize)>, rest: Vec<u8> }
+pub struct Unread { left: u64, chunked: Option<(Vec<u8>, usize)>, rest: Vec<u8>, cut: bool }
 
 /// Data as one chunk.
 fn chunk(data: &[u8]) -> Vec<u8> {
@@ -3340,12 +3346,16 @@ fn chunk(data: &[u8]) -> Vec<u8> {
 /// bytes of a body with a Content-Length as they are, the data of a chunked
 /// one in a chunk for each read, with the last chunk once it ends, and returns
 /// how many bytes it wrote ($upstream_bytes_sent). None when
-/// the client closes, the body is invalid or the writing fails.
-async fn pass_body<C: AsyncRead + Unpin, W: AsyncWrite + Unpin>(u: &mut Unread, client: &mut C, max: u64, to: &mut W) -> Option<u64> {
+/// the client closes, the body is invalid or the writing fails. Something
+/// coming on answered, the server's connection, while it waits for the client
+/// stops it there: the body is cut.
+async fn pass_body<C: AsyncRead + Unpin, W: AsyncWrite + Unpin>(u: &mut Unread, client: &mut C, max: u64, to: &mut W, answered: Option<&TcpStream>) -> Option<u64> {
     let (mut buf, mut written) = (vec![0u8; 4096], 0);
+    let early = || async { match answered { Some(s) => drop(s.readable().await), None => std::future::pending().await } };
     let Some((raw, sent)) = &mut u.chunked else {
         while u.left > 0 {
-            let got = client.read(&mut buf[..u.left.min(4096) as usize]).await.ok().filter(|g| *g > 0)?;
+            let got = tokio::select! { biased; got = client.read(&mut buf[..u.left.min(4096) as usize]) => got, () = early() => { u.cut = true; return Some(written) } };
+            let got = got.ok().filter(|g| *g > 0)?;
             u.left -= got as u64;
             if !write_all(to, &buf[..got], None).await { return None }
             written += got as u64;
@@ -3360,7 +3370,8 @@ async fn pass_body<C: AsyncRead + Unpin, W: AsyncWrite + Unpin>(u: &mut Unread, 
         if !write_all(to, &out, None).await { return None }
         written += out.len() as u64;
         if let Some(used) = used { u.rest = raw.split_off(used); u.chunked = None; return Some(written); }
-        let got = client.read(&mut buf).await.ok().filter(|g| *g > 0)?;
+        let got = tokio::select! { biased; got = client.read(&mut buf) => got, () = early() => { u.cut = true; return Some(written) } };
+        let got = got.ok().filter(|g| *g > 0)?;
         raw.extend_from_slice(&buf[..got]);
     }
 }
@@ -6422,7 +6433,7 @@ pub(crate) mod tests {
             for (framing, left, chunked) in [("Content-Length: 1", 1, None), ("Transfer-Encoding: chunked", 0, Some((Vec::new(), 0)))] {
                 let ((a, sent), (b, again)) = (closing(first), closing(OK));
                 let directives = format!("proxy_request_buffering off; {directives}");
-                assert_eq!(passed_to([a, b], &directives, &format!("PUT / HTTP/1.1\nHost: h\n{framing}\n\n"), Some(Unread { left, chunked, rest: Vec::new() })), want, "{framing}");
+                assert_eq!(passed_to([a, b], &directives, &format!("PUT / HTTP/1.1\nHost: h\n{framing}\n\n"), Some(Unread { left, chunked, rest: Vec::new(), cut: false })), want, "{framing}");
                 assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, 0), "{framing}");
             }
         }
@@ -6582,7 +6593,7 @@ pub(crate) mod tests {
         let body = || {
             // A body passed as it comes is passed once.
             let ((a, sent), (b, again)) = (silent(NEVER), silent(&[OK]));
-            let body = Unread { left: 1, chunked: None, rest: Vec::new() };
+            let body = Unread { left: 1, chunked: None, rest: Vec::new(), cut: false };
             assert_eq!(passed_to([a, b], "proxy_request_buffering off;", "PUT / HTTP/1.1\nHost: h\nContent-Length: 1\n\n", Some(body)), 504);
             assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, 0));
         };
@@ -7539,23 +7550,33 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     fn passes_bodies_as_they_come() {
         block_on(async {
             let (mut client, mut out) = pair().await;
-            let unread = |left: u64, chunked: Option<&[u8]>| Unread { left, chunked: chunked.map(|c| (c.to_vec(), 1)), rest: Vec::new() };
+            let unread = |left: u64, chunked: Option<&[u8]>| Unread { left, chunked: chunked.map(|c| (c.to_vec(), 1)), rest: Vec::new(), cut: false };
             out.write_all(b"abcdef").await.unwrap();
             let (mut to, mut u) = (Vec::new(), unread(4, None));
-            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to).await, Some(4));
+            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to, None).await, Some(4));
             assert_eq!((to.as_slice(), u.left), (&b"abcd"[..], 0));
             // A chunked body: the data that came after the one passed, in one chunk
             // for each read, then the last chunk; what follows it is kept.
             let (mut to, mut u) = (Vec::new(), unread(0, Some(b"3\r\nx")));
             out.write_all(b"\r\n4\r\nmany\r\n0\r\n\r\nGET").await.unwrap();
-            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to).await, Some(16));
+            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to, None).await, Some(16));
             assert_eq!((String::from_utf8_lossy(&to), u.rest.as_slice()), ("6\r\nefmany\r\n0\r\n\r\n".into(), &b"GET"[..]));
             // An invalid chunk, or the client closing before the end, fails it.
-            assert_eq!(pass_body(&mut unread(0, Some(b"z\r\n")), &mut client, 100, &mut to).await, None);
+            assert_eq!(pass_body(&mut unread(0, Some(b"z\r\n")), &mut client, 100, &mut to, None).await, None);
             drop(out);
             let mut u = unread(5, None);
-            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to).await, None);
+            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to, None).await, None);
             assert_eq!(u.left, 5);
+            // Something from the server while the client sends nothing cuts it short, as
+            // it does a chunked body.
+            let ((mut client, _out), (server, mut answer)) = (pair().await, pair().await);
+            answer.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+            let mut u = unread(5, None);
+            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to, server.tcp()).await, Some(0));
+            assert!(u.cut && u.left == 5);
+            let mut u = unread(0, Some(b"3\r\nx"));
+            assert_eq!(pass_body(&mut u, &mut client, 100, &mut to, server.tcp()).await, Some(0));
+            assert!(u.cut && u.chunked.is_some());
         });
     }
 
