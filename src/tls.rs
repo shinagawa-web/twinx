@@ -563,10 +563,6 @@ impl rustls::sign::SigningKey for Told {
         Some(Box::new(ToldSigner(offered.iter().find_map(|s| self.0.choose_scheme(&[*s]))?)))
     }
 
-    fn public_key(&self) -> Option<rustls::pki_types::SubjectPublicKeyInfoDer<'_>> {
-        self.0.public_key()
-    }
-
     fn algorithm(&self) -> rustls::SignatureAlgorithm {
         self.0.algorithm()
     }
@@ -945,7 +941,7 @@ impl ClientCertVerifier for AnyClient {
     }
 
     // Only a client that does not take TLS 1.3 has this called.
-    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> { signed(1, d.scheme); rustls::crypto::verify_tls12_signature(m, c, d, &self.0) }
+    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> { rustls::crypto::verify_tls12_signature(m, c, d, &self.0) }
 
     fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
         signed(1, dss.scheme);
