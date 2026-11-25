@@ -2425,7 +2425,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let hit = |e: crate::cache::Entry| {
         // With its server's status line, and its headers for $upstream_http_*.
         let status_line = e.line.map(|l| Box::new(crate::vars::bytes(&l).into_boxed_slice()));
-        let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, relative: e.relative, proxy_host: Some(host.clone()), status_line, upstream: e.upstream, ..Response::default() };
+        let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, proxy_host: Some(host.clone()), status_line, upstream: e.upstream, ..Response::default() };
+        // What is kept is shared by the locations of the zone: each sends it as it says.
+        location_headers(r, level, &mut resp);
         // An answer to HEAD is kept without its body, with the length it was told.
         if let Some(n) = e.length.filter(|&n| n != resp.body.len()) { resp.told = Some(Some(n)); }
         // One its server gave no length of has none.
@@ -2662,7 +2664,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let now = crate::clock::seconds();
         let said = crate::cache::said(&a.upstream, &level.proxy_ignore_headers, now).and_then(|(until, updating)| until.map(|u| (u, updating)));
         let valid = said.or_else(|| crate::cache::validity(&level.proxy_cache_valid, e.status).map(|t| (now.saturating_add(t.as_secs() as i64), 0)));
-        if let Some(valid) = valid { zone.renew(&key, valid); }
+        let vary = a.upstream.iter().any(|h| h.0.eq_ignore_ascii_case("vary")).then(|| crate::cache::vary(&a.upstream)).flatten().filter(|_| !level.proxy_ignore_headers.iter().any(|i| i == "vary"));
+        if let Some(valid) = valid { zone.renew(&key, valid, vary.map(|v| (v, &r.headers[..]))); }
         let mut kept = hit(e.clone());
         (kept.upstream_addr, kept.upstream_status, kept.upstream_time, kept.upstream_bytes) = (Some(addrs.join(", ")), Some(statuses.join(", ")), Some(times), Some(bytes));
         return kept;
@@ -2693,14 +2696,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let Some((uri, args)) = (if named { Some((to, None)) } else { unsafe_uri(&to) }) else { return Response { headers: resp.headers, ..special(404) } };
         return Response { internal: Some(Box::new((args.map_or_else(|| uri.clone(), |a| format!("{uri}?{a}")), None))), as_get: !named, ..resp };
     }
-    let hidden = |name: &str| hidden(&level.proxy_hide_header, &level.proxy_pass_header, name);
-    resp.headers.retain(|h| !hidden(&h.0));
-    // The page generated for a timeout keeps its own.
-    if hidden("content-type") && !resp.generated { resp.ctype = None; }
-    for h in resp.headers.iter_mut().filter(|h| h.0.eq_ignore_ascii_case("set-cookie")) {
-        if let Some(cookie) = rewrite_cookie(r, &h.1, level) { h.1 = cookie; }
-    }
-    resp.relative = !rewrite_redirect(r, level, &mut resp.headers);
+    // What the cache keeps is as the server sent it, without what the location does to it.
+    let kept = (resp.ctype.as_deref().map(str::to_string), resp.headers.clone());
+    location_headers(r, level, &mut resp);
     // Conditions are only for what the cache may keep, not before proxy_cache_min_uses requests.
     resp.unconditional = cache.is_none() || scarce;
     // An answer whose status proxy_cache_valid names is read whole and kept.
@@ -2726,7 +2724,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // Nor one the range filter answers with 416, which ends the request too.
         let unsatisfiable = resp.ranges && resp.status == 200 && ranges_asked(r, &resp).is_some_and(|(_, asked)| asked.is_err());
         let line = resp.status_line.as_deref().map(|l| crate::vars::text(l));
-        if resp.cut.is_none() && !unsatisfiable { zone.put((&main, &key), (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), (length, resp.relative, line, resp.upstream.clone()), valid, (vary.unwrap_or_default(), &r.headers)); }
+        if resp.cut.is_none() && !unsatisfiable { zone.put((&main, &key), (resp.status, kept.0, kept.1, resp.body.clone()), (length, line, resp.upstream.clone()), valid, (vary.unwrap_or_default(), &r.headers)); }
     }
     // proxy_force_ranges: one range of any other answer is given too, whatever its Accept-Ranges
     // says, read whole for it.
@@ -2735,6 +2733,19 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         allow_ranges(&mut resp, true, true);
     }
     resp
+}
+
+/// What a location does to the headers of a proxied server's answer as it sends it: those
+/// hidden go, and cookies and redirects are rewritten.
+fn location_headers(r: &Request, level: &Level, resp: &mut Response) {
+    let hidden = |name: &str| hidden(&level.proxy_hide_header, &level.proxy_pass_header, name);
+    resp.headers.retain(|h| !hidden(&h.0));
+    // The page generated for a timeout keeps its own.
+    if hidden("content-type") && !resp.generated { resp.ctype = None; }
+    for h in resp.headers.iter_mut().filter(|h| h.0.eq_ignore_ascii_case("set-cookie")) {
+        if let Some(cookie) = rewrite_cookie(r, &h.1, level) { h.1 = cookie; }
+    }
+    resp.relative = !rewrite_redirect(r, level, &mut resp.headers);
 }
 
 /// Whether a proxied answer has a header of that name.
@@ -3056,7 +3067,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     time[1] = Some(start.elapsed().as_millis());
     let version = head.split(['\r', '\n', ' ']).next().unwrap_or_default();
     let mut resp = Response { status, proxied: true, status_line: (!level.proxy_h2).then(|| Box::new(status_line(&answer))), ..Response::default() };
-    // Those of the connection, which nginx never passes, and those it hides unless proxy_pass_header passes them.
+    // Those of the connection, which nginx never passes; those it hides go as the location sends the answer.
     const HOP: &[&str] = &["connection", "keep-alive", "transfer-encoding", "content-length"];
     for line in upstream_lines(&head) {
         let (name, value) = upstream_header(line).ok_or_else(|| invalid(&invalid_header(line)))?;
@@ -3065,7 +3076,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         if lower == "content-type" { resp.ctype = Some(value.into()); continue; }
         // A second Expires is ignored.
         let again = lower == "expires" && resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("expires"));
-        if !again && !HOP.contains(&lower.as_str()) && !hidden(&[], &level.proxy_pass_header, &lower) { resp.headers.push((name.to_string(), value)); }
+        if !again && !HOP.contains(&lower.as_str()) { resp.headers.push((name.to_string(), value)); }
     }
     // 101 to a request with Upgrade: what came after the head goes to the client first.
     if status == 101 && upgrade { return Ok((Response { body: answer[end..].to_vec(), tunnel: Some(conn.stream), ..resp }, None)); }
@@ -4229,8 +4240,16 @@ pub(crate) mod tests {
         // The body, the whole answer and the request, in bytes.
         assert_eq!(resp.upstream_bytes.unwrap(), [[4, 80, 18]]);
         assert_eq!((resp.status, resp.ctype.as_deref(), resp.body.as_slice()), (201, Some("a/b"), &b"body"[..]));
-        assert_eq!(resp.headers, vec![("X-A".to_string(), "1".to_string())]);
+        // Those nginx hides go only as a location sends the answer, which the cache keeps without.
+        assert_eq!(resp.headers.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "X-A", "X-Accel-B"]);
         assert_eq!(resp.upstream.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["Server", "Content-Type", "X-A", "X-Accel-B"]);
+        let mut sent = Response { headers: resp.headers.clone(), ctype: resp.ctype.clone(), ..Response::default() };
+        location_headers(&request("GET / HTTP/1.1\n\n").1, &level, &mut sent);
+        assert_eq!((sent.headers, sent.ctype.as_deref()), (vec![("X-A".to_string(), "1".to_string())], Some("a/b")));
+        let passing = Level { proxy_pass_header: vec!["server".into()], proxy_hide_header: vec!["x-a".into(), "content-type".into()], ..level };
+        let mut sent = Response { headers: resp.headers, ctype: resp.ctype, ..Response::default() };
+        location_headers(&request("GET / HTTP/1.1\n\n").1, &passing, &mut sent);
+        assert_eq!((sent.headers, sent.ctype), (vec![("Server".to_string(), "x".to_string())], None));
     }
 
     #[test]
