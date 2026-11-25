@@ -72,9 +72,28 @@ jobs:
         if: steps.baseline-cache.outputs.cache-hit != 'true'
         run: '"$RUNNER_TEMP/harness/judge.sh" baseline'
 
+      # As baseline.yml names and saves them (both the key and the path have to match),
+      # from main's files: the pull request is merged only in the next step.
+      - name: Name main's dependencies
+        id: deps
+        shell: bash
+        run: |
+          hash=$({ cat Cargo.lock Cargo.toml rust-toolchain.toml \
+            && PYTHONPATH=harness python3 -c 'import run_tests; print(run_tests.RUST_IMAGE)' \
+            && grep '^RUSTFLAGS_COVERAGE=' harness/judge.sh; } | sha256sum | cut -d ' ' -f 1)
+          echo "key=deps-$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Restore main's dependencies
+        id: deps-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/deps
+          key: ${{ steps.deps.outputs.key }}
+
       - name: Judge the pull request
         env:
           BASE: ${{ steps.base.outputs.sha }}
+          DEPS: ${{ steps.deps-cache.outputs.cache-hit == 'true' && format('{0}/deps', runner.temp) || '' }}
         run: '"$RUNNER_TEMP/harness/judge.sh" pr'
 
       - name: Summary
