@@ -955,6 +955,13 @@ fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> S
         let rw = match op {
             // set $limit_rate: a value that is not a size leaves it as it was.
             Op::Set(name, value) if name == "limit_rate" => { if let Ok(rate) = crate::conf::size(&value.render(to, &Sent::default())) { to.shared.limit_rate.set(rate); } continue }
+            // set $args: the arguments, which the URI keeps, and $request_uri as it was.
+            Op::Set(name, value) if name == "args" => {
+                let (args, uri) = (value.render(to, &Sent::default()), to.uri.clone());
+                let target = if args.is_empty() { uri.clone() } else { format!("{uri}?{args}") };
+                to.to_mut().redirect(uri, target);
+                continue
+            }
             Op::Set(name, value) => { to.set_var(name, value.render(to, &Sent::default())); continue }
             Op::If(cond, body, level) => {
                 if !holds(to, cond) { continue }
@@ -967,7 +974,7 @@ fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> S
             Op::Rewrite(rw) => rw,
         };
         let Some(caps) = rw.regex.captures(&to.uri) else { continue };
-        to.set_captures(&caps);
+        to.set_captures(&rw.regex, &caps);
         let (uri, new_args) = replacement(rw, to);
         let uri = if rw.redirect { unescape_redirect(&uri) } else { uri };
         // The request's arguments follow those of the replacement, "&" between them.
@@ -2067,7 +2074,7 @@ fn holds(r: &Request, cond: &Condition) -> bool {
     match cond {
         Condition::Var(var) => !matches!(value(var).as_str(), "" | "0"),
         Condition::Equal(var, to, not) => (value(var) == value(to)) != *not,
-        Condition::Match(var, re, not) => re.captures(&value(var)).map(|c| r.set_captures(&c)).is_some() != *not,
+        Condition::Match(var, re, not) => re.captures(&value(var)).map(|c| r.set_captures(re, &c)).is_some() != *not,
         Condition::File(path, test, not) => {
             let meta = std::fs::metadata(value(path));
             let is = meta.is_ok_and(|m| match test { 'f' => m.is_file(), 'd' => m.is_dir(), 'x' => m.permissions().mode() & 0o111 != 0, _ => true });
@@ -2618,7 +2625,7 @@ fn rewrite_cookie(r: &Request, cookie: &str, level: &Level) -> Option<String> {
 /// flag. A flag that is not one nginx knows is logged and left out.
 fn cookie_flags(r: &Request, rules: &[CookieFlags], level: &Level, attrs: &mut Vec<(String, Option<String>)>) -> bool {
     let (sent, name) = (Sent::default(), attrs[0].0.clone());
-    let matches = |rule: &&CookieFlags| match &rule.cookie { CookiePattern::Regex(re) => re.captures(&name).map(|c| r.set_captures(&c)).is_some(), CookiePattern::Text(t) => t.render(r, &sent).eq_ignore_ascii_case(&name) };
+    let matches = |rule: &&CookieFlags| match &rule.cookie { CookiePattern::Regex(re) => re.captures(&name).map(|c| r.set_captures(re, &c)).is_some(), CookiePattern::Text(t) => t.render(r, &sent).eq_ignore_ascii_case(&name) };
     let Some(rule) = rules.iter().find(matches) else { return false };
     let mut bits = 0;
     for f in rule.flags.iter().map(|f| f.render(r, &sent)).filter(|f| !f.is_empty()) {
@@ -2643,7 +2650,7 @@ fn cookie_value(r: &Request, rw: &CookieRewrite, value: &str, domain: bool) -> O
     let replacement = || rw.replacement.render(r, &Sent::default());
     match &rw.pattern {
         CookiePattern::Regex(re) => {
-            r.set_captures(&re.captures(value)?);
+            r.set_captures(re, &re.captures(value)?);
             Some(replacement())
         }
         CookiePattern::Text(p) if domain => {
@@ -3278,7 +3285,7 @@ type Found<'a> = (&'a str, &'a Level, bool);
 fn located<'a>(server: &'a Server, r: &Request, uri: &str) -> Found<'a> {
     let (found, regex) = search(server, uri);
     if let Some(Match::Regex(re)) = regex.map(|i| &server.locations[i].kind) {
-        if let Some(caps) = re.captures(uri) { r.set_captures(&caps); }
+        if let Some(caps) = re.captures(uri) { r.set_captures(re, &caps); }
     }
     // A method limit_except does not allow gets the settings of its block.
     let limited = found.1.limit_except.as_ref().filter(|(methods, _)| !methods.contains(&r.method)).map(|(_, l)| &**l);
@@ -6702,6 +6709,21 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(get("/e/").1, "x");
         // A byte that is not UTF-8 stays as it is.
         assert_eq!(crate::vars::bytes(&decode("/%C3%A9%FF").unwrap()), b"/\xc3\xa9\xff");
+    }
+
+    #[test]
+    fn named_captures_and_set_args() {
+        let text = "http { server { location /r { rewrite ^/r/(?<a>\\w+)/(?P<b>\\w+)$ /s/$b/$a last; } location /s { return 200 \"$uri $a $b\"; } \
+                    location /set { set $args \"x=y&$args\"; return 200 \"$args $arg_x $request_uri\"; } location /none { set $args \"\"; return 200 \"[$args]\"; } } }";
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            String::from_utf8(block_on(answer(s, &r, Ok(()), location(s, &r.uri), None)).0.body).unwrap()
+        };
+        assert_eq!(get("/r/p/q"), "/s/q/p p q");
+        assert_eq!(get("/set?a=b"), "x=y&a=b y /set?a=b");
+        assert_eq!(get("/none?a=b"), "[]");
     }
 
     #[test]
