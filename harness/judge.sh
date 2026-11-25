@@ -49,7 +49,7 @@ unit_tests() {
   UNIT_PROFILES="$profiles" cargo_in "$tree" none "$RUSTFLAGS_COVERAGE" test --release --offline || return 1
   local objects=()
   mapfile -t objects < <(cargo_in "$tree" none "$RUSTFLAGS_COVERAGE" test --release --offline --no-run \
-    --message-format=json 2>/dev/null | python3 -c '
+    --message-format=json 2>/dev/null | python3 -I -c '
 import json, sys
 for line in sys.stdin:
     m = json.loads(line)
@@ -69,22 +69,32 @@ for line in sys.stdin:
   fi
 }
 
-# Build the tree at $1; succeeds only when the build does.
+# Build the tree at $1 and its unit tests, and copy twinx to $3, apart from the tests'
+# container; succeeds only when cargo build does.
 build() {
-  local tree=$1 rustflags=$2
-  cargo_in "$tree" net "$rustflags" fetch && cargo_in "$tree" none "$rustflags" build --release --offline
+  local tree=$1 rustflags=$2 binary=$3
+  rm -f "$binary"
+  cargo_in "$tree" net "$rustflags" fetch || return 1
+  # Only to build twinx and its tests at the same time: the next build decides, and
+  # leaves out what only dev-dependencies turn on.
+  cargo_in "$tree" none "$rustflags" build --release --offline --bins --tests || true
+  cargo_in "$tree" none "$rustflags" build --release --offline || return 1
+  [ ! -f "$tree/target/release/twinx" ] || cp "$tree/target/release/twinx" "$binary"
 }
 
 baseline() {
-  local tree="$JUDGE_DIR/main"
+  local tree="$JUDGE_DIR/main" binary="$JUDGE_DIR/main-twinx"
   rm -rf "$tree" && mkdir -p "$tree"
   git archive HEAD | tar -x -C "$tree"
   if [ -f "$tree/Cargo.toml" ]; then
-    build "$tree" "" || true
+    build "$tree" "$RUSTFLAGS_COVERAGE" "$binary" || true
     unit_tests "$tree" "$OUT/unit-main.json" || true
   fi
   python3 "$HARNESS/run_tests.py" --nginx --out "$OUT/reference.json"
-  python3 "$HARNESS/run_tests.py" --twinx "$tree/target/release/twinx" --out "$OUT/baseline.json"
+  # Nothing reads these profiles: main is built and run as a pull request is.
+  local profiles="$JUDGE_DIR/main-profiles"
+  rm -rf "$profiles" && mkdir -p "$profiles" && chmod 0777 "$profiles"
+  python3 "$HARNESS/run_tests.py" --profiles "$profiles" --twinx "$binary" --out "$OUT/baseline.json"
 }
 
 fail_merge() {
@@ -107,11 +117,11 @@ pr() {
   git merge -q --no-ff --no-commit "$head" || fail_merge
 
   # The containers get a copy of the merged tree, never the checkout and its .git.
-  local tree="$JUDGE_DIR/pr" build=skipped test=skipped
+  local tree="$JUDGE_DIR/pr" binary="$JUDGE_DIR/pr-twinx" build=skipped test=skipped
   rm -rf "$tree" && mkdir -p "$tree"
   tar -C "$TWINX_REPO" --exclude=./.git -cf - . | tar -C "$tree" -xf -
   if [ -f "$tree/Cargo.toml" ]; then
-    if build "$tree" "$RUSTFLAGS_COVERAGE"; then
+    if build "$tree" "$RUSTFLAGS_COVERAGE" "$binary"; then
       build=success
       unit_tests "$tree" "$OUT/unit.json" && test=success || test=failure
     else
@@ -122,12 +132,12 @@ pr() {
   local profiles="$JUDGE_DIR/profiles"
   rm -rf "$profiles" && mkdir -p "$profiles" && chmod 0777 "$profiles"
   python3 "$HARNESS/run_tests.py" --profiles "$profiles" \
-    --twinx "$tree/target/release/twinx" --out "$OUT/results.json" || true
+    --twinx "$binary" --out "$OUT/results.json" || true
 
   local lcov=()
-  if ls "$profiles"/*.profraw >/dev/null 2>&1 && [ -x "$tree/target/release/twinx" ]; then
+  if ls "$profiles"/*.profraw >/dev/null 2>&1 && [ -x "$binary" ]; then
     docker run --rm --cap-drop ALL --security-opt no-new-privileges \
-      -v "$tree:$tree:ro" -v "$profiles:/profiles:ro" "$IMAGE" sh -c '
+      -v "$binary:$binary:ro" -v "$profiles:/profiles:ro" "$IMAGE" sh -c '
         rustup component add llvm-tools-preview >/dev/null 2>&1
         bin=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n "s/^host: //p")/bin
         "$bin/llvm-profdata" merge -sparse /profiles/*.profraw -o /tmp/merged.profdata
@@ -135,7 +145,7 @@ pr() {
           --ignore-filename-regex="/registry/src/|/rustc/"
         echo "=====REGIONS====="
         "$bin/llvm-cov" export "$0" -instr-profile=/tmp/merged.profdata -format=text -skip-functions \
-          --ignore-filename-regex="/registry/src/|/rustc/"' "$tree/target/release/twinx" \
+          --ignore-filename-regex="/registry/src/|/rustc/"' "$binary" \
       > "$OUT/coverage.raw" \
       && sed '/^=====REGIONS=====$/,$d' "$OUT/coverage.raw" > "$OUT/tests.lcov" \
       && sed '1,/^=====REGIONS=====$/d' "$OUT/coverage.raw" > "$OUT/tests-regions.json" \
