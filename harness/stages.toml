@@ -119,3 +119,12 @@ files = [
   "twinx_ssl_config.t", "twinx_ssl_session.t", "twinx_ssl_sigalgs.t",
   "twinx_ssl_variables.t", "twinx_uri.t", "twinx_variables.t",
 ]
+
+# Stage 6: what the files of stage 5 leave unchecked, in twinx's own tests
+# (harness/nginx-tests/extra).
+[stage6]
+files = [
+  "twinx_cache_buffering.t", "twinx_cache_fields.t", "twinx_cache_hit.t",
+  "twinx_cache_key.t", "twinx_cache_path.t", "twinx_cache_stale.t",
+  "twinx_header_inherit.t", "twinx_keepalive_options.t", "twinx_proxy_pass_request.t",
+]
