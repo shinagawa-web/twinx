@@ -2509,9 +2509,11 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let sending = crate::h2::Framing { authority: !is_set("host"), chunked: pass_body && chunked, length: length.unwrap_or(0) };
     let body = if pass_body && chunked && !body.is_empty() { chunk(&body) } else { body };
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
-    // With a cache, the server is asked for the whole answer, whatever the client's conditions and ranges.
+    // When the answer may be cached, the server is asked for the whole of it, whatever the
+    // client's conditions and ranges; a request of another method than GET and HEAD, or
+    // without a zone, passes them.
     const WHOLE: &[&str] = &["if-modified-since", "if-unmodified-since", "if-none-match", "if-match", "range", "if-range"];
-    let dropped = |n: &str| DROPPED.contains(&n) || (if get { cache.is_some() } else { level.proxy_cache.is_some() }) && !scarce && !far && WHOLE.contains(&n);
+    let dropped = |n: &str| DROPPED.contains(&n) || cache.is_some() && !scarce && !far && WHOLE.contains(&n);
     // proxy_pass_request_headers off passes none of the client's headers.
     let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !dropped(&n.to_ascii_lowercase()) && !is_set(n));
     passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
@@ -5403,6 +5405,31 @@ pub(crate) mod tests {
             assert!(took >= at_least && (cache || took < 400), "{cache} {took}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn only_requests_that_may_be_cached_lose_their_conditions() {
+        let _busy = serving_on();
+        let (addr, came) = answering("");
+        let dir = log_path("methods-cache");
+        let text = format!("http {{ proxy_cache_path {} keys_zone=z:1m; proxy_cache z; proxy_cache_valid 200 1m; server {{ location / {{ proxy_pass http://{addr}; }} }} }}", dir.display());
+        let config = Arc::new(crate::conf::build(&crate::config::parse(&format!("events {{ }} {text}"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap());
+        block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let to = listener.local_addr().unwrap();
+            let tasks = accept(config, &[(listener, to)]).unwrap();
+            for method in ["POST", "GET"] {
+                let mut client = tokio::net::TcpStream::connect(to).await.unwrap();
+                let req = format!("{method} /{method} HTTP/1.1\r\nHost: a\r\nConnection: close\r\nIf-Match: \"d\"\r\nRange: bytes=0-1\r\nContent-Length: 0\r\n\r\n");
+                client.write_all(req.as_bytes()).await.unwrap();
+                within(Some(Duration::from_secs(2)), client.read_to_end(&mut Vec::new())).await.unwrap().unwrap();
+            }
+            tasks.iter().for_each(JoinHandle::abort);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let came = came.lock().unwrap();
+        assert!(came[0].1.starts_with("POST ") && came[0].1.contains("\r\nIf-Match: \"d\"\r\n") && came[0].1.contains("\r\nRange: bytes=0-1\r\n"), "{}", came[0].1);
+        assert!(came[1].1.starts_with("GET ") && !came[1].1.contains("If-Match") && !came[1].1.contains("Range"), "{}", came[1].1);
     }
 
     #[test]
