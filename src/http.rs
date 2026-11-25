@@ -1372,12 +1372,13 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     // chunked, with its length if it has one, to tell its end and carry them.
     let passed = resp.proxied && (!r.shared.trailers.lock().unwrap().is_empty() || resp.rest.as_ref().is_some_and(|rest| rest.trailers.is_some() || rest.slot.is_some())) && r.method != "HEAD" && ![204, 304].contains(&status);
     let h2 = (unknown || trailing || passed) && !upgraded && r.line.ends_with("HTTP/2.0");
-    let chunked = (unknown || trailing) && http11(&r.line) && level.chunked && !upgraded && !resp.http09 || h2;
+    // Nor is an informational answer (1xx) chunked.
+    let chunked = (unknown || trailing) && http11(&r.line) && level.chunked && !upgraded && !resp.http09 && status >= 200 || h2;
     let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown) && !upgraded;
     let mut out = buffer();
     if !silent && !http09(r.line.as_bytes()) && !resp.http09 {
-        // A proxied server's status line is sent as it is, while the status is its code.
-        match resp.status_line.as_deref().map(|l| &**l).filter(|line| line.starts_with(status.to_string().as_bytes())) {
+        // A proxied server's status line is sent as it is, while the status is its code, of three digits.
+        match resp.status_line.as_deref().map(|l| &**l).filter(|line| line.starts_with(format!("{status:03}").as_bytes())) {
             Some(line) => out.extend_from_slice(&[b"HTTP/1.1 ", line, b"\r\n"].concat()),
             None => out.extend_from_slice(format!("HTTP/1.1 {status} {}\r\n", reason(status)).as_bytes()),
         }
@@ -1390,7 +1391,8 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         if let Some(ctype) = &resp.ctype { add(&["Content-Type: ", ctype, "\r\n"]); }
         if chunked { add(&["Transfer-Encoding: chunked\r\n"]); }
         if let Some(n) = length.filter(|_| (!chunked || h2) && (![204, 304].contains(&status) || resp.told.is_some() && (status == 304 || !r.line.ends_with("HTTP/2.0"))) && !upgraded) { add(&["Content-Length: ", decimal(&mut [0; 20], n as u64), "\r\n"]); }
-        add(&["Connection: ", if upgraded { "upgrade" } else if keepalive { "keep-alive" } else { "close" }, "\r\n"]);
+        // 101 says the connection is upgraded, whether it is or not.
+        add(&["Connection: ", if upgraded || status == 101 { "upgrade" } else if keepalive { "keep-alive" } else { "close" }, "\r\n"]);
         if let Some(t) = level.keepalive_header.filter(|_| keepalive) { add(&["Keep-Alive: timeout=", decimal(&mut [0; 20], t), "\r\n"]); }
         if resp.vary && level.gzip_vary { add(&["Vary: Accept-Encoding\r\n"]); }
         resp.headers.iter().for_each(|(n, v)| add(&[n, ": ", v, "\r\n"]));
@@ -1449,7 +1451,9 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     }
     if written && level.post_action.is_some() { Box::pin(post_action(server, r, level, Some(stream))).await; }
     if !level.access_log.is_empty() {
-        let sent = Sent { bytes, body, complete: written && !cut, ..so_far(resp, trailers) };
+        // An answer of HTTP/0.9 from a proxied server has no status of its own: $status is 009, as nginx logs it.
+        let status = if resp.http09 { 9 } else { resp.status };
+        let sent = Sent { status, bytes, body, complete: written && !cut, ..so_far(resp, trailers) };
         level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     }
     recycle(out);
@@ -4508,6 +4512,24 @@ pub(crate) mod tests {
     /// closed, without the Date lines, when a server's location has the
     /// directives and passes them to a server that sends the answer to each and closes
     /// the connection; and how many requests came to that one.
+    #[test]
+    fn passes_status_lines_of_three_digits_and_says_101_upgrades() {
+        let text = |answer: &str, directives: &str, request: &str| String::from_utf8_lossy(&passed_on(answer, directives, request).0).into_owned();
+        // A code below 100 is still the status line's three digits.
+        let got = text("HTTP/1.1 099 X\r\n\r\nBODY", "", "GET / HTTP/1.0\r\n\r\n");
+        assert!(got.starts_with("HTTP/1.1 099 X\r\n") && got.ends_with("\r\n\r\nBODY"), "{got}");
+        // 101 to a request that did not ask for it: the connection is said to be upgraded, and nothing is chunked.
+        let got = text("HTTP/1.1 101 X\r\n\r\n", "", "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        assert!(got.starts_with("HTTP/1.1 101 X\r\n") && got.contains("\r\nConnection: upgrade\r\n") && !got.contains("chunked"), "{got}");
+        // An answer of HTTP/0.9 is logged with the status 009.
+        let log = log_path("http09-status");
+        let got = text("HTTP/1.1 99 X\r\n\r\nBODY", &format!("access_log {};", log.display()), "GET / HTTP/1.0\r\n\r\n");
+        assert_eq!(got, "HTTP/1.1 99 X\r\n\r\nBODY");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("\" 009 "), "{logged}");
+        let _ = std::fs::remove_file(&log);
+    }
+
     fn passed_on(answer: &str, directives: &str, requests: &str) -> (Vec<u8>, usize) {
         let _busy = serving_on();
         let (addr, came) = closing(answer.to_string().leak());
