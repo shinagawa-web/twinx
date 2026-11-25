@@ -307,7 +307,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             upstream_status: None,
             upstream: Vec::new(),
             captures: Vec::new(),
-            shared: Arc::new(crate::vars::Shared { number: peer.1, ..Default::default() }),
+            shared: Arc::new(crate::vars::Shared { number: peer.1, fd: stream.tcp().map(std::os::fd::AsRawFd::as_raw_fd), ..Default::default() }),
             ssl: ssl.clone(),
         };
         let parsed = parse(&mut r, &buf[..end], &default.level, matches!(stream, Stream::Pipe(_)));
@@ -1020,6 +1020,13 @@ async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto)
         Ok(()) if auto => return (redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))), level),
         Ok(()) => {}
     }
+    if crate::vars::files_used() {
+        let files = crate::vars::Files {
+            root: level.root.clone(), root_vars: level.root_vars.clone(), alias: level.alias.clone(), alias_vars: level.alias_vars.clone(),
+            alias_len: level.alias_len, prefix: prefix.to_string(),
+        };
+        *r.shared.files.lock().unwrap() = Some(files);
+    }
     let mut to = Cow::Borrowed(r);
     let mut s = Script { level, changed: false, moved: false, proxied: level.proxy.is_some() };
     let stop = script(&mut to, &level.script, &mut s);
@@ -1365,7 +1372,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     }
     if written && level.post_action.is_some() { Box::pin(post_action(server, r, level, Some(stream))).await; }
     if !level.access_log.is_empty() {
-        let sent = Sent { bytes, body, ..so_far(resp, trailers) };
+        let sent = Sent { bytes, body, complete: written && !cut, ..so_far(resp, trailers) };
         level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     }
     recycle(out);
