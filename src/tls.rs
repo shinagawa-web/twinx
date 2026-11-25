@@ -713,20 +713,55 @@ pub async fn accept(tcp: TcpStream, config: &Config, listen: SocketAddr) -> Opti
     Some((Stream::Server(Box::new(stream)), session))
 }
 
+/// The host_name of the server_name extension of a ClientHello, from the TLS
+/// records that carry it, as the client wrote it.
+fn sni(records: &[u8]) -> Option<String> {
+    // The handshake message, from the fragments of the records.
+    let (mut msg, mut rest) = (Vec::new(), records);
+    while let [0x16, _, _, hi, lo, more @ ..] = rest {
+        let len = usize::from(u16::from_be_bytes([*hi, *lo]));
+        msg.extend_from_slice(more.get(..len)?);
+        rest = &more[len..];
+    }
+    let take = |at: &mut usize, n: usize| { let part = msg.get(*at..*at + n); *at += n; part };
+    let u16_at = |b: &[u8]| usize::from(u16::from_be_bytes([b[0], b[1]]));
+    // Type and length, version, random, then the session id, the ciphers and the compression methods.
+    let mut at = 4 + 2 + 32;
+    let n = usize::from(*take(&mut at, 1)?.first()?); take(&mut at, n)?;
+    let n = u16_at(take(&mut at, 2)?); take(&mut at, n)?;
+    let n = usize::from(*take(&mut at, 1)?.first()?); take(&mut at, n)?;
+    let end = u16_at(take(&mut at, 2)?) + at;
+    while at + 4 <= end {
+        let (kind, len) = (u16_at(take(&mut at, 2)?), u16_at(take(&mut at, 2)?));
+        let ext = take(&mut at, len)?;
+        // server_name: the list's length, then a host_name (0) and its length.
+        if let (0, [_, _, 0, hi, lo, name @ ..]) = (kind, ext) { return name.get(..u16_at(&[*hi, *lo])).map(|n| String::from_utf8_lossy(n).into_owned()) }
+    }
+    None
+}
+
 /// The handshake of a connection taken: the ClientHello is read first, as
 /// the server is chosen by its SNI name.
 async fn handshake<'a>(mut tcp: TcpStream, config: &'a Config, listen: SocketAddr, addrs: (SocketAddr, SocketAddr)) -> Option<(tokio_rustls::server::TlsStream<TcpStream>, &'a ServerTls, Session)> {
     let (mut acceptor, mut buf) = (rustls::server::Acceptor::default(), Vec::new());
+    // All that came before the ClientHello was whole, for the name in it as the client wrote it.
+    let mut came = Vec::new();
     let accepted = loop {
         buf.clear();
         if crate::stream::read_into(&mut tcp, &mut buf, None).await == 0 { return None }
+        came.extend_from_slice(&buf);
         let mut data = &buf[..];
         while !data.is_empty() { if acceptor.read_tls(&mut data).ok()? == 0 { break } }
         if let Some(accepted) = acceptor.accept().ok()? { break accepted }
     };
     let hello = accepted.client_hello();
-    let name = hello.server_name().unwrap_or_default().to_string();
-    let server = crate::http::server(config, listen, hello.server_name()).0;
+    // $ssl_server_name is the name as sent, which rustls gives in lower case,
+    // and not at all when it is an address; the server is chosen by it in
+    // lower case and without a last dot, as ngx_http_validate_host() leaves it.
+    let sent = sni(&came);
+    let chosen = sent.as_deref().map(|n| n.strip_suffix('.').unwrap_or(n).to_ascii_lowercase());
+    let name = hello.server_name().map(str::to_string).or_else(|| chosen.clone()).unwrap_or_default();
+    let server = crate::http::server(config, listen, chosen.as_deref().or(hello.server_name())).0;
     // A rejected handshake gets a fatal unrecognized_name alert, as OpenSSL sends it.
     if server.level.ssl_reject_handshake { let _ = tcp.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70]).await; return None }
     // A server without certificates of its own takes the default server's.
@@ -754,7 +789,7 @@ async fn handshake<'a>(mut tcp: TcpStream, config: &'a Config, listen: SocketAdd
     let reused = conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed);
     let alpn = String::from_utf8_lossy(conn.alpn_protocol().unwrap_or_default()).into_owned();
     let id = id.iter().map(|b| format!("{b:02x}")).collect();
-    Some((stream, tls, Session { protocol, server_name: name, reused, id, cipher, ciphers, curve, curves, alpn, ..Session::default() }))
+    Some((stream, tls, Session { protocol, server_name: sent.unwrap_or(name), reused, id, cipher, ciphers, curve, curves, alpn, ..Session::default() }))
 }
 
 /// Clients may send a certificate, which the handshake takes whatever it is;
@@ -971,6 +1006,22 @@ pub async fn connect(tcp: TcpStream, (peer, name): (IpAddr, Option<&str>), timeo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_of_client_hellos() {
+        let ext = |name: &[u8]| { let mut e = vec![0, 0]; let list = [&[0u8][..], &(name.len() as u16).to_be_bytes(), name].concat(); e.extend((list.len() as u16 + 2).to_be_bytes()); e.extend((list.len() as u16).to_be_bytes()); e.extend(list); e };
+        let hello = |exts: Vec<u8>| {
+            let body = [&[3u8, 3][..], &[0; 32], &[0], &[0, 2, 0x13, 1], &[1, 0], &(exts.len() as u16).to_be_bytes(), &exts].concat();
+            let msg = [&[1u8, 0][..], &(body.len() as u16).to_be_bytes(), &body].concat();
+            // In two records, as a client may split it.
+            let (a, b) = msg.split_at(10);
+            [&[0x16u8, 3, 1][..], &(a.len() as u16).to_be_bytes(), a, &[0x16, 3, 1], &(b.len() as u16).to_be_bytes(), b].concat()
+        };
+        assert_eq!(sni(&hello([&[0u8, 23, 0, 0][..], &ext(b"SeCond.")].concat())).as_deref(), Some("SeCond."));
+        assert_eq!(sni(&hello(ext(b"127.0.0.1"))).as_deref(), Some("127.0.0.1"));
+        assert_eq!(sni(&hello(Vec::new())), None);
+        assert_eq!(sni(&hello(ext(b"x"))[..20]), None);
+    }
 
     /// A self-signed P-256 certificate for localhost and its key, made by openssl only for these tests.
     const CERT: &str = "-----BEGIN CERTIFICATE-----

@@ -31,6 +31,8 @@ pub struct Shared {
     pub cache_status: std::sync::Mutex<Option<&'static str>>,
     /// Whether the request updates the cache in the background (proxy_cache_background_update).
     pub updater: bool,
+    /// The status of the error that error_page redirected the request for ($status meanwhile).
+    pub err_status: std::sync::atomic::AtomicU16,
 }
 
 /// What a request carries, as the variables see it.
@@ -308,7 +310,7 @@ impl Var {
         Some(bytes(match self {
             Var::Uri => r.uri.clone(),
             Var::RequestMethod => r.method.clone(),
-            Var::Status => format!("{:03}", s.status),
+            Var::Status => format!("{:03}", if s.status == 0 { r.shared.err_status.load(std::sync::atomic::Ordering::Relaxed) } else { s.status }),
             Var::RequestLength => r.length.to_string(),
             Var::RequestTime => format!("{:.3}", r.started.elapsed().as_secs_f64()),
             Var::BytesSent => s.bytes.to_string(),

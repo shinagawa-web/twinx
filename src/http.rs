@@ -268,6 +268,8 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             match (overflow(&buf[..end.unwrap_or(buf.len())], default.level.header_buffer, buffers), end) {
                 (Err((status, at)), _) => break (at, Some(status), 0),
                 (Ok(limit), Some(end)) => break (end, None, u32::try_from(limit.saturating_sub(end)).unwrap_or(u32::MAX)),
+                // A request line that cannot be one is refused as soon as it comes.
+                (Ok(_), None) if bad_method(&buf) => break (buf.len(), None, 0),
                 (Ok(_), None) => {}
             }
             // Waiting for a next request, the time left counts from the end of the last one.
@@ -552,6 +554,16 @@ fn in_memory(buffer: u64, chunked: bool, preread: usize, room: usize) -> u64 {
 /// and a chunked body only to a server of HTTP/1.1 or later.
 fn unbuffered(level: &Level, chunked: bool) -> bool {
     level.proxy.is_some() && !level.proxy_request_buffering && level.proxy_pass_request_body && level.proxy_set_body.is_none() && (!chunked || level.proxy_http_11)
+}
+
+/// Whether what came of a request line, after the empty lines before it, is
+/// not the start of one, as ngx_http_parse_request_line() tells it byte by
+/// byte: its method has a byte other than A-Z, "_" and "-", or is empty.
+fn bad_method(buf: &[u8]) -> bool {
+    let Some(start) = buf.iter().position(|c| !matches!(c, b'\r' | b'\n')) else { return false };
+    let line = &buf[start..];
+    let method = &line[..line.iter().position(|c| *c == b' ').unwrap_or(line.len())];
+    method.is_empty() || method.iter().any(|c| !(c.is_ascii_uppercase() || matches!(c, b'_' | b'-')))
 }
 
 /// Whether a location may read the request body: it proxies, or its rewrite
@@ -1143,7 +1155,11 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             }
             // The answer is sent with the error's status ("=code" replaces it, "=" leaves the
             // answer's own), unless it is a page generated for its own error or redirect.
-            let status = ep.status.unwrap_or(resp.status);
+            // Without "=code", the errors of TLS and of a head too large are answered
+            // with 400, as nginx sets for them (ngx_http_core_error_page()).
+            let status = ep.status.unwrap_or(if (494..=497).contains(&resp.status) { 400 } else { resp.status });
+            // $status is the error's while the URI is answered.
+            to.shared.err_status.store(status, std::sync::atomic::Ordering::Relaxed);
             let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
             redirected = to;
             (resp, level, last) = Box::pin(answer(server, &redirected, Ok(()), found, Some(&mut *stream))).await;
@@ -1164,8 +1180,10 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     let absolute = level.absolute_redirect && !resp.relative;
     if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| absolute) {
         let host = if level.server_name_in_redirect { r.server_name.clone() } else { r.host.clone().unwrap_or_else(|| local.ip().to_string()) };
-        let port = if level.port_in_redirect && local.port() != 80 { format!(":{}", local.port()) } else { String::new() };
-        h.1 = format!("http://{host}{port}{}", h.1);
+        // Over TLS the scheme is https, whose port 443 goes without saying.
+        let (scheme, default) = if r.ssl.is_some() { ("https", 443) } else { ("http", 80) };
+        let port = if level.port_in_redirect && local.port() != default { format!(":{}", local.port()) } else { String::new() };
+        h.1 = format!("{scheme}://{host}{port}{}", h.1);
     }
     let gzipped = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("content-encoding") && h.1.eq_ignore_ascii_case("gzip"));
     let streams = streams(r, &resp);
@@ -6518,6 +6536,12 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(in_memory(1024, false, 100, 6000), 6000);
         // A chunked body: in a buffer of client_body_buffer_size that does not fill.
         assert_eq!(in_memory(1024, true, 900, 900), 1924);
+    }
+
+    #[test]
+    fn request_lines_that_cannot_be() {
+        for good in [&b""[..], b"\r\n", b"GE", b"GET", b"GET /", b"\r\nM-SEARCH_X *"] { assert!(!bad_method(good), "{good:?}"); }
+        for bad in [&b"\0"[..], b" ", b"\r\n ", b"get /", b"\x7f", b"\x15\x03", b"GET\0"] { assert!(bad_method(bad), "{bad:?}"); }
     }
 
     #[test]
