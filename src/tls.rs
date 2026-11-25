@@ -632,14 +632,41 @@ fn cipher(id: u16) -> String {
     CIPHERS.iter().find(|c| c.0 == id).map_or_else(|| format!("0x{id:04x}"), |c| c.1.to_string())
 }
 
-/// A name as OpenSSL writes it: RFC 2253, the last attribute first
-/// ("CN=name,O=organization"), or legacy, the first first ("/O=organization/CN=name").
+/// The short names OpenSSL gives the attribute types of names; others are
+/// written by their OIDs.
+const ATTRIBUTES: &[(&str, &str)] = &[
+    ("2.5.4.3", "CN"), ("2.5.4.4", "SN"), ("2.5.4.5", "serialNumber"), ("2.5.4.6", "C"), ("2.5.4.7", "L"), ("2.5.4.8", "ST"),
+    ("2.5.4.9", "street"), ("2.5.4.10", "O"), ("2.5.4.11", "OU"), ("2.5.4.12", "title"), ("2.5.4.17", "postalCode"),
+    ("2.5.4.42", "GN"), ("2.5.4.43", "initials"), ("2.5.4.46", "dnQualifier"), ("2.5.4.65", "pseudonym"),
+    ("0.9.2342.19200300.100.1.1", "UID"), ("0.9.2342.19200300.100.1.25", "DC"), ("1.2.840.113549.1.9.1", "emailAddress"),
+];
+
+/// A value of a name as RFC 2253 escapes it, as OpenSSL does: a backslash
+/// before ,+"\<>; anywhere, before "#" first and a space first or last, and
+/// bytes that are controls or not ASCII as a backslash and two hex digits.
+fn escape_2253(value: &str) -> String {
+    let last = value.len().saturating_sub(1);
+    value.bytes().enumerate().map(|(i, c)| match c {
+        b',' | b'+' | b'"' | b'\\' | b'<' | b'>' | b';' => format!("\\{}", c as char), 0..0x20 | 0x7f.. => format!("\\{c:02X}"),
+        b'#' if i == 0 => "\\#".to_string(),
+        b' ' if i == 0 || i == last => "\\ ".to_string(),
+        _ => (c as char).to_string(),
+    }).collect()
+}
+
+/// A name as OpenSSL writes it: RFC 2253, the last attribute first, those of
+/// one RDN joined by "+" ("CN=name,O=organization"), with its values escaped;
+/// or legacy, the first first ("/O=organization/CN=name").
 fn name(name: &x509_parser::x509::X509Name, legacy: bool) -> String {
-    let registry = x509_parser::objects::oid_registry();
-    let attr = |a: &x509_parser::x509::AttributeTypeAndValue| format!("{}={}", x509_parser::objects::oid2abbrev(a.attr_type(), registry).map_or_else(|_| a.attr_type().to_id_string(), str::to_string), a.as_str().unwrap_or_default());
-    let rdns = name.iter_rdn().map(|rdn| rdn.iter().map(attr).collect::<Vec<_>>());
-    if legacy { return rdns.flatten().map(|a| format!("/{a}")).collect() }
-    rdns.map(|a| a.join("+")).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(",")
+    let attr = |a: &x509_parser::x509::AttributeTypeAndValue| {
+        let oid = a.attr_type().to_id_string();
+        let value = a.as_str().unwrap_or_default();
+        format!("{}={}", ATTRIBUTES.iter().find(|t| t.0 == oid).map_or(oid.as_str(), |t| t.1), if legacy { value.to_string() } else { escape_2253(value) })
+    };
+    if legacy { return name.iter_attributes().map(|a| format!("/{}", attr(a))).collect() }
+    // Each attribute, the last first, after "," or, within an RDN, "+".
+    let attrs: Vec<(usize, String)> = name.iter_rdn().enumerate().flat_map(|(i, rdn)| rdn.iter().map(move |a| (i, attr(a)))).collect();
+    attrs.iter().rev().enumerate().map(|(n, (i, a))| if n == 0 { a.clone() } else { format!("{}{a}", if attrs[attrs.len() - n].0 == *i { "+" } else { "," }) }).collect()
 }
 
 /// Data in base64, padded with "=".
@@ -898,11 +925,13 @@ impl Verify {
 /// Verifies a certificate chain as OpenSSL does without partial chains: from
 /// the peer's certificate up through the issuers it sent or the trusted ones,
 /// each signing the one below, to a trusted self-signed certificate, the
-/// chain at most depth + 1 certificates long with it; all of them valid now, the issuers CAs, and
+/// chain at most depth + 2 certificates long with it; those not trusted for
+/// the purpose (a client's with last, else a server's) when they name one;
+/// all of them valid now, the issuers CAs, and
 /// with CRLs, none revoked by a CRL of its issuer, which each must have (as
 /// X509_V_FLAG_CRL_CHECK_ALL). Gives the chain parsed, the peer's certificate first, or the
 /// error as OpenSSL words it: once the chain is built, the first error in
-/// the order OpenSSL checks (the issuers being CAs, the CRLs from the peer's
+/// the order OpenSSL checks (the purposes, the issuers being CAs, the CRLs from the peer's
 /// certificate up, the times from the top down), or with last the last one,
 /// as OpenSSL ends with when its callback goes on after each, as nginx's
 /// does for clients' certificates.
@@ -910,17 +939,26 @@ fn verify_chain<'a>(end: &'a [u8], sent: &'a [CertificateDer], trusted: &'a [Cer
     let parse = |d: &'a [u8]| X509Certificate::from_der(d).ok().map(|(_, c)| c);
     let (anchors, sent): (Vec<_>, Vec<_>) = (trusted.iter().filter_map(|d| parse(d)).collect(), sent.iter().filter_map(|d| parse(d)).collect());
     let mut chain = vec![parse(end).ok_or("unable to decode certificate")?];
+    let is_trusted = |c: &X509Certificate| trusted.iter().any(|t| t.as_ref() == c.as_raw());
+    // As OpenSSL builds it, a chain takes issuers while it has at most depth + 1
+    // certificates: depth certificates between the end and the trusted root.
     loop {
         let cur = chain.last().unwrap();
         let self_signed = cur.subject().as_raw() == cur.issuer().as_raw();
-        if self_signed && trusted.iter().any(|t| t.as_ref() == cur.as_raw()) { break }
-        if self_signed { return Err(if chain.len() == 1 { "self-signed certificate" } else { "self-signed certificate in certificate chain" }) }
+        if self_signed && is_trusted(cur) { break }
         let issued = |c: &&X509Certificate<'a>| c.subject().as_raw() == cur.issuer().as_raw() && cur.verify_signature(Some(c.public_key())).is_ok();
-        let issuer = anchors.iter().find(issued).or_else(|| sent.iter().find(issued)).ok_or("unable to get local issuer certificate")?.clone();
-        if chain.len() > depth { return Err("certificate chain too long") }
+        let issuer = if self_signed || chain.len() > depth + 1 { None } else { anchors.iter().find(issued).or_else(|| sent.iter().find(issued)) };
+        let Some(issuer) = issuer.cloned() else {
+            let alone = if chain.len() == 1 { "self-signed certificate" } else { "self-signed certificate in certificate chain" };
+            return Err(if self_signed { alone } else if chain.iter().any(is_trusted) { "unable to get issuer certificate" } else { "unable to get local issuer certificate" });
+        };
         chain.push(issuer);
     }
     let mut errors = Vec::new();
+    // Those that are not trusted have to be for the purpose, a client's or a
+    // server's, when they say what they are for.
+    let purpose = |c: &&X509Certificate| c.extended_key_usage().ok().flatten().is_some_and(|u| !if last { u.value.client_auth } else { u.value.server_auth });
+    if chain.iter().filter(|c| !is_trusted(c)).any(|c| purpose(&c)) { errors.push("unsuitable certificate purpose") }
     if chain[1..].iter().any(|c| !c.is_ca() && c.version() != X509Version::V1) { errors.push("invalid CA certificate") }
     let crls: Option<Vec<_>> = crls.map(|crls| crls.iter().filter_map(|d| CertificateRevocationList::from_der(d).ok().map(|(_, c)| c)).collect());
     for (i, c) in chain.iter().enumerate().filter(|_| crls.is_some()) {
@@ -1115,11 +1153,14 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         let (root, int, end) = (der(ROOT), der(INT), der(END));
         let ok = |sent: &[CertificateDer<'static>], trusted: &[CertificateDer<'static>], crls: Option<&[Vec<u8>]>, depth| verify_chain(&end, sent, trusted, crls, depth, false).map(|_| ());
         assert_eq!(ok(&[int.clone()], &[root.clone()], None, 2), Ok(()));
-        assert_eq!(ok(&[int.clone()], &[root.clone()], None, 1), Err("certificate chain too long"));
+        // Depth counts the certificates between the end and the root.
+        assert_eq!(ok(&[int.clone()], &[root.clone()], None, 1), Ok(()));
+        assert_eq!(ok(&[int.clone()], &[root.clone()], None, 0), Err("unable to get local issuer certificate"));
         assert_eq!(ok(&[], &[root.clone()], None, 2), Err("unable to get local issuer certificate"));
         // A trusted intermediate is no end: the chain goes on to the root.
-        assert_eq!(ok(&[], &[int.clone(), root.clone()], None, 1), Err("certificate chain too long"));
-        assert_eq!(ok(&[], &[int.clone()], None, 2), Err("unable to get local issuer certificate"));
+        assert_eq!(ok(&[], &[int.clone(), root.clone()], None, 1), Ok(()));
+        assert_eq!(ok(&[], &[int.clone(), root.clone()], None, 0), Err("unable to get issuer certificate"));
+        assert_eq!(ok(&[], &[int.clone()], None, 2), Err("unable to get issuer certificate"));
         // Every certificate needs a CRL of its issuer, the root its own.
         assert_eq!(ok(&[int.clone()], &[root.clone()], Some(&[crl(ROOT_CRL)]), 2), Err("unable to get certificate CRL"));
         assert_eq!(ok(&[int.clone()], &[root.clone()], Some(&[crl(ROOT_CRL), crl(INT_CRL)]), 2), Ok(()));
@@ -1133,6 +1174,16 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert!(verify_chain(&root, &[], &[root.clone()], None, 0, false).is_ok());
         assert_eq!(verify_chain(&root, &[], &[], None, 0, false).map(|_| ()), Err("self-signed certificate"));
         assert_eq!(verify_chain(&int, &[root.clone()], &[], None, 1, false).map(|_| ()), Err("self-signed certificate in certificate chain"));
+    }
+
+    #[test]
+    fn escapes_names_as_rfc_2253() {
+        assert_eq!(escape_2253("d\"e;f<g>h"), "d\\\"e\\;f\\<g\\>h");
+        assert_eq!(escape_2253("a, b+c"), "a\\, b\\+c");
+        assert_eq!(escape_2253(" a#b "), "\\ a#b\\ ");
+        assert_eq!(escape_2253("#c\\"), "\\#c\\\\");
+        assert_eq!(escape_2253("\u{e9}\n"), "\\C3\\A9\\0A");
+        assert_eq!(escape_2253(""), "");
     }
 
     #[test]
