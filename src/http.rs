@@ -2553,7 +2553,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // Those proxy_set_header sets replace them; over HTTP/2 a body is not chunked.
     let length = match &set_body {
         Some(b) => Some(b.len() as u64),
-        None => (pass_body && !chunked && framing(r) != Ok(Some(0))).then(|| body.len() as u64 + unread.as_ref().map_or(0, |u| u.left)),
+        // A request without a body has none, but one that says Content-Length: 0 is passed with it, as in nginx.
+        None => (pass_body && !chunked && (framing(r) != Ok(Some(0)) || header(r, "content-length").is_some())).then(|| body.len() as u64 + unread.as_ref().map_or(0, |u| u.left)),
     };
     if pass_body && chunked && !is_set("transfer-encoding") && !level.proxy_h2 { req += "Transfer-Encoding: chunked\r\n"; }
     if let Some(n) = length.filter(|_| !is_set("content-length")) { req += &format!("Content-Length: {n}\r\n"); }
