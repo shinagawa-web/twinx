@@ -68,13 +68,15 @@ pub fn said(headers: &[(String, String)], ignored: &[String], now: i64) -> Optio
                 if let Some(n) = n { (valid, no_cache, expired) = (Some(n), false, false); }
             }
             "cache-control" => {
-                if !(valid.is_some() && accel) {
+                // A time X-Accel-Expires gave ("@0" gives none) comes first.
+                if !(valid.is_some_and(|v| v != 0) && accel) {
                     if ["no-cache", "no-store", "private"].iter().any(|d| lower.contains(d)) { no_cache = true; continue; }
                     let age = lower.find("s-maxage=").map(|i| i + 9).or_else(|| lower.find("max-age=").map(|i| i + 8));
-                    // Other than digits goes no further; "0" caches nothing.
-                    match age.map(|age| seconds(&lower[age..])) { Some(None) => continue, Some(Some(0)) => { no_cache = true; continue } Some(Some(n)) => (valid, expired) = (Some(now.saturating_add(n)), false), None => {} }
+                    // Other than digits caches nothing at all, nor does "0".
+                    match age.map(|age| seconds(&lower[age..])) { Some(None) => return None, Some(Some(0)) => { no_cache = true; continue } Some(Some(n)) => (valid, expired) = (Some(now.saturating_add(n)), false), None => {} }
                 }
-                if let Some(n) = lower.find("stale-while-revalidate=").and_then(|i| seconds(&lower[i + 23..])) { updating = n; }
+                match lower.find("stale-while-revalidate=").map(|i| seconds(&lower[i + 23..])) { Some(None) => return None, Some(Some(n)) => updating = n, None => {} }
+                if let Some(None) = lower.find("stale-if-error=").map(|i| seconds(&lower[i + 15..])) { return None; }
             }
             "expires" if valid.is_none() => match crate::expires::http_time(value).filter(|t| *t >= now) {
                 Some(t) => valid = Some(t),
@@ -83,7 +85,7 @@ pub fn said(headers: &[(String, String)], ignored: &[String], now: i64) -> Optio
             _ => {}
         }
     }
-    (!no_cache && !expired).then_some((valid, updating))
+    (!no_cache && !expired).then_some((valid.filter(|&v| v != 0), updating))
 }
 
 /// The seconds a directive of Cache-Control gives, up to ",", ";" or " " (as many as
@@ -121,6 +123,17 @@ pub struct Zone {
     since: Mutex<HashMap<String, Instant>>,
     /// How many requests asked for each key (proxy_cache_min_uses).
     uses: Mutex<HashMap<String, u64>>,
+    /// The keys whose kept answer, no longer valid, a request asks the server to update.
+    refreshing: Mutex<std::collections::HashSet<String>>,
+}
+
+/// A request asking the server to update what a zone keeps for a key, until it is dropped.
+pub struct Refresh<'a>(&'a Zone, String);
+
+impl Drop for Refresh<'_> {
+    fn drop(&mut self) {
+        self.0.refreshing.lock().unwrap().remove(&self.1);
+    }
 }
 
 /// How long a request waits for another that asks for the same key (proxy_cache_lock_timeout's default).
@@ -159,6 +172,12 @@ impl Zone {
     /// The answer kept for a key, also once it is no longer valid (proxy_cache_use_stale).
     pub fn stale(&self, key: &str) -> Option<Entry> {
         self.entries.lock().unwrap().get(key).cloned()
+    }
+
+    /// Notes that a request asks the server to update what is kept for a key, unless another
+    /// already does (the node's updating flag of nginx): None then.
+    pub fn refresh(&self, key: &str) -> Option<Refresh<'_>> {
+        self.refreshing.lock().unwrap().insert(key.to_string()).then(|| Refresh(self, key.to_string()))
     }
 
     /// Counts one more request for a key, and gives how many asked for it so far.
@@ -281,6 +300,15 @@ mod tests {
     }
 
     #[test]
+    fn one_request_refreshes_a_key() {
+        let z = Zone::default();
+        let held = z.refresh("k").unwrap();
+        assert!(z.refresh("k").is_none() && z.refresh("other").is_some());
+        drop(held);
+        assert!(z.refresh("k").is_some());
+    }
+
+    #[test]
     fn one_request_at_a_time_holds_a_key() {
         let z = Zone::default();
         crate::stream::block_on(async {
@@ -313,7 +341,15 @@ mod tests {
         assert_eq!(said(&[("Cache-Control", "max-age=60")]), Some((Some(1060), 0)));
         assert_eq!(said(&[("Cache-Control", "s-maxage=5, max-age=60")]), Some((Some(1005), 0)));
         assert_eq!(said(&[("Cache-Control", "max-age=9223372036854775808")]), Some((Some(i64::MAX), 0)));
-        assert_eq!(said(&[("Cache-Control", "max-age=6x")]), Some((None, 0)));
+        // Other than digits caches nothing, also in its extensions.
+        assert_eq!(said(&[("Cache-Control", "max-age=6x")]), None);
+        assert_eq!(said(&[("Cache-Control", "max-age=60, stale-while-revalidate=x")]), None);
+        assert_eq!(said(&[("Cache-Control", "max-age=60, stale-if-error=x")]), None);
+        assert_eq!(said(&[("Cache-Control", "max-age=60, stale-if-error=1")]), Some((Some(1060), 0)));
+        // "@0" gives no time.
+        assert_eq!(said(&[("X-Accel-Expires", "@0"), ("Cache-Control", "max-age=60")]), Some((Some(1060), 0)));
+        assert_eq!(said(&[("Cache-Control", "max-age=60"), ("X-Accel-Expires", "@0")]), Some((None, 0)));
+        assert_eq!(said(&[("X-Accel-Expires", "@0"), ("Cache-Control", "no-cache")]), None);
         assert_eq!(said(&[("Cache-Control", "max-age=0")]), None);
         assert_eq!(said(&[("Cache-Control", "no-cache, max-age=60")]), None);
         assert_eq!(said(&[("Cache-Control", "no-cache"), ("Cache-Control", "max-age=60")]), None);
