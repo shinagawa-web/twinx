@@ -272,25 +272,20 @@ pub enum Flag {
     Break,
 }
 
-/// The directives of the rewrite module that a level runs in order, after set and if.
+/// The directives of the rewrite module, which a level runs in the order they are written.
 #[derive(Debug, Clone)]
-pub enum Step {
+pub enum Op {
     Rewrite(Rewrite),
     /// return code [text] | code URL | URL.
     Return(u16, Template),
     /// break: the rewrite module's directives after it are not run.
     Break,
-}
-
-/// What set and if do, in the order they are written.
-#[derive(Debug, Clone)]
-pub enum Op {
     /// set $name value.
     Set(String, Template),
     /// if ($variable) { ... }: when the value is neither empty nor "0", the
-    /// directives of the block, and from then on the settings of the block
-    /// (None for a block in a server, whose settings the location replaces).
-    If(Condition, Vec<Op>, Option<Arc<Level>>),
+    /// directives of the block, then those after it, and from then on the
+    /// settings of the block.
+    If(Condition, Vec<Op>, Arc<Level>),
 }
 
 /// The condition of if, the last field of each saying whether it is negated ("!").
@@ -347,11 +342,8 @@ pub enum CacheZone {
 /// The settings of one level (http, server or location) after inheriting from the one above.
 #[derive(Debug, Clone, Default)]
 pub struct Level {
-    /// rewrite, return and break, in order, those of the server first.
-    pub rewrite: Vec<Step>,
-    /// set and if of the server, run before those of the location.
-    pub server_script: Vec<Op>,
-    /// set and if of the location, which nested locations do not inherit.
+    /// The rewrite module's directives of the level, which nested locations do
+    /// not inherit: those of a server run before its location is looked for.
     pub script: Vec<Op>,
     /// proxy_cookie_domain and proxy_cookie_path; None when off.
     pub proxy_cookie_domain: Option<Vec<CookieRewrite>>,
@@ -983,16 +975,15 @@ impl Builder<'_> {
         let named = files.iter().any(|(cert, key)| [cert, key].iter().any(|p| p.to_string_lossy().contains('$')));
         s.tls = (!files.is_empty()).then(|| crate::tls::server((&files, l.ssl_password_file.as_deref()), named.then(|| l.ssl_certificate_cache.clone()), &trust, options)).transpose()?;
         let level = s.level.clone();
-        self.locations(block, None, (&level, &level.rewrite), &mut s.locations)?;
+        self.locations(block, None, &level, &mut s.locations)?;
         Ok(s)
     }
 
     /// The locations of a block, and of the location it is in, if any, with its kind, name and
-    /// index; they inherit the settings of the level above, but of rewrite, return and break
-    /// only those of the server.
-    fn locations(&mut self, block: &[Directive], around: Option<(Kind, &str, usize)>, (parent, server_rewrite): (&Level, &[Step]), out: &mut Vec<Location>) -> Result<(), String> {
+    /// index; they inherit the settings of the level above, but not the rewrite module's directives.
+    fn locations(&mut self, block: &[Directive], around: Option<(Kind, &str, usize)>, parent: &Level, out: &mut Vec<Location>) -> Result<(), String> {
         for d in block.iter().filter(|d| d.name == "location") {
-            let mut level = Level { proxy: None, try_files: None, script: Vec::new(), limit_except: None, rewrite: server_rewrite.to_vec(), ..parent.clone() };
+            let mut level = Level { proxy: None, try_files: None, script: Vec::new(), limit_except: None, ..parent.clone() };
             let inner = d.block.as_deref().unwrap_or_default();
             let (kind, path) = location(&d.args).map_err(|e| format!("{e} in {}", d.at))?;
             nested(&kind, &path, around.map(|(k, n, _)| (k, n))).map_err(|e| format!("{e} in {}", d.at))?;
@@ -1006,7 +997,7 @@ impl Builder<'_> {
             let around = match &kind { Match::Exact => Kind::Exact, Match::Named => Kind::Named, Match::Regex(_) => Kind::Regex, _ => Kind::Prefix };
             let index = out.len();
             out.push(Location { kind, path, level: level.clone(), auto_redirect, parent: parent_index });
-            self.locations(inner, Some((around, &name, index)), (&level, server_rewrite), out)?;
+            self.locations(inner, Some((around, &name, index)), &level, out)?;
         }
         Ok(())
     }
@@ -1015,8 +1006,6 @@ impl Builder<'_> {
     /// access_log and error_log replace what the level above set as a whole.
     fn level(&mut self, block: &[Directive], ctx: u16, level: &mut Level) -> Result<(), String> {
         let mut logs: Option<Vec<Arc<AccessLog>>> = None;
-        // The rewrite, return and break inherited, the server's: a limit_except block has only those.
-        let inherited = level.rewrite.len();
         let mut errors: Option<Vec<(Arc<File>, usize)>> = None;
         let (mut headers, mut trailers): (Option<Vec<(String, Template, bool)>>, Option<Vec<_>>) = (None, None);
         let mut pages: Option<Vec<ErrorPage>> = None;
@@ -1038,14 +1027,13 @@ impl Builder<'_> {
             let at = |e: String| format!("{e} in {}", d.at);
             let invalid = || at(format!("\"{}\" directive invalid value", d.name));
             match d.name.as_str() {
-                "return" => level.rewrite.push(ret(&d.args).map(|(code, text)| Step::Return(code, text)).map_err(at)?),
-                "rewrite" => level.rewrite.push(rewrite(&d.args).map(Step::Rewrite).map_err(at)?),
-                "break" => level.rewrite.push(Step::Break),
-                "set" | "if" => {
-                    let op = if d.name == "set" { set(&d.args) } else { condition(&d.args).map(|c| Op::If(c, Vec::new(), None)) }.map_err(at)?;
-                    let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
-                    if d.name == "if" { ifs.push((script.len(), d)); }
-                    script.push(op);
+                "return" => level.script.push(ret(&d.args).map(|(code, text)| Op::Return(code, text)).map_err(at)?),
+                "rewrite" => level.script.push(rewrite(&d.args).map(Op::Rewrite).map_err(at)?),
+                "break" => level.script.push(Op::Break),
+                "set" => level.script.push(set(&d.args).map_err(at)?),
+                "if" => {
+                    ifs.push((level.script.len(), d));
+                    level.script.push(condition(&d.args).map(|c| Op::If(c, Vec::new(), Arc::default())).map_err(at)?);
                 }
                 "proxy_cookie_domain" | "proxy_cookie_path" => {
                     let (i, rewrite) = (d.name.ends_with("path") as usize, cookie_rewrite(&d.args, d.name.ends_with("domain")).map_err(at)?);
@@ -1339,18 +1327,15 @@ impl Builder<'_> {
             level.proxy_redirect = level.proxy.as_ref().and_then(|p| self.default_redirect(p)).map(|r| vec![r]).or(Some(Vec::new()));
         }
         // An if block inherits everything its level has, wherever it is written there.
-        // One in a server block gives a level only to return, which answers at once.
         for (i, d) in ifs {
-            let mut inner = Level { script: Vec::new(), server_script: Vec::new(), ..level.clone() };
+            let mut inner = Level { script: Vec::new(), ..level.clone() };
             self.level(d.block.as_deref().unwrap_or_default(), if ctx == SRV { SIF } else { LIF }, &mut inner)?;
-            let script = if ctx == SRV { &mut level.server_script } else { &mut level.script };
-            if let Op::If(_, body, to) = &mut script[i] { (*body, *to) = (std::mem::take(&mut inner.script), (ctx != SRV || inner.rewrite.iter().any(|s| matches!(s, Step::Return(..)))).then(|| Arc::new(inner))); }
+            if let Op::If(_, body, to) = &mut level.script[i] { (*body, *to) = (std::mem::take(&mut inner.script), Arc::new(inner)); }
         }
-        // A limit_except block inherits the location's settings, but not its set, if,
-        // rewrite, return and break, which do not run there.
+        // A limit_except block inherits the location's settings, but not the
+        // rewrite module's directives, which do not run there.
         if let Some((methods, d)) = limit {
             let mut inner = Level { script: Vec::new(), ..level.clone() };
-            inner.rewrite.truncate(inherited);
             self.level(d.block.as_deref().unwrap_or_default(), LMT, &mut inner)?;
             level.limit_except = Some((methods, Arc::new(inner)));
         }
@@ -1897,7 +1882,7 @@ mod tests {
     use crate::config::parse;
 
     fn return_code(level: &Level) -> u16 {
-        level.rewrite.iter().find_map(|s| if let Step::Return(code, _) = s { Some(*code) } else { None }).unwrap()
+        level.script.iter().find_map(|s| if let Op::Return(code, _) = s { Some(*code) } else { None }).unwrap()
     }
 
     fn build_text(text: &str) -> Result<Config, String> {
@@ -2467,9 +2452,11 @@ mod tests {
         assert_eq!(rewrite(&["^".into(), "/x".into(), "last".into()]).unwrap().flag, Flag::Last);
         assert_eq!(rewrite(&["^".into(), "http://e/".into(), "x".into()]).unwrap_err(), "invalid parameter \"x\"");
         assert!(rewrite(&["(".into(), "http://e/".into()]).is_err());
-        let c = build_text("http { server { rewrite ^/s http://s/; location / { rewrite ^/l http://l/; break; return 204; } } }").unwrap();
-        let steps = &c.servers[0].locations[0].level.rewrite;
-        assert!(matches!(steps[..], [Step::Rewrite(_), Step::Rewrite(_), Step::Break, Step::Return(204, _)]));
+        let c = build_text("http { server { rewrite ^/s http://s/; set $a 1; location / { rewrite ^/l http://l/; if ($a) { set $a 2; } break; return 204; } } }").unwrap();
+        // The server keeps its own, which the location does not inherit, all in the order written.
+        assert!(matches!(c.servers[0].level.script[..], [Op::Rewrite(_), Op::Set(..)]));
+        let ops = &c.servers[0].locations[0].level.script;
+        assert!(matches!(&ops[..], [Op::Rewrite(_), Op::If(_, body, _), Op::Break, Op::Return(204, _)] if matches!(body[..], [Op::Set(..)])));
         assert_eq!(build_text("http { server { break 1; } }").unwrap_err(), "invalid number of arguments in \"break\" directive in t.conf:1");
     }
 
@@ -2665,11 +2652,11 @@ mod tests {
         let redirect = s.locations[0].level.proxy_redirect.as_ref().unwrap();
         assert!(matches!(&redirect[0].pattern, CookiePattern::Text(t) if matches!(&t.0[..], [Part::Text(u)] if u == "https://127.0.0.1/u")));
         assert_eq!(s.locations[1].level.limit_except.as_ref().unwrap().0, ["GET", "HEAD"]);
-        // Only the server's rewrite, return and break go on in a limit_except block.
+        // The location's rewrite module directives do not go on in a limit_except block.
         let c = build_text("http { server { break; location / { return 200; limit_except GET { } } } }").unwrap();
         let level = &c.servers[0].locations[0].level;
-        assert_eq!(level.rewrite.len(), 2);
-        assert!(matches!(level.limit_except.as_ref().unwrap().1.rewrite[..], [Step::Break]));
+        assert_eq!(level.script.len(), 1);
+        assert!(level.limit_except.as_ref().unwrap().1.script.is_empty());
     }
 
     #[test]
