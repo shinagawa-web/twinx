@@ -3298,6 +3298,11 @@ pub(crate) mod tests {
         (addr, Told { told, addr, over })
     }
 
+    /// Does so with each of the cases, at once, as they wait rather than work.
+    pub(crate) fn at_once<T: Send>(cases: impl IntoIterator<Item = T>, each: impl Fn(T) + Sync) {
+        thread::scope(|s| cases.into_iter().for_each(|case| drop(s.spawn(|| each(case)))));
+    }
+
     #[test]
     fn listens_with_the_backlog() {
         let l = listen("127.0.0.1:0".parse().unwrap(), 511).unwrap();
@@ -4232,7 +4237,8 @@ pub(crate) mod tests {
 
     /// Where a test logs to.
     pub(crate) fn log_path(name: &str) -> PathBuf {
-        let log = std::env::temp_dir().join(format!("twinx-{name}-{}", std::process::id()));
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        let log = std::env::temp_dir().join(format!("twinx-{name}-{}-{}", std::process::id(), COUNT.fetch_add(1, Ordering::SeqCst)));
         let _ = std::fs::remove_file(&log);
         log
     }
@@ -4465,11 +4471,10 @@ pub(crate) mod tests {
     #[test]
     fn answers_cut_off_or_malformed_later_end_there() {
         let _busy = serving_on();
-        let log = log_path("later");
         let (with_length, in_chunks, plain) = (head("Content-Length: 30000\r\n", "close"), head("Transfer-Encoding: chunked\r\n", "close"), head("", "close"));
         // The Date line, which is left out of what comes, is counted.
         let counted = |head: &str, body: usize| format!("200 {body} {} 200", head.len() + 37 + body);
-        for (head, pieces, closes, request, directives, want, received) in [
+        at_once([
             (LENGTH, &["ab", "cd", ""][..], true, HTTP11, "", vec![with_length.clone() + "abcd"], 4),
             (LENGTH, &["ab", "cd", ""], true, HTTP11, OFF, vec![with_length.clone() + "ab", "cd".into()], 4),
             (LENGTH, &["ab", ""], true, HTTP11, "", vec![with_length.clone() + "ab"], 2),
@@ -4487,7 +4492,8 @@ pub(crate) mod tests {
             (CHUNKED, &["2\r\nab\r\nzz"], false, HTTP11, "", vec![], 9),
             // Too little to be looked at before the server closes the connection.
             (CHUNKED, &["2\r\nab\r\n", "zz", ""], true, HTTP11, "", vec![in_chunks.clone() + "2\r\nab\r\n"], 9),
-        ] {
+        ], |(head, pieces, closes, request, directives, want, received)| {
+            let log = log_path("later");
             let (addr, count) = plays(&after_head(head, pieces, 60), closes);
             let got = block_on(arrivals(&passing(addr, &format!("{directives} access_log {} f;", log.display())), request));
             assert_eq!(got.iter().map(|g| &g.1).collect::<Vec<_>>(), want.iter().collect::<Vec<_>>(), "{head} {pieces:?}");
@@ -4496,14 +4502,14 @@ pub(crate) mod tests {
             let line = if want.is_empty() { "200 0 0 200".to_string() } else { counted(&want[0][..start], sent - start) };
             assert_eq!(logged(&log), format!("{line} {received} {} -\n", head.len() + received), "{head} {pieces:?}");
             assert_eq!(count.lock().unwrap()[0], 1);
-        }
+        });
         // A read of it that waits longer than proxy_read_timeout.
-        for (directives, want) in [("", ""), (OFF, "abcd")] {
+        at_once([("", ""), (OFF, "abcd")], |(directives, want)| {
             let (addr, count) = plays(&after_head(LENGTH, &["ab", "cd"], 60), false);
             let got = block_on(arrivals(&passing(addr, &format!("proxy_read_timeout 1s; {directives}")), HTTP11));
             assert_eq!(got.iter().map(|g| g.1.as_str()).collect::<String>(), with_length.clone() + want);
             while count.lock().unwrap()[1] == 0 { thread::sleep(Duration::from_millis(1)); }
-        }
+        });
     }
 
     #[test]
@@ -4538,12 +4544,12 @@ pub(crate) mod tests {
         let data = "x".repeat(9000);
         let length = LENGTH.replace("30000", "9000") + &data;
         let chunks = CHUNKED.to_string() + &chunk_of(&data) + "0\r\n\r\n";
-        for (answer, directives) in [(&length, ""), (&chunks, ""), (&length, "limit_rate 100k;"), (&length, "limit_rate 10000; limit_rate_after 1000;")] {
+        at_once([(&length, ""), (&chunks, ""), (&length, "limit_rate 100k;"), (&length, "limit_rate 10000; limit_rate_after 1000;")], |(answer, directives)| {
             let (addr, _count) = plays(&vec![(0, answer.clone().into_bytes())], false);
             let got = block_on(arrivals(&passing(addr, &format!("proxy_limit_rate 10000; {directives}")), HTTP11));
             let all = got.iter().map(|g| g.1.as_str()).collect::<String>();
             assert!(all.matches('x').count() >= 9000 && got[0].1.matches('x').count() <= 4096 && got.last().unwrap().0 >= 450, "{directives} {:?}", got.iter().map(|g| (g.0, g.1.len())).collect::<Vec<_>>());
-        }
+        });
         // Nothing is waited for before the first read, and for nothing.
         block_on(async {
             let mut intake = Intake::new(1000, 0);
@@ -4729,11 +4735,11 @@ pub(crate) mod tests {
     #[test]
     fn answers_that_fail_while_the_client_is_behind() {
         let _busy = serving_on();
-        let (log, data) = (log_path("behind-cut"), much());
+        let data = much();
         let length = LENGTH.replace("30000", "60000000");
         let big = [length.as_bytes(), &data].concat();
         let chunk = [CHUNKED.as_bytes(), format!("{:x}\r\n", data.len()).as_bytes(), &data, b"\r\n"].concat();
-        for (pieces, closes, all) in [
+        at_once([
             // Cut off where the connection ends, all that came is sent.
             (vec![(0, big.clone()), (50, Vec::new())], true, true),
             (vec![(0, chunk.clone()), (50, Vec::new())], true, true),
@@ -4741,7 +4747,8 @@ pub(crate) mod tests {
             (vec![(0, big.clone())], false, false),
             (vec![(0, chunk.clone())], false, false),
             (vec![(0, chunk.clone()), (50, b"zz\r\nzzzz".to_vec())], false, false),
-        ] {
+        ], |(pieces, closes, all)| {
+            let log = log_path("behind-cut");
             let malformed = pieces.last().unwrap().1.starts_with(b"zz");
             let (addr, count) = plays(&pieces, closes);
             let http = passing(addr, &format!("proxy_read_timeout 1s; access_log {} f;", log.display()));
@@ -4764,7 +4771,7 @@ pub(crate) mod tests {
             assert!(data.starts_with(&got) && (got.len() == data.len()) == all, "{} {} {all}", got.len(), data.len());
             let text = logged(&log);
             assert!(text.starts_with("200 ") && text.contains(&format!(" 200 {} ", pieces.iter().map(|p| p.1.len()).sum::<usize>() - head_end(&pieces[0].1).unwrap())), "{text}");
-        }
+        });
     }
 
     #[test]
@@ -4861,7 +4868,6 @@ pub(crate) mod tests {
     #[test]
     fn failures_to_reach_servers_are_logged() {
         let _busy = serving_on();
-        let errors = log_path("unreached");
         // Nothing listens on these, and nothing else takes their ports.
         let bound = [(); 2].map(|_| socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap());
         let [a, b] = [0, 1].map(|i| {
@@ -4872,7 +4878,7 @@ pub(crate) mod tests {
         let ((silent, _one), (resets, _two), (late, _three)) = (failing("", false), failing("", true), failing(&answer, false));
         let refused = "error connect() failed (111: Connection refused) while connecting to upstream";
         let disabled = "warn upstream server temporarily disabled while connecting to upstream";
-        for (servers, want) in [
+        at_once([
             (format!("server {a};"), vec![refused]),
             (format!("server {a}; server {b};"), vec![refused, disabled, refused, disabled]),
             (format!("server {a} max_fails=0; server {b} max_fails=0;"), vec![refused, refused]),
@@ -4880,13 +4886,14 @@ pub(crate) mod tests {
             (format!("server {silent};"), vec!["error upstream timed out (110: Connection timed out) while reading response header from upstream"]),
             (format!("server {resets};"), vec!["error recv() failed (104: Connection reset by peer) while reading response header from upstream"]),
             (format!("server {late};"), vec!["error upstream timed out (110: Connection timed out) while reading upstream"]),
-        ] {
+        ], |(servers, want)| {
+            let errors = log_path("unreached");
             let http = format!("upstream u {{ {servers} }} server {{ proxy_read_timeout 1s; location / {{ proxy_pass http://u/x/; error_log {} warn; }} }}", errors.display());
             block_on(arrivals(&http, HTTP11));
             let text = std::fs::read_to_string(&errors).unwrap();
             if want[0].contains("no live") { assert!(text.contains(", upstream: \"http://u/x/\", host: "), "{text}"); }
             assert_eq!(messages(&errors), want, "{servers}");
-        }
+        });
     }
 
     #[test]
@@ -5065,7 +5072,7 @@ pub(crate) mod tests {
         let (gz_length, gz_chunked) = (with_length(gz_len, &format!("{GZ}{strong}")), CHUNKED.replacen("\r\n\r\n", &format!("\r\n{GZ}\r\n"), 1));
         let delimited = DELIMITED.to_string();
         let none = String::new();
-        for (answer, pieces, closes, directives, request, want, came) in [
+        at_once([
             // Each read is flushed without buffering; else it waits for a buffer to be full, or the end.
             (&length, raw.clone(), false, format!("{gzip} {OFF}"), GZIP11, format!("{in_chunks}{recoded}{GZ}\r\n"), &[32, 32, 38][..]),
             (&chunked, chunks(&raw), false, format!("{gzip} {OFF}"), GZIP11, format!("{in_chunks}{GZ}\r\n"), &[32, 32, 38]),
@@ -5086,7 +5093,7 @@ pub(crate) mod tests {
             (&gz_length, gz.clone(), false, gunzip.to_string(), HTTP11, format!("{in_chunks}{recoded}\r\n"), &[102]),
             (&gz_length, gz.clone(), false, format!("gunzip on; {OFF}"), HTTP10, head("", "close").replace("\r\n\r\n", &format!("\r\n{recoded}\r\n")), &[32, 32, 38]),
             (&gz_length, gz.clone(), false, format!("{gunzip} {OFF}"), GZIP11, none.clone(), &[]),
-        ] {
+        ], |(answer, pieces, closes, directives, request, want, came)| {
             let (addr, _count) = plays(&pieces_after(answer, &pieces), closes);
             let got = block_on(bytes_arriving(&passing(addr, &directives), request));
             let (head, data, last) = opened(&got.concat());
@@ -5094,7 +5101,7 @@ pub(crate) mod tests {
                 // It takes gzip: the answer stays as it is.
                 assert!(head.contains("Content-Length") && head.contains(GZ) && head.contains("Vary") && head.contains(strong), "{head}");
                 assert_eq!(got.concat()[got[0].len() - gz[0].len()..], gz.concat(), "{head}");
-                continue;
+                return;
             }
             assert_eq!((&head, last), (&want, head.contains("chunked")), "{directives} {request}");
             let all = if came.iter().sum::<usize>() == 19 { "x".repeat(10) + &"y".repeat(9) } else { plain.clone() };
@@ -5108,14 +5115,12 @@ pub(crate) mod tests {
                 sum = n;
             }
             assert_eq!(is, came, "{answer} {directives} {request}");
-        }
+        });
     }
 
     #[test]
     fn what_gzip_changes_ends_where_the_answer_does() {
         let _busy = serving_on();
-        let log = log_path("coded");
-        let errors = log_path("coded-errors");
         let (a, b) = ("a".repeat(50), "b".repeat(50));
         let gz = member(&[&a, &b]);
         let whole = gz.concat();
@@ -5129,7 +5134,7 @@ pub(crate) mod tests {
         let (half, half_bad) = (exact(one.len() + 5), exact(one.len() + bad.len()));
         let (alone, junk) = (exact(5), exact(whole.len() + 4));
         let raw = [a.as_bytes().to_vec(), b.as_bytes().to_vec(), Vec::new()];
-        for (answer, pieces, closes, directives, request, want, data, error) in [
+        at_once([
             // Cut off: what was held goes on, without the end of gzip; but what is in a buffer
             // not full when a read waits too long does not.
             (&long, raw.to_vec(), true, "gzip on;", GZIP11, &compressed, a.clone() + &b, ""),
@@ -5150,7 +5155,9 @@ pub(crate) mod tests {
             (&gz_long, vec![[&one[..], &bad].concat()], false, "gunzip on; proxy_buffering off;", HTTP11, &String::new(), String::new(), "inflate() failed: 2, -3"),
             (&junk, vec![[&whole[..], b"junk"].concat()], false, "gunzip on;", HTTP11, &String::new(), String::new(), "inflate() failed: 0, -3"),
             (&junk, vec![[&whole[..], b"junk"].concat()], false, "gunzip on; proxy_buffering off;", HTTP11, &in_chunks, a.clone() + &b, "inflate() failed: 0, -3"),
-        ] {
+        ], |(answer, pieces, closes, directives, request, want, data, error)| {
+            let log = log_path("coded");
+            let errors = log_path("coded-errors");
             let (addr, count) = plays(&pieces_after(answer, &pieces), closes);
             // The connection would stay open otherwise.
             let request = request.replace("Connection: close\r\n", "");
@@ -5164,7 +5171,7 @@ pub(crate) mod tests {
             let line = logged(&errors).lines().filter(|l| !l.contains(" while reading upstream")).collect::<String>();
             assert!(if error.is_empty() { line.is_empty() } else { line.contains(&format!(": {error}, client: ")) }, "{directives} {line}");
             assert_eq!(count.lock().unwrap()[0], 1);
-        }
+        });
     }
 
     #[test]
@@ -5285,39 +5292,39 @@ pub(crate) mod tests {
         // Reset, with an error or without one; going away before the stream; a frame too short.
         let fails = [h2_frame(3, 0, 1, &[0, 0, 0, 2]), h2_frame(3, 0, 1, &[0; 4]), h2_frame(7, 0, 0, &[0; 8]), h2_frame(8, 0, 0, &[0; 3])];
         let going = h2_frame(7, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]);
-        for head in [&head, &length] {
-            for fail in &fails {
+        at_once([&head, &length], |head| {
+            at_once(&fails, |fail| {
                 assert_eq!(over_h2(&[head.clone(), data.clone(), fail.clone()], false, "", request), (cut(head, "abcde"), 1), "{fail:?}");
                 // Nothing is sent of the answer when no part of its body came before.
                 assert_eq!(over_h2(&[head.clone(), fail.clone()], false, "", request), (String::new(), 1), "{fail:?}");
                 assert_eq!(over_h2(&[[&head[..], &data, fail].concat()], false, "", request), (String::new(), 1), "{fail:?}");
-            }
-            for closing in [Vec::new(), going.clone()] {
+            });
+            at_once([Vec::new(), going.clone()], |closing| {
                 assert_eq!(over_h2(&[head.clone(), data.clone(), closing.clone()], true, "", request), (cut(head, "abcde"), 1));
                 assert_eq!(over_h2(&[head.clone(), closing], true, "", request), (cut(head, ""), 1));
-            }
+            });
             // One going away after the stream goes on with it.
             let (whole, came) = over_h2(&[head.clone(), data.clone(), going.clone(), h2_frame(0, 1, 1, b"fghij")], false, "", request);
             let want = if *head == length { text("Content-Length: 10", "abcdefghij") } else { text("Transfer-Encoding: chunked", "a\r\nabcdefghij\r\n0\r\n\r\n") };
             assert_eq!((joined(whole.as_bytes()), came), (want, 1));
-        }
+        });
         // What has no body is not cut.
         let head_only = "HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
         let (got, came) = over_h2(&[[&length[..], &fails[0]].concat()], false, "", head_only);
         assert!(got.starts_with("HTTP/1.1 200 ") && came == 1, "{got}");
         // Before the head, what fails is an invalid header, and the connection closing an error.
-        for fail in &fails {
+        at_once(&fails, |fail| {
             for (next, want) in [("", 1), ("proxy_next_upstream error;", 1), ("proxy_next_upstream invalid_header;", 2)] {
                 let (got, came) = over_h2(&[Vec::new(), fail.clone()], false, next, request);
                 assert!(got.starts_with("HTTP/1.1 502 ") && came == want, "{fail:?} {next} {came} {got}");
             }
-        }
-        for closing in [Vec::new(), going] {
+        });
+        at_once([Vec::new(), going], |closing| {
             for (next, want) in [("", 2), ("proxy_next_upstream error;", 2), ("proxy_next_upstream invalid_header;", 1)] {
                 let (got, came) = over_h2(&[Vec::new(), closing.clone()], true, next, request);
                 assert!(got.starts_with("HTTP/1.1 502 ") && came == want, "{closing:?} {next} {came} {got}");
             }
-        }
+        });
     }
 
     #[test]
@@ -5403,14 +5410,13 @@ pub(crate) mod tests {
     #[test]
     fn answers_whose_reading_fails_are_logged() {
         let _busy = serving_on();
-        let log = std::env::temp_dir().join(format!("twinx-failed-{}", std::process::id()));
         let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n{}", "x".repeat(100));
-        for (resets, rate) in [false, true].into_iter().flat_map(|resets| [RATES[0], RATES[1], OFF].map(|rate| (resets, rate))) {
-            let _ = std::fs::remove_file(&log);
+        at_once([false, true].into_iter().flat_map(|resets| [RATES[0], RATES[1], OFF].map(|rate| (resets, rate))), |(resets, rate)| {
+            let log = log_path("failed");
             let got = block_on(failed_on(&answer, resets, &format!("access_log {} f; {rate}", log.display()), "GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
             assert!(got.ends_with(&if rate == OFF { "x".repeat(100) } else { "\r\n\r\n".into() }), "{got}");
-            assert_eq!(std::fs::read_to_string(&log).unwrap(), "200 200 142 100\n");
-        }
+            assert_eq!(logged(&log), "200 200 142 100\n");
+        });
     }
 
     #[test]
@@ -5834,30 +5840,40 @@ pub(crate) mod tests {
             })).collect();
             for task in all { task.await.unwrap(); }
         });
-        // error_page takes the 504.
-        let (addr, _came) = silent(NEVER);
-        let http = format!("server {{ proxy_read_timeout 1s; location / {{ proxy_pass http://{addr}; error_page 504 = /e; }} location = /e {{ return 403; }} }}");
-        let got = block_on(received(&http, "GET / HTTP/1.0\r\n\r\n"));
-        assert!(got.starts_with(b"HTTP/1.1 403 "), "{got:?}");
-        // A body passed as it comes is passed once.
-        let ((a, sent), (b, again)) = (silent(NEVER), silent(&[OK]));
-        let body = Unread { left: 1, chunked: None, rest: Vec::new() };
-        assert_eq!(passed_to([a, b], "proxy_request_buffering off;", "PUT / HTTP/1.1\nHost: h\nContent-Length: 1\n\n", Some(body)), 504);
-        assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, 0));
-        // On a kept connection it uses up the try: no other is made to the server.
-        let (a, came) = silent(&[OK]);
-        let config = passing_to(&[a], "");
-        // A server that timed out has failed: the other one gets the requests for a while.
-        let ((b, sent), (c, _came)) = (silent(NEVER), silent(&[OK, OK]));
-        let two = passing_to(&[b, c], off);
-        block_on(async {
-            for want in [200, 504] {
-                let resp = answered(&config.servers[0], "GET / HTTP/1.0\n\n").await;
-                assert_eq!((resp.status, resp.upstream_status), (want, Some(want.to_string())));
-            }
-            for want in [504, 200, 200] { assert_eq!(answered(&two.servers[0], "GET / HTTP/1.0\n\n").await.status, want); }
-        });
-        assert_eq!((*came.lock().unwrap(), *sent.lock().unwrap()), (1, 1));
+        let error_page = || {
+            // error_page takes the 504.
+            let (addr, _came) = silent(NEVER);
+            let http = format!("server {{ proxy_read_timeout 1s; location / {{ proxy_pass http://{addr}; error_page 504 = /e; }} location = /e {{ return 403; }} }}");
+            let got = block_on(received(&http, "GET / HTTP/1.0\r\n\r\n"));
+            assert!(got.starts_with(b"HTTP/1.1 403 "), "{got:?}");
+        };
+        let body = || {
+            // A body passed as it comes is passed once.
+            let ((a, sent), (b, again)) = (silent(NEVER), silent(&[OK]));
+            let body = Unread { left: 1, chunked: None, rest: Vec::new() };
+            assert_eq!(passed_to([a, b], "proxy_request_buffering off;", "PUT / HTTP/1.1\nHost: h\nContent-Length: 1\n\n", Some(body)), 504);
+            assert_eq!((*sent.lock().unwrap(), *again.lock().unwrap()), (1, 0));
+        };
+        let kept = || {
+            // On a kept connection it uses up the try: no other is made to the server.
+            let (a, came) = silent(&[OK]);
+            let config = passing_to(&[a], "");
+            block_on(async {
+                for want in [200, 504] {
+                    let resp = answered(&config.servers[0], "GET / HTTP/1.0\n\n").await;
+                    assert_eq!((resp.status, resp.upstream_status), (want, Some(want.to_string())));
+                }
+            });
+            assert_eq!(*came.lock().unwrap(), 1);
+        };
+        let failed = || {
+            // A server that timed out has failed: the other one gets the requests for a while.
+            let ((b, sent), (c, _came)) = (silent(NEVER), silent(&[OK, OK]));
+            let two = passing_to(&[b, c], off);
+            block_on(async { for want in [504, 200, 200] { assert_eq!(answered(&two.servers[0], "GET / HTTP/1.0\n\n").await.status, want); } });
+            assert_eq!(*sent.lock().unwrap(), 1);
+        };
+        at_once([&error_page as &(dyn Fn() + Sync), &body, &kept, &failed], |each| each());
     }
 
     #[test]
@@ -5870,17 +5886,17 @@ pub(crate) mod tests {
         let mut queue = Vec::new();
         while let Ok(s) = std::net::TcpStream::connect_timeout(&a, Duration::from_millis(200)) { queue.push(s); }
         let _busy = serving_on();
-        for (directives, method, status, statuses) in [
+        at_once([
             ("", "GET", 200, "504, 200"), ("proxy_next_upstream error;", "GET", 504, "504"), ("proxy_next_upstream timeout;", "GET", 200, "504, 200"),
             // Nothing was sent to it.
             ("", "POST", 200, "504, 200"),
-        ] {
+        ], |(directives, method, status, statuses)| {
             let (b, came) = silent(&["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]);
             let config = passing_to(&[a, b], directives);
             let resp = block_on(answered(&config.servers[0], &format!("{method} / HTTP/1.0\n\n")));
             assert_eq!((resp.status, resp.upstream_status.as_deref()), (status, Some(statuses)), "{directives} {method}");
             assert_eq!(*came.lock().unwrap(), (status == 200) as usize, "{directives} {method}");
-        }
+        });
     }
 
     /// An Ed25519 key and its certificate, made by openssl only for these tests (those of src/tls.rs).
@@ -7326,11 +7342,11 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let _busy = serving_on();
         let (dir, data) = (files("rate"), letters(150_000));
         std::fs::write(dir.join("f"), &data).unwrap();
-        for (directives, ms) in [("limit_rate 100k;", 500..1800), ("limit_rate 50k; limit_rate_after 100k;", 400..1800), ("sendfile on; limit_rate 100k;", 500..1800), ("sendfile on; tcp_nopush on; limit_rate 50k; limit_rate_after 50k;", 500..1800)] {
+        at_once([("limit_rate 100k;", 500..1800), ("limit_rate 50k; limit_rate_after 100k;", 400..1800), ("sendfile on; limit_rate 100k;", 500..1800), ("sendfile on; tcp_nopush on; limit_rate 50k; limit_rate_after 50k;", 500..1800)], |(directives, ms)| {
             let started = Instant::now();
             let got = block_on(received(&serves_files(&dir, directives), "GET /f HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"));
             assert!(parted(&got).1 == data && ms.contains(&started.elapsed().as_millis()), "{directives} {:?}", started.elapsed());
-        }
+        });
         std::fs::remove_dir_all(dir).unwrap();
     }
 
