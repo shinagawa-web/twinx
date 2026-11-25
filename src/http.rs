@@ -2629,7 +2629,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // proxy_http_version 2: the request goes through a pipe, over HTTP/2 beyond it.
         // Its trailers come in a slot of their own.
         let slot = crate::h2::Slot::default();
-        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c, theirs, if p.ssl { "https" } else { "http" }, level.proxy_buffer_size, slot.clone(), sending)); Conn::new(Stream::Pipe(ours.into()), connecting) } else { c });
+        let conn = conn.map(|c| if level.proxy_h2 { let (ours, theirs) = tokio::io::duplex(65536); tokio::task::spawn_local(crate::h2::upstream(c, theirs, if p.ssl { "https" } else { "http" }, level.proxy_buffer_size, slot.clone(), sending)); let mut c = Conn::new(Stream::Pipe(ours.into()), connecting); c.slot = Some(slot.clone()); c } else { c });
         let begun = conn.is_ok();
         let mut fetched = match conn {
             Ok(conn) => {
@@ -3010,6 +3010,8 @@ const HANDSHAKING: &str = "SSL handshaking to upstream";
 const READING_HEAD: &str = "reading response header from upstream";
 const TIMED_OUT: &str = "upstream timed out (110: Connection timed out)";
 const PREMATURE: &str = "upstream prematurely closed connection";
+/// proxy_send_timeout's default.
+const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 const MORE: &str = "upstream sent more data than specified in \"Content-Length\" header";
 
 /// Why reading an answer failed: an end of TLS without its alert is an end.
@@ -3066,8 +3068,11 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     use NoAnswer::{Closed, Gone, Other, TimedOut};
     let invalid = |msg: &str| Other(format!("{msg} while {READING_HEAD}"));
     let s = &mut conn.stream;
-    // proxy_read_timeout: how long each read may wait.
+    // proxy_read_timeout: how long each read may wait. Over HTTP/2, as in nginx, it begins once
+    // the request has been sent whole; until then, a server that lets its body wait has
+    // proxy_send_timeout's default.
     let wait = Some(level.proxy_read_timeout).filter(|t| !t.is_zero());
+    let sending = |waited: &mut Duration| conn.slot.as_ref().is_some_and(|slot| !slot.lock().unwrap().sent) && wait.is_some_and(|w| { *waited += w; *waited < SEND_TIMEOUT });
     let (mut answer, mut chunk) = (Vec::new(), vec![0u8; 4096]);
     let wrote = async { tokio::io::AsyncWriteExt::write_all(s, req).await?; tokio::io::AsyncWriteExt::flush(s).await }.await;
     wrote.map_err(|e| Closed(format!("writev() failed {} while sending request to upstream", os_error(&e))))?;
@@ -3092,7 +3097,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
                     let action = if answer.is_empty() { "sending request to upstream" } else { READING_HEAD };
                     return Err(Gone(client.as_deref().filter(|_| gone).and_then(|c| client_gone(c, action)).unwrap_or_default()))
                 }
-                n = within(wait, s.read(&mut chunk)) => match n.ok_or(TimedOut(READING_HEAD))? {
+                n = async { let mut waited = Duration::ZERO; loop { match within(wait, s.read(&mut chunk)).await { None if sending(&mut waited) => {} n => break n } } } => match n.ok_or(TimedOut(READING_HEAD))? {
                     Ok(0) => return Err(Closed(format!("{PREMATURE} while {READING_HEAD}"))),
                     Ok(n) => n,
                     Err(e) => return Err(Closed(format!("{} while {READING_HEAD}", read_failed("recv", &e)))),

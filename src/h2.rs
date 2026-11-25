@@ -876,9 +876,10 @@ pub enum End { Whole, #[default] Closed, Failed }
 /// closed, besides what came on it: how its stream ended, its trailers, and whether
 /// its head ended it; the connection, if it may be used for another request, and
 /// where it goes then, with how long each read of the rest of its answer may wait, once
-/// that is known: whichever comes first waits for the other.
+/// that is known: whichever comes first waits for the other; and whether the request has
+/// been sent whole, body and all.
 #[derive(Debug, Default)]
-pub struct Ending { pub end: End, pub trailers: Vec<(String, String)>, pub bodiless: bool, conn: Option<Conn>, home: Option<Home> }
+pub struct Ending { pub end: End, pub trailers: Vec<(String, String)>, pub bodiless: bool, conn: Option<Conn>, home: Option<Home>, pub sent: bool }
 
 /// The upstream whose connection it is, the server's address and the location, and
 /// how long a read may wait.
@@ -981,6 +982,8 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
             frame(&mut out, DATA, if ended { END_STREAM } else { 0 }, id, &pending.drain(..n).collect::<Vec<_>>());
             (window, stream_window) = (window - n as i64, stream_window - n as i64);
         }
+        // Once the request has gone whole, the wait for the answer begins.
+        if ended { slot.lock().unwrap().sent = true; }
         let (frames, had) = (std::mem::take(&mut out), buf.len());
         if !frames.is_empty() && !deaf {
             tokio::select! {
@@ -1436,7 +1439,8 @@ mod tests {
     fn requests_are_passed_over_http2() {
         crate::stream::block_on(async {
             let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
-            let bridge = upstream_framed(Stream::Pipe(up.into()), theirs, ("http", 4096, Default::default()), Framing { chunked: true, ..GET });
+            let slot = Slot::default();
+            let bridge = upstream_framed(Stream::Pipe(up.into()), theirs, ("http", 4096, slot.clone()), Framing { chunked: true, ..GET });
             let test = async {
                 ours.write_all(b"POST /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\nX-A: b\r\nX-C: \xff\xc3\r\n\r\n").await.unwrap();
                 // The server lets only a byte of the body go at first.
@@ -1449,10 +1453,13 @@ mod tests {
                 while !frames(&got).iter().any(|f| f.0 == PING) { server.read_buf(&mut got).await.unwrap(); }
                 ours.write_all(b"2\r\nab\r\n1;e\r\nc\r\n0\r\n\r\n").await.unwrap();
                 while !frames(&got).iter().any(|f| f.0 == DATA) { server.read_buf(&mut got).await.unwrap(); }
+                // The request has not gone whole while its body waits for the window.
+                assert!(!slot.lock().unwrap().sent);
                 out.clear();
                 frame(&mut out, WINDOW_UPDATE, 0, 1, &[0, 0, 0, 10]);
                 server.write_all(&out).await.unwrap();
                 while !frames(&got).iter().any(|f| f.0 == DATA && f.1 == END_STREAM) { server.read_buf(&mut got).await.unwrap(); }
+                assert!(slot.lock().unwrap().sent);
                 let sent = frames(&got);
                 let kinds: Vec<_> = sent.iter().map(|f| (f.0, f.1)).collect();
                 assert_eq!(kinds, [(SETTINGS, 0), (WINDOW_UPDATE, 0), (HEADERS, END_HEADERS), (SETTINGS, ACK), (PING, ACK), (DATA, 0), (DATA, END_STREAM)]);
