@@ -690,7 +690,8 @@ pub enum Match {
     Exact,
     Prefix,
     NoRegex,
-    Regex(regex::Regex),
+    /// A regular expression that matches the bytes of the URI (bytes_regex()).
+    Regex(regex::bytes::Regex),
     /// "@name": only error_page goes there, never a URI.
     Named,
 }
@@ -1586,9 +1587,8 @@ fn try_files(args: &[String]) -> Result<TryFiles, String> {
 
 fn location(args: &[String]) -> Result<(Match, String), String> {
     let (modifier, path) = if args.len() == 2 { (args[0].as_str(), &args[1]) } else { ("", &args[0]) };
-    let regex = |p: String| regex::Regex::new(&p).map(Match::Regex).map_err(|e| format!("invalid regular expression \"{path}\": {e}"));
     let kind = match modifier {
-        "~" | "~*" => regex(if modifier == "~*" { format!("(?i){path}") } else { path.clone() })?,
+        "~" | "~*" => Match::Regex(bytes_regex(path, modifier == "~*").map_err(|e| format!("invalid regular expression \"{path}\": {e}"))?),
         _ => {
             let plain = [("", Match::Prefix), ("=", Match::Exact), ("^~", Match::NoRegex)].into_iter().find(|k| k.0 == modifier);
             let kind = plain.ok_or_else(|| format!("invalid location modifier \"{modifier}\""))?.1;
@@ -1685,6 +1685,27 @@ fn capture_names(p: &str) -> Vec<&str> {
     let starts = p.match_indices("(?<").map(|(i, _)| i + 3).chain(p.match_indices("(?P<").map(|(i, _)| i + 4));
     let name = |i: usize| p[i..].split_once('>').map(|(n, _)| n).filter(|n| n.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'));
     starts.filter_map(name).collect()
+}
+
+/// A regular expression that matches bytes as PCRE does without UTF-8: "."
+/// and a class match one byte, \\w and the others only ASCII, and "$" also
+/// matches before a line break that ends the subject.
+pub fn bytes_regex(p: &str, caseless: bool) -> Result<regex::bytes::Regex, regex::Error> {
+    let (p, mut out, mut class, mut escaped) = (pcre(p), String::new(), false, false);
+    for c in p.chars() {
+        // A "]" right after the "[" or "[^" that opens a class is one of its bytes.
+        let opened = class && (out.ends_with('[') || out.ends_with("[^"));
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '[' => class = true,
+            ']' if !opened => class = false,
+            '$' if !class => { out += "(?:\\n?\\z)"; continue }
+            _ => {}
+        }
+        out.push(c);
+    }
+    regex::bytes::Regex::new(&format!("(?{}-u){out}", if caseless { "i" } else { "" }))
 }
 
 fn pcre(p: &str) -> String {
@@ -2241,7 +2262,10 @@ mod tests {
         assert!(matches!(location(&["^~".into(), "/i/".into()]).unwrap().0, Match::NoRegex));
         assert!(matches!(location(&["/".into()]).unwrap().0, Match::Prefix));
         let Match::Regex(re) = location(&["~*".into(), "\\.GIF$".into()]).unwrap().0 else { panic!() };
-        assert!(re.is_match("/a.gif"));
+        assert!(re.is_match(b"/a.gif") && re.is_match(b"/a.gif\n") && !re.is_match(b"/a.gif\n\n"));
+        let re = bytes_regex("^/[$]a.b$", false).unwrap();
+        assert!(re.is_match(b"/$a\xffb") && !re.is_match("/$a\u{e9}b".as_bytes()));
+        assert!(bytes_regex("^/[]$]$", false).unwrap().is_match(b"/$\n") && bytes_regex("^/[^]]\\$", false).unwrap().is_match(b"/a$"));
         assert_eq!(location(&["!".into(), "/".into()]).unwrap_err(), "invalid location modifier \"!\"");
         assert!(location(&["~".into(), "(".into()]).is_err());
         let p = peer(&["127.0.0.1:1".into(), "max_fails=3".into(), "fail_timeout=5s".into()]).unwrap();

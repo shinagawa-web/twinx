@@ -264,6 +264,9 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         // of the body comes with it, then the most bytes the body may take in
         // memory: one u32, so that the future of the connection stays small.
         let (end, overflowed, mut room) = loop {
+            // Line breaks before a request line are skipped, as nginx skips them.
+            let empty = buf.iter().take_while(|&&c| c == b'\r' || c == b'\n').count();
+            buf.drain(..empty);
             let end = head_end(&buf);
             match (overflow(&buf[..end.unwrap_or(buf.len())], default.level.header_buffer, buffers), end) {
                 (Err((status, at)), _) => break (at, Some(status), 0),
@@ -323,7 +326,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         let level = found.1;
         let framing = parsed.and_then(|()| framing(&r)).and_then(|n| if n.unwrap_or(0) > level.max_body { Err(413) } else { Ok(n) });
         let expect = header(&r, "expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue"));
-        if framing.is_ok() && expect && r.line.ends_with("HTTP/1.1") { write_all(&mut stream, b"HTTP/1.1 100 Continue\r\n\r\n", send_timeout(level)).await; }
+        if framing.is_ok() && expect && http11(&r.line) { write_all(&mut stream, b"HTTP/1.1 100 Continue\r\n\r\n", send_timeout(level)).await; }
         let reading = if !reads_body(level, &server.level.script) { Reading::Discarded } else if level.proxy.is_some() && !level.proxy_request_buffering { Reading::Unbuffered } else { Reading::Buffered };
         if framing.is_ok() { if let Some(tell) = origin.as_mut().and_then(|o| o.reading.take()) { tell(reading); } }
         // A stream of HTTP/2 whose body is discarded is answered without waiting for it.
@@ -439,7 +442,7 @@ fn framing(r: &Request) -> Result<Option<u64>, u16> {
     let digits = |v: &str| v.bytes().all(|c| c.is_ascii_digit()).then(|| v.parse::<i64>().ok()).flatten().map(|n| n as u64);
     if te.is_empty() { return length.map_or(Ok(Some(0)), |v| digits(v).map(Some).ok_or(400)); }
     // A stream of HTTP/2 without a length passes its body in chunks too.
-    if te.len() > 1 || length.is_some() || !(r.line.ends_with("HTTP/1.1") || r.line.ends_with("HTTP/2.0")) { return Err(400); }
+    if te.len() > 1 || length.is_some() || !(http11(&r.line) || r.line.ends_with("HTTP/2.0")) { return Err(400); }
     if te[0].eq_ignore_ascii_case("chunked") { Ok(None) } else { Err(501) }
 }
 
@@ -1094,7 +1097,7 @@ async fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str, clie
         let name = name.render(r, &Sent::default());
         // With alias, the location's prefix at the start of the name is replaced, as in the URI.
         let rest = level.alias.as_ref().and(level.alias_len).and_then(|n| name.strip_prefix(r.uri.get(..n)?)).unwrap_or(&name);
-        let path = PathBuf::from(format!("{}{rest}", level.alias.clone().unwrap_or_else(|| root(level, r)).display()));
+        let path = os_path(&format!("{}{rest}", level.alias.clone().unwrap_or_else(|| root(level, r)).display()));
         if std::fs::metadata(&path).is_ok_and(|m| m.is_dir() == *dir) {
             let to = Request { uri: name, ..r.clone() };
             // A directory whose URI ends with "/" is answered by the index module.
@@ -1285,7 +1288,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     // chunked, with its length if it has one, to tell its end and carry them.
     let passed = resp.proxied && (!r.shared.trailers.lock().unwrap().is_empty() || resp.rest.as_ref().is_some_and(|rest| rest.trailers.is_some() || rest.slot.is_some())) && r.method != "HEAD" && ![204, 304].contains(&status);
     let h2 = (unknown || trailing || passed) && !upgraded && r.line.ends_with("HTTP/2.0");
-    let chunked = (unknown || trailing) && r.line.ends_with("HTTP/1.1") && level.chunked && !upgraded || h2;
+    let chunked = (unknown || trailing) && http11(&r.line) && level.chunked && !upgraded || h2;
     let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown) && !upgraded;
     let mut out = buffer();
     if !silent && !http09(r.line.as_bytes()) {
@@ -2104,6 +2107,13 @@ fn holds(r: &Request, cond: &Condition) -> bool {
 }
 
 /// The root of a request: that of root with variables is made for it.
+/// The path of a name made of the URI, with the bytes that are not UTF-8 it
+/// has (crate::vars::text()) as they are.
+fn os_path(name: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(crate::vars::bytes(name)))
+}
+
 fn root(level: &Level, r: &Request) -> PathBuf {
     level.root_vars.as_ref().map_or_else(|| level.root.clone(), |t| PathBuf::from(t.render(r, &Sent::default())))
 }
@@ -2116,10 +2126,10 @@ fn file(level: &Level, r: &Request, prefix: &str) -> Response {
     if !matches!(r.method.as_str(), "GET" | "HEAD" | "POST") { return special(405); }
     let path = match &level.alias {
         // In a regular expression location, alias with captures names the whole path.
-        Some(_) if let (Some(t), None) = (&level.alias_vars, level.alias_len) => PathBuf::from(t.render(r, &Sent::default())),
-        Some(alias) => std::path::PathBuf::from(format!("{}{}", alias.display(), r.uri.get(prefix.len()..).unwrap_or_default())),
+        Some(_) if let (Some(t), None) = (&level.alias_vars, level.alias_len) => os_path(&t.render(r, &Sent::default())),
+        Some(alias) => os_path(&format!("{}{}", alias.display(), r.uri.get(prefix.len()..).unwrap_or_default())),
         // As in nginx, the URI goes after root as it is.
-        None => PathBuf::from(format!("{}{}", root(level, r).display(), r.uri)),
+        None => os_path(&format!("{}{}", root(level, r).display(), r.uri)),
     };
     if r.uri.ends_with('/') { return index(level, r, &path); }
     file_at(level, r, path)
@@ -2230,7 +2240,7 @@ fn gzip_ok(r: &Request, level: &Level) -> bool {
         name.trim().eq_ignore_ascii_case("gzip") && q.trim().strip_prefix("q=").is_none_or(|q| q.parse::<f64>() != Ok(0.0))
     };
     let accepts = header(r, "accept-encoding").is_some_and(|v| v.split(',').any(gzip));
-    accepts && (["HTTP/1.1", "HTTP/2.0"].iter().any(|v| r.line.ends_with(v)) || !level.gzip_http_11) && header(r, "via").is_none()
+    accepts && (http11(&r.line) || r.line.ends_with("HTTP/2.0") || !level.gzip_http_11) && header(r, "via").is_none()
 }
 
 /// Takes away what no longer holds once the body is recoded: Content-Encoding,
@@ -2404,7 +2414,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let resend = !(pass_body && unread.is_some()) && (!matches!(r.method.as_str(), "POST" | "LOCK" | "PATCH") || next("non_idempotent"));
     let upgrade = r.headers.iter().any(|h| h.0.eq_ignore_ascii_case("upgrade"));
     // early_hints: whether a value is neither empty nor "0", for a client of HTTP/1.1.
-    let hints = r.line.ends_with("HTTP/1.1") && level.early_hints.iter().any(|t| !matches!(t.render(r, &sent).as_str(), "" | "0"));
+    let hints = http11(&r.line) && level.early_hints.iter().any(|t| !matches!(t.render(r, &sent).as_str(), "" | "0"));
     // The name certificates are verified for (proxy_ssl_verify) and SNI sends
     // (proxy_ssl_server_name): proxy_ssl_name or $proxy_host, without the port.
     let name = ((level.proxy_ssl_verify || level.proxy_ssl_server_name) && p.ssl).then(|| ssl_name(&level.proxy_ssl_name.as_ref().map_or_else(|| host.clone(), |t| t.render(r, &sent))).to_string());
@@ -3104,6 +3114,22 @@ async fn pass_body<C: AsyncRead + Unpin, W: AsyncWrite + Unpin>(u: &mut Unread, 
     }
 }
 
+/// The major and minor numbers of the version of a request line, as nginx
+/// reads them: 400 when it is not HTTP/ and two numbers of at most 99, the
+/// first not beginning with 0; 505 when the major one is not 1.
+fn http_version(version: &str) -> Result<(u32, u32), u16> {
+    let (major, minor) = version.strip_prefix("HTTP/").and_then(|v| v.split_once('.')).ok_or(400u16)?;
+    let number = |n: &str| (!n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())).then(|| n.parse::<u32>().ok().filter(|n| *n <= 99)).flatten();
+    let (Some(major), Some(minor)) = (number(major).filter(|_| !major.starts_with('0')), number(minor)) else { return Err(400) };
+    if major != 1 { return Err(505) }
+    Ok((major, minor))
+}
+
+/// Whether a request line is of HTTP/1.1 or a later HTTP/1 version.
+fn http11(line: &str) -> bool {
+    line.rsplit(' ').next().and_then(|v| http_version(v).ok()).is_some_and(|v| v.1 >= 1)
+}
+
 /// Fills the request from its head, or gives the status nginx refuses it with.
 fn parse(r: &mut Request, head: &[u8], level: &Level, h2: bool) -> Result<(), u16> {
     let text = std::str::from_utf8(head).map_or_else(|_| Cow::Owned(crate::vars::text(head)), Cow::Borrowed);
@@ -3114,8 +3140,12 @@ fn parse(r: &mut Request, head: &[u8], level: &Level, h2: bool) -> Result<(), u1
     let (method, target, version) = match [(); 4].map(|()| words.next()) { [Some(m), Some(t), Some(v), None] => (m, t, v), [Some(m @ "GET"), Some(t), None, _] => (m, t, ""), _ => return Err(400) };
     r.method = method.to_string();
     let valid_method = method.bytes().all(|c| c.is_ascii_uppercase() || c == b'_' || c == b'-');
+    if !valid_method { return Err(400); }
     // HTTP/2.0 is the version of a request of an HTTP/2 stream (crate::h2).
-    if !valid_method || !(matches!(version, "HTTP/1.0" | "HTTP/1.1" | "") || h2 && version == "HTTP/2.0") { return Err(400); }
+    // nginx reads the line in order: a target that begins with neither "/"
+    // nor a scheme is refused before the version is read.
+    if method != "CONNECT" && !target.starts_with(|c: char| c == '/' || c.is_ascii_alphabetic()) { return Err(400); }
+    if !(h2 && version == "HTTP/2.0" || version.is_empty()) { http_version(version)?; }
     for line in lines.filter(|l| !l.is_empty()) {
         let Some((name, value)) = header_line(line, level)? else { continue };
         // Only spaces go around a value: a tab is a part of it.
@@ -3131,7 +3161,7 @@ fn parse(r: &mut Request, head: &[u8], level: &Level, h2: bool) -> Result<(), u1
     }
     let mut hosts = r.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("host")).map(|(_, v)| v);
     let host = hosts.next();
-    if hosts.next().is_some() || (host.is_none() && version == "HTTP/1.1") { return Err(400); }
+    if hosts.next().is_some() || (host.is_none() && http11(&r.line)) { return Err(400); }
     r.host = host.map(|h| valid_host(h).ok_or(400u16)).transpose()?;
     // A stream of HTTP/2 has its method apart from its path, and CONNECT is not allowed.
     if method == "CONNECT" { return Err(if !h2 && (target.starts_with('/') || !target.contains(':')) { 400 } else { 405 }); }
@@ -3288,7 +3318,7 @@ fn valid_host(h: &str) -> Option<String> {
 }
 
 fn keepalive(r: &Request) -> bool {
-    let http11 = r.line.ends_with("HTTP/1.1");
+    let http11 = http11(&r.line);
     // As nginx reads each Connection line, "close" anywhere in its value closes, else
     // "keep-alive" keeps alive, else it changes nothing: the last that says one decides.
     let said = r.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("connection")).map(|(_, v)| v.to_ascii_lowercase())
@@ -3305,7 +3335,7 @@ type Found<'a> = (&'a str, &'a Level, bool);
 fn located<'a>(server: &'a Server, r: &Request, uri: &str) -> Found<'a> {
     let (found, regex) = search(server, uri);
     if let Some(Match::Regex(re)) = regex.map(|i| &server.locations[i].kind) {
-        if let Some(caps) = re.captures(uri) { r.set_captures(re, &caps); }
+        if let Some(caps) = re.captures(&crate::vars::bytes(uri)) { r.set_byte_captures(re, &caps); }
     }
     // A method limit_except does not allow gets the settings of its block.
     let limited = found.1.limit_except.as_ref().filter(|(methods, _)| !methods.contains(&r.method)).map(|(_, l)| &**l);
@@ -3358,7 +3388,7 @@ impl Search {
             if step != Ended::Other { return step; }
         }
         if noregex { return Ended::Other; }
-        let Some((i, _)) = here().find(|(_, l)| matches!(&l.kind, Match::Regex(re) if re.is_match(uri))) else { return Ended::Other };
+        let Some((i, _)) = here().find(|(_, l)| matches!(&l.kind, Match::Regex(re) if re.is_match(&crate::vars::bytes(uri)))) else { return Ended::Other };
         (self.found, self.regex) = (Some(i), Some(i));
         // Whatever the locations inside a regular expression one find, the search ends there.
         self.level(locs, Some(i), uri);
@@ -3857,6 +3887,23 @@ pub(crate) mod tests {
         assert_eq!(line(b"HTTP/1.0  404  Two  spaces \n\n"), b"404  Two  spaces ");
         assert_eq!(line(b"HTTP/1.1 200\r\n\r\n"), b"200");
         assert_eq!(line(b"HTTP/1.1 200 \xff\r\n\r\n"), b"200 \xff");
+    }
+
+    #[test]
+    fn versions_as_nginx_reads_them() {
+        for (version, read) in [("HTTP/1.0", Ok((1, 0))), ("HTTP/1.2", Ok((1, 2))), ("HTTP/1.99", Ok((1, 99))), ("HTTP/1.01", Ok((1, 1))),
+            ("HTTP/2.0", Err(505)), ("HTTP/10.0", Err(505)), ("HTTP/01.1", Err(400)), ("HTTP/1.100", Err(400)), ("HTTP/1", Err(400)),
+            ("HTTP/1.", Err(400)), ("HTTP/1.x", Err(400)), ("HTTX/1.1", Err(400)), ("HTTP/100.0", Err(400))] {
+            assert_eq!(http_version(version), read, "{version}");
+        }
+        assert!(http11("GET / HTTP/1.1") && http11("GET / HTTP/1.2") && !http11("GET / HTTP/1.0") && !http11("GET /") && !http11("GET / HTTP/2.0"));
+    }
+
+    #[test]
+    fn paths_keep_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(os_path(&crate::vars::text(b"/a/f\xff")).as_os_str().as_bytes(), b"/a/f\xff");
+        assert_eq!(os_path("/a/\u{e9}").as_os_str().as_bytes(), "/a/\u{e9}".as_bytes());
     }
 
     #[test]
