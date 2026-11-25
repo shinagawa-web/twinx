@@ -842,7 +842,7 @@ pub struct Ending { pub end: End, pub trailers: Vec<(String, String)>, pub bodil
 
 /// The upstream whose connection it is, the server's address and the location, and
 /// how long a read may wait.
-type Home = (Arc<Upstream>, SocketAddr, usize, Option<Duration>);
+type Home = (Arc<Upstream>, crate::upstream::Addr, usize, Option<Duration>);
 
 /// Gives the connection of an answer that is not read any more back for other requests,
 /// once its stream has ended so that it may be.

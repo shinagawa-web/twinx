@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::config::Directive;
 use crate::log::{AccessLog, Cache, Format, Target};
 use crate::resolver::Resolver;
-use crate::upstream::{Keepalive, Peer, Upstream};
+use crate::upstream::{Addr, Keepalive, Peer, Upstream};
 use crate::vars::{Escape, Part, Template};
 
 const MAIN: u16 = 1;
@@ -1385,11 +1385,17 @@ impl Builder<'_> {
     }
 
     /// proxy_pass http://host[:port][/uri], where host may name an upstream block.
+    /// A URL with variables is checked only once it is made, for each request, as in nginx; one
+    /// with a unix-domain socket, http://unix:path[:uri], sends Host: localhost.
     fn proxy(&self, url: &str) -> Result<Proxy, String> {
-        let (rest, ssl) = url.strip_prefix("http://").map(|r| (r, false)).or_else(|| Some((url.strip_prefix("https://")?, true))).ok_or_else(|| format!("invalid URL prefix in \"{url}\""))?;
         let template = Template::parse(url)?;
         if template.0.iter().any(|p| matches!(p, Part::Var(_))) {
             return Ok(Proxy { host: String::new(), ssl: false, upstream: Arc::new(Upstream::new(Vec::new())), uri: None, url: Some(template), groups: self.upstreams.clone(), implicit: self.implicit.clone() });
+        }
+        let (rest, ssl) = url.strip_prefix("http://").map(|r| (r, false)).or_else(|| Some((url.strip_prefix("https://")?, true))).ok_or_else(|| format!("invalid URL prefix in \"{url}\""))?;
+        if let Some((path, uri)) = unix_url(rest) {
+            let upstream = Arc::new(Upstream::new(vec![Peer::new(Addr::Unix(Path::new(path).into()))]));
+            return Ok(Proxy { host: "localhost".into(), ssl, upstream, uri, url: None, groups: HashMap::new(), implicit: Implicit::default() });
         }
         let (host, uri) = rest.find('/').map_or((rest, None), |i| (&rest[..i], Some(rest[i..].to_string())));
         if host_port(host, 80).is_some_and(|(_, port)| port == 0) { return Err(format!("invalid port in upstream \"{rest}\"")); }
@@ -1450,6 +1456,12 @@ fn same_locations(block: &[Directive]) -> Result<(), String> {
         if !seen.insert(key) { return Err(format!("duplicate location \"{}\" in {}", key.1, d.at)); }
     }
     block.iter().filter(|d| d.name == "location").try_for_each(|d| same_locations(d.block.as_deref().unwrap_or_default()))
+}
+
+/// The path and the URI, if any, of a URL's "unix:path[:uri]", as ngx_parse_unix_domain_url() takes them.
+pub fn unix_url(rest: &str) -> Option<(&str, Option<String>)> {
+    let path = rest.get(..5).filter(|p| p.eq_ignore_ascii_case("unix:")).map(|_| &rest[5..])?;
+    Some(path.split_once(':').map_or((path, None), |(p, uri)| (p, Some(uri.to_string()))))
 }
 
 /// The name and port of host[:port], the default port when it has none; an
@@ -1572,11 +1584,15 @@ fn location(args: &[String]) -> Result<(Match, String), String> {
     Ok((kind, path.clone()))
 }
 
-/// server address [weight=n] [max_fails=n] [fail_timeout=time] [backup] [down] in an upstream block.
+/// server address [weight=n] [max_fails=n] [fail_timeout=time] [max_conns=n] [backup] [down] in an
+/// upstream block, where the address may be unix:path.
 fn peer(args: &[String]) -> Result<Peer, String> {
-    let addr = listen(&args[0]).map_err(|_| format!("host not found in upstream \"{}\"", args[0]))?;
-    if addr.port() == 0 { return Err(format!("invalid port in upstream \"{}\"", args[0])); }
-    let (mut values, mut backup, mut down) = ([("weight", 1u64), ("max_fails", 1), ("fail_timeout", 10)], false, false);
+    let addr = match unix_url(&args[0]) {
+        Some((path, _)) => Addr::Unix(Path::new(path).into()),
+        None => listen(&args[0]).map_err(|_| format!("host not found in upstream \"{}\"", args[0]))?.into(),
+    };
+    if matches!(addr, Addr::Inet(a) if a.port() == 0) { return Err(format!("invalid port in upstream \"{}\"", args[0])); }
+    let (mut values, mut backup, mut down) = ([("weight", 1u64), ("max_fails", 1), ("fail_timeout", 10), ("max_conns", 0)], false, false);
     for a in &args[1..] {
         if a == "backup" { backup = true; continue; }
         if a == "down" { down = true; continue; }
@@ -1586,8 +1602,8 @@ fn peer(args: &[String]) -> Result<Peer, String> {
         slot.1 = value.trim_end_matches('s').parse().map_err(|_| invalid())?;
         if name == "weight" && slot.1 == 0 { return Err(invalid()); }
     }
-    let [weight, max_fails, fail_timeout] = values.map(|v| v.1);
-    Ok(Peer { addr, weight: weight as i64, max_fails, fail_timeout, backup, down })
+    let [weight, max_fails, fail_timeout, max_conns] = values.map(|v| v.1);
+    Ok(Peer { addr, weight: weight as i64, max_fails, fail_timeout, backup, down, max_conns })
 }
 
 /// keepalive number [local], keepalive_requests, keepalive_time and
@@ -2186,6 +2202,15 @@ mod tests {
         assert_eq!((p.max_fails, p.fail_timeout, p.weight, p.backup), (3, 5, 1, false));
         assert!(peer(&["127.0.0.1:1".into(), "down".into()]).unwrap().down);
         assert_eq!(peer(&["127.0.0.1:1".into(), "up".into()]).unwrap_err(), "invalid parameter \"up\"");
+        assert_eq!(peer(&["127.0.0.1:1".into(), "max_conns=2".into()]).unwrap().max_conns, 2);
+        assert_eq!(peer(&["unix:/a.sock".into()]).unwrap().addr.to_string(), "unix:/a.sock");
+        // A unix-domain socket in proxy_pass, with a URI or not.
+        let c = build_text("http { server { location /a { proxy_pass http://unix:/a.sock; } location /b { proxy_pass http://unix:/b.sock:/u/; } } }").unwrap();
+        let p = |i: usize| c.servers[0].locations[i].level.proxy.clone().unwrap();
+        assert_eq!((p(0).host.as_str(), p(0).uri.clone(), p(0).upstream.peers[0].addr.to_string()), ("localhost", None, "unix:/a.sock".into()));
+        assert_eq!((p(1).uri.as_deref(), p(1).upstream.peers[0].addr.to_string()), (Some("/u/"), "unix:/b.sock".into()));
+        // A URL of variables is checked for each request.
+        assert!(build_text("http { server { location / { proxy_pass $arg_u; } } }").unwrap().servers[0].locations[0].level.proxy.as_ref().unwrap().url.is_some());
     }
 
     #[test]
@@ -2630,7 +2655,7 @@ mod tests {
         assert_eq!(s.ssl, ["127.0.0.1:8443".parse().unwrap()]);
         let p = s.locations[0].level.proxy.as_ref().unwrap();
         assert!(p.ssl);
-        assert_eq!(p.upstream.peers[0].addr, "127.0.0.1:443".parse().unwrap());
+        assert_eq!(p.upstream.peers[0].addr.to_string(), "127.0.0.1:443");
         let redirect = s.locations[0].level.proxy_redirect.as_ref().unwrap();
         assert!(matches!(&redirect[0].pattern, CookiePattern::Text(t) if matches!(&t.0[..], [Part::Text(u)] if u == "https://127.0.0.1/u")));
         assert_eq!(s.locations[1].level.limit_except.as_ref().unwrap().0, ["GET", "HEAD"]);
