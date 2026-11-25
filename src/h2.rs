@@ -842,7 +842,7 @@ pub struct Ending { pub end: End, pub trailers: Vec<(String, String)>, pub bodil
 
 /// The upstream whose connection it is, the server's address and the location, and
 /// how long a read may wait.
-type Home = (Arc<Upstream>, SocketAddr, usize, Option<Duration>);
+type Home = (Arc<Upstream>, crate::upstream::Addr, usize, Option<Duration>);
 
 /// Gives the connection of an answer that is not read any more back for other requests,
 /// once its stream has ended so that it may be.
@@ -868,6 +868,12 @@ impl Default for Session {
     }
 }
 
+/// How the request that comes on the pipe is to be passed over HTTP/2: whether its
+/// Host is the one of the proxied server, to go as :authority, and how its body comes
+/// after the head, whatever its headers say.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Framing { pub authority: bool, pub chunked: bool, pub length: u64 }
+
 /// Where what passes the answer tells it what reads the answer.
 pub type Slot = Arc<std::sync::Mutex<Ending>>;
 
@@ -877,7 +883,7 @@ pub type Slot = Arc<std::sync::Mutex<Ending>>;
 /// that follow it, how it ended, and the connection that may be kept, go in the slot. The
 /// frames of the head have the size of proxy_buffer_size at most. Whatever goes wrong
 /// closes both, and so does the answer not being wanted any more.
-pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot) {
+pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot, framing: Framing) {
     let kept = conn.h2.take();
     let (up, mut out) = (&mut conn.stream, if kept.is_none() { PREFACE.to_vec() } else { Vec::new() });
     let Session { id, mut window, mut initial, mut recv } = kept.as_deref().copied().unwrap_or_default();
@@ -891,14 +897,13 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
     let mut line = lines.next().unwrap_or_default().split(' ');
     let (method, path) = (line.next().unwrap_or_default(), line.next().unwrap_or_default());
     let mut fields = vec![(b":method".to_vec(), method.as_bytes().to_vec()), (b":scheme".to_vec(), scheme.as_bytes().to_vec()), (b":path".to_vec(), path.as_bytes().to_vec())];
-    let mut body = Body::Length(0);
-    // Those only HTTP/1 connections have are not passed.
-    const DROPPED: &[&str] = &["connection", "keep-alive", "proxy-connection", "upgrade", "te"];
-    for (name, value) in lines.filter_map(|l| l.split_once(':')).map(|(n, v)| (n.to_ascii_lowercase(), v.trim())).filter(|(n, _)| !DROPPED.contains(&n.as_str())) {
+    // The headers go as they are, those proxy_set_header sets that only HTTP/1 has too, as in
+    // nginx; the Host it gives of its own is :authority. How the body comes is told apart.
+    let mut body = if framing.chunked { Body::Chunked(0, false) } else { Body::Length(framing.length) };
+    for (name, value) in lines.filter_map(|l| l.split_once(':')).map(|(n, v)| (n.to_ascii_lowercase(), v.trim())) {
         match name.as_str() {
-            "host" => fields.insert(2, (b":authority".to_vec(), value.as_bytes().to_vec())),
-            "transfer-encoding" => body = Body::Chunked(0, false),
-            _ => { if name == "content-length" { body = Body::Length(value.parse().unwrap_or(0)) } fields.push((name.into_bytes(), value.as_bytes().to_vec())) }
+            "host" if framing.authority => fields.insert(2, (b":authority".to_vec(), value.as_bytes().to_vec())),
+            _ => fields.push((name.into_bytes(), value.as_bytes().to_vec())),
         }
     }
     buf.drain(..end + 4);
@@ -1275,10 +1280,18 @@ mod tests {
         [if table_update { &[0x20][..] } else { &[] }, &super::header_block(status, &headers)].concat()
     }
 
-    /// As upstream() does, on a new connection.
+    /// As upstream() does, on a new connection, for a request without a body, or with as
+    /// long a one as framing says.
     async fn upstream(up: Stream, pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot) {
-        super::upstream(Conn::new(up, Instant::now()), pipe, scheme, head_size, slot).await
+        upstream_framed(up, pipe, (scheme, head_size, slot), GET).await
     }
+
+    async fn upstream_framed(up: Stream, pipe: tokio::io::DuplexStream, (scheme, head_size, slot): (&str, usize, Slot), framing: Framing) {
+        super::upstream(Conn::new(up, Instant::now()), pipe, scheme, head_size, slot, framing).await
+    }
+
+    /// That of a request without a body whose Host is the proxied server's.
+    const GET: Framing = Framing { authority: true, chunked: false, length: 0 };
 
     #[test]
     fn huffman_codes() {
@@ -1380,9 +1393,9 @@ mod tests {
     fn requests_are_passed_over_http2() {
         crate::stream::block_on(async {
             let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
-            let bridge = upstream(Stream::Pipe(up.into()), theirs, "http", 4096, Default::default());
+            let bridge = upstream_framed(Stream::Pipe(up.into()), theirs, ("http", 4096, Default::default()), Framing { chunked: true, ..GET });
             let test = async {
-                ours.write_all(b"POST /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-A: b\r\n\r\n").await.unwrap();
+                ours.write_all(b"POST /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\nX-A: b\r\n\r\n").await.unwrap();
                 // The server lets only a byte of the body go at first.
                 let mut out = Vec::new();
                 frame(&mut out, SETTINGS, 0, 0, &[0, 4, 0, 0, 0, 1, 0, 9, 0, 0, 0, 0]);
@@ -1404,7 +1417,7 @@ mod tests {
                 let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
                 let fields = t.decode(&sent[2].2, sent[2].2.len(), (100, 100)).unwrap();
                 let text: Vec<_> = fields.iter().map(|(n, v)| format!("{}: {}", String::from_utf8_lossy(n), String::from_utf8_lossy(v))).collect();
-                assert_eq!(text, [":method: POST", ":scheme: http", ":authority: h", ":path: /x", "x-a: b"]);
+                assert_eq!(text, [":method: POST", ":scheme: http", ":authority: h", ":path: /x", "connection: close", "x-a: b"]);
                 // The answer, padded, in parts.
                 out.clear();
                 let block = header_block(200, &[(b"x-b".to_vec(), b"c".to_vec())], false);
@@ -1644,7 +1657,8 @@ mod tests {
             conn.h2 = session.map(Box::new);
             ours.write_all(request.as_bytes()).await.unwrap();
             server.write_all(&frames).await.unwrap();
-            super::upstream(conn, theirs, "http", 4096, slot.clone()).await;
+            let framing = Framing { length: if request.starts_with("POST") { 5 } else { 0 }, ..GET };
+            super::upstream(conn, theirs, "http", 4096, slot.clone(), framing).await;
             let mut ending = slot.lock().unwrap();
             let kept = ending.conn.take().map(|c| *c.h2.unwrap());
             let mut sent = vec![0; 1 << 16];
@@ -1892,12 +1906,34 @@ mod tests {
     }
 
     #[test]
+    fn headers_set_go_as_they_are() {
+        // A Host of its own goes as host, and Transfer-Encoding and Content-Length do not
+        // say how the body comes.
+        for (framing, want, end) in [(Framing { authority: false, ..GET }, "host: h", END_STREAM), (Framing { length: 2, ..GET }, ":authority: h", 0)] {
+            crate::stream::block_on(async {
+                let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
+                tokio::task::spawn_local(upstream_framed(Stream::Pipe(up.into()), theirs, ("http", 4096, Slot::default()), framing));
+                ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 9\r\nTE: trailers\r\n\r\n").await.unwrap();
+                let mut got = Vec::new();
+                let at = PREFACE.len() + 9 + 18 + 9 + 4;
+                while got.len() < at + 9 || got.len() < at + 9 + u32::from_be_bytes([0, got[at], got[at + 1], got[at + 2]]) as usize { server.read_buf(&mut got).await.unwrap(); }
+                assert_eq!((got[at + 3], got[at + 4]), (HEADERS, END_HEADERS | end));
+                let len = u32::from_be_bytes([0, got[at], got[at + 1], got[at + 2]]) as usize;
+                let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
+                let fields = t.decode(&got[at + 9..at + 9 + len], len, (100, 100)).unwrap();
+                let text: Vec<_> = fields.iter().map(|(n, v)| format!("{}: {}", String::from_utf8_lossy(n), String::from_utf8_lossy(v))).collect();
+                assert!(text.contains(&want.to_string()) && text.contains(&"transfer-encoding: chunked".to_string()) && text.contains(&"te: trailers".to_string()), "{text:?}");
+            });
+        }
+    }
+
+    #[test]
     fn bodies_go_in_frames_every_server_takes() {
         // Whatever the largest frame the server says it takes, as nginx.
         for size in [0, 1, 100, 16384, 1 << 24] {
             crate::stream::block_on(async {
                 let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
-                tokio::task::spawn_local(upstream(Stream::Pipe(up.into()), theirs, "http", 4096, Slot::default()));
+                tokio::task::spawn_local(upstream_framed(Stream::Pipe(up.into()), theirs, ("http", 4096, Slot::default()), Framing { length: 20000, ..GET }));
                 ours.write_all(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 20000\r\n\r\n").await.unwrap();
                 server.write_all(&framed(SETTINGS, 0, 0, &[&[0, 5][..], &u32::to_be_bytes(size)].concat())).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1935,11 +1971,13 @@ mod tests {
                 }
                 for _ in 0..random(4) { if !sent.is_empty() { let at = random(sent.len()); sent[at] = random(256) as u8; } }
                 let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
-                ours.write_all(if random(2) == 0 { b"GET / HTTP/1.1\r\nHost: h\r\n\r\n" } else { b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc" }).await.unwrap();
+                let post = random(2) == 0;
+                ours.write_all(if post { b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc" } else { b"GET / HTTP/1.1\r\nHost: h\r\n\r\n" }).await.unwrap();
                 server.write_all(&sent).await.unwrap();
                 // The server keeps the connection, or closes it; what reads the answer goes, or not.
                 let (server, ours) = match random(3) { 0 => { drop(server); (None, Some(ours)) } 1 => { drop(ours); (Some(server), None) } _ => { drop((server, ours)); (None, None) } };
-                let ended = crate::stream::within(Some(Duration::from_secs(1)), upstream(Stream::Pipe(up.into()), theirs, "http", 4096, Slot::default())).await;
+                let framing = Framing { length: if post { 3 } else { 0 }, ..GET };
+                let ended = crate::stream::within(Some(Duration::from_secs(1)), upstream_framed(Stream::Pipe(up.into()), theirs, ("http", 4096, Slot::default()), framing)).await;
                 assert!(ended.is_some(), "{}", sent.escape_ascii());
                 drop((server, ours));
             }

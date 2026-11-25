@@ -14,21 +14,38 @@ use tokio::io::Interest;
 
 use crate::stream::Stream;
 
+/// The address of a proxied server: an IP address and a port, or the path of a
+/// unix-domain socket, written "unix:path" as nginx writes it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Addr { Inet(SocketAddr), Unix(Arc<std::path::Path>) }
+
+impl From<SocketAddr> for Addr {
+    fn from(a: SocketAddr) -> Addr { Addr::Inet(a) }
+}
+
+impl std::fmt::Display for Addr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self { Addr::Inet(a) => a.fmt(f), Addr::Unix(path) => write!(f, "unix:{}", path.display()) }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Peer {
-    pub addr: SocketAddr,
+    pub addr: Addr,
     pub weight: i64,
     pub max_fails: u64,
     pub fail_timeout: u64,
     pub backup: bool,
     /// down: the server is never tried.
     pub down: bool,
+    /// max_conns: how many connections it may have at once in the worker; 0 is no limit.
+    pub max_conns: u64,
 }
 
 impl Peer {
     /// A server with nginx's defaults: weight=1 max_fails=1 fail_timeout=10s.
-    pub fn new(addr: SocketAddr) -> Peer {
-        Peer { addr, weight: 1, max_fails: 1, fail_timeout: 10, backup: false, down: false }
+    pub fn new(addr: impl Into<Addr>) -> Peer {
+        Peer { addr: addr.into(), weight: 1, max_fails: 1, fail_timeout: 10, backup: false, down: false, max_conns: 0 }
     }
 }
 
@@ -39,6 +56,8 @@ struct State {
     fails: u64,
     accessed: u64,
     checked: u64,
+    /// The connections it has for requests now, as nginx's peer->conns.
+    conns: u64,
 }
 
 /// How an upstream keeps the connections to its servers: at most max idle
@@ -111,7 +130,7 @@ impl Conn {
 #[derive(Debug)]
 struct Idle {
     conn: Conn,
-    addr: SocketAddr,
+    addr: Addr,
     /// The location that opened it.
     tag: usize,
     /// When it has been idle for too long; None means never.
@@ -225,17 +244,23 @@ impl Upstream {
             for (i, p) in self.peers.iter().enumerate().filter(|(i, p)| p.backup == backup && !p.down && (single || !tried[*i])) {
                 let s = &mut state[i];
                 if !single && p.max_fails > 0 && s.fails >= p.max_fails && now - s.checked <= p.fail_timeout { continue; }
+                if p.max_conns > 0 && s.conns >= p.max_conns { continue; }
                 s.current += s.effective;
                 total += s.effective;
                 s.effective += (s.effective < p.weight) as i64;
                 if best.is_none_or(|(_, current)| s.current > current) { best = Some((i, s.current)); }
             }
             let (b, _) = best?;
-            state[b].current -= total;
+            (state[b].current, state[b].conns) = (state[b].current - total, state[b].conns + 1);
             if now - state[b].checked > self.peers[b].fail_timeout { state[b].checked = now; }
             tried[b] = true;
             Some(b)
         })
+    }
+
+    /// What gives back the connection to the server pick() gave, once it is not used for the request any more.
+    pub fn held(self: &Arc<Self>, i: usize) -> Held {
+        Held(self.clone(), i)
     }
 
     /// Records how a server answered, as ngx_http_upstream_free_round_robin_peer() does:
@@ -257,7 +282,7 @@ impl Upstream {
     /// one more request; opened by the location if they are local to one; and used for
     /// HTTP/2 or for HTTP/1 before, as neither is used for the other. Those found on
     /// the way that are not usable any more are closed.
-    pub fn take_for(&self, addr: &SocketAddr, tag: usize, h2: bool) -> Option<Conn> {
+    pub fn take_for(&self, addr: &Addr, tag: usize, h2: bool) -> Option<Conn> {
         let keepalive = self.keepalive.as_ref()?;
         let (mut cache, now) = (self.cache.lock().unwrap(), Instant::now());
         let mut from = 0;
@@ -274,7 +299,7 @@ impl Upstream {
     /// ngx_http_upstream_free_keepalive_peer() does; the one kept for the longest
     /// makes room for it. The task that closes idle connections is told of it
     /// without being woken.
-    pub fn put(self: &Arc<Self>, mut conn: Conn, addr: SocketAddr, tag: usize) {
+    pub fn put(self: &Arc<Self>, mut conn: Conn, addr: Addr, tag: usize) {
         let Some(keepalive) = &self.keepalive else { return };
         let now = Instant::now();
         if conn.requests >= keepalive.requests || now.duration_since(conn.opened) > keepalive.time { return }
@@ -304,6 +329,16 @@ impl Upstream {
     }
 }
 
+/// A connection to a server of an upstream that a request uses, which counts for its max_conns until it is dropped.
+#[derive(Debug)]
+pub struct Held(Arc<Upstream>, usize);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap()[self.1].conns -= 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,7 +350,7 @@ mod tests {
     impl Upstream {
         /// Takes a connection used for HTTP/1.
         pub(crate) fn take(&self, addr: &SocketAddr, tag: usize) -> Option<Conn> {
-            self.take_for(addr, tag, false)
+            self.take_for(&(*addr).into(), tag, false)
         }
     }
 
@@ -371,6 +406,20 @@ mod tests {
     }
 
     /// A server, whose sockets block.
+    #[test]
+    fn max_conns_keeps_servers_from_more() {
+        let addr = |port| SocketAddr::from(([127, 0, 0, 1], port));
+        let peers = vec![Peer { max_conns: 1, ..Peer::new(addr(1)) }, Peer { backup: true, ..Peer::new(addr(2)) }];
+        let u = Arc::new(Upstream::new(peers));
+        let held = u.held(u.pick(&mut [false; 2]).unwrap());
+        // The first is at its limit while it is held: the backup is tried, then nothing is.
+        let mut tried = [false; 2];
+        assert_eq!((u.pick(&mut tried), u.pick(&mut tried)), (Some(1), None));
+        drop(held);
+        assert_eq!(u.pick(&mut [false; 2]), Some(0));
+        assert_eq!(Addr::Unix(std::path::Path::new("/s").into()).to_string(), "unix:/s");
+    }
+
     fn server() -> (TcpListener, SocketAddr) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
@@ -443,7 +492,7 @@ mod tests {
         block_on(async {
             let (u, (l, addr)) = (keeping(Keepalive { max: 2, ..Keepalive::default() }), server());
             let ((a, a_other, _), (b, _b, b_port), (c, _c, c_port)) = (open(&l).await, open(&l).await, open(&l).await);
-            for conn in [a, b, c] { u.put(conn, addr, 0); }
+            for conn in [a, b, c] { u.put(conn, addr.into(), 0); }
             assert_eq!((idle(&u), tasks(&u)), (2, 1));
             assert!(closed(&a_other));
             assert_eq!(port(&u.take(&addr, 0)), Some(c_port));
@@ -458,8 +507,8 @@ mod tests {
             for local in [true, false] {
                 let (u, (l, addr), (l2, addr2)) = (keeping(Keepalive { local, ..Keepalive::default() }), server(), server());
                 let ((a, _a, a_port), (b, _b, b_port)) = (open(&l).await, open(&l2).await);
-                u.put(a, addr, 1);
-                u.put(b, addr2, 1);
+                u.put(a, addr.into(), 1);
+                u.put(b, addr2.into(), 1);
                 assert_eq!(port(&u.take(&addr, 2)), (!local).then_some(a_port));
                 assert_eq!(port(&u.take(&addr, 1)), local.then_some(a_port));
                 assert!(u.take(&addr, 1).is_none());
@@ -474,10 +523,10 @@ mod tests {
             let (u, (l, addr)) = (keeping(Keepalive { local: false, ..Keepalive::default() }), server());
             let ((mut a, _a, a_port), (b, _b, b_port)) = (open(&l).await, open(&l).await);
             a.h2 = Some(Box::new(crate::h2::Session::default()));
-            u.put(a, addr, 0);
-            u.put(b, addr, 0);
-            assert_eq!(port(&u.take_for(&addr, 0, true)), Some(a_port));
-            assert!(u.take_for(&addr, 0, true).is_none());
+            u.put(a, addr.into(), 0);
+            u.put(b, addr.into(), 0);
+            assert_eq!(port(&u.take_for(&addr.into(), 0, true)), Some(a_port));
+            assert!(u.take_for(&addr.into(), 0, true).is_none());
             assert_eq!(port(&u.take(&addr, 0)), Some(b_port));
         });
     }
@@ -488,24 +537,24 @@ mod tests {
             let (l, addr) = server();
             let u = keeping(Keepalive { requests: 1, ..Keepalive::default() });
             let (conn, other, _) = open(&l).await;
-            u.put(conn, addr, 0);
+            u.put(conn, addr.into(), 0);
             assert!(idle(&u) == 0 && tasks(&u) == 0 && closed(&other));
 
             let u = keeping(Keepalive { requests: 2, ..Keepalive::default() });
             let (conn, other, _) = open(&l).await;
-            u.put(conn, addr, 0);
+            u.put(conn, addr.into(), 0);
             let conn = u.take(&addr, 0).unwrap();
             assert_eq!(conn.requests, 2);
-            u.put(conn, addr, 0);
+            u.put(conn, addr.into(), 0);
             assert!(idle(&u) == 0 && closed(&other));
 
             let u = keeping(Keepalive { time: Duration::from_secs(5), ..Keepalive::default() });
             let (mut conn, _other, _) = open(&l).await;
             conn.opened -= Duration::from_secs(1);
-            u.put(conn, addr, 0);
+            u.put(conn, addr.into(), 0);
             let mut conn = u.take(&addr, 0).unwrap();
             conn.opened -= Duration::from_secs(5);
-            u.put(conn, addr, 0);
+            u.put(conn, addr.into(), 0);
             assert_eq!(idle(&u), 0);
         });
     }
@@ -515,11 +564,11 @@ mod tests {
         block_on(async {
             let (u, (l, addr)) = (keeping(Keepalive { timeout: Duration::from_millis(50), ..Keepalive::default() }), server());
             let ((a, a_other, _), (b, b_other, _)) = (open(&l).await, open(&l).await);
-            u.put(a, addr, 0);
+            u.put(a, addr.into(), 0);
             pause(60);
             assert!(u.take(&addr, 0).is_none());
             assert!(idle(&u) == 0 && closed(&a_other));
-            u.put(b, addr, 0);
+            u.put(b, addr.into(), 0);
             assert_eq!(idle(&u), 1);
             wait(|| idle(&u) == 0).await;
             assert!(closed(&b_other));
@@ -527,7 +576,7 @@ mod tests {
             // A time too long to represent never passes.
             let u = keeping(Keepalive { timeout: Duration::MAX, ..Keepalive::default() });
             let (conn, _other, _) = open(&l).await;
-            u.put(conn, addr, 0);
+            u.put(conn, addr.into(), 0);
             run(250).await;
             assert!(u.take(&addr, 0).is_some());
         });
@@ -540,8 +589,8 @@ mod tests {
                 let (u, (l, addr)) = (keeping(Keepalive::default()), server());
                 // It is found by take(), which goes on to the next.
                 let ((a, _a, a_port), (b, b_other, _)) = (open(&l).await, open(&l).await);
-                u.put(a, addr, 0);
-                u.put(b, addr, 0);
+                u.put(a, addr.into(), 0);
+                u.put(b, addr.into(), 0);
                 act(&b_other);
                 pause(20);
                 assert_eq!(idle(&u), 2);
@@ -552,12 +601,12 @@ mod tests {
                 let (b, b_other, _) = open(&l).await;
                 act(&b_other);
                 pause(20);
-                u.put(b, addr, 0);
+                u.put(b, addr.into(), 0);
                 assert!(idle(&u) == 0 && closed(&b_other));
                 // And by the task, which leaves the others.
                 let (b, b_other, _) = open(&l).await;
-                u.put(a.unwrap(), addr, 0);
-                u.put(b, addr, 0);
+                u.put(a.unwrap(), addr.into(), 0);
+                u.put(b, addr.into(), 0);
                 act(&b_other);
                 wait(|| idle(&u) == 1).await;
                 assert!(closed(&b_other));
@@ -572,13 +621,13 @@ mod tests {
         std::thread::spawn(|| block_on(async {
             let (u, u2, (l, addr)) = (keeping(Keepalive::default()), keeping(Keepalive::default()), server());
             let ((a, a_other, _), (b, b_other, _), (c, c_other, _)) = (open(&l).await, open(&l).await, open(&l).await);
-            u.put(a, addr, 0);
+            u.put(a, addr.into(), 0);
             run(20).await;
-            u2.put(b, addr, 0);
+            u2.put(b, addr.into(), 0);
             close_idle();
             assert_eq!((idle(&u), idle(&u2)), (0, 0));
             assert!(closed(&a_other) && closed(&b_other));
-            u.put(c, addr, 0);
+            u.put(c, addr.into(), 0);
             assert!(idle(&u) == 0 && closed(&c_other));
             wait(|| tasks(&u) + tasks(&u2) == 0).await;
         })).join().unwrap();
@@ -589,7 +638,7 @@ mod tests {
         block_on(async {
             let (u, (l, addr)) = (Arc::new(peers(1, 1)), server());
             let (conn, other, _) = open(&l).await;
-            u.put(conn, addr, 0);
+            u.put(conn, addr.into(), 0);
             assert!(idle(&u) == 0 && tasks(&u) == 0 && closed(&other));
             assert!(u.take(&addr, 0).is_none());
         });
@@ -600,15 +649,15 @@ mod tests {
         block_on(async {
             let (u, (l, addr)) = (keeping(Keepalive::default()), server());
             let ((a, _a, _), (b, b_other, _)) = (open(&l).await, open(&l).await);
-            u.put(a, addr, 0);
+            u.put(a, addr.into(), 0);
             // A connection taken and kept again before the task ran needs no other task.
             let a = u.take(&addr, 0).unwrap();
-            u.put(a, addr, 0);
+            u.put(a, addr.into(), 0);
             assert_eq!(tasks(&u), 1);
             let _a = u.take(&addr, 0).unwrap();
             wait(|| tasks(&u) == 0).await;
             assert!(!u.cache.lock().unwrap().waker.is_some());
-            u.put(b, addr, 0);
+            u.put(b, addr.into(), 0);
             assert_eq!(tasks(&u), 1);
             drop(b_other);
             wait(|| idle(&u) == 0 && tasks(&u) == 0).await;
@@ -618,7 +667,7 @@ mod tests {
             for ms in [0, 20] {
                 let u = keeping(Keepalive { timeout: Duration::MAX, ..Keepalive::default() });
                 let (c, c_other, _) = open(&l).await;
-                u.put(c, addr, 0);
+                u.put(c, addr.into(), 0);
                 if ms > 0 { run(ms).await }
                 let weak = Arc::downgrade(&u);
                 drop(u);
@@ -635,9 +684,9 @@ mod tests {
                 let (u, (l, addr)) = (keeping(Keepalive::default()), server());
                 let ((a, a_other, _), (b, b_other, _)) = (open(&l).await, open(&l).await);
                 // The task registers the first, put() the second.
-                u.put(a, addr, 0);
+                u.put(a, addr.into(), 0);
                 run(20).await;
-                u.put(b, addr, 0);
+                u.put(b, addr.into(), 0);
                 run(20).await;
                 assert_eq!((idle(&u), tasks(&u)), (2, 1));
                 act(&b_other);
@@ -656,10 +705,10 @@ mod tests {
             let timeout = Duration::from_millis(300);
             let (u, (l, addr)) = (keeping(Keepalive { timeout, ..Keepalive::default() }), server());
             let ((a, _a, a_port), (b, b_other, _), (c, _c, c_port)) = (open(&l).await, open(&l).await, open(&l).await);
-            u.put(a, addr, 0);
+            u.put(a, addr.into(), 0);
             run(100).await;
             let kept = Instant::now();
-            u.put(b, "127.0.0.1:1".parse().unwrap(), 0);
+            u.put(b, "127.0.0.1:1".parse::<SocketAddr>().unwrap().into(), 0);
             let a = u.take(&addr, 0);
             assert_eq!((port(&a), idle(&u), tasks(&u)), (Some(a_port), 1, 1));
             wait(|| idle(&u) == 0).await;
@@ -667,7 +716,7 @@ mod tests {
             wait(|| tasks(&u) == 0).await;
 
             // Taken, the only one leaves the task running until the time has passed.
-            u.put(c, addr, 0);
+            u.put(c, addr.into(), 0);
             run(20).await;
             let c = u.take(&addr, 0);
             assert_eq!((port(&c), idle(&u), tasks(&u)), (Some(c_port), 0, 1));
@@ -681,11 +730,11 @@ mod tests {
             for act in ACTS {
                 let (u, (l, addr)) = (keeping(Keepalive::default()), server());
                 let (conn, other, _) = open(&l).await;
-                u.put(conn, addr, 0);
+                u.put(conn, addr.into(), 0);
                 run(20).await;
                 let mut conn = u.take(&addr, 0).unwrap();
                 exchange(&mut conn, &other).await;
-                u.put(conn, addr, 0);
+                u.put(conn, addr.into(), 0);
                 run(20).await;
                 assert_eq!((idle(&u), tasks(&u)), (1, 1));
                 act(&other);
@@ -700,8 +749,8 @@ mod tests {
         block_on(async {
             let (u, (l, addr)) = (keeping(Keepalive::default()), server());
             let ((a, _a, _), (b, b_other, _)) = (open(&l).await, open(&l).await);
-            u.put(a, addr, 0);
-            u.put(b, addr, 0);
+            u.put(a, addr.into(), 0);
+            u.put(b, addr.into(), 0);
             run(20).await;
             let polls = POLLS.get();
             assert!(polls > 0);
@@ -710,7 +759,7 @@ mod tests {
             for _ in 0..100 {
                 let mut b = u.take(&addr, 0).unwrap();
                 exchange(&mut b, &b_other).await;
-                u.put(b, addr, 0);
+                u.put(b, addr.into(), 0);
                 run(1).await;
             }
             assert_eq!((POLLS.get(), idle(&u), tasks(&u)), (polls, 2, 1));
