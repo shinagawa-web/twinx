@@ -17,6 +17,7 @@
 # Environment: TWINX_REPO, JUDGE_DIR (scratch space, outputs in $JUDGE_DIR/out),
 # and for the pr phase BRANCH, PR_NUMBER, PR_HEAD and BASE (main's commit).
 # PR_REF names a local ref to merge instead of fetching the pull request.
+# DEPS, if set, has main's compiled dependencies; the pr phase moves them away.
 set -euo pipefail
 
 HARNESS=$(cd "$(dirname "$0")" && pwd)
@@ -139,6 +140,11 @@ pr() {
   local tree="$JUDGE_DIR/pr" binary="$JUDGE_DIR/pr-twinx" build=skipped test=skipped
   rm -rf "$tree" && mkdir -p "$tree"
   tar -C "$TWINX_REPO" --exclude=./.git -cf - . | tar -C "$tree" -xf -
+  # -T: whatever the pull request has at target is neither replaced nor followed.
+  if [ -n "${DEPS:-}" ]; then
+    mv -T "$DEPS/target" "$tree/target" || true
+    mv -T "$DEPS/cargo/registry" "$JUDGE_DIR/cargo/registry" || true
+  fi
   if [ -f "$tree/Cargo.toml" ]; then
     if build "$tree" "$RUSTFLAGS_COVERAGE" "$binary"; then
       build=success
