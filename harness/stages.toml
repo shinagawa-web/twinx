@@ -132,5 +132,5 @@ files = [
   "twinx_h2_streams.t", "twinx_h2_upstream_body.t", "twinx_header_inherit.t",
   "twinx_keepalive_options.t", "twinx_proxy_early_answer.t",
   "twinx_proxy_pass_request.t", "twinx_proxy_send_timeout.t", "twinx_proxy_status.t",
-  "twinx_variables_left.t",
+  "twinx_proxy_xar_escape.t", "twinx_variables_left.t",
 ]
