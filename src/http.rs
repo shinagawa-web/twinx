@@ -990,7 +990,7 @@ fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> S
 
 /// The answer the location gives, before error_page and the headers every
 /// answer gets, and the settings that gave it.
-async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found<'a>, client: Option<&mut Stream>) -> (Response, &'a Level) {
+async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Response, &'a Level) {
     match parsed {
         Err(status) => return (special(status), level),
         Ok(()) if auto => return (redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))), level),
@@ -1004,11 +1004,7 @@ async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto)
     // is proxied: when the last if block that applied has no proxy_pass to
     // inherit, nginx has no upstream for it and answers 500.
     if s.proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration", ""); return (special(500), level); }
-    match stop {
-        Stop::Return(code, text) => return (serve(&to, level, prefix, Some((code, text)), client).await, level),
-        Stop::Answer(resp) => return (resp, level),
-        Stop::No | Stop::Yes => {}
-    }
+    if let Some(resp) = ended(&to, level, prefix, stop, client.as_deref_mut()).await { return (resp, level); }
     // A URI changed without "break" is looked for again among the locations.
     // The URI goes apart from the arguments: a "?" it has is a part of it.
     if s.changed { let to = to.into_owned(); return (Response { internal: Some(Box::new((to.target, Some(to.uri)))), rewritten: true, ..Response::default() }, level); }
@@ -2046,11 +2042,20 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
 async fn server_rewrite<'a>(server: &'a Server, to: &mut Cow<'_, Request>, found: Found<'a>, client: Option<&mut Stream>) -> Result<Found<'a>, (Response, &'a Level)> {
     if server.level.script.is_empty() { return Ok(found); }
     let mut s = Script { level: &server.level, changed: false, moved: false, proxied: false };
-    match script(to, &server.level.script, &mut s) {
-        Stop::Return(code, text) => Err((serve(to, s.level, "", Some((code, text)), client).await, s.level)),
-        Stop::Answer(resp) => Err((resp, s.level)),
-        Stop::No | Stop::Yes if s.moved => Ok(located(server, to, &to.uri)),
-        Stop::No | Stop::Yes => Ok(found),
+    let stop = script(to, &server.level.script, &mut s);
+    match ended(to, s.level, "", stop, client).await {
+        Some(resp) => Err((resp, s.level)),
+        None if s.moved => Ok(located(server, to, &to.uri)),
+        None => Ok(found),
+    }
+}
+
+/// The answer of a return or a redirect that ended the rewrite module's directives, if one did.
+async fn ended(to: &Request, level: &Level, prefix: &str, stop: Stop<'_>, client: Option<&mut Stream>) -> Option<Response> {
+    match stop {
+        Stop::Return(code, text) => Some(serve(to, level, prefix, Some((code, text)), client).await),
+        Stop::Answer(resp) => Some(resp),
+        Stop::No | Stop::Yes => None,
     }
 }
 
