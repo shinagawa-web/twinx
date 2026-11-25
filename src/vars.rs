@@ -188,10 +188,16 @@ impl Request {
     /// match, "$1" the first group; those it does not have are empty. A
     /// named group is also a variable of its name, which keeps its value.
     pub fn set_captures(&self, re: &regex::Regex, caps: &regex::Captures) {
-        self.shared.vars.lock().unwrap().retain(|v| !v.0.bytes().all(|c| c.is_ascii_digit()));
+        self.clear_captures();
         let value = |i: usize| caps.get(i).map_or("", |m| m.as_str()).to_string();
         (0..caps.len()).for_each(|i| self.set_var(&i.to_string(), value(i)));
         re.capture_names().enumerate().for_each(|(i, name)| if let Some(name) = name { self.set_var(name, value(i)) });
+    }
+
+    /// Drops the numbered captures, as a regular expression of if or rewrite that does not
+    /// match does; the named ones stay.
+    pub fn clear_captures(&self) {
+        self.shared.vars.lock().unwrap().retain(|v| !v.0.bytes().all(|c| c.is_ascii_digit()));
     }
 
     /// set_captures() of a regular expression that matched bytes, the bytes

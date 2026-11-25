@@ -1065,6 +1065,8 @@ fn verify_chain<'a>(end: &'a [u8], sent: &'a [CertificateDer], trusted: &'a [Cer
         let issuer = if self_signed || chain.len() > depth + 1 { None } else { anchors.iter().find(issued).or_else(|| sent.iter().find(issued)) };
         let Some(issuer) = issuer.cloned() else {
             let alone = if chain.len() == 1 { "self-signed certificate" } else { "self-signed certificate in certificate chain" };
+            // Going on, OpenSSL then finds no signature to verify the peer's own certificate with.
+            if !self_signed && last && chain.len() == 1 { return Err("unable to verify the first certificate") }
             return Err(if self_signed { alone } else if chain.iter().any(is_trusted) { "unable to get issuer certificate" } else { "unable to get local issuer certificate" });
         };
         chain.push(issuer);
@@ -1272,6 +1274,9 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert_eq!(ok(&[int.clone()], &[root.clone()], None, 1), Ok(()));
         assert_eq!(ok(&[int.clone()], &[root.clone()], None, 0), Err("unable to get local issuer certificate"));
         assert_eq!(ok(&[], &[root.clone()], None, 2), Err("unable to get local issuer certificate"));
+        // With the last error, one with no issuer at all ends with its signature.
+        assert_eq!(verify_chain(&end, &[], &[root.clone()], None, 2, true).map(|_| ()), Err("unable to verify the first certificate"));
+        assert_eq!(verify_chain(&end, &[int.clone()], &[], None, 2, true).map(|_| ()), Err("unable to get local issuer certificate"));
         // A trusted intermediate is no end: the chain goes on to the root.
         assert_eq!(ok(&[], &[int.clone(), root.clone()], None, 1), Ok(()));
         assert_eq!(ok(&[], &[int.clone(), root.clone()], None, 0), Err("unable to get issuer certificate"));

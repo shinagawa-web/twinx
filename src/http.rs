@@ -200,6 +200,26 @@ fn status_line(answer: &[u8]) -> Box<[u8]> {
     after[after.iter().take_while(|&&b| b == b' ').count()..].into()
 }
 
+/// The status code of the first line of a proxied server's answer, if it is a status line
+/// as ngx_http_parse_status_line() reads it: "HTTP/", a major version of 1 to 99, ".", a
+/// minor one of at most 99, spaces, three digits, and then a space, a ".", or its end.
+fn status_code(answer: &[u8]) -> Option<u16> {
+    let line = &answer[..line_end(answer).unwrap_or(answer.len())];
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let rest = line.strip_prefix(b"HTTP/")?;
+    let digits = |b: &[u8]| b.iter().take_while(|c| c.is_ascii_digit()).count();
+    let major = digits(rest);
+    if !(1..=2).contains(&major) || rest[0] == b'0' || rest.get(major) != Some(&b'.') { return None }
+    let rest = &rest[major + 1..];
+    let minor = digits(rest);
+    if !(1..=2).contains(&minor) || rest.get(minor) != Some(&b' ') { return None }
+    let rest = &rest[minor..];
+    let rest = &rest[rest.iter().take_while(|&&c| c == b' ').count()..];
+    if digits(rest) < 3 || !matches!(rest.get(3), None | Some(b' ' | b'.')) { return None }
+    std::str::from_utf8(&rest[..3]).ok()?.parse().ok()
+}
+
 /// Where the first line of the buffer ends, after its LF, if that has come.
 fn line_end(buf: &[u8]) -> Option<usize> {
     // SAFETY: memchr() reads the buffer's length from its start, and gives a
@@ -655,6 +675,9 @@ struct Response {
     told: Option<Option<usize>>,
     /// Whether it is a proxied answer that is not buffered, which limit_rate does not pace.
     unbuffered: bool,
+    /// Whether it is a proxied server's answer without a valid status line, which, as one of
+    /// HTTP/0.9, is sent as it came, without a head of its own.
+    http09: bool,
     /// The status line of a proxied server's answer from its code on, which is sent as it
     /// is while the status stays that code (r->headers_out.status_line). Boxed
     /// twice, a thin pointer, to keep the answer small.
@@ -990,7 +1013,7 @@ fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> S
             Op::Break => { s.changed = false; return Stop::Yes }
             Op::Rewrite(rw) => rw,
         };
-        let Some(caps) = rw.regex.captures(&to.uri) else { continue };
+        let Some(caps) = rw.regex.captures(&to.uri) else { to.clear_captures(); continue };
         to.set_captures(&rw.regex, &caps);
         let (uri, new_args) = replacement(rw, to);
         let uri = if rw.redirect { unescape_redirect(&uri) } else { uri };
@@ -1178,6 +1201,9 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             redirected = to;
             (resp, level, last) = Box::pin(answer(server, &redirected, Ok(()), found, Some(&mut *stream))).await;
             if !resp.generated && status != 0 { (resp.status, resp.status_line) = (status, None); }
+            // Of a file given with another status, the header filter drops Last-Modified unless
+            // it is 200, 206 or 304, and the range filter gives Accept-Ranges only for a 200.
+            if !resp.proxied { resp.headers.retain(|h| !(h.0.eq_ignore_ascii_case("last-modified") && ![200, 206, 304].contains(&resp.status) || h.0.eq_ignore_ascii_case("accept-ranges") && resp.status != 200)); }
             // A redirect the new answer makes replaces the Location kept.
             let own = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("location"));
             resp.headers.splice(0..0, kept.into_iter().filter(|h| !own || !h.0.eq_ignore_ascii_case("location")));
@@ -1206,7 +1232,8 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         if !streams { finish(&mut resp, (level, r)).await; }
         if !gzip_ok(r, level) {
             // A file is decompressed piece by piece as it is sent, of a length not known before.
-            if streams || resp.told.is_some() || resp.file.is_some() { coded(&mut resp, Coder::gunzip()); } else { gunzip(&mut resp); }
+            if streams || resp.told.is_some() || resp.file.is_some() { coded(&mut resp, Coder::gunzip()); }
+            else if !gunzip(&mut resp) && r.method != "HEAD" && ![204, 304].contains(&resp.status) { unended(level, r, &mut resp); }
         }
     }
     const ADDED: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
@@ -1305,10 +1332,10 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     // chunked, with its length if it has one, to tell its end and carry them.
     let passed = resp.proxied && (!r.shared.trailers.lock().unwrap().is_empty() || resp.rest.as_ref().is_some_and(|rest| rest.trailers.is_some() || rest.slot.is_some())) && r.method != "HEAD" && ![204, 304].contains(&status);
     let h2 = (unknown || trailing || passed) && !upgraded && r.line.ends_with("HTTP/2.0");
-    let chunked = (unknown || trailing) && http11(&r.line) && level.chunked && !upgraded || h2;
+    let chunked = (unknown || trailing) && http11(&r.line) && level.chunked && !upgraded && !resp.http09 || h2;
     let keepalive = parsed.is_ok() && keepalive(r) && keeps_alive(r, level) && ![400, 413, 414, 500, 501].contains(&status) && (chunked || !unknown) && !upgraded;
     let mut out = buffer();
-    if !silent && !http09(r.line.as_bytes()) {
+    if !silent && !http09(r.line.as_bytes()) && !resp.http09 {
         // A proxied server's status line is sent as it is, while the status is its code.
         match resp.status_line.as_deref().map(|l| &**l).filter(|line| line.starts_with(status.to_string().as_bytes())) {
             Some(line) => out.extend_from_slice(&[b"HTTP/1.1 ", line, b"\r\n"].concat()),
@@ -1477,7 +1504,7 @@ fn precondition_fails(r: &Request, resp: &Response) -> bool {
 /// or its Last-Modified time. A range that starts past the end is 416.
 /// Several ranges (multipart), which no test needs, are not done yet.
 fn range(r: &Request, level: &Level, resp: &mut Response) {
-    let ok = resp.status == 200 && resp.ranges && resp.cut.is_none() && !resp.unknown_length && !http09(r.line.as_bytes());
+    let ok = resp.status == 200 && resp.ranges && resp.cut.is_none() && !resp.unknown_length && !http09(r.line.as_bytes()) && !resp.http09;
     // max_ranges 0: none, and no Accept-Ranges either.
     if ok && level.max_ranges == Some(0) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges")); return; }
     let Some((len, asked)) = ranges_asked(r, resp).filter(|_| ok) else { return };
@@ -1539,8 +1566,8 @@ static BOUNDARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 
 /// The byte ranges, each from its start to before its end, of a body so long that a Range
 /// header's value after "bytes=" asks for, as ngx_http_range_parse() reads it. None when the
-/// whole body is sent instead (a range from 0 that is empty, or ranges longer than the body
-/// together); an error when the value is malformed or no range is in the body (416).
+/// whole body is sent instead (a range from 0 that is empty, ranges longer than the body
+/// together, or too many of them for its length); an error when the value is malformed or no range is in the body (416).
 fn byte_ranges(spec: &str, len: u64) -> Result<Option<Vec<(u64, u64)>>, ()> {
     let b = spec.as_bytes();
     let at = |i: usize| b.get(i).copied().unwrap_or(0);
@@ -1577,7 +1604,10 @@ fn byte_ranges(spec: &str, len: u64) -> Result<Option<Vec<(u64, u64)>>, ()> {
         i += 1;
     }
     if ranges.is_empty() { return Err(()) }
-    Ok(Some(ranges).filter(|_| size <= len))
+    // Nor when the parts of a multipart body would cost too much: 256 bytes for each,
+    // with what they give, past 4096 more than the body.
+    let parts = 256 * ranges.len() as u64;
+    Ok(Some(ranges).filter(|_| size <= len && size.saturating_add(parts) <= len.saturating_add(4096)))
 }
 
 /// Whether an If-Match (or, weak, If-None-Match) list has the ETag, as
@@ -2081,8 +2111,11 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
         // nginx gives up after 10 internal redirects.
         redirects += 1;
         // After X-Accel-Redirect the proxied answer's headers stay ($upstream_http_*),
-        // and the new answer has those of them nginx keeps.
-        let kept = resp.proxied.then(|| { to.to_mut().upstream = std::mem::take(&mut resp.upstream); (std::mem::take(&mut resp.headers), resp.ctype.take()) });
+        // and the new answer has those of them nginx keeps, through any internal
+        // redirect after it too (of an index), as the headers of a request stay.
+        let proxied = resp.proxied;
+        if proxied { to.to_mut().upstream = std::mem::take(&mut resp.upstream); }
+        let kept = (proxied || !resp.headers.is_empty() || resp.ctype.is_some()).then(|| (std::mem::take(&mut resp.headers), resp.ctype.take()));
         // A named location answers the request as it is, without the server's rewrites.
         let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && l.path == target);
         // After a rewrite of a location the location is looked for again, but
@@ -2103,7 +2136,7 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
         if let Some((headers, ctype)) = kept {
             resp.headers.splice(0..0, headers);
             if let Some(ctype) = ctype.filter(|_| resp.status < 300) { resp.ctype = Some(ctype); }
-            resp.upstream = to.upstream.clone();
+            if proxied || resp.upstream.is_empty() { resp.upstream = to.upstream.clone(); }
         }
     }
     (resp, level, to)
@@ -2141,7 +2174,10 @@ fn holds(r: &Request, cond: &Condition) -> bool {
     match cond {
         Condition::Var(var) => !matches!(value(var).as_str(), "" | "0"),
         Condition::Equal(var, to, not) => (value(var) == value(to)) != *not,
-        Condition::Match(var, re, not) => re.captures(&value(var)).map(|c| r.set_captures(re, &c)).is_some() != *not,
+        Condition::Match(var, re, not) => match re.captures(&value(var)) {
+            Some(c) => { r.set_captures(re, &c); !*not }
+            None => { r.clear_captures(); *not }
+        },
         Condition::File(path, test, not) => {
             let meta = std::fs::metadata(value(path));
             let is = meta.is_ok_and(|m| match test { 'f' => m.is_file(), 'd' => m.is_dir(), 'x' => m.permissions().mode() & 0o111 != 0, _ => true });
@@ -2326,12 +2362,22 @@ fn gzips(level: &Level, resp: &Response) -> bool {
 
 /// gunzip: decompresses a gzip answer for a client that does not take gzip,
 /// without its Content-Encoding and Accept-Ranges, and with a weak ETag.
-fn gunzip(resp: &mut Response) {
+fn gunzip(resp: &mut Response) -> bool {
     recoded(resp);
     let mut body = Vec::new();
-    let _ = flate2::read::MultiGzDecoder::new(resp.body.as_slice()).read_to_end(&mut body);
+    // A body that ends before its stream does, or that is empty, is one inflate() did not end.
+    let read = flate2::read::MultiGzDecoder::new(resp.body.as_slice()).read_to_end(&mut body);
+    let ended = !resp.body.is_empty() && !read.is_err_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof);
     resp.body = body;
     if let Some(cut) = &mut resp.cut { cut.length = None; }
+    ended
+}
+
+/// A gzip body that does not end, of which nothing is sent: nginx ends the request with
+/// an error before it sends the head it made, and closes the connection.
+fn unended(level: &Level, r: &Request, resp: &mut Response) {
+    error_log(level, r, "inflate() returned -5 on response end");
+    resp.cut = Some(Box::new(Cut { length: None, malformed: true, failed: None }));
 }
 
 /// The URI a proxied server is sent when proxy_pass has none: the request line's
@@ -2552,7 +2598,11 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         failed = failure;
         let (mut kept, mut why) = (None, String::new());
         answer = match fetched {
-            Ok((resp, conn)) => { kept = Some(conn); Some(resp) }
+            Ok((resp, conn)) => {
+                if resp.http09 { log_at(level, r, "error", &format!("upstream sent no valid HTTP/1.0 header while {READING_HEAD}"), &url(&addr, &uri)); }
+                kept = Some(conn);
+                Some(resp)
+            }
             Err(NoAnswer::Gone(gone)) => {
                 if !gone.is_empty() { log_at(level, r, "info", &gone, &url(&addr, &uri)); }
                 Some(Response { status: 499, ..Response::default() })
@@ -2958,7 +3008,9 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
         // A head that does not fit in proxy_buffer_size is too big: the answer is invalid.
         let end = loop {
             let buf = &answer[..answer.len().min(level.proxy_buffer_size)];
-            if let Some(end) = line_end(buf).and_then(|at| lines_end(buf, at)) { break end; }
+            // An answer whose first line is no status line is one of HTTP/0.9.
+            if line_end(buf).is_some_and(|at| status_code(&buf[..at]).is_none()) { break None }
+            if let Some(end) = line_end(buf).and_then(|at| lines_end(buf, at)) { break Some(end); }
             if answer.len() >= level.proxy_buffer_size { return Err(invalid("upstream sent too big header")); }
             // Not that of a request whose answer may be cached, which goes on without the client.
             let closed = async { match client.as_deref().filter(|_| watch) { Some(c) => crate::stream::gone(c).await, None => std::future::pending().await } };
@@ -2979,9 +3031,15 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
             answer.extend_from_slice(&chunk[..n]);
             bytes[1] = answer.len() as u64;
         };
+        // It is passed as it is, its status 200, until the server closes the connection.
+        let Some(end) = end else {
+            time[1] = Some(start.elapsed().as_millis());
+            let rest = Rest { conn, answer, end: 0, length: None, chunked: false, rate: 0, started: start, wait, keep: false, home: None, held: None, trailers: None, slot: None, sizes: Err(level.proxy_buffer_size), coder: None, to: None };
+            return Ok((Response { status: 200, proxied: true, http09: true, unbuffered: true, rest: Some(Box::new(rest)), ..Response::default() }, None));
+        };
         let head = crate::vars::text(&answer[..end]);
         let first = head.split('\n').next().unwrap_or_default().trim_end_matches('\r');
-        let status: u16 = first.strip_prefix("HTTP/1.").and_then(|f| f.get(2..)?.split(' ').find(|w| !w.is_empty())?.parse().ok()).ok_or_else(|| invalid("upstream sent no valid HTTP/1.0 header"))?;
+        let status = status_code(&answer[..end]).unwrap_or_default();
         if status != 103 { break (head, end, status) }
         // Early hints go to the client, with the headers of the answer that are
         // not hidden, when early_hints lets them and it has any; the answer comes after.
@@ -3222,13 +3280,21 @@ async fn pass_body<C: AsyncRead + Unpin, W: AsyncWrite + Unpin>(u: &mut Unread, 
 }
 
 /// The major and minor numbers of the version of a request line, as nginx
-/// reads them: 400 when it is not HTTP/ and two numbers of at most 99, the
-/// first not beginning with 0; 505 when the major one is not 1.
+/// reads them, one character after another: 505 as soon as the major number,
+/// which does not begin with 0, is more than 1, even before its end; 400 when
+/// it is not HTTP/ and two numbers, the minor one of at most 99.
 fn http_version(version: &str) -> Result<(u32, u32), u16> {
-    let (major, minor) = version.strip_prefix("HTTP/").and_then(|v| v.split_once('.')).ok_or(400u16)?;
-    let number = |n: &str| (!n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())).then(|| n.parse::<u32>().ok().filter(|n| *n <= 99)).flatten();
-    let (Some(major), Some(minor)) = (number(major).filter(|_| !major.starts_with('0')), number(minor)) else { return Err(400) };
-    if major != 1 { return Err(505) }
+    let v = version.strip_prefix("HTTP/").ok_or(400u16)?.as_bytes();
+    if !matches!(v.first(), Some(b'1'..=b'9')) { return Err(400) }
+    let mut major = 0;
+    let mut i = 0;
+    while let Some(c) = v.get(i).filter(|c| c.is_ascii_digit()) {
+        major = major * 10 + u32::from(c - b'0');
+        if major > 1 { return Err(505) }
+        i += 1;
+    }
+    let minor = v.get(i).filter(|c| **c == b'.').map(|_| &v[i + 1..]).ok_or(400u16)?;
+    let minor = (!minor.is_empty() && minor.iter().all(u8::is_ascii_digit)).then(|| std::str::from_utf8(minor).ok()?.parse::<u32>().ok().filter(|n| *n <= 99)).flatten().ok_or(400u16)?;
     Ok((major, minor))
 }
 
@@ -3630,6 +3696,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn too_many_ranges_for_the_length_give_the_whole() {
+        let singles = |n: u64| (0..n).map(|i| format!("{i}-{i}")).collect::<Vec<_>>().join(",");
+        assert_eq!(byte_ranges(&singles(16), 100).map(|r| r.map(|r| r.len())), Ok(Some(16)));
+        assert_eq!(byte_ranges(&singles(17), 100), Ok(None));
+        assert_eq!(byte_ranges(&singles(54), 10000).map(|r| r.map(|r| r.len())), Ok(Some(54)));
+        assert_eq!(byte_ranges(&singles(55), 10000), Ok(None));
+    }
+
+    #[test]
     fn max_ranges_limits_ranges() {
         let ranged = |max, h: &str| {
             let mut resp = Response { status: 200, body: b"0123456789".to_vec(), ranges: true, headers: vec![("Accept-Ranges".into(), "bytes".into())], ..Response::default() };
@@ -3997,10 +4072,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn status_codes_of_proxied_answers() {
+        for (line, code) in [("HTTP/1.1 200 OK\r\n", Some(200)), ("HTTP/1.0  404\n", Some(404)), ("HTTP/1.1 403.1 x\r\n", Some(403)), ("HTTP/2.0 204", Some(204)),
+            ("HTTP/1.1 abc X\r\n", None), ("HTTP/1.1 2000\r\n", None), ("HTTP/1.1 20\r\n", None), ("HTTP/0.9 200\r\n", None), ("HTTP/1 200\r\n", None),
+            ("HTTP/1.123 200\r\n", None), ("http/1.1 200\r\n", None), ("HTTP/1.1200\r\n", None)] {
+            assert_eq!(status_code(line.as_bytes()), code, "{line}");
+        }
+    }
+
+    #[test]
     fn versions_as_nginx_reads_them() {
         for (version, read) in [("HTTP/1.0", Ok((1, 0))), ("HTTP/1.2", Ok((1, 2))), ("HTTP/1.99", Ok((1, 99))), ("HTTP/1.01", Ok((1, 1))),
-            ("HTTP/2.0", Err(505)), ("HTTP/10.0", Err(505)), ("HTTP/01.1", Err(400)), ("HTTP/1.100", Err(400)), ("HTTP/1", Err(400)),
-            ("HTTP/1.", Err(400)), ("HTTP/1.x", Err(400)), ("HTTX/1.1", Err(400)), ("HTTP/100.0", Err(400))] {
+            ("HTTP/2.0", Err(505)), ("HTTP/10.0", Err(505)), ("HTTP/3", Err(505)), ("HTTP/2x", Err(505)), ("HTTP/x", Err(400)), ("HTTP/1x", Err(400)), ("HTTP/1.", Err(400)), ("HTTP/01.1", Err(400)), ("HTTP/1.100", Err(400)), ("HTTP/1", Err(400)),
+            ("HTTP/1.", Err(400)), ("HTTP/1.x", Err(400)), ("HTTX/1.1", Err(400)), ("HTTP/100.0", Err(505))] {
             assert_eq!(http_version(version), read, "{version}");
         }
         assert!(http11("GET / HTTP/1.1") && http11("GET / HTTP/1.2") && !http11("GET / HTTP/1.0") && !http11("GET /") && !http11("GET / HTTP/2.0"));
@@ -4233,6 +4317,19 @@ pub(crate) mod tests {
         assert!(b.starts_with("HTTP/1.1 302 ") && b.contains("Location: x\r\n") && b.ends_with("\r\n\r\nt"), "{b}");
         let c = get("/c");
         assert!(c.contains("Location: y\r\n") && !c.contains("Location: x"), "{c}");
+    }
+
+    #[test]
+    fn files_given_with_an_error_status_lose_last_modified_and_accept_ranges() {
+        let dir = std::env::temp_dir().join(format!("twinx-error-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("page.html"), "page").unwrap();
+        let text = format!("http {{ server {{ root {}; location / {{ error_page 404 /page.html; }} }} }}", dir.display());
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {text}"), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let got = exchanged(&config.servers[0], "/nx");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(got.starts_with("HTTP/1.1 404 ") && got.contains("\r\nETag: ") && got.ends_with("page"), "{got}");
+        assert!(!got.contains("Last-Modified") && !got.contains("Accept-Ranges"), "{got}");
     }
 
     #[test]
@@ -7071,6 +7168,21 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     }
 
     #[test]
+    fn regular_expressions_that_do_not_match_drop_the_numbered_captures() {
+        let text = "http { server { location /if { if ($arg_v ~ (x)) { set $z 1; } if ($arg_v ~ (y)) { set $z 2; } return 200 \"$z [$1]\"; } \
+                    location /rw { if ($arg_v ~ (?<a>x)) { set $q 1; } rewrite ^/none(y) /z; return 200 \"[$1] [$a]\"; } } }";
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| {
+            let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
+            String::from_utf8(block_on(answer(s, &r, Ok(()), location(s, &r.uri), None)).0.body).unwrap()
+        };
+        assert_eq!(get("/if?v=x"), "1 []");
+        assert_eq!(get("/if?v=xy"), "2 [y]");
+        assert_eq!(get("/rw?v=x"), "[] [x]");
+    }
+
+    #[test]
     fn rewrite_directives_run_in_order() {
         let text = "http { server { listen 127.0.0.1:8080; set $x 1; rewrite ^/a /b; set $y $uri; rewrite ^/l /last last; \
                     if ($arg_r) { return 200 server; } if ($arg_b) { break; } set $x ${x}2; \
@@ -7342,9 +7454,15 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let headers = [("Content-Encoding", "gzip"), ("ETag", "\"1-2\""), ("Accept-Ranges", "bytes"), ("X", "y")];
         let mut resp = Response { body: [member.clone(), member].concat(), ..Response::default() };
         resp.headers = headers.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
-        gunzip(&mut resp);
+        assert!(gunzip(&mut resp));
         assert_eq!(resp.body, b"abcabc");
         assert_eq!(resp.headers, vec![("ETag".to_string(), "W/\"1-2\"".to_string()), ("X".to_string(), "y".to_string())]);
+        // An empty body, or a stream that is cut short, does not end.
+        assert!(!gunzip(&mut Response::default()));
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(b"abc").unwrap();
+        let member = gz.finish().unwrap();
+        assert!(!gunzip(&mut Response { body: member[..member.len() - 3].to_vec(), ..Response::default() }));
     }
 
     #[test]
