@@ -398,6 +398,8 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         drop(fresh.take());
         idle = exchange(&mut stream, server, &r, parsed, found, local, &buf).await;
         drop(busy);
+        let background = r.shared.background.lock().unwrap().take();
+        if let Some(update) = background { let _ = update.await; }
         // What of an unbuffered body was not passed on is read and dropped.
         // What came after a chunked one is the next request.
         let unread = r.shared.unread.lock().unwrap().take();
@@ -2399,10 +2401,10 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
             Err(status) => return special(status),
         },
     };
-    // proxy_cache: a GET or HEAD is answered with what the cache keeps for its key
-    // while that is valid.
+    // proxy_cache: a GET or HEAD, or a POST that proxy_cache_methods names, is answered
+    // with what the cache keeps for its key while that is valid.
     // One with variables names the zone for each request; nothing, or "off", is none.
-    let get = matches!(r.method.as_str(), "GET" | "HEAD");
+    let get = matches!(r.method.as_str(), "GET" | "HEAD") || r.method == "POST" && level.proxy_cache_post;
     let cache = match level.proxy_cache.as_ref().filter(|_| get) {
         Some(crate::conf::CacheZone::Named(name, zones)) => match name.render(r, &Sent::default()) {
             n if n.is_empty() || n == "off" => None,
@@ -2454,17 +2456,18 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // The key stays noted as being updated until that request ends.
         if let Some(Some(noted)) = refresh { noted.hand_over(); }
         let (zone, key) = (cache.cloned(), key.clone());
-        tokio::task::spawn_local(async move {
+        *r.shared.background.lock().unwrap() = Some(tokio::task::spawn_local(async move {
             Box::pin(proxy(&p, &level, &update, &prefix, None)).await;
             if let Some(zone) = zone { zone.release(&key); }
-        });
+        }));
         return hit(e);
     }
     noted(if bypass { "BYPASS" } else if stale.is_some() { "EXPIRED" } else { "MISS" });
     let uses = cache.map_or(0, |z| z.used(&key));
     // proxy_cache_lock: while another request asks the server for the key, this one waits
     // for what it caches; once that wait is over, it asks too, and its answer is not cached.
-    let locked = match cache.filter(|_| level.proxy_cache_lock && !bypass) {
+    // What is kept but no longer valid is not waited for.
+    let locked = match cache.filter(|_| level.proxy_cache_lock && !bypass && stale.is_none()) {
         Some(zone) => Some(zone.lock(&key, level.proxy_cache_lock_timeout, level.proxy_cache_lock_age).await),
         None => None,
     };
@@ -2491,7 +2494,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let is_set = |name: &str| set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
     // proxy_method replaces the request's method.
     // One that may be cached asks for the body of a HEAD too, unless proxy_cache_convert_head is off.
-    let method = level.proxy_method.as_ref().map_or_else(|| if cache.is_some() && level.proxy_cache_convert_head { "GET".to_string() } else { r.method.clone() }, |m| m.render(r, &sent));
+    let method = level.proxy_method.as_ref().map_or_else(|| if cache.is_some() && level.proxy_cache_convert_head && r.method == "HEAD" { "GET".to_string() } else { r.method.clone() }, |m| m.render(r, &sent));
     let mut req = format!("{method} {uri} HTTP/1.{}\r\n", level.proxy_http_11 as u8);
     set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
     if !is_set("host") { req += &format!("Host: {host}\r\n"); }
@@ -2673,7 +2676,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // proxy_cache_use_stale: what the cache keeps is given when the server failed so.
     let condition = answer.as_ref().map_or_else(|| failed.to_string(), |a| if a.generated { "timeout".to_string() } else { format!("http_{}", a.status) });
     // With what is known of the servers asked.
-    if let Some(e) = stale.filter(|_| level.proxy_cache_use_stale.contains(&condition)) {
+    // Its stale-if-error lets it be given when the server gave no answer.
+    let erred = answer.as_ref().is_none_or(|a| a.generated);
+    if let Some(e) = stale.filter(|e| level.proxy_cache_use_stale.contains(&condition) || erred && e.erring()) {
         noted("STALE");
         let mut kept = hit(e);
         (kept.upstream_addr, kept.upstream_status, kept.upstream_time, kept.upstream_bytes) = (Some(addrs.join(", ")), Some(statuses.join(", ")), Some(times), Some(bytes));
@@ -2724,7 +2729,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         // Nor one the range filter answers with 416, which ends the request too.
         let unsatisfiable = resp.ranges && resp.status == 200 && ranges_asked(r, &resp).is_some_and(|(_, asked)| asked.is_err());
         let line = resp.status_line.as_deref().map(|l| crate::vars::text(l));
-        if resp.cut.is_none() && !unsatisfiable { zone.put((&main, &key), (resp.status, kept.0, kept.1, resp.body.clone()), (length, line, resp.upstream.clone()), valid, (vary.unwrap_or_default(), &r.headers)); }
+        if resp.cut.is_none() && !unsatisfiable { zone.put((&main, &key), (resp.status, kept.0, kept.1, resp.body.clone()), (length, line, resp.upstream.clone()), (valid.0, valid.1, crate::cache::stale_if_error(&resp.upstream, &level.proxy_ignore_headers)), (vary.unwrap_or_default(), &r.headers)); }
     }
     // proxy_force_ranges: one range of any other answer is given too, whatever its Accept-Ranges
     // says, read whole for it.
