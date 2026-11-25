@@ -3015,7 +3015,8 @@ fn parse(r: &mut Request, head: &[u8], level: &Level, h2: bool) -> Result<(), u1
     if !valid_method || !(matches!(version, "HTTP/1.0" | "HTTP/1.1" | "") || h2 && version == "HTTP/2.0") { return Err(400); }
     for line in lines.filter(|l| !l.is_empty()) {
         let Some((name, value)) = header_line(line, level)? else { continue };
-        r.headers.push((name.to_string(), value.trim_matches([' ', '\t']).to_string()));
+        // Only spaces go around a value: a tab is a part of it.
+        r.headers.push((name.to_string(), value.trim_matches(' ').to_string()));
     }
     // Headers nginx takes only once: a second one is refused.
     const UNIQUE: &[&str] = &["if-modified-since", "if-unmodified-since", "if-match", "if-none-match", "content-length",
@@ -3062,7 +3063,8 @@ fn parse(r: &mut Request, head: &[u8], level: &Level, h2: bool) -> Result<(), u1
 /// None for a line ignore_invalid_headers drops.
 fn header_line<'a>(line: &'a str, level: &Level) -> Result<Option<(&'a str, &'a str)>, u16> {
     let (name, value) = line.split_once(':').ok_or(400u16)?;
-    if name.is_empty() || name.bytes().any(|c| c <= 0x20 || c == 0x7f) { return Err(400); }
+    // A CR that no LF follows, or a NUL, is an invalid header line wherever it is.
+    if name.is_empty() || name.bytes().any(|c| c <= 0x20 || c == 0x7f) || value.bytes().any(|c| c == b'\r' || c == 0) { return Err(400); }
     let valid = name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || (c == b'_' && level.underscores_in_headers));
     Ok((valid || !level.ignore_invalid_headers).then_some((name, value)))
 }
@@ -3182,10 +3184,12 @@ fn valid_host(h: &str) -> Option<String> {
 }
 
 fn keepalive(r: &Request) -> bool {
-    let connection = header(r, "connection").map(|v| v.to_ascii_lowercase());
     let http11 = r.line.ends_with("HTTP/1.1");
-    // As nginx reads it, "close" anywhere in the value closes; else "keep-alive" keeps alive.
-    connection.map_or(http11, |c| !c.contains("close") && (http11 || c.contains("keep-alive")))
+    // As nginx reads each Connection line, "close" anywhere in its value closes, else
+    // "keep-alive" keeps alive, else it changes nothing: the last that says one decides.
+    let said = r.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("connection")).map(|(_, v)| v.to_ascii_lowercase())
+        .filter_map(|c| if c.contains("close") { Some(false) } else { c.contains("keep-alive").then_some(true) }).last();
+    said.unwrap_or(http11)
 }
 
 /// A location found for a URI: its prefix, its settings, and whether the
@@ -3789,6 +3793,24 @@ pub(crate) mod tests {
             let (_, r) = request(&format!("GET / HTTP/{version}\nHost: a\nConnection: {connection}\n\n"));
             assert_eq!(keepalive(&r), kept, "{version} {connection}");
         }
+        // Of more lines, the last that says close or keep-alive decides.
+        for (lines, kept) in [(["keep-alive", "close"], false), (["foo", "close"], false), (["close", "keep-alive"], true), (["keep-alive", "foo"], true)] {
+            let (_, r) = request(&format!("GET / HTTP/1.0\nConnection: {}\nConnection: {}\n\n", lines[0], lines[1]));
+            assert_eq!(keepalive(&r), kept, "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn values_of_header_lines() {
+        // Only spaces go around a value, so a tab is a part of it.
+        let (res, r) = request("GET / HTTP/1.0\nX-A:   a\tb  \nX-B:\tc\t\n\n");
+        assert_eq!((res, header(&r, "x-a"), header(&r, "x-b")), (Ok(()), Some("a\tb"), Some("\tc\t")));
+        assert_eq!(request("GET / HTTP/1.1\nHost:\ta\n\n").0, Err(400));
+        // A CR that no LF follows, and a NUL, are refused; other control characters are not.
+        for bad in ["X-A: a\rb", "X-A: \rb", "X-A: a\0b", "X-A: \0"] {
+            assert_eq!(request(&format!("GET / HTTP/1.0\n{bad}\r\n\n")).0, Err(400), "{bad:?}");
+        }
+        assert_eq!(request("GET / HTTP/1.0\nX-A: a\x01\x7f\"b\r\n\n").0, Ok(()));
     }
 
     #[test]
