@@ -69,6 +69,20 @@ for line in sys.stdin:
   fi
 }
 
+# unit_tests beside nginx-tests: its output waits, so that the two do not mix.
+start_unit_tests() {
+  unit_tests "$@" > "$JUDGE_DIR/unit.log" 2>&1 &
+  unit_tests_pid=$!
+}
+
+# The status of the unit tests started.
+finish_unit_tests() {
+  local status=0
+  wait "$unit_tests_pid" || status=$?
+  cat "$JUDGE_DIR/unit.log"
+  return "$status"
+}
+
 # Build the tree at $1 and its unit tests, and copy twinx to $3, apart from the tests'
 # container; succeeds only when cargo build does.
 build() {
@@ -123,7 +137,6 @@ pr() {
   if [ -f "$tree/Cargo.toml" ]; then
     if build "$tree" "$RUSTFLAGS_COVERAGE" "$binary"; then
       build=success
-      unit_tests "$tree" "$OUT/unit.json" && test=success || test=failure
     else
       build=failure
     fi
@@ -131,8 +144,12 @@ pr() {
 
   local profiles="$JUDGE_DIR/profiles"
   rm -rf "$profiles" && mkdir -p "$profiles" && chmod 0777 "$profiles"
+  [ "$build" != success ] || start_unit_tests "$tree" "$OUT/unit.json"
   python3 "$HARNESS/run_tests.py" --profiles "$profiles" \
     --twinx "$binary" --out "$OUT/results.json" || true
+  if [ "$build" = success ]; then
+    finish_unit_tests && test=success || test=failure
+  fi
 
   local lcov=()
   if ls "$profiles"/*.profraw >/dev/null 2>&1 && [ -x "$binary" ]; then
