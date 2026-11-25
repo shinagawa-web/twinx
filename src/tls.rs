@@ -433,6 +433,7 @@ impl Staple {
             return Ok(Some(Arc::new(Staple { source: None, verify: false, state: Mutex::new((Some((stapled, i64::MAX)), i64::MAX, false)) })));
         }
         let source = crate::ocsp::stapled(&key.cert, trusted, stapling.responder.as_deref());
+        if let Some(url) = source.as_ref().map(|s| &s.0).filter(|u| !u.starts_with("http://")) { return Err(format!("invalid URL prefix in OCSP responder \"{url}\" in resolver")) }
         Ok(source.map(|source| Arc::new(Staple { source: Some(source), verify: stapling.verify, state: Mutex::new((None, 0, false)) })))
     }
 
@@ -615,6 +616,8 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     let groups = options.curves.as_deref().map(curves).transpose()?;
     let suites = CryptoProvider { cipher_suites: suites.unwrap_or_else(|| provider().cipher_suites.clone()), kx_groups: groups.unwrap_or_else(|| provider().kx_groups.clone()), ..(*provider()).clone() };
     let versions: Vec<_> = [&rustls::version::TLS12, &rustls::version::TLS13].into_iter().zip(options.protocols).filter_map(|(v, on)| on.then_some(v)).collect();
+    // With none of them, the server starts, and no handshake succeeds: there is no certificate.
+    let (versions, fixed) = if versions.is_empty() { (vec![&rustls::version::TLS13], Vec::new()) } else { (versions, fixed) };
     let builder = ServerConfig::builder_with_provider(Arc::new(suites)).with_protocol_versions(&versions).map_err(|e| e.to_string())?;
     let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms, ca_names(options.client_ca.as_deref())?))) } else { builder.with_no_client_auth() };
     let mut fixed = Fixed::new(fixed);
@@ -1486,7 +1489,9 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let addrs = ("127.0.0.1:1".parse().unwrap(), "127.0.0.1:2".parse().unwrap());
         assert!(tls.for_connection(addrs, "c.pem").is_some());
         assert!(tls.for_connection(addrs, "none").is_none());
-        assert!(server(files, None, &[], options).is_err());
+        assert!(server(files, None, &[], options.clone()).is_err());
+        // Without a protocol twinx has, such as with only SSLv2, it is still taken.
+        assert!(server(files, Some(Some(Arc::new(CertCache::new(4, 60, 10)))), &[], Options { protocols: [false, false], ..options }).is_ok());
     }
 
     #[test]
