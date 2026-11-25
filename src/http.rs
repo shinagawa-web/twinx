@@ -308,7 +308,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         buf.drain(..end);
         let parsed = overflowed.map_or(parsed, Err);
         let (server, captures) = server(config, listen, r.host.as_deref());
-        r.captures = captures;
+        name_captures(&mut r, captures);
         let parsed = parsed.and_then(|()| if r.headers.len().saturating_sub(origin.as_ref().map_or(0, |o| o.made)) > server.level.max_headers { Err(400) } else { Ok(()) });
         let parsed = parsed.and_then(|()| if to_https { Err(497) } else { Ok(()) });
         let parsed = parsed.and_then(|()| if misdirected(r.ssl.as_deref(), r.host.as_deref(), server.level.ssl_verify_client) { Err(421) } else { Ok(()) });
@@ -1011,10 +1011,9 @@ async fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Temp
 async fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str, client: Option<&mut Stream>) -> Response {
     for (name, dir) in &tf.files {
         let name = name.render(r, &Sent::default());
-        let base = level.alias.as_ref().unwrap_or(&level.root);
         // With alias, the location's prefix at the start of the name is replaced, as in the URI.
         let rest = level.alias.as_ref().and(level.alias_len).and_then(|n| name.strip_prefix(r.uri.get(..n)?)).unwrap_or(&name);
-        let path = PathBuf::from(format!("{}{rest}", base.display()));
+        let path = PathBuf::from(format!("{}{rest}", level.alias.clone().unwrap_or_else(|| root(level, r)).display()));
         if std::fs::metadata(&path).is_ok_and(|m| m.is_dir() == *dir) {
             let to = Request { uri: name, ..r.clone() };
             // A directory whose URI ends with "/" is answered by the index module.
@@ -1069,7 +1068,8 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             // by its location, with the error's status unless that answer has its own.
             // A named location answers the request as it is.
             let mut to = Box::new(r.clone());
-            (to.upstream_addr, to.upstream_status) = (resp.upstream_addr.take(), resp.upstream_status.take());
+            // As do the proxied server's headers ($upstream_http_*, $upstream_cookie_*).
+            (to.upstream_addr, to.upstream_status, to.upstream) = (resp.upstream_addr.take(), resp.upstream_status.take(), std::mem::take(&mut resp.upstream));
             if named.is_none() {
                 to.redirect(url.split('?').next().unwrap_or_default().to_string(), url);
                 to.method = if r.method == "HEAD" { "HEAD" } else { "GET" }.to_string();
@@ -2000,6 +2000,11 @@ fn holds(r: &Request, cond: &Condition) -> bool {
     }
 }
 
+/// The root of a request: that of root with variables is made for it.
+fn root(level: &Level, r: &Request) -> PathBuf {
+    level.root_vars.as_ref().map_or_else(|| level.root.clone(), |t| PathBuf::from(t.render(r, &Sent::default())))
+}
+
 /// Serves a file under root (or alias), as nginx's static module does; a
 /// directory asked for without the trailing "/" is redirected to it. A URI
 /// that ends with "/" is the index module's: "index.html" in that directory,
@@ -2010,7 +2015,8 @@ fn file(level: &Level, r: &Request, prefix: &str) -> Response {
         // In a regular expression location, alias with captures names the whole path.
         Some(_) if let (Some(t), None) = (&level.alias_vars, level.alias_len) => PathBuf::from(t.render(r, &Sent::default())),
         Some(alias) => std::path::PathBuf::from(format!("{}{}", alias.display(), r.uri.get(prefix.len()..).unwrap_or_default())),
-        None => level.root.join(r.uri.trim_start_matches('/')),
+        // As in nginx, the URI goes after root as it is.
+        None => PathBuf::from(format!("{}{}", root(level, r).display(), r.uri)),
     };
     if r.uri.ends_with('/') { return index(level, r, &path); }
     file_at(level, r, path)
@@ -2439,7 +2445,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         const KEPT: &[&str] = &["set-cookie", "content-disposition", "cache-control", "expires", "accept-ranges"];
         resp.headers.retain(|h| KEPT.contains(&h.0.to_ascii_lowercase().as_str()));
         let named = to.starts_with('@');
-        let Some((uri, args)) = (if named { Some((to, None)) } else { unsafe_uri(&to) }) else { return special(404) };
+        // As in nginx, the 404 of an unsafe URI has the headers kept too.
+        let Some((uri, args)) = (if named { Some((to, None)) } else { unsafe_uri(&to) }) else { return Response { headers: resp.headers, ..special(404) } };
         return Response { internal: Some(args.map_or_else(|| uri.clone(), |a| format!("{uri}?{a}"))), as_get: !named, ..resp };
     }
     let hidden = |name: &str| hidden(&level.proxy_hide_header, &level.proxy_pass_header, name);
@@ -3113,8 +3120,16 @@ fn escape_uri(s: &str) -> String {
     crate::vars::bytes(s).into_iter().map(|c| if plain(c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
 }
 
-/// The server that answers on a listening address, and the named captures of
-/// its name: the one with the host as its name, else the longest "*.name"
+/// Gives a request the captures of the server name of a regular expression that matched its host:
+/// the named ones are variables everywhere, the others $0, $1, ... until another regular expression matches.
+fn name_captures(r: &mut Request, captures: Vec<(String, String)>) {
+    let (numbered, named): (Vec<_>, _) = captures.into_iter().partition(|c| c.0.bytes().all(|b| b.is_ascii_digit()));
+    numbered.into_iter().for_each(|(n, v)| r.set_var(&n, v));
+    r.captures = named;
+}
+
+/// The server that answers on a listening address, and the captures of its name,
+/// by number and by name: the one with the host as its name, else the longest "*.name"
 /// that matches, else the longest "name.*", else the first regular expression
 /// that matches, else the first server listening there. No host is "".
 pub fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) -> (&'a Server, Vec<(String, String)>) {
@@ -3133,7 +3148,7 @@ pub fn server<'a>(config: &'a Config, listen: SocketAddr, host: Option<&str>) ->
     }
     if let Some((_, _, s)) = best { return (s, Vec::new()); }
     let regex = on().flat_map(|s| s.names.iter().map(move |n| (s, n))).find_map(|(s, n)| match n {
-        ServerName::Regex(re) => re.captures(host).map(|c| (s, re.capture_names().flatten().filter_map(|name| Some((name.to_string(), c.name(name)?.as_str().to_string()))).collect())),
+        ServerName::Regex(re) => re.captures(host).map(|c| (s, re.capture_names().enumerate().flat_map(|(i, name)| { let v = c.get(i).map_or("", |m| m.as_str()); [Some(i.to_string()), name.map(String::from)].into_iter().flatten().map(move |n| (n, v.to_string())) }).collect())),
         _ => None,
     });
     regex.unwrap_or_else(|| (default_server(config, listen), Vec::new()))
@@ -3332,6 +3347,15 @@ pub(crate) mod tests {
         let _client = TcpStream::connect(addr).unwrap();
         assert_eq!(l.accept().unwrap().1.ip(), addr.ip());
         assert!(listen(addr, 511).is_err());
+    }
+
+    #[test]
+    fn roots_with_variables() {
+        let config = crate::conf::build(&crate::config::parse("events { } http { server { location /a { root /r/$arg_x; } location /b { root /s; } } }", std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let (_, r) = request("GET /a?x=y HTTP/1.0\n\n");
+        let level = |i: usize| &config.servers[0].locations[i].level;
+        assert_eq!((root(level(0), &r), root(level(1), &r)), (PathBuf::from("/r/y"), PathBuf::from("/s")));
+        assert!(level(1).root_vars.is_none());
     }
 
     #[test]
@@ -6448,7 +6472,12 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let cases = [(Some("zz"), "a"), (None, ""), (Some("y.b.c"), "*.b.c"), (Some("y.x.b.c"), "*.x.b.c"), (Some("d.e"), "*.x.b.c"), (Some("y.d.e"), "*.x.b.c"),
                      (Some("f.z"), "f.*"), (Some("f.g.z"), "f.*"), (Some("xyz.h"), "~^(?P<n1>[a-z]+)\\Q.h\\E$"), (Some("xyzah"), "a")];
         for (host, expected) in cases { assert_eq!(name(host), expected, "{host:?}"); }
-        assert_eq!(server(&config, listen, Some("xyz.h")).1, vec![("n1".to_string(), "xyz".to_string())]);
+        let captures = server(&config, listen, Some("xyz.h")).1;
+        assert_eq!(captures, [("0", "xyz.h"), ("1", "xyz"), ("n1", "xyz")].map(|(n, v)| (n.to_string(), v.to_string())));
+        // The named ones are variables, all are $0, $1, ...
+        let (_, mut r) = request("GET / HTTP/1.0\n\n");
+        name_captures(&mut r, captures);
+        assert_eq!(Template::parse("$0 $1 $n1").unwrap().render(&r, &Sent::default()), "xyz.h xyz xyz");
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
         r.captures = vec![("n1".into(), "v".into())];
         assert_eq!(Template::parse("[$n1]").unwrap().render(&r, &Sent::default()), "[v]");
