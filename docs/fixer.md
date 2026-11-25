@@ -22,7 +22,7 @@ Among the open failing files (see `docs/loop.md`), take the one in the lowest st
 3. Crates from crates.io may be used. Prefer ones whose behavior you can make match nginx byte for byte.
 4. Implement only what nginx-tests needs. The judge builds twinx with coverage instrumentation, runs the stage's files, and rejects the pull request when nginx-tests run less than 99% of the executable lines it adds. Rust unit tests do not count toward this.
 5. Add Rust unit tests in `src/` or `tests/` for the parts you write.
-6. Before pushing, build, run `cargo test` and run every file of the current stages against nginx's results. No subtest that passes on main may fail. A file your environment skips is checked only by the judge.
+6. Before pushing, build, run `cargo test` and run the file and the files the change may touch. The judge runs every file and rejects the pull request if a subtest that passes on main fails. A file your environment skips is checked only by the judge.
 
 ## What to open
 
