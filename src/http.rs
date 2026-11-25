@@ -2536,7 +2536,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     // proxy_set_header comes first, then the headers it does not set, as nginx sends them.
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     // proxy_set_body replaces the client's body, whatever proxy_pass_request_body
-    // says; proxy_pass_request_body off sends no body, and so no Content-Length.
+    // says; proxy_pass_request_body off sends no body, but its Content-Length still.
     let set_body = level.proxy_set_body.as_ref().map(|b| b.render(r, &sent).into_bytes());
     let pass_body = level.proxy_pass_request_body && set_body.is_none();
     let body = match &set_body {
@@ -2562,7 +2562,11 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let length = match &set_body {
         Some(b) => Some(b.len() as u64),
         // A request without a body has none, but one that says Content-Length: 0 is passed with it, as in nginx.
-        None => (pass_body && !chunked && (framing(r) != Ok(Some(0)) || header(r, "content-length").is_some())).then(|| body.len() as u64 + unread.as_ref().map_or(0, |u| u.left)),
+        None => {
+            let had = if pass_body { body.len() as u64 } else { r.body_file.as_ref().map_or(r.body.len() as u64, |f| std::fs::metadata(f).map_or(0, |m| m.len())) };
+            // Over HTTP/2, where it would frame a body, there is none without one.
+            (!chunked && (pass_body || !level.proxy_h2) && (framing(r) != Ok(Some(0)) || header(r, "content-length").is_some())).then(|| had + unread.as_ref().map_or(0, |u| u.left))
+        }
     };
     if pass_body && chunked && !is_set("transfer-encoding") && !level.proxy_h2 { req += "Transfer-Encoding: chunked\r\n"; }
     if let Some(n) = length.filter(|_| !is_set("content-length")) { req += &format!("Content-Length: {n}\r\n"); }
@@ -3101,6 +3105,9 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
             if line_end(buf).is_some_and(|at| status_code(&buf[..at]).is_none()) { break None }
             if let Some(end) = line_end(buf).and_then(|at| lines_end(buf, at)) { break Some(end); }
             if answer.len() >= level.proxy_buffer_size { return Err(invalid("upstream sent too big header")); }
+            // As in nginx, the head is read into a buffer of proxy_buffer_size: what comes
+            // with it of the body is no more than what is left of that.
+            let room = (level.proxy_buffer_size - answer.len()).min(chunk.len());
             // Not that of a request whose answer may be cached, which goes on without the client.
             let closed = async { match client.as_deref().filter(|_| watch) { Some(c) => crate::stream::gone(c).await, None => std::future::pending().await } };
             // So does the worker_shutdown_timeout of a worker shutting down.
@@ -3111,7 +3118,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
                     let action = if answer.is_empty() { "sending request to upstream" } else { READING_HEAD };
                     return Err(Gone(client.as_deref().filter(|_| gone).and_then(|c| client_gone(c, action)).unwrap_or_default()))
                 }
-                n = async { let mut waited = Duration::ZERO; loop { match within(wait, s.read(&mut chunk)).await { None if sending(&mut waited) => {} n => break n } } } => match n.ok_or(TimedOut(READING_HEAD))? {
+                n = async { let mut waited = Duration::ZERO; loop { match within(wait, s.read(&mut chunk[..room])).await { None if sending(&mut waited) => {} n => break n } } } => match n.ok_or(TimedOut(READING_HEAD))? {
                     Ok(0) => return Err(Closed(format!("{PREMATURE} while {READING_HEAD}"))),
                     Ok(n) => n,
                     Err(e) => return Err(Closed(format!("{} while {READING_HEAD}", read_failed("recv", &e)))),
@@ -7523,7 +7530,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let got = thread::spawn(move || {
-            (0..2).map(|_| {
+            (0..3).map(|_| {
                 let (mut s, _) = listener.accept().unwrap();
                 let mut buf = [0u8; 1024];
                 let n = s.read(&mut buf).unwrap();
@@ -7541,7 +7548,11 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         // A Content-Length proxy_set_header sets replaces the one of the body.
         let level = Level { proxy_set_body: None, proxy_pass_request_body: true, proxy_set_header: vec![("Content-Length".into(), Template::parse("7").unwrap())], ..level };
         assert_eq!(block_on(proxy(&p, &level, &r, "", None)).status, 204);
+        // proxy_pass_request_body off sends the Content-Length of the body it does not send.
+        let level = Level { proxy_pass_request_body: false, proxy_set_header: Vec::new(), ..level };
+        assert_eq!(block_on(proxy(&p, &level, &r, "", None)).status, 204);
         let sent = got.join().unwrap();
+        assert!(sent[2].contains("Content-Length: 3\r\n") && sent[2].ends_with("\r\n\r\n"), "{sent:?}");
         assert!(sent[0].contains("Content-Length: 3\r\n") && sent[0].ends_with("\r\n\r\nb=1"), "{sent:?}");
         assert!(sent[1].contains("Content-Length: 7\r\n") && !sent[1].contains("Content-Length: 3") && sent[1].ends_with("\r\n\r\nxyz"), "{sent:?}");
     }
