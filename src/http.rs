@@ -1146,6 +1146,8 @@ fn args(r: &Request) -> &str {
 async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found<'_>, local: SocketAddr, ahead: &[u8]) -> Option<Duration> {
     let redirected;
     let (mut resp, mut level, mut last) = answer(server, r, parsed, found, Some(&mut *stream)).await;
+    // The 412 of the not modified filter is an error error_page takes.
+    if precondition_fails(r, &resp) { resp = special(412); }
     let intercepted = !resp.proxied || level.proxy_intercept_errors;
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)).filter(|_| intercepted) {
         // An intercepted 401 keeps the proxied server's WWW-Authenticate headers,
@@ -1263,7 +1265,15 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             gzip(r, level, &mut resp);
         }
     }
+    let ranged = resp.status;
     range(r, level, &mut resp);
+    // Its 416 is another answer, to which add_header adds those that are "always" again.
+    if ranged != 416 && resp.status == 416 {
+        for (name, value, _) in level.add_header.iter().filter(|h| h.2) {
+            let value = value.render(r, &at_head(&resp));
+            if !value.is_empty() { resp.headers.push((name.clone(), value)); }
+        }
+    }
     // What is read at once is written with the head. With sendfile, less is: one write of both costs less than two up to about there.
     let once = if level.sendfile && matches!(stream, Stream::Tcp(_)) { PIECE / 2 } else { PIECE };
     // One that is decompressed as it is sent stays in its file.
@@ -1439,15 +1449,25 @@ async fn post_action(server: &Server, r: &Request, level: &Level, client: Option
 fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
     const CONDITIONS: &[&str] = &["if-match", "if-modified-since", "if-none-match", "if-unmodified-since"];
     if resp.status != 200 || resp.unconditional || !r.headers.iter().any(|h| CONDITIONS.iter().any(|c| h.0.eq_ignore_ascii_case(c))) { return; }
+    if precondition_fails(r, resp) { return *resp = special(412); }
     let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
     let (modified, etag) = (sent("last-modified").and_then(|t| expires::http_time(&t)), sent("etag"));
-    if header(r, "if-unmodified-since").is_some_and(|t| !modified.zip(expires::http_time(t)).is_some_and(|(m, t)| t >= m)) { return *resp = special(412); }
-    if header(r, "if-match").is_some_and(|v| !etag_match(v, etag.as_deref(), false)) { return *resp = special(412); }
     let (ims, inm) = (header(r, "if-modified-since"), header(r, "if-none-match"));
     let same = |t: &str| level.if_modified_since.zip(modified).is_some_and(|(before, m)| expires::http_time(t).is_some_and(|t| t == m || before && t > m));
     if (ims.is_none() && inm.is_none()) || ims.is_some_and(|t| !same(t)) || inm.is_some_and(|v| !etag_match(v, etag.as_deref(), true)) { return; }
     (resp.status, resp.ctype, resp.body, resp.file, resp.rest, resp.cut, resp.told) = (304, None, Vec::new(), None, None, None, None);
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges") && !h.0.eq_ignore_ascii_case("content-encoding"));
+}
+
+/// Whether the not modified filter answers a 200 answer it does not leave as it is with
+/// 412: its If-Unmodified-Since is before its Last-Modified (or it has none), or its
+/// If-Match fails.
+fn precondition_fails(r: &Request, resp: &Response) -> bool {
+    if resp.status != 200 || resp.unconditional { return false; }
+    let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
+    let (modified, etag) = (sent("last-modified").and_then(|t| expires::http_time(&t)), sent("etag"));
+    header(r, "if-unmodified-since").is_some_and(|t| !modified.zip(expires::http_time(t)).is_some_and(|(m, t)| t >= m))
+        || header(r, "if-match").is_some_and(|v| !etag_match(v, etag.as_deref(), false))
 }
 
 /// The range filter, as ngx_http_range_header_filter() is: a 200 answer of a
@@ -1460,15 +1480,18 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
     let ok = resp.status == 200 && resp.ranges && resp.cut.is_none() && !resp.unknown_length && !http09(r.line.as_bytes());
     // max_ranges 0: none, and no Accept-Ranges either.
     if ok && level.max_ranges == Some(0) { resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges")); return; }
-    let Some(spec) = header(r, "range").filter(|v| ok && v.len() > 6 && v[..6].eq_ignore_ascii_case("bytes=")).map(|v| v[6..].trim()) else { return };
-    let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
-    let same = |v: &str| if v.len() >= 2 && v.ends_with('"') { sent("etag").as_deref() == Some(v) } else { sent("last-modified").and_then(|t| expires::http_time(&t)).is_some_and(|t| expires::http_time(v) == Some(t)) };
-    if !header(r, "if-range").is_none_or(same) { return; }
-    let len = resp.len() as u64;
-    let ranges = match byte_ranges(spec, len) {
+    let Some((len, asked)) = ranges_asked(r, resp).filter(|_| ok) else { return };
+    let ranges = match asked {
         Ok(Some(ranges)) if !(resp.single_range && ranges.len() > 1) && level.max_ranges.is_none_or(|max| ranges.len() <= max) => ranges,
         Ok(_) => return,
-        Err(()) => { *resp = Response { headers: vec![("Content-Range".into(), format!("bytes */{len}"))], ..special(416) }; return }
+        // The answer's other headers stay, but those that told of its body.
+        Err(()) => {
+            let mut headers = std::mem::take(&mut resp.headers);
+            headers.retain(|h| !["etag", "last-modified", "accept-ranges", "content-range"].contains(&h.0.to_ascii_lowercase().as_str()));
+            headers.push(("Content-Range".into(), format!("bytes */{len}")));
+            *resp = Response { headers, ..special(416) };
+            return
+        }
     };
     resp.status = 206;
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
@@ -1480,6 +1503,7 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
         resp.headers.insert(given.unwrap_or(resp.headers.len()), ("Content-Range".into(), format!("bytes {start}-{}/{len}", end - 1)));
         match &mut resp.file {
             Some(file) => (file.start, file.len) = (file.start + start, end - start),
+            None if resp.told.is_some() => resp.told = Some(Some((end - start) as usize)),
             None => resp.body = resp.body[start as usize..end as usize].to_vec(),
         }
         return;
@@ -1495,6 +1519,19 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
     }
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     (resp.body, resp.ctype) = (body, Some(format!("multipart/byteranges; boundary={boundary}").into()));
+}
+
+/// The length of an answer and the ranges of it a request's "bytes=" Range asks for, unless an
+/// If-Range differs from its ETag (a quoted value, compared exactly) or its Last-Modified time;
+/// Err when none of them can be given (416).
+fn ranges_asked(r: &Request, resp: &Response) -> Option<(u64, Result<Option<Vec<(u64, u64)>>, ()>)> {
+    let spec = header(r, "range").filter(|v| v.len() > 6 && v[..6].eq_ignore_ascii_case("bytes=")).map(|v| v[6..].trim())?;
+    let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
+    let same = |v: &str| if v.len() >= 2 && v.ends_with('"') { sent("etag").as_deref() == Some(v) } else { sent("last-modified").and_then(|t| expires::http_time(&t)).is_some_and(|t| expires::http_time(v) == Some(t)) };
+    if !header(r, "if-range").is_none_or(same) { return None; }
+    // That of an answer to HEAD is the one it was told.
+    let len = resp.told.flatten().unwrap_or(resp.len()) as u64;
+    Some((len, byte_ranges(spec, len)))
 }
 
 /// The boundaries of multipart/byteranges bodies are numbered, from 1.
@@ -2336,10 +2373,12 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let any_set = |t: &[Template]| t.iter().any(|t| !matches!(t.render(r, &to_host).as_str(), "" | "0"));
     let bypass = cache.is_some() && any_set(&level.proxy_cache_bypass);
     // Ranges of what the cache keeps are given when its Accept-Ranges was kept, or with
-    // proxy_force_ranges (ngx_http_upstream_copy_allow_ranges()).
+    // proxy_force_ranges (ngx_http_upstream_copy_allow_ranges()), and its server gave its length.
     let hit = |e: crate::cache::Entry| {
-        let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, proxy_host: Some(host.clone()), ..Response::default() };
-        if level.proxy_force_ranges || has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, false); }
+        let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, relative: e.relative, proxy_host: Some(host.clone()), ..Response::default() };
+        // An answer to HEAD is kept without its body, with the length it was told.
+        if let Some(n) = e.length.filter(|&n| n != resp.body.len()) { resp.told = Some(Some(n)); }
+        if level.proxy_force_ranges || has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, false, e.length.is_some()); }
         resp
     };
     // $upstream_cache_status: how the cache answered.
@@ -2596,18 +2635,22 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let now = crate::clock::seconds();
     let said = cache.filter(|_| cacheable).and_then(|_| crate::cache::said(&resp.upstream, &level.proxy_ignore_headers, now));
     let valid = said.and_then(|(until, updating)| until.or_else(|| crate::cache::validity(&level.proxy_cache_valid, resp.status).map(|t| now.saturating_add(t.as_secs() as i64))).map(|u| (u, updating)));
-    if let Some((zone, valid)) = cache.zip(valid) {
+    // Nor one the not modified filter answers with 412, which ends the request.
+    if let Some((zone, valid)) = cache.zip(valid).filter(|_| !precondition_fails(r, &resp)) {
         finish(&mut resp, (level, r)).await;
+        let length = resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case("content-length")).and_then(|h| h.1.parse().ok());
         // One range of what is being cached may be given, read whole as it is, when it
-        // has Accept-Ranges.
-        if has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, true); }
-        if resp.cut.is_none() { zone.put((&main, &key), (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), valid, (vary.unwrap_or_default(), &r.headers)); }
+        // has Accept-Ranges and its server gave its length.
+        if has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, true, length.is_some()); }
+        // Nor one the range filter answers with 416, which ends the request too.
+        let unsatisfiable = resp.ranges && resp.status == 200 && ranges_asked(r, &resp).is_some_and(|(_, asked)| asked.is_err());
+        if resp.cut.is_none() && !unsatisfiable { zone.put((&main, &key), (resp.status, resp.ctype.as_deref().map(str::to_string), resp.headers.clone(), resp.body.clone()), (length, resp.relative), valid, (vary.unwrap_or_default(), &r.headers)); }
     }
     // proxy_force_ranges: one range of any other answer is given too, whatever its Accept-Ranges
     // says, read whole for it.
     if level.proxy_force_ranges && !resp.ranges {
         if resp.status == 200 && header(r, "range").is_some() { finish(&mut resp, (level, r)).await; }
-        allow_ranges(&mut resp, true);
+        allow_ranges(&mut resp, true, true);
     }
     resp
 }
@@ -2618,9 +2661,11 @@ fn has_header(resp: &Response, name: &str) -> bool {
 }
 
 /// A proxied answer whose ranges are given (r->allow_ranges): the range filter says
-/// "Accept-Ranges: bytes" for a 200, in place of what the server said.
-fn allow_ranges(resp: &mut Response, single: bool) {
+/// "Accept-Ranges: bytes" for a 200, in place of what the server said, when its length
+/// is known; when it is not, nothing is said and no range is given.
+fn allow_ranges(resp: &mut Response, single: bool, known: bool) {
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges"));
+    if !known { return; }
     if resp.status == 200 { resp.headers.push(("Accept-Ranges".to_string(), "bytes".to_string())); }
     (resp.ranges, resp.single_range) = (true, single);
 }
@@ -6441,15 +6486,51 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
     }
 
     #[test]
+    fn ranges_of_head_and_unsatisfiable() {
+        let ranged = |resp: &mut Response, h: &str| range(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, &Level::default(), resp);
+        // An answer to HEAD has the length it was told, and the part's.
+        let mut resp = Response { status: 200, ranges: true, told: Some(Some(10)), ..Response::default() };
+        ranged(&mut resp, "Range: bytes=2-4");
+        assert_eq!((resp.status, resp.told, resp.headers.last().map(|h| h.1.as_str())), (206, Some(Some(3)), Some("bytes 2-4/10")));
+        // A 416 keeps the other headers, but those of the body.
+        let headers = ["X-Foo", "ETag", "Last-Modified", "Accept-Ranges", "Content-Range"].map(|n| (n.to_string(), "v".to_string())).to_vec();
+        let mut resp = Response { status: 200, ranges: true, body: b"0123".to_vec(), headers, ..Response::default() };
+        ranged(&mut resp, "Range: bytes=9-");
+        assert_eq!((resp.status, resp.headers), (416, vec![("X-Foo".into(), "v".into()), ("Content-Range".into(), "bytes */4".into())]));
+        // What a request asks for, unless If-Range differs.
+        let file = Response { status: 200, body: b"0123".to_vec(), headers: vec![("ETag".into(), "\"e\"".into())], ..Response::default() };
+        let asked = |h: &str| ranges_asked(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, &file);
+        assert_eq!(asked("Range: bytes=1-2"), Some((4, Ok(Some(vec![(1, 3)])))));
+        assert_eq!(asked("Range: bytes=x"), Some((4, Err(()))));
+        assert_eq!(asked("Range: bytes=1-2\nIf-Range: \"x\""), None);
+        assert_eq!(asked("Accept: a"), None);
+    }
+
+    #[test]
+    fn preconditions() {
+        let answer = || Response { status: 200, headers: vec![("ETag".into(), "\"e\"".into()), ("Last-Modified".into(), "Sun, 06 Nov 1994 08:49:37 GMT".into())], ..Response::default() };
+        let resp = answer();
+        let fails = |h: &str, resp: &Response| precondition_fails(&request(&format!("GET / HTTP/1.0\n{h}\n\n")).1, resp);
+        assert!(fails("If-Match: \"x\"", &resp) && fails("If-Unmodified-Since: Sun, 06 Nov 1994 08:49:36 GMT", &resp));
+        assert!(!fails("If-Match: \"e\"", &resp) && !fails("If-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT", &resp) && !fails("Accept: a", &resp));
+        // Not of another status, nor of an answer the filter leaves as it is.
+        assert!(!fails("If-Match: \"x\"", &Response { status: 404, ..answer() }) && !fails("If-Match: \"x\"", &Response { unconditional: true, ..answer() }));
+    }
+
+    #[test]
     fn allows_ranges() {
         // What the server said of its ranges is replaced, for a 200 only.
         let mut resp = Response { status: 200, headers: vec![("Accept-Ranges".into(), "none".into()), ("ETag".into(), "\"e\"".into())], ..Response::default() };
         assert!(has_header(&resp, "ACCEPT-RANGES") && !has_header(&resp, "vary"));
-        allow_ranges(&mut resp, true);
+        allow_ranges(&mut resp, true, true);
         assert_eq!((resp.headers, resp.ranges, resp.single_range), (vec![("ETag".into(), "\"e\"".into()), ("Accept-Ranges".into(), "bytes".into())], true, true));
         let mut resp = Response { status: 404, headers: vec![("Accept-Ranges".into(), "bytes".into())], ..Response::default() };
-        allow_ranges(&mut resp, false);
+        allow_ranges(&mut resp, false, true);
         assert_eq!((resp.headers.len(), resp.ranges, resp.single_range), (0, true, false));
+        // Of a length not known, none.
+        let mut resp = Response { status: 200, headers: vec![("Accept-Ranges".into(), "bytes".into())], ..Response::default() };
+        allow_ranges(&mut resp, true, false);
+        assert_eq!((resp.headers.len(), resp.ranges), (0, false));
     }
 
     #[test]
