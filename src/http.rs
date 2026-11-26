@@ -1047,24 +1047,27 @@ fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> S
             Some(a) if rw.add_args && !old.is_empty() => format!("?{a}&{old}"),
             Some(a) => format!("?{a}"),
             None if rw.add_args && !old.is_empty() => format!("?{old}"),
+            None if !rw.redirect && !old.is_empty() => "?".to_string(),
             None => String::new(),
         };
         if rw.redirect { return Stop::Answer(Box::new(redirect(rw.status, format!("{uri}{args}")))); }
         if uri.is_empty() { error_log(s.level, to, "the rewritten URI has a zero length"); return Stop::Answer(Box::new(special(500))); }
         let target = format!("{uri}{args}");
         to.to_mut().redirect(uri, target);
+        to.shared.rewritten.store(true, std::sync::atomic::Ordering::Relaxed);
         (s.changed, s.moved) = (rw.flag != Flag::Break, true);
         if rw.flag != Flag::Next { return Stop::Yes; }
     }
     Stop::No
 }
 
-async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Box<Response>, &'a Level) {
+async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Box<Response>, &'a Level, Option<Request>) {
     match parsed {
-        Err(status) => return (Box::new(special(status)), level),
-        Ok(()) if auto => return (Box::new(redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r)))), level),
+        Err(status) => return (Box::new(special(status)), level, None),
+        Ok(()) if auto => return (Box::new(redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r)))), level, None),
         Ok(()) => {}
     }
+    r.shared.rewritten.store(false, std::sync::atomic::Ordering::Relaxed);
     if crate::vars::files_used() {
         let files = crate::vars::Files {
             root: level.root.clone(), root_vars: level.root_vars.clone(), alias: level.alias.clone(), alias_vars: level.alias_vars.clone(),
@@ -1076,14 +1079,18 @@ async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto)
     let mut s = Script { level, changed: false, moved: false, proxied: level.proxy.is_some() };
     let stop = script(&mut to, &level.script, &mut s);
     let (level, moved) = (s.level, s.moved);
-    if s.proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration", ""); return (Box::new(special(500)), level); }
-    if let Some(resp) = ended(&to, level, prefix, stop, client.as_deref_mut()).await { return (resp, level); }
-    if s.changed { let to = to.into_owned(); return (Box::new(Response { internal: Some(Box::new((to.target, Some(to.uri)))), rewritten: true, ..Response::default() }), level); }
+    if s.proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration", ""); return (Box::new(special(500)), level, None); }
+    if let Some(resp) = ended(&to, level, prefix, stop, client.as_deref_mut()).await { return (resp, level, owned(to)); }
+    if s.changed { let to = to.into_owned(); return (Box::new(Response { internal: Some(Box::new((to.target, Some(to.uri)))), rewritten: true, ..Response::default() }), level, None); }
     let resp = match level.proxy.as_deref().filter(|p| moved && p.uri.is_some() && level.try_files.is_none()) {
         Some(p) => Box::new(Box::pin(async { proxy(&Proxy { uri: None, ..p.clone() }, level, &to, prefix, client).await }).await),
         None => serve(&to, level, prefix, None, client).await,
     };
-    (resp, level)
+    (resp, level, owned(to))
+}
+
+fn owned(to: Cow<'_, Request>) -> Option<Request> {
+    match to { Cow::Borrowed(_) => None, Cow::Owned(to) => Some(to) }
 }
 
 fn replacement(rw: &Rewrite, r: &Request) -> (String, Option<String>) {
@@ -1912,13 +1919,14 @@ fn browser(ua: &str) -> (bool, bool) {
 async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u16>, found: Found<'a>, mut client: Option<&mut Stream>) -> (Box<Response>, &'a Level, Option<Box<Request>>) {
     let mut to = Cow::Borrowed(r);
     let rewrite = !server.level.script.is_empty() && !(server.named && server.locations.iter().any(|l| matches!(l.kind, Match::Named) && std::ptr::eq(&l.level, found.1)));
-    let (mut resp, mut level) = match parsed {
+    let (mut resp, mut level, moved) = match parsed {
         Ok(()) if rewrite => match Box::pin(server_rewrite(server, &mut to, found, client.as_deref_mut())).await {
             Ok(found) => Box::pin(respond(&to, parsed, found, client.as_deref_mut())).await,
-            Err(answered) => answered,
+            Err((resp, level)) => (resp, level, None),
         },
         _ => Box::pin(respond(&to, parsed, found, client.as_deref_mut())).await,
     };
+    if let Some(moved) = moved { to = Cow::Owned(moved); }
     let mut redirects = 0;
     while let Some(internal) = resp.internal.take() {
         let (target, uri) = *internal;
@@ -1935,11 +1943,13 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
             let found = located(server, &to, &to.uri);
             if rewritten || redirects > 10 { Ok(found) } else { Box::pin(server_rewrite(server, &mut to, found, client.as_deref_mut())).await }
         };
-        (resp, level) = match found {
-            _ if redirects > 10 || (target.starts_with('@') && named.is_none()) => (Box::new(special(500)), level),
+        let moved;
+        (resp, level, moved) = match found {
+            _ if redirects > 10 || (target.starts_with('@') && named.is_none()) => (Box::new(special(500)), level, None),
             Ok(found) => Box::pin(respond(&to, Ok(()), found, client.as_deref_mut())).await,
-            Err(answered) => answered,
+            Err((resp, level)) => (resp, level, None),
         };
+        if let Some(moved) = moved { to = Cow::Owned(moved); }
         if let Some((headers, ctype)) = kept {
             resp.headers.splice(0..0, headers);
             if let Some(ctype) = ctype.filter(|_| resp.status < 300) { resp.ctype = Some(ctype); }
@@ -1997,6 +2007,10 @@ fn root(level: &Level, r: &Request) -> PathBuf {
 
 fn file(level: &Level, r: &Request, prefix: &str) -> Response {
     if !matches!(r.method.as_str(), "GET" | "HEAD" | "POST") { return special(405); }
+    if level.alias.is_some() && r.rewritten() {
+        log_at(level, r, "alert", &format!("\"alias\" cannot be used in location \"{prefix}\" where URI was rewritten"), "");
+        return special(500);
+    }
     let path = match &level.alias {
         Some(_) if let (Some(t), None) = (&level.alias_vars, level.alias_len) => os_path(&t.render(r, &Sent::default())),
         Some(alias) => os_path(&format!("{}{}", alias.display(), r.uri.get(prefix.len()..).unwrap_or_default())),
@@ -7240,6 +7254,22 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let (head, body, _) = parted(&get("/whole"));
         assert!(head.contains("\r\nTransfer-Encoding: chunked\r\n") && !head.contains("Content-Length") && body == data, "{head}");
         for uri in ["/short", "/empty"] { assert!(!get(uri).ends_with(b"0\r\n\r\n"), "{uri}"); }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn alias_is_refused_once_the_uri_was_rewritten() {
+        let _busy = serving_on();
+        let dir = files("alias-rewritten");
+        std::fs::write(dir.join("ab"), b"F").unwrap();
+        let directives = "location /b/ { alias DIR/; rewrite ^/b/(.*)$ /a$1 break; } location /n/ { alias DIR/; rewrite ^/n/(.*)$ /a$1; return 200 f=$request_filename; }
+            location /a { alias DIR/a; } location /k/ { alias DIR/; } location /q/ { rewrite ^ /ab?; return 200 [$args][$is_args]; }".replace("DIR", &dir.display().to_string());
+        let get = |uri: &str| parted(&block_on(received(&serves_files(&dir, &directives), &format!("GET {uri} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"))));
+        assert!(get("/b/b").0.starts_with("HTTP/1.1 500 "));
+        assert_eq!(get("/n/b").1, b"f=");
+        assert_eq!(get("/k/ab").1, b"F");
+        assert_eq!((get("/q/x?b=1").1, get("/q/x").1), (b"[][]".to_vec(), b"[][]".to_vec()));
+        assert!(std::fs::read_to_string(dir.join("errors")).unwrap().contains("[alert] ") && std::fs::read_to_string(dir.join("errors")).unwrap().contains("\"alias\" cannot be used in location \"/b/\" where URI was rewritten"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

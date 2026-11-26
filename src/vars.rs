@@ -24,6 +24,7 @@ pub struct Shared {
     pub completion: std::sync::OnceLock<bool>,
     pub gzip: std::sync::Mutex<Option<(u64, u64)>>,
     pub nodelay: std::sync::atomic::AtomicBool,
+    pub rewritten: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,10 +45,11 @@ impl Files {
         }
     }
 
-    fn filename(&self, r: &Request, s: &Sent) -> String {
+    fn filename(&self, r: &Request, s: &Sent) -> Option<String> {
+        if self.alias.is_some() && r.rewritten() { return None }
         let whole = self.alias_vars.is_some() && self.alias_len.is_none();
         let rest = if self.alias.is_none() { &r.uri[..] } else if whole { "" } else { r.uri.get(self.prefix.len()..).unwrap_or_default() };
-        format!("{}{rest}", self.root(r, s))
+        Some(format!("{}{rest}", self.root(r, s)))
     }
 }
 
@@ -117,6 +119,8 @@ impl Request {
             shared: Default::default(), ssl,
         }
     }
+
+    pub fn rewritten(&self) -> bool { self.shared.rewritten.load(std::sync::atomic::Ordering::Relaxed) }
 
     pub fn request_uri(&self) -> &str { self.shared.unparsed.get().unwrap_or(&self.target) }
 
@@ -398,9 +402,9 @@ impl Var {
             Var::SslNone => { r.ssl.as_ref()?; String::new() }
             Var::DocumentRoot => r.shared.files.lock().unwrap().clone()?.root(r, s),
             Var::RealpathRoot => std::fs::canonicalize(r.shared.files.lock().unwrap().clone()?.root(r, s)).ok()?.display().to_string(),
-            Var::RequestFilename => r.shared.files.lock().unwrap().clone()?.filename(r, s),
+            Var::RequestFilename => r.shared.files.lock().unwrap().clone()?.filename(r, s)?,
             Var::RequestId => r.shared.id.get_or_init(request_id).clone(),
-            Var::IsArgs => (if Var::Args.value(r, s, now).is_some() { "?" } else { "" }).to_string(),
+            Var::IsArgs => (if Var::Args.value(r, s, now).is_some_and(|a| !a.is_empty()) { "?" } else { "" }).to_string(),
             Var::NginxVersion => env!("CARGO_PKG_VERSION").to_string(),
             Var::Hostname => hostname().to_string(),
             Var::TcpInfo(which) => tcpinfo(r.shared.fd?, *which)?.to_string(),
@@ -422,7 +426,7 @@ impl Var {
             Var::ProxyHost => s.proxy_host.clone()?,
             Var::ProxyPort => s.proxy_host.as_ref()?.rsplit_once(':').map_or("80", |(_, p)| p).to_string(),
             Var::ProxyAddXForwardedFor => joined(&r.headers, "x-forwarded-for", ", ").map_or_else(|| r.peer.ip().to_string(), |x| format!("{x}, {}", r.peer.ip())),
-            Var::Args => r.target.get(r.args_at()? + 1..).filter(|a| !a.is_empty())?.to_string(),
+            Var::Args => r.target.get(r.args_at()? + 1..).filter(|a| !a.is_empty() || r.shared.unparsed.get().is_some())?.to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
             Var::Arg(name) => {
@@ -669,6 +673,9 @@ mod tests {
         assert_eq!(t.render(&r, &Sent::default()), "[/al/][/al/a][]");
         *r.shared.files.lock().unwrap() = Some(alias(Some(Template::parse("/x$uri").unwrap()), None));
         assert_eq!(t.render(&r, &Sent::default()), "[/x/a][/x/a][]");
+        r.shared.rewritten.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(t.render(&r, &Sent::default()), "[/x/a][][]");
+        r.shared.rewritten.store(false, std::sync::atomic::Ordering::Relaxed);
         *r.shared.files.lock().unwrap() = Some(Files { root: "/".into(), ..Files::default() });
         assert_eq!(Template::parse("$realpath_root").unwrap().render(&r, &Sent::default()), "/");
         let t = Template::parse("$request_id $request_id").unwrap().render(&r, &Sent::default());
@@ -718,6 +725,8 @@ mod tests {
         assert_eq!(Template::parse("$args").unwrap().log_line(&r, &Sent::default(), Escape::Default), b"q=\\xC3\\xA9\\xC3");
         r.target = "/a?".into();
         assert_eq!(Template::parse("[$args]").unwrap().log_line(&r, &Sent::default(), Escape::Default), b"[-]");
+        r.redirect("/b".into(), "/b?".into());
+        assert_eq!(Template::parse("[$args][$is_args]").unwrap().log_line(&r, &Sent::default(), Escape::Default), b"[][]");
     }
 
     #[test]
