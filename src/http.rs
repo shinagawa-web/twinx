@@ -166,13 +166,8 @@ pub async fn shut_down(accepting: Vec<JoinHandle<()>>, timeout: Option<Duration>
     for _ in 0..100 { if BUSY.load(Ordering::SeqCst) == 0 { break } tokio::task::yield_now().await; }
 }
 
-thread_local! {
-    static NUMBER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 fn number() -> u64 {
-    NUMBER.set(NUMBER.get() + 1);
-    NUMBER.get()
+    crate::shm::connection_number()
 }
 
 pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> Result<Vec<JoinHandle<()>>, String> {
@@ -1403,7 +1398,7 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
         return;
     }
     load(r, level, resp);
-    let boundary = format!("{:020}", BOUNDARY.fetch_add(1, Ordering::Relaxed) + 1);
+    let boundary = format!("{:020}", crate::shm::temp_number(1));
     let ctype = resp.ctype.as_ref().map_or_else(String::new, |t| format!("Content-Type: {t}\r\n"));
     let mut body = Vec::new();
     for (start, end) in ranges {
@@ -1422,8 +1417,6 @@ fn ranges_asked(r: &Request, resp: &Response) -> Option<(u64, Result<Option<Vec<
     let len = resp.told.flatten().unwrap_or(resp.len()) as u64;
     Some((len, byte_ranges(spec, len)))
 }
-
-static BOUNDARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn byte_ranges(spec: &str, len: u64) -> Result<Option<Vec<(u64, u64)>>, ()> {
     let b = spec.as_bytes();
@@ -4942,7 +4935,7 @@ pub(crate) mod tests {
 
     #[test]
     fn connections_have_numbers_in_the_log() {
-        let _busy = serving_on();
+        let _alone = alone();
         let errors = log_path("numbers");
         let (addr, _count) = plays(&vec![], true);
         let text = format!("http {{ error_log {}; server {{ location / {{ proxy_pass http://{addr}; }} }} }}", errors.display());
@@ -4959,7 +4952,9 @@ pub(crate) mod tests {
             tasks.iter().for_each(JoinHandle::abort);
         });
         let failed = "upstream prematurely closed connection while reading response header from upstream";
-        assert_eq!(messages(&errors), [1, 3].map(|n| format!("error *{n} {failed}")));
+        let got = messages(&errors);
+        let first: u64 = got[0].split(['*', ' ']).nth(2).unwrap().parse().unwrap();
+        assert_eq!(got, [first, first + 2].map(|n| format!("error *{n} {failed}")));
     }
 
     #[test]

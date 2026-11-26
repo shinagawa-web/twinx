@@ -10,6 +10,7 @@ mod http;
 mod log;
 mod ocsp;
 mod resolver;
+mod shm;
 mod spool;
 mod stream;
 mod tls;
@@ -83,6 +84,7 @@ fn wait_signal(set: &sigset_t) -> c_int {
 
 fn run(a: &Args) -> Result<(), String> {
     let config = Arc::new(load(a)?);
+    shm::share_counters()?;
     let mut listeners = http::bind(&config, &[])?;
     let set = signal_set();
     // SAFETY: the master is single-threaded here; blocking signals has no other effect on it.
