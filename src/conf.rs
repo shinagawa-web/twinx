@@ -506,6 +506,7 @@ pub struct Server {
     pub defaults: Vec<SocketAddr>,
     pub backlogs: Vec<(SocketAddr, i32)>,
     pub http2: Vec<SocketAddr>,
+    pub named: bool,
 }
 
 const LISTEN_WORDS: &[&str] = &["default_server", "default", "ssl", "http2", "quic", "proxy_protocol", "deferred", "bind", "reuseport", "multipath"];
@@ -680,7 +681,7 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), children: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), http2: Vec::new() };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), children: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), http2: Vec::new(), named: false };
         self.level(block, SRV, &mut s.level)?;
         let mut listens = Vec::new();
         for d in block {
@@ -735,6 +736,7 @@ impl Builder<'_> {
         s.tls = (!files.is_empty()).then(|| crate::tls::server((&files, l.ssl_password_file.as_deref()), named.then(|| l.ssl_certificate_cache.clone()), &trust, options)).transpose()?;
         let level = s.level.clone();
         s.children = self.locations(block, None, &level, &mut s.locations)?;
+        s.named = s.locations.iter().any(|l| matches!(l.kind, Match::Named));
         Ok(s)
     }
 
