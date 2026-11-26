@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -205,6 +205,18 @@ pub struct Now(OnceCell<DateTime<Local>>);
 
 impl Now {
     fn get(&self) -> &DateTime<Local> { self.0.get_or_init(Local::now) }
+
+    fn text(&self, iso: bool) -> Vec<u8> {
+        thread_local! { static TEXT: RefCell<[(i64, String); 2]> = const { RefCell::new([(i64::MIN, String::new()), (i64::MIN, String::new())]) } }
+        let now = self.get();
+        TEXT.with_borrow_mut(|texts| {
+            let (at, text) = &mut texts[iso as usize];
+            if *at != now.timestamp() {
+                (*at, *text) = (now.timestamp(), now.format(if iso { "%Y-%m-%dT%H:%M:%S%:z" } else { "%d/%b/%Y:%H:%M:%S %z" }).to_string());
+            }
+            text.as_bytes().to_vec()
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -348,8 +360,8 @@ impl Var {
             Var::BodyBytesSent => s.body.to_string(),
             Var::Pipe => (if r.pipelined { "p" } else { "." }).to_string(),
             Var::Msec => { let now = now.get(); format!("{}.{:03}", now.timestamp(), now.timestamp_subsec_millis()) }
-            Var::TimeIso8601 => now.get().format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
-            Var::TimeLocal => now.get().format("%d/%b/%Y:%H:%M:%S %z").to_string(),
+            Var::TimeIso8601 => return Some(now.text(true)),
+            Var::TimeLocal => return Some(now.text(false)),
             Var::RemoteAddr => r.peer.ip().to_string(),
             Var::RemotePort => r.peer.port().to_string(),
             Var::BinaryRemoteAddr => return Some(match r.peer.ip() { IpAddr::V4(a) => a.octets().to_vec(), IpAddr::V6(a) => a.octets().to_vec() }),
@@ -796,6 +808,16 @@ mod tests {
         let line = t.render(&request(), &Sent::default());
         let parts: Vec<&str> = line.split('|').collect();
         assert!(parts[0].contains('.') && parts[1].contains('T') && parts[2].contains('/'));
+    }
+
+    #[test]
+    fn times_of_another_second_are_formatted_again() {
+        let at = |t: i64| Now(OnceCell::from(DateTime::from_timestamp(t, 0).unwrap().with_timezone(&Local)));
+        for t in [1_700_000_000, 1_700_000_000, 1_700_000_001, 1_700_003_600, 1_700_000_000] {
+            let now = at(t);
+            assert_eq!(now.text(false), now.get().format("%d/%b/%Y:%H:%M:%S %z").to_string().into_bytes());
+            assert_eq!(now.text(true), now.get().format("%Y-%m-%dT%H:%M:%S%:z").to_string().into_bytes());
+        }
     }
 
     #[test]
