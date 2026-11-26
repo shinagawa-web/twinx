@@ -501,7 +501,7 @@ pub enum ServerName {
 pub struct Server {
     pub listen: Vec<SocketAddr>,
     pub names: Vec<ServerName>,
-    pub name: String,
+    pub name: Arc<str>,
     pub level: Level,
     pub locations: Vec<Location>,
     pub children: Vec<usize>,
@@ -705,7 +705,7 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), children: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), ipv6only_off: Vec::new(), http2: Vec::new(), named: false };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: "".into(), level: parent.clone(), locations: Vec::new(), children: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), ipv6only_off: Vec::new(), http2: Vec::new(), named: false };
         self.level(block, SRV, &mut s.level)?;
         let mut listens = Vec::new();
         for d in block {
@@ -745,7 +745,7 @@ impl Builder<'_> {
                     s.listen.extend(addrs);
                 }
                 "server_name" => {
-                    if s.names.is_empty() { s.name = d.args[0].strip_prefix('.').unwrap_or(&d.args[0]).to_string(); }
+                    if s.names.is_empty() { s.name = d.args[0].strip_prefix('.').unwrap_or(&d.args[0]).into(); }
                     for n in &d.args { s.names.extend(server_name(n).map_err(|e| format!("{e} in {}", d.at))?); }
                 }
                 _ => {}

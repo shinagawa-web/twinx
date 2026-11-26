@@ -208,7 +208,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
     let mut fresh = Some(fresh);
     let mut buf = Vec::new();
     let ((connected, mut requests), mut idle) = (origin.as_ref().map_or((Instant::now(), 0), |o| (o.connected, o.number - 1)), None);
-    let (mut piped, mut nodelay) = (false, false);
+    let (mut piped, mut nodelay, mut spare) = (false, false, None);
     let mut timer = None;
     let to_https = ssl.is_none() && !matches!(stream, Stream::Pipe(_)) && config.servers.iter().any(|s| s.ssl.contains(&listen));
     if ssl.as_ref().is_some_and(|s| s.alpn == "h2") && !matches!(stream, Stream::Pipe(_)) {
@@ -247,7 +247,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             line: String::new(),
             headers: Vec::new(),
             host: None,
-            server_name: String::new(),
+            server_name: default.name.clone(),
             peer: peer.0,
             local,
             started,
@@ -261,7 +261,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             upstream_status: None,
             upstream: Vec::new(),
             captures: Vec::new(),
-            shared: Arc::new(crate::vars::Shared { number: peer.1, fd: stream.tcp().map(std::os::fd::AsRawFd::as_raw_fd), nodelay: AtomicBool::new(nodelay), ..Default::default() }),
+            shared: spare.take().unwrap_or_else(|| Arc::new(crate::vars::Shared { number: peer.1, fd: stream.tcp().map(std::os::fd::AsRawFd::as_raw_fd), nodelay: AtomicBool::new(nodelay), ..Default::default() })),
             ssl: ssl.clone(),
         };
         let parsed = parse(&mut r, &buf[..end], &default.level, matches!(stream, Stream::Pipe(_)));
@@ -351,6 +351,11 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
                 always => always.is_some(),
             };
             return close(&mut stream, lingers).await;
+        }
+        let mut shared = r.shared;
+        if let Some(s) = Arc::get_mut(&mut shared) {
+            *s = crate::vars::Shared { number: s.number, fd: s.fd, nodelay: AtomicBool::new(nodelay), ..Default::default() };
+            spare = Some(shared);
         }
         if buf.is_empty() { recycle(std::mem::take(&mut buf)); }
     }
@@ -1019,7 +1024,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     not_modified(r, level, &mut resp);
     let absolute = level.absolute_redirect && !resp.relative;
     if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| absolute) {
-        let host = if level.server_name_in_redirect { r.server_name.clone() } else { r.host.clone().unwrap_or_else(|| local.ip().to_string()) };
+        let host = if level.server_name_in_redirect { r.server_name.to_string() } else { r.host.clone().unwrap_or_else(|| local.ip().to_string()) };
         let (scheme, default) = if r.ssl.is_some() { ("https", 443) } else { ("http", 80) };
         let port = if level.port_in_redirect && local.port() != default { format!(":{}", local.port()) } else { String::new() };
         h.1 = format!("{scheme}://{host}{port}{}", h.1);
@@ -3283,8 +3288,8 @@ pub(crate) mod tests {
         let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let open = vec![(a.1, a.0), (b.1, b.0)];
         assert_eq!(bind(&config, &open).unwrap().iter().map(|l| l.1).collect::<Vec<_>>(), [a.0, b.0]);
-        assert_eq!((default_server(&config, a.0).name.as_str(), default_server(&config, b.0).name.as_str()), ("one", "two"));
-        assert_eq!(server(&config, b.0, Some("other")).0.name, "two");
+        assert_eq!((&*default_server(&config, a.0).name, &*default_server(&config, b.0).name), ("one", "two"));
+        assert_eq!(&*server(&config, b.0, Some("other")).0.name, "two");
     }
 
     #[test]
@@ -6220,7 +6225,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let name = |host: Option<&str>| server(&config, listen, host).0.name.clone();
         let cases = [(Some("zz"), "a"), (None, ""), (Some("y.b.c"), "*.b.c"), (Some("y.x.b.c"), "*.x.b.c"), (Some("d.e"), "*.x.b.c"), (Some("y.d.e"), "*.x.b.c"),
                      (Some("f.z"), "f.*"), (Some("f.g.z"), "f.*"), (Some("xyz.h"), "~^(?P<n1>[a-z]+)\\Q.h\\E$"), (Some("xyzah"), "a")];
-        for (host, expected) in cases { assert_eq!(name(host), expected, "{host:?}"); }
+        for (host, expected) in cases { assert_eq!(&*name(host), expected, "{host:?}"); }
         let captures = server(&config, listen, Some("xyz.h")).1;
         assert_eq!(captures, [("0", "xyz.h"), ("1", "xyz"), ("n1", "xyz")].map(|(n, v)| (n.to_string(), v.to_string())));
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
@@ -6238,8 +6243,8 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
                     server { listen 127.0.0.1:8080; server_name b; } }";
         let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
         let listen = "127.0.0.1:8080".parse().unwrap();
-        assert_eq!(server(&config, listen, Some("b")).0.name, "b");
-        assert_eq!(server(&config, listen, Some("c")).0.name, "a");
+        assert_eq!(&*server(&config, listen, Some("b")).0.name, "b");
+        assert_eq!(&*server(&config, listen, Some("c")).0.name, "a");
         let s = &config.servers[0];
         assert_eq!((location(s, "/p").0, location(s, "/p").2), ("/p/", true));
         assert_eq!((location(s, "/p/x").0, location(s, "/p/x").2), ("/p/", false));

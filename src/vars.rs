@@ -89,7 +89,7 @@ pub struct Request {
     pub line: String,
     pub headers: Vec<(String, String)>,
     pub host: Option<String>,
-    pub server_name: String,
+    pub server_name: std::sync::Arc<str>,
     pub peer: SocketAddr,
     pub local: SocketAddr,
     pub started: Instant,
@@ -112,7 +112,7 @@ impl Request {
         let now = Instant::now();
         Request {
             method: String::new(), uri: String::new(), target: String::new(), line: String::new(), headers: Vec::new(), host: None,
-            server_name: String::new(), peer, local, started: now, pipelined: false, connected: now, requests: 0, length: 0,
+            server_name: "".into(), peer, local, started: now, pipelined: false, connected: now, requests: 0, length: 0,
             body: Vec::new(), body_file: None, upstream_addr: None, upstream_status: None, upstream: Vec::new(), captures: Vec::new(),
             shared: Default::default(), ssl,
         }
@@ -372,12 +372,12 @@ impl Var {
             Var::Connection => r.shared.number.to_string(),
             Var::ConnectionRequests => r.requests.to_string(),
             Var::ConnectionTime => { let ms = r.connected.elapsed().as_millis(); format!("{}.{:03}", ms / 1000, ms % 1000) }
-            Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
+            Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.to_string()),
             Var::RequestUri => Some(r.request_uri()).filter(|u| !u.is_empty())?.to_string(),
             Var::RequestPort => request_port(r).to_string(),
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
             Var::Pid => std::process::id().to_string(),
-            Var::ServerName => r.server_name.clone(),
+            Var::ServerName => r.server_name.to_string(),
             Var::Scheme => (if r.ssl.is_some() { "https" } else { "http" }).to_string(),
             Var::Https => (if r.ssl.is_some() { "on" } else { "" }).to_string(),
             Var::Http2 => (if !r.line.ends_with(" HTTP/2.0") { "" } else if r.ssl.is_some() { "h2" } else { "h2c" }).to_string(),
