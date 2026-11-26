@@ -2069,7 +2069,15 @@ fn file_at(level: &Level, r: &Request, path: PathBuf) -> Response {
     };
     let (file, meta) = match opened {
         Ok(opened) => opened,
-        Err(e) => return special(if e.kind() == std::io::ErrorKind::PermissionDenied { 403 } else { 404 }),
+        Err(e) => {
+            let (code, severity) = match e.raw_os_error().unwrap_or(0) {
+                libc::ENOENT | libc::ENOTDIR | libc::ENAMETOOLONG => (404, "error"),
+                libc::EACCES | libc::EMLINK | libc::ELOOP => (403, "error"),
+                _ => (500, "crit"),
+            };
+            if code != 404 || level.log_not_found { log_at(level, r, severity, &format!("open() \"{}\" failed {}", path.display(), os_error(&e)), ""); }
+            return special(code);
+        }
     };
     if meta.is_dir() && !r.uri.ends_with('/') { return redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))); }
     if !meta.is_file() { return special(404); }
@@ -6996,7 +7004,8 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let log = std::fs::read_to_string(dir.join("e.log")).unwrap();
         assert!(log.contains(&format!("[error] {}#0: \"{}/f/index.html\" is not found (20: Not a directory), client: 127.0.0.1, server: localhost", std::process::id(), dir.display())));
         assert!(log.contains("directory index of \""));
-        assert_eq!(log.lines().count(), 2);
+        assert!(log.contains(&format!("open() \"{}/m/localhost\" failed (2: No such file or directory)", dir.display())));
+        assert_eq!(log.lines().count(), 3);
         assert_eq!(std::fs::read_to_string(dir.join("c.log")).unwrap(), "");
     }
 
