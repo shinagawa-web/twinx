@@ -11,7 +11,7 @@ libc = "0.2"
 pkcs8 = { version = "0.11.0", features = ["encryption", "pem", "std"] }
 md-5 = "0.10"
 ring = "0.17.14"
-regex = { version = "1.13.2", default-features = false, features = ["std", "unicode-case", "unicode-gencat", "unicode-perl"] }
+regex = { version = "1.13.2", default-features = false, features = ["perf", "std", "unicode-case", "unicode-gencat", "unicode-perl"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "zlib"] }
 socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
