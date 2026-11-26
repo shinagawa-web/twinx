@@ -389,12 +389,20 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
                 let mut spill: Option<Spill> = None;
                 loop {
                     if let Some(s) = spill.as_mut() {
-                        s.write(&r, level, &mut buf);
-                        if let Some(s) = spill.take_if(|s| s.left == 0) { r.length += s.length as usize; break s.done(&mut r); }
+                        match s.write(&r, level, &mut buf) {
+                            Ok(false) => {}
+                            Ok(true) => if let Some(s) = spill.take() { r.length += s.length as usize; break s.done(&mut r); },
+                            Err(status) => { if let Some(s) = spill.take() { s.remove(level); } break Err(status); }
+                        }
                     } else if let Some(n) = spills.filter(|&n| buf.len() as u64 > level.body_buffer && (buf.len() as u64) < n) {
-                        spill = Some(Spill::open(&r, level, n));
+                        spill = Some(Spill::open(&r, level, Some(n)));
                         continue;
                     } else { match take_body(&buf, length, level.max_body) {
+                        Ok(None) if length.is_none() && buf.len() as u64 > level.body_buffer && !unbuffered(level, true) && (level.body_in_file_only || buf.len() as u64 > room as u64
+                            || (origin.is_some() && decode_chunked(&buf, level.max_body).is_ok_and(|(body, _)| body.len() as u64 > level.body_buffer))) => {
+                            spill = Some(Spill::open(&r, level, None));
+                            continue;
+                        }
                         Ok(None) => {}
                         Ok(Some((body, used))) => {
                             r.length += used;
@@ -514,6 +522,26 @@ fn decode_chunked(buf: &[u8], max: u64) -> Result<(Vec<u8>, Option<usize>), u16>
     }
 }
 
+fn chunks(buf: &[u8], mut left: u64, had: u64, max: u64) -> Result<(Vec<u8>, usize, u64, bool), u16> {
+    let (mut body, mut at) = (Vec::new(), 0);
+    loop {
+        let n = left.saturating_sub(2).min((buf.len() - at) as u64) as usize;
+        body.extend_from_slice(&buf[at..at + n]);
+        (at, left) = (at + n, left - n as u64);
+        if left > 2 { return Ok((body, at, left, false)) }
+        let (crlf, got) = (&b"\r\n"[2 - left as usize..], &buf[at..]);
+        let k = crlf.len().min(got.len());
+        if crlf[..k] != got[..k] { return Err(400) }
+        (at, left) = (at + k, left - k as u64);
+        if left > 0 { return Ok((body, at, left, false)) }
+        let Some((size, next)) = chunk_line(buf, at)? else { return Ok((body, at, 0, false)) };
+        let size = chunk_size(&size).ok_or(400u16)?;
+        if size == 0 { return Ok(match decode_chunked(&buf[at..], 0)? { (_, Some(n)) => (body, at + n, 0, true), _ => (body, at, 0, false) }) }
+        if (had + body.len() as u64).saturating_add(size) > max { return Err(413); }
+        (at, left) = (next, size + 2);
+    }
+}
+
 fn chunk_size(line: &str) -> Option<u64> {
     let digits = line.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(line.len());
     let (hex, rest) = line.split_at(digits);
@@ -549,24 +577,38 @@ struct Spill {
     file: Option<std::fs::File>,
     length: u64,
     left: u64,
+    chunked: Option<u64>,
 }
 
 impl Spill {
-    fn open(r: &Request, level: &Level, length: u64) -> Spill {
+    fn open(r: &Request, level: &Level, length: Option<u64>) -> Spill {
         let path = temp_path(&level.body_temp_path, &level.body_temp_levels);
         let file = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::File::create(&path));
         if let Err(e) = &file { error_log(level, r, &format!("open() \"{}\" failed ({e})", path.display())); }
-        Spill { path, file: file.ok(), length, left: length }
+        let n = length.unwrap_or(0);
+        Spill { path, file: file.ok(), length: n, left: n, chunked: length.is_none().then_some(0) }
     }
 
-    fn write(&mut self, r: &Request, level: &Level, buf: &mut Vec<u8>) {
-        let n = self.left.min(buf.len() as u64) as usize;
-        if let Some(Err(e)) = self.file.as_mut().map(|f| f.write_all(&buf[..n])) {
+    fn write(&mut self, r: &Request, level: &Level, buf: &mut Vec<u8>) -> Result<bool, u16> {
+        let Some(had) = self.chunked else {
+            let n = self.left.min(buf.len() as u64) as usize;
+            self.put(r, level, &buf[..n]);
+            buf.drain(..n);
+            self.left -= n as u64;
+            return Ok(self.left == 0);
+        };
+        let (body, used, left, ended) = chunks(buf, self.left, had, level.max_body)?;
+        self.put(r, level, &body);
+        buf.drain(..used);
+        (self.length, self.left, self.chunked) = (self.length + used as u64, left, Some(had + body.len() as u64));
+        Ok(ended)
+    }
+
+    fn put(&mut self, r: &Request, level: &Level, data: &[u8]) {
+        if let Some(Err(e)) = self.file.as_mut().map(|f| f.write_all(data)) {
             error_log(level, r, &format!("open() \"{}\" failed ({e})", self.path.display()));
             self.file = None;
         }
-        buf.drain(..n);
-        self.left -= n as u64;
     }
 
     fn done(self, r: &mut Request) -> Result<(), u16> {
@@ -6218,18 +6260,39 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let dir = std::env::temp_dir().join(format!("twinx-spill-{}", std::process::id()));
         let level = Level { body_buffer: 4, body_temp_path: dir, ..Level::default() };
         let (_, mut r) = request("POST / HTTP/1.0\nContent-Length: 8\n\n");
-        let (mut s, mut buf) = (Spill::open(&r, &level, 8), b"abcde".to_vec());
-        s.write(&r, &level, &mut buf);
+        let (mut s, mut buf) = (Spill::open(&r, &level, Some(8)), b"abcde".to_vec());
+        assert_eq!(s.write(&r, &level, &mut buf), Ok(false));
         buf.extend_from_slice(b"fghGET");
-        s.write(&r, &level, &mut buf);
+        assert_eq!(s.write(&r, &level, &mut buf), Ok(true));
         assert_eq!((buf.as_slice(), s.left), (&b"GET"[..], 0));
         s.done(&mut r).unwrap();
         assert_eq!(std::fs::read(r.body_file.unwrap()).unwrap(), b"abcdefgh");
         let level = Level { body_buffer: 4, body_temp_path: std::env::current_exe().unwrap(), ..Level::default() };
         let (_, mut r) = request("POST / HTTP/1.0\nContent-Length: 3\n\n");
-        let (mut s, mut buf) = (Spill::open(&r, &level, 3), b"abc".to_vec());
-        s.write(&r, &level, &mut buf);
+        let (mut s, mut buf) = (Spill::open(&r, &level, Some(3)), b"abc".to_vec());
+        assert_eq!(s.write(&r, &level, &mut buf), Ok(true));
         assert_eq!((buf.len(), s.done(&mut r), r.body_file), (0, Err(500), None));
+    }
+
+    #[test]
+    fn writes_chunked_bodies_to_files_as_they_come() {
+        let dir = std::env::temp_dir().join(format!("twinx-spill-chunked-{}", std::process::id()));
+        let level = Level { body_buffer: 4, body_temp_path: dir, max_body: 100, ..Level::default() };
+        let (_, mut r) = request("POST / HTTP/1.1\nHost: a\nTransfer-Encoding: chunked\n\n");
+        let mut s = Spill::open(&r, &level, None);
+        let mut buf = Vec::new();
+        for part in [&b"3\r\nab"[..], b"c", b"\r", b"\n5;x\r\nde", b"fgh\r\n0\r\nA: b\r\n", b"\r\nGET"] {
+            assert_eq!(s.write(&r, &level, &mut buf), Ok(false));
+            buf.extend_from_slice(part);
+        }
+        assert_eq!(s.write(&r, &level, &mut buf), Ok(true));
+        assert_eq!((buf.as_slice(), s.length), (&b"GET"[..], 31));
+        s.done(&mut r).unwrap();
+        assert_eq!(std::fs::read(r.body_file.unwrap()).unwrap(), b"abcdefgh");
+        assert_eq!(chunks(b"3\r\nabcX", 0, 0, 100), Err(400));
+        assert_eq!(chunks(b"\rX", 2, 0, 100), Err(400));
+        assert_eq!(chunks(b"c\r\n", 0, 90, 100), Err(413));
+        assert_eq!(chunks(b"bc\r\n2\r\nd", 4, 1, 100), Ok((b"bcd".to_vec(), 8, 3, false)));
     }
 
     #[test]
