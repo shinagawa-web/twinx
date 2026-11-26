@@ -1,6 +1,3 @@
-//! Variables ($uri, $status, ...) and the strings built from them: the
-//! complex values of directives such as return, and access log formats.
-
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::net::{IpAddr, SocketAddr};
@@ -9,48 +6,25 @@ use std::time::Instant;
 
 use chrono::{DateTime, Local};
 
-/// What the internal redirects of a request share with it.
 #[derive(Debug, Default)]
 pub struct Shared {
-    /// The number of the connection, for the error log; 0 for none.
     pub number: u64,
-    /// With proxy_request_buffering off: the body still to be read from the
-    /// client, sent on to the proxied server as it comes; what the proxy does
-    /// not take is read and dropped afterwards.
     pub unread: std::sync::Mutex<Option<crate::http::Unread>>,
-    /// $limit_rate, which set changes.
     pub limit_rate: Rate,
-    /// The variables set gives values to, and the captures of the last regular
-    /// expression matched ("1", "2", ...).
     pub vars: std::sync::Mutex<Vec<(String, String)>>,
-    /// The target the request line had, once another replaced it ($request_uri).
     pub unparsed: std::sync::OnceLock<String>,
-    /// The trailers of a proxied server's answer that proxy_pass_trailers passes.
     pub trailers: std::sync::Mutex<Vec<(String, String)>>,
-    /// How the cache answered the request: MISS, HIT, EXPIRED, STALE, REVALIDATED ($upstream_cache_status).
     pub cache_status: std::sync::Mutex<Option<&'static str>>,
-    /// Whether the request updates the cache in the background (proxy_cache_background_update).
     pub updater: bool,
-    /// The request that updates the cache in the background, which the connection waits
-    /// for before it reads the next request, as nginx's does for its subrequest.
     pub background: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// The status of the error that error_page redirected the request for ($status meanwhile).
     pub err_status: std::sync::atomic::AtomicU16,
-    /// The settings of the location of the request that name its files, once
-    /// it is found, when a variable takes them (files_used()).
     pub files: std::sync::Mutex<Option<Files>>,
-    /// $request_id, made when it is first asked for.
     pub id: std::sync::OnceLock<String>,
-    /// The socket of the connection, for $tcpinfo_*; None for a stream of HTTP/2.
     pub fd: Option<i32>,
-    /// $request_completion as it was first asked for, which it stays, as nginx keeps it.
     pub completion: std::sync::OnceLock<bool>,
-    /// The bytes gzip took and made of the answer, once it has ended ($gzip_ratio).
     pub gzip: std::sync::Mutex<Option<(u64, u64)>>,
 }
 
-/// What $document_root, $realpath_root and $request_filename take from the
-/// location of a request: its root or alias, and its prefix.
 #[derive(Debug, Clone, Default)]
 pub struct Files {
     pub root: PathBuf,
@@ -62,7 +36,6 @@ pub struct Files {
 }
 
 impl Files {
-    /// $document_root: the root, or the alias, with its variables.
     fn root(&self, r: &Request, s: &Sent) -> String {
         match &self.alias {
             Some(alias) => self.alias_vars.as_ref().map_or_else(|| alias.display().to_string(), |t| t.render(r, s)),
@@ -70,8 +43,6 @@ impl Files {
         }
     }
 
-    /// $request_filename: the URI after the root, or after the alias in place
-    /// of the location's prefix; the alias whole in a regular expression location.
     fn filename(&self, r: &Request, s: &Sent) -> String {
         let whole = self.alias_vars.is_some() && self.alias_len.is_none();
         let rest = if self.alias.is_none() { &r.uri[..] } else if whole { "" } else { r.uri.get(self.prefix.len()..).unwrap_or_default() };
@@ -79,14 +50,12 @@ impl Files {
     }
 }
 
-/// Whether a variable takes the files of a location (Shared::files).
 static FILES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn files_used() -> bool {
     FILES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// $hostname: the name of the machine, as gethostname() gives it.
 fn hostname() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
@@ -97,8 +66,6 @@ fn hostname() -> &'static str {
     })
 }
 
-/// $tcpinfo_rtt, $tcpinfo_rttvar, $tcpinfo_snd_cwnd and $tcpinfo_rcv_space,
-/// from the TCP_INFO of the socket; None when it cannot be read.
 fn tcpinfo(fd: i32, which: u8) -> Option<u32> {
     // SAFETY: tcp_info is plain data, and the length given is its size.
     let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
@@ -107,56 +74,39 @@ fn tcpinfo(fd: i32, which: u8) -> Option<u32> {
     (got == 0).then_some(match which { 0 => info.tcpi_rtt, 1 => info.tcpi_rttvar, 2 => info.tcpi_snd_cwnd, _ => info.tcpi_rcv_space })
 }
 
-/// $request_id: 16 random bytes in hexadecimal.
 fn request_id() -> String {
     let mut id = [0u8; 16];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut id).ok();
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// What a request carries, as the variables see it.
 #[derive(Debug, Clone)]
 pub struct Request {
     pub method: String,
     pub uri: String,
-    /// The URI as the request line has it, with the arguments, or as the last rewrite or internal redirect left it.
     pub target: String,
     pub line: String,
     pub headers: Vec<(String, String)>,
-    /// The validated host of the request line or the Host header.
     pub host: Option<String>,
-    /// The first name of the server that answers, for $host when the request has none.
     pub server_name: String,
     pub peer: SocketAddr,
-    /// The address the connection was accepted on.
     pub local: SocketAddr,
     pub started: Instant,
     pub pipelined: bool,
-    /// When the connection was accepted, and how many requests it has had, this one included.
     pub connected: Instant,
     pub requests: u64,
     pub length: usize,
-    /// The body when it is kept in memory, and the file it was written to otherwise.
     pub body: Vec<u8>,
     pub body_file: Option<PathBuf>,
-    /// The proxied servers tried before an internal redirect ($upstream_addr).
     pub upstream_addr: Option<String>,
-    /// The statuses they answered with ($upstream_status).
     pub upstream_status: Option<String>,
-    /// The headers of the proxied server's answer that redirected with
-    /// X-Accel-Redirect, for $upstream_http_* after the redirect.
     pub upstream: Vec<(String, String)>,
-    /// The named captures of the server name that matched the host.
     pub captures: Vec<(String, String)>,
-    /// What the internal redirects of the request share.
     pub shared: std::sync::Arc<Shared>,
-    /// The TLS session of a connection accepted with "ssl".
     pub ssl: Option<std::sync::Arc<crate::tls::Session>>,
 }
 
 impl Request {
-    /// A request of a connection whose head has not been read: for what only
-    /// the connection gives, such as $ssl_server_name in ssl_certificate.
     pub fn connection(peer: SocketAddr, local: SocketAddr, ssl: Option<std::sync::Arc<crate::tls::Session>>) -> Request {
         let now = Instant::now();
         Request {
@@ -167,33 +117,25 @@ impl Request {
         }
     }
 
-    /// The URI as the request line has it, also after an internal redirect.
     pub fn request_uri(&self) -> &str { self.shared.unparsed.get().unwrap_or(&self.target) }
 
-    /// Where the arguments start in the target, at its "?": once a rewrite or
-    /// an internal redirect set it, right after the URI, which may have a "?" of its own.
     pub fn args_at(&self) -> Option<usize> {
         let after = self.shared.unparsed.get().and(self.target.strip_prefix(self.uri.as_str()));
         match after { Some(a) if a.is_empty() || a.starts_with('?') => (!a.is_empty()).then_some(self.uri.len()), _ => self.target.find('?') }
     }
 
-    /// Replaces the URI and the arguments, as a rewrite or an internal redirect does.
     pub fn redirect(&mut self, uri: String, target: String) {
         let old = std::mem::replace(&mut self.target, target);
         self.shared.unparsed.get_or_init(|| old);
         self.uri = uri;
     }
 
-    /// Gives a variable of set, or a capture, its value for this request.
     pub fn set_var(&self, name: &str, value: String) {
         let mut vars = self.shared.vars.lock().unwrap();
         vars.retain(|v| v.0 != name);
         vars.push((name.to_string(), value));
     }
 
-    /// The captures of a regular expression that matched: "$0" is the whole
-    /// match, "$1" the first group; those it does not have are empty. A
-    /// named group is also a variable of its name, which keeps its value.
     pub fn set_captures(&self, re: &regex::Regex, caps: &regex::Captures) {
         self.clear_captures();
         let value = |i: usize| caps.get(i).map_or("", |m| m.as_str()).to_string();
@@ -201,14 +143,10 @@ impl Request {
         re.capture_names().enumerate().for_each(|(i, name)| if let Some(name) = name { self.set_var(name, value(i)) });
     }
 
-    /// Drops the numbered captures, as a regular expression of if or rewrite that does not
-    /// match does; the named ones stay.
     pub fn clear_captures(&self) {
         self.shared.vars.lock().unwrap().retain(|v| !v.0.bytes().all(|c| c.is_ascii_digit()));
     }
 
-    /// set_captures() of a regular expression that matched bytes, the bytes
-    /// that are not UTF-8 kept as text() keeps them.
     pub fn set_byte_captures(&self, re: &regex::bytes::Regex, caps: &regex::bytes::Captures) {
         self.shared.vars.lock().unwrap().retain(|v| !v.0.bytes().all(|c| c.is_ascii_digit()));
         let value = |i: usize| text(caps.get(i).map_or(&b""[..], |m| m.as_bytes()));
@@ -217,8 +155,6 @@ impl Request {
     }
 }
 
-/// The limit_rate of a request, once set $limit_rate or X-Accel-Limit-Rate set
-/// it (r->limit_rate_set): the limit_rate directive is not looked at then.
 #[derive(Debug)]
 pub struct Rate(std::sync::atomic::AtomicU64);
 
@@ -231,57 +167,38 @@ impl Rate {
     pub fn get(&self) -> Option<u64> { Some(self.0.load(std::sync::atomic::Ordering::Relaxed)).filter(|r| *r != u64::MAX) }
 }
 
-/// The names of the captures that are variables.
 static CAPTURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 pub fn add_captures<'a>(names: impl Iterator<Item = &'a str>) {
     CAPTURES.lock().unwrap().extend(names.map(String::from));
 }
 
-/// The names of the variables set gives values to, known before any directive uses them.
 static USER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 pub fn add_user(name: &str) {
     USER.lock().unwrap().push(name.to_string());
 }
 
-/// Whether the name is one of the variables twinx makes itself, which set
-/// cannot change (all but $limit_rate).
 pub fn builtin(name: &str) -> bool {
     !matches!(Var::named(name), None | Some(Var::User(_)))
 }
 
-/// What the answer to a request was, once it was sent.
 #[derive(Debug, Clone, Default)]
 pub struct Sent {
     pub status: u16,
     pub bytes: usize,
     pub body: usize,
-    /// The headers of the answer so far ($sent_http_*).
     pub headers: Vec<(String, String)>,
-    /// The headers of the proxied server's answer ($upstream_http_*, $upstream_cookie_*).
     pub upstream: Vec<(String, String)>,
-    /// The trailers so far ($sent_trailer_*).
     pub trailers: Vec<(String, String)>,
-    /// The proxied servers tried, as $upstream_addr gives them.
     pub upstream_addr: Option<String>,
-    /// The status each of them answered with, as $upstream_status gives them.
     pub upstream_status: Option<String>,
-    /// For each of them, the milliseconds it took to connect, to send the
-    /// response head and to send the whole answer, None when it did not
-    /// ($upstream_connect_time, $upstream_header_time, $upstream_response_time).
     pub upstream_time: Option<Vec<[Option<u128>; 3]>>,
-    /// For each of them, the bytes of the body and of the whole answer read,
-    /// and of the request sent ($upstream_response_length,
-    /// $upstream_bytes_received, $upstream_bytes_sent).
     pub upstream_bytes: Option<Vec<[u64; 3]>>,
-    /// The host of the proxy_pass URL ($proxy_host, $proxy_port).
     pub proxy_host: Option<String>,
-    /// Whether the whole answer was sent ($request_completion).
     pub complete: bool,
 }
 
-/// The time a string's variables show: read once, when the first of them asks for it.
 #[derive(Debug, Default)]
 pub struct Now(OnceCell<DateTime<Local>>);
 
@@ -322,7 +239,6 @@ pub enum Var {
     UpstreamAddr,
     UpstreamStatus,
     UpstreamCacheStatus,
-    /// $upstream_connect_time (0), $upstream_header_time (1), $upstream_response_time (2).
     UpstreamTime(usize),
     UpstreamBytes(usize),
     ProxyHost,
@@ -330,13 +246,9 @@ pub enum Var {
     ProxyAddXForwardedFor,
     Pid,
     ServerName,
-    /// The scheme of the request: https on a TLS connection, else http.
     Scheme,
-    /// "on" on a TLS connection, else empty.
     Https,
-    /// The protocol of an HTTP/2 stream: h2 over TLS, h2c without; else empty.
     Http2,
-    /// The version the request line gives (HTTP/1.1, HTTP/2.0), empty for HTTP/0.9.
     ServerProtocol,
     SslProtocol,
     SslServerName,
@@ -358,20 +270,13 @@ pub enum Var {
     IsArgs,
     NginxVersion,
     Hostname,
-    /// $tcpinfo_rtt (0), $tcpinfo_rttvar (1), $tcpinfo_snd_cwnd (2), $tcpinfo_rcv_space (3).
     TcpInfo(u8),
     RequestCompletion,
-    /// $proxy_protocol_addr and the others: twinx takes no PROXY protocol header, so none is found.
     NotFound,
-    /// $ssl_early_data, $ssl_ech_status and $ssl_ech_outer_server_name: twinx
-    /// takes no early data and no ECH, so they are empty on a TLS connection.
     SslNone,
-    /// $ssl_client_i_dn and the others of the client's certificate, by what follows "ssl_client_".
     SslClient(&'static str),
     LimitRate,
-    /// A named capture of the server name's regular expression.
     Capture(String),
-    /// A variable of set, or a capture of a regular expression ("$1").
     User(String),
     Arg(String),
     Http(String),
@@ -417,7 +322,6 @@ impl Var {
             ("proxy_protocol_server_port", Var::NotFound), ("proxy_protocol_tlv_alpn", Var::NotFound),
             ("content_length", Var::Http("content-length".into())), ("content_type", Var::Http("content-type".into())),
         ];
-        // Header names have "-" where the variable has "_"; cookie names are as they are.
         let prefixed: [(&str, fn(String) -> Var, bool); 8] = [
             ("http_", Var::Http, true), ("sent_http_", Var::SentHttp, true), ("sent_trailer_", Var::SentTrailer, true),
             ("upstream_http_", Var::UpstreamHttp, true), ("arg_", Var::Arg, false), ("cookie_", Var::Cookie, false),
@@ -431,10 +335,8 @@ impl Var {
         var
     }
 
-    /// The value, or None when the variable is "not found" (no such header, no user).
     pub fn value(&self, r: &Request, s: &Sent, now: &Now) -> Option<Vec<u8>> {
         Some(bytes(match self {
-            // Neither is found of a request whose line could not be read.
             Var::Uri | Var::RequestMethod if r.method.is_empty() => return None,
             Var::Uri => r.uri.clone(),
             Var::RequestMethod => r.method.clone(),
@@ -458,7 +360,6 @@ impl Var {
             Var::ConnectionRequests => r.requests.to_string(),
             Var::ConnectionTime => { let ms = r.connected.elapsed().as_millis(); format!("{}.{:03}", ms / 1000, ms % 1000) }
             Var::Host => r.host.clone().unwrap_or_else(|| r.server_name.clone()),
-            // Nor is it of one whose URI could not be read.
             Var::RequestUri => Some(r.request_uri()).filter(|u| !u.is_empty())?.to_string(),
             Var::RequestPort => request_port(r).to_string(),
             Var::IsRequestPort => (if request_port(r).is_empty() { "" } else { ":" }).to_string(),
@@ -508,7 +409,6 @@ impl Var {
             Var::ProxyHost => s.proxy_host.clone()?,
             Var::ProxyPort => s.proxy_host.as_ref()?.rsplit_once(':').map_or("80", |(_, p)| p).to_string(),
             Var::ProxyAddXForwardedFor => joined(&r.headers, "x-forwarded-for", ", ").map_or_else(|| r.peer.ip().to_string(), |x| format!("{x}, {}", r.peer.ip())),
-            // Empty arguments, with "?" or without, are not found.
             Var::Args => r.target.get(r.args_at()? + 1..).filter(|a| !a.is_empty())?.to_string(),
             Var::RequestBody => String::from_utf8_lossy(&r.body).into_owned(),
             Var::RequestBodyFile => r.body_file.as_ref()?.display().to_string(),
@@ -516,7 +416,6 @@ impl Var {
                 let args = r.target.get(r.args_at()? + 1..)?.split('&');
                 args.filter_map(|a| a.split_once('=')).find(|(n, _)| n.eq_ignore_ascii_case(name))?.1.to_string()
             }
-            // Cookie headers are joined with "; ", the others with ", ".
             Var::Http(name) => joined(&r.headers, name, if name.eq_ignore_ascii_case("cookie") { "; " } else { ", " })?,
             Var::Cookie(name) => cookie(&r.headers, name)?,
             Var::SentHttp(name) => joined(&s.headers, name, ", ")?,
@@ -528,16 +427,11 @@ impl Var {
     }
 }
 
-/// $gzip_ratio: the bytes taken for each byte made, with two decimals rounded as nginx
-/// rounds them; None for an answer that made none.
 fn ratio((taken, made): (u64, u64)) -> Option<String> {
     let hundredths = taken.checked_mul(100)?.checked_div(made)? + u64::from(taken * 1000 / made % 10 > 4);
     Some(format!("{}.{:02}", hundredths / 100, hundredths % 100))
 }
 
-/// Text read from the network, its bytes that are not UTF-8 kept as nginx
-/// keeps them: each becomes a character of the Private Use Area, U+10FF00
-/// plus the byte, which bytes() turns back into the byte when it is sent.
 pub fn text(b: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(b) { return s.to_string() }
     let mut out = String::with_capacity(b.len());
@@ -548,8 +442,6 @@ pub fn text(b: &[u8]) -> String {
     out
 }
 
-/// The bytes of text made by text(), each character of U+10FF00 to U+10FFFF
-/// the byte it stands for.
 pub fn bytes(s: &str) -> Vec<u8> {
     if plain(s.as_bytes()) { return s.as_bytes().to_vec() }
     let mut out = Vec::with_capacity(s.len());
@@ -559,23 +451,18 @@ pub fn bytes(s: &str) -> Vec<u8> {
     out
 }
 
-/// Whether text, as its UTF-8, cannot have a character that stands for a
-/// byte: those begin with the byte 0xf4, which is rare.
+/// The characters that stand for a byte all begin with the byte 0xf4 in UTF-8.
 pub fn plain(utf8: &[u8]) -> bool {
     !utf8.contains(&0xf4)
 }
 
-/// The values of every header with the name, joined; None when there is none.
 fn joined(headers: &[(String, String)], name: &str, sep: &str) -> Option<String> {
-    // As nginx compares them, "_" in a header's name is "-" in the variable's.
     let same = |n: &str| n.len() == name.len() && n.bytes().zip(name.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b) || a == b'_' && b == b'-');
     let values: Vec<&str> = headers.iter().filter(|(n, _)| same(n)).map(|(_, v)| v.as_str()).collect();
     (!values.is_empty()).then(|| values.join(sep))
 }
 
-/// A cookie of the Cookie headers, as nginx 1.30 finds it: pairs are separated
-/// by ";", and the value runs to the next ";". As in nginx, a pair that starts
-/// with the name but has no "=" after it hides the pair that follows.
+/// As in nginx, a pair that starts with the name but has no "=" after it hides the pair that follows.
 fn cookie(headers: &[(String, String)], name: &str) -> Option<String> {
     for (_, line) in headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("cookie")) {
         let (b, mut at) = (line.as_bytes(), 0);
@@ -598,8 +485,6 @@ fn cookie(headers: &[(String, String)], name: &str) -> Option<String> {
     None
 }
 
-/// A cookie the proxied server sets: the first Set-Cookie that starts with
-/// "name=", its value up to ";".
 fn set_cookie(headers: &[(String, String)], name: &str) -> Option<String> {
     headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("set-cookie")).find_map(|(_, v)| {
         let starts = v.len() > name.len() && v.as_bytes()[..name.len()].eq_ignore_ascii_case(name.as_bytes());
@@ -608,8 +493,6 @@ fn set_cookie(headers: &[(String, String)], name: &str) -> Option<String> {
     })
 }
 
-/// The port of the request: the one in an absolute URI of the request line,
-/// else the one in the Host header; empty when neither has one.
 fn request_port(r: &Request) -> &str {
     let target = r.line.split(' ').filter(|w| !w.is_empty()).nth(1).unwrap_or_default();
     let absolute = target.split_once("://").filter(|_| !target.starts_with('/')).map(|(_, rest)| rest.split(['/', '?']).next().unwrap_or_default());
@@ -618,8 +501,6 @@ fn request_port(r: &Request) -> &str {
     host.split_once(':').map_or("", |(_, port)| port)
 }
 
-/// The user of "Authorization: Basic <base64 of user:password>"; None when the
-/// header is not that or the user is empty, as ngx_http_auth_basic_user() decides.
 fn basic_user(r: &Request) -> Option<String> {
     let auth = r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("authorization"))?.1.as_str();
     let credentials = auth.get(..6).filter(|s| s.eq_ignore_ascii_case("basic ")).and(auth.get(6..))?.trim_start_matches(' ');
@@ -628,8 +509,6 @@ fn basic_user(r: &Request) -> Option<String> {
     (!user.is_empty()).then(|| String::from_utf8_lossy(user).into_owned())
 }
 
-/// Base64 as ngx_decode_base64() reads it: up to the first "=", None for any
-/// other character outside the alphabet or a length that cannot be decoded.
 fn decode_base64(s: &str) -> Option<Vec<u8>> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let digits: Option<Vec<u32>> = s.bytes().take_while(|&c| c != b'=').map(|c| ALPHABET.iter().position(|&a| a == c).map(|p| p as u32)).collect();
@@ -648,12 +527,10 @@ pub enum Part {
     Var(Var),
 }
 
-/// A string with variables in it, compiled once from the configuration.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Template(pub Vec<Part>);
 
 impl Template {
-    /// Compiles "$name" and "${name}" references; the error is nginx's message.
     pub fn parse(s: &str) -> Result<Template, String> {
         let (mut parts, mut text, mut rest) = (Vec::new(), String::new(), s);
         while let Some(i) = rest.find('$') {
@@ -661,7 +538,6 @@ impl Template {
             let after = &rest[i + 1..];
             let braced = after.starts_with('{');
             let body = if braced { &after[1..] } else { after };
-            // "$1" is a capture, whatever follows it.
             let len = if body.starts_with(|c: char| c.is_ascii_digit()) { 1 } else { body.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(body.len()) };
             let name = &body[..len];
             if name.is_empty() || (braced && !body[len..].starts_with('}')) { return Err(format!("invalid variable name in \"{s}\"")); }
@@ -675,25 +551,20 @@ impl Template {
         Ok(Template(parts))
     }
 
-    /// The value when there are no variables in it.
     pub fn fixed(&self) -> Option<&str> {
         match &self.0[..] { [] => Some(""), [Part::Text(t)] => Some(t), _ => None }
     }
 
-    /// The value for a directive, as render() gives it, not copied when it is fixed.
     pub fn value(&self, r: &Request, s: &Sent) -> Cow<'_, str> {
         self.fixed().map_or_else(|| Cow::Owned(self.render(r, s)), Cow::Borrowed)
     }
 
-    /// The value for a directive: variables that are not found give "".
     pub fn render(&self, r: &Request, s: &Sent) -> String {
         let now = Now::default();
         let value = |v: &Var| v.value(r, s, &now).map(|v| text(&v)).unwrap_or_default();
         self.0.iter().map(|p| match p { Part::Text(t) => t.clone(), Part::Var(v) => value(v) }).collect()
     }
 
-    /// The value for an access log line, its variables escaped as log_format
-    /// says: "-" for variables that are not found by default, nothing otherwise.
     pub fn log_line(&self, r: &Request, s: &Sent, escape: Escape) -> Vec<u8> {
         let (now, mut out) = (Now::default(), Vec::new());
         for part in &self.0 {
@@ -710,7 +581,6 @@ impl Template {
     }
 }
 
-/// How log_format escapes the values of variables (its "escape=" parameter).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Escape {
     Default,
@@ -718,14 +588,11 @@ pub enum Escape {
     None,
 }
 
-/// '"', '\\', control characters and bytes above 0x7e as \xXX.
 fn escape_default(b: u8, out: &mut Vec<u8>) {
     let plain = (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\';
     if plain { out.push(b) } else { out.extend(format!("\\x{b:02X}").bytes()) }
 }
 
-/// As in a JSON string: '"' and '\\' with a backslash, control characters as
-/// \n, \r, \t, \b, \f or \u00XX.
 fn escape_json(b: u8, out: &mut Vec<u8>) {
     const NAMED: &[(u8, u8)] = &[(b'"', b'"'), (b'\\', b'\\'), (b'\n', b'n'), (b'\r', b'r'), (b'\t', b't'), (8, b'b'), (12, b'f')];
     match NAMED.iter().find(|e| e.0 == b) {
@@ -811,7 +678,6 @@ mod tests {
         let mut r = request();
         r.target = "/a?x=1&E=2".into();
         assert_eq!(Template::parse("[$arg_e][$arg_y]").unwrap().render(&r, &Sent::default()), "[2][]");
-        // After an internal redirect to a URI with a "?" of its own, the arguments are those after it.
         r.redirect("/a?x=3".into(), "/a?x=3?x=4".into());
         assert_eq!(Template::parse("[$arg_x][$args]").unwrap().render(&r, &Sent::default()), "[4][x=4]");
         r.redirect("/a?x=3".into(), "/a?x=3".into());
@@ -833,7 +699,6 @@ mod tests {
         let raw = b"/\xff\xfe?q=\xc3\xa9\xc3";
         assert_eq!(text(raw), "/\u{10ffff}\u{10fffe}?q=\u{e9}\u{10ffc3}");
         assert_eq!(bytes(&text(raw)), raw);
-        // Characters whose UTF-8 begins as theirs does, and text without any.
         assert_eq!((bytes("\u{10fffd}\u{10fe00}"), bytes("\u{e9}a")), ([&b"\xfd"[..], "\u{10fe00}".as_bytes()].concat(), "\u{e9}a".as_bytes().to_vec()));
         let mut r = request();
         r.target = text(raw);
@@ -937,7 +802,6 @@ mod tests {
         let r = request();
         let t = Template::parse("[$request_completion]").unwrap();
         assert_eq!(t.render(&r, &Sent::default()), "[]");
-        // Once asked for, it keeps its value.
         assert_eq!(t.render(&r, &Sent { complete: true, ..Sent::default() }), "[]");
         let t = Template::parse("[$gzip_ratio][$upstream_trailer_x_a]").unwrap();
         assert_eq!(t.log_line(&r, &Sent::default(), Escape::Default), b"[-][-]");
