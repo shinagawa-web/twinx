@@ -23,7 +23,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use libc::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, c_int, pid_t, sigset_t};
+use libc::{SIGCHLD, SIGHUP, SIGINT, SIGQUIT, SIGTERM, c_int, pid_t, sigset_t};
 
 const CONFIGURE: &str = "--with-http_ssl_module --with-http_v2_module --without-http_fastcgi_module --without-http_uwsgi_module \
 --with-http_gunzip_module --with-http_gzip_static_module --without-http_scgi_module --without-http_grpc_module --without-http_memcached_module";
@@ -83,40 +83,87 @@ fn wait_signal(set: &sigset_t) -> c_int {
 }
 
 fn run(a: &Args) -> Result<(), String> {
-    let config = Arc::new(load(a)?);
+    let mut config = Arc::new(load(a)?);
     shm::share_counters()?;
     let mut listeners = http::bind(&config, &[])?;
     let set = signal_set();
+    let mut master = set;
     // SAFETY: the master is single-threaded here; blocking signals has no other effect on it.
-    unsafe { libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
-    let pid = &config.pid;
-    std::fs::write(pid, format!("{}\n", std::process::id())).map_err(|e| format!("open() \"{}\" failed ({e})", pid.display()))?;
+    unsafe { libc::sigaddset(&mut master, SIGCHLD); libc::sigprocmask(libc::SIG_BLOCK, &master, std::ptr::null_mut()) };
+    let pid = config.pid.clone();
+    std::fs::write(&pid, format!("{}\n", std::process::id())).map_err(|e| format!("open() \"{}\" failed ({e})", pid.display()))?;
     let mut workers = spawn(&config, &listeners, &set)?;
+    let mut old = Vec::new();
     let sig = loop {
-        let sig = wait_signal(&set);
+        let sig = wait_signal(&master);
+        if sig == SIGCHLD { reap(&config, &listeners, &set, &mut workers, &mut old); continue }
         if sig != SIGHUP { break sig }
-        let Ok((config, open)) = load(a).map(Arc::new).and_then(|c| Ok((c.clone(), http::bind(&c, &listeners)?))).map_err(|e| emerg(&e, Some(&a.prefix.join(&a.error_log)))) else { continue };
-        let old = std::mem::replace(&mut workers, spawn(&config, &open, &set)?);
-        listeners = open;
-        for (pid, status) in stop(&old, SIGQUIT) { log(&config.notice_logs, "notice", &format!("worker process {pid} exited with code {}", libc::WEXITSTATUS(status))) }
+        log(&config.notice_logs, "notice", "reconfiguring");
+        let Ok((new, open)) = load(a).map(Arc::new).and_then(|c| Ok((c.clone(), http::bind(&c, &listeners)?))).map_err(|e| emerg(&e, Some(&a.prefix.join(&a.error_log)))) else { continue };
+        let replaced = std::mem::replace(&mut workers, spawn(&new, &open, &set)?);
+        (config, listeners) = (new, open);
+        // SAFETY: a plain system call on the process ids of the workers being replaced.
+        replaced.iter().for_each(|&w| unsafe { libc::kill(w, SIGQUIT); });
+        old.extend(replaced);
     };
-    stop(&workers, sig);
-    let _ = std::fs::remove_file(pid);
+    stop(&config, &[workers, old].concat(), sig);
+    let _ = std::fs::remove_file(&pid);
     Ok(())
 }
 
 fn spawn(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> Result<Vec<pid_t>, String> {
-    (0..config.workers).map(|_| {
-        // SAFETY: the master has no other threads, so the child starts in a consistent state.
-        let child = unsafe { libc::fork() };
-        forked(child, config, listeners, set)
-    }).collect()
+    log(&config.notice_logs, "notice", "start worker processes");
+    let mut started = Vec::new();
+    for _ in 0..config.workers {
+        let w = start(config, listeners, set).inspect_err(|_| stop(config, &started, SIGTERM))?;
+        started.push(w);
+    }
+    Ok(started)
 }
 
-fn stop(workers: &[pid_t], sig: c_int) -> Vec<(pid_t, c_int)> {
+fn start(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> Result<pid_t, String> {
+    // SAFETY: the master has no other threads, so the child starts in a consistent state.
+    let child = unsafe { libc::fork() };
+    let w = forked(child, config, listeners, set)?;
+    log(&config.notice_logs, "notice", &format!("start worker process {w}"));
+    Ok(w)
+}
+
+fn reap(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t, workers: &mut Vec<pid_t>, old: &mut Vec<pid_t>) {
+    let mut status = 0;
+    // SAFETY: waitpid() only writes the status it is given a place for.
+    while let pid @ 1.. = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) } {
+        exited(config, pid, status);
+        old.retain(|&w| w != pid);
+        let Some(slot) = workers.iter().position(|&w| w == pid) else { continue };
+        if libc::WEXITSTATUS(status) == 2 {
+            alert(config, &format!("worker process {pid} exited with fatal code 2 and cannot be respawned"));
+            workers.remove(slot);
+            continue
+        }
+        match start(config, listeners, set) {
+            Ok(w) => workers[slot] = w,
+            Err(e) => { alert(config, &e); alert(config, "could not respawn worker process"); workers.remove(slot); }
+        }
+    }
+}
+
+fn stop(config: &conf::Config, workers: &[pid_t], sig: c_int) {
     // SAFETY: plain system calls on the workers' process ids: pass the signal on to all, then wait for each.
     workers.iter().for_each(|&w| unsafe { libc::kill(w, sig); });
-    workers.iter().map(|&w| { let mut status = 0; unsafe { libc::waitpid(w, &mut status, 0) }; (w, status) }).collect()
+    for &w in workers {
+        let mut status = 0;
+        if unsafe { libc::waitpid(w, &mut status, 0) } == w { exited(config, w, status) }
+    }
+}
+
+fn exited(config: &conf::Config, pid: pid_t, status: c_int) {
+    if libc::WIFSIGNALED(status) {
+        let core = if libc::WCOREDUMP(status) { " (core dumped)" } else { "" };
+        alert(config, &format!("worker process {pid} exited on signal {}{core}", libc::WTERMSIG(status)))
+    } else {
+        log(&config.notice_logs, "notice", &format!("worker process {pid} exited with code {}", libc::WEXITSTATUS(status)))
+    }
 }
 
 /// Not inlined, so that each process counts what it runs here in its own coverage profile.
@@ -142,7 +189,10 @@ fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], s
         let signals = signal_fd(set).unwrap_or_else(|e| fail(&format!("signalfd() failed ({e})"), None));
         let mut sig = SIGHUP;
         while sig == SIGHUP { sig = next_signal(&signals).await }
-        if sig == SIGQUIT { http::shut_down(accepting, config.shutdown_timeout).await }
+        if sig == SIGQUIT {
+            log(&config.notice_logs, "notice", "gracefully shutting down");
+            http::shut_down(accepting, config.shutdown_timeout).await
+        }
     });
     std::process::exit(0)
 }
