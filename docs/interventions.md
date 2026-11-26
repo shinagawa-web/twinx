@@ -283,3 +283,8 @@ Kinds:
 | 2026-11-25 | Stage 6 | finding | The judge's comment job failed twice on #361 with a GitHub GraphQL error; the judge job passed | The Fixer read the verdict from the job's log; later runs found nothing to do |
 | 2026-11-26 | After stage 6 | decision | The schedule is paused after stage 6 | 234 of 234 files, 3844 of 3844 subtests at #361; seven runs between had nothing to do |
 | 2026-11-26 | After stage 6 | decision | No release after stage 6; the next one is not decided | v0.5.0 stays the latest |
+| 2026-11-26 | After stage 6 | decision | What is found after stage 6 goes into stage 6, not a stage 7; the Fixer is resumed in the evening | More is expected to be found during the day (#363, #364, #368) |
+| 2026-11-26 | After stage 6 | approval | Pull requests that add a twinx_*.t test are opened without asking, and merged by the agent once the judge passes | "Merge the tests quickly"; #368 |
+| 2026-11-26 | After stage 6 | decision | Some HTTP/2 tests are put on hold | The human could not follow the agent's explanation of them |
+| 2026-11-26 | After stage 6 | decision | Performance starts from three issues: regex built with its perf feature (#365), headers over 1 KB (#366), what made v0.5.0 cost more than v0.4.1 (#367) | Measured again after them; the human then decides what to look into further |
+| 2026-11-26 | After stage 6 | correction | The agent opened the three performance issues and then waited to be told to start | Work is started when an issue is opened; the agent does not stop during the day |
