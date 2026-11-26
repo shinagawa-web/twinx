@@ -140,6 +140,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("port_in_redirect", HSL, 1, 1, false),
     ("rewrite", SRV | LOC | SIF | LIF, 2, 3, false),
     ("default_type", HSL, 1, 1, false),
+    ("types", HSL, 0, 0, true),
     ("proxy_set_header", HSL, 2, 2, false),
     ("proxy_hide_header", HSL, 1, 1, false),
     ("proxy_pass_header", HSL, 1, 1, false),
@@ -212,6 +213,7 @@ const REPEATED: &[&str] = &[
     "ssl_certificate", "ssl_certificate_key", "ssl_protocols", "proxy_ssl_protocols", "ssl_conf_command", "ssl_session_cache", "ssl_session_ticket_key", "early_hints", "proxy_set_header", "proxy_hide_header", "proxy_pass_header", "proxy_next_upstream",
     "proxy_cookie_domain", "proxy_cookie_path", "proxy_redirect", "proxy_cookie_flags", "gzip_types", "proxy_cache_path", "proxy_cache_valid",
     "proxy_no_cache", "proxy_cache_bypass", "proxy_ignore_headers",
+    "types",
 ];
 
 const COMBINED: &str =
@@ -347,6 +349,7 @@ pub struct Level {
     pub keepalive_disable_safari: bool,
     pub lingering_close: Option<bool>,
     pub default_type: String,
+    pub types: Option<Arc<HashMap<String, String>>>,
     pub proxy_set_header: Vec<(String, Template)>,
     pub proxy_hide_header: Vec<String>,
     pub proxy_pass_header: Vec<String>,
@@ -790,6 +793,7 @@ impl Builder<'_> {
         let mut commands: Option<Vec<(String, String)>> = None;
         let mut ticket_keys: Option<Vec<PathBuf>> = None;
         let mut proxy_headers: Option<Vec<(String, Template)>> = None;
+        let mut types: Option<HashMap<String, String>> = None;
         let (mut hidden, mut passed): (Option<Vec<String>>, Option<Vec<String>>) = (None, None);
         let mut cookies: [Option<Option<Vec<CookieRewrite>>>; 2] = [None, None];
         let mut flags: Option<Option<Vec<CookieFlags>>> = None;
@@ -1018,6 +1022,13 @@ impl Builder<'_> {
                     self.temp_path(&d.args[0], &level.body_temp_levels, Some(&d.at))?;
                 }
                 "default_type" => level.default_type = d.args[0].clone(),
+                "types" => {
+                    let types = types.get_or_insert_default();
+                    for t in d.block.as_deref().unwrap_or_default() {
+                        if t.block.is_some() { return Err(format!("unexpected \"{{\" in {}", t.at)); }
+                        types.extend(t.args.iter().map(|ext| (ext.to_ascii_lowercase(), t.name.clone())));
+                    }
+                }
                 "proxy_set_header" => proxy_headers.get_or_insert_default().push((d.args[0].clone(), Template::parse(&d.args[1]).map_err(at)?)),
                 "resolver" => level.resolver = Some(Arc::new(Resolver::parse(&d.args).map_err(at)?)),
                 "resolver_timeout" => level.resolver_timeout = seconds(&d.args[0]).map_err(at)?,
@@ -1086,6 +1097,7 @@ impl Builder<'_> {
         if let Some(c) = commands { level.ssl_conf_command = c; }
         if let Some(k) = ticket_keys { level.ssl_session_ticket_key = k; }
         if let Some(headers) = proxy_headers { level.proxy_set_header = headers; }
+        if let Some(types) = types { level.types = Some(Arc::new(types)); }
         if let Some(hidden) = hidden { level.proxy_hide_header = hidden; }
         if let Some(passed) = passed { level.proxy_pass_header = passed; }
         let [domain, path] = cookies;
@@ -2516,6 +2528,18 @@ mod tests {
         assert_eq!(e, "unknown log format \"nope\" in t.conf:1");
         let e = build_text("http { server { location / { limit_except GET NOPE { } } } }").unwrap_err();
         assert_eq!(e, "invalid method \"NOPE\" in t.conf:1");
+    }
+
+    #[test]
+    fn types() {
+        let mime = include_str!("../conf/mime.types");
+        let c = build_text(&format!("http {{ {mime} server {{ location /a {{ types {{ }} }} location /b {{ types {{ a/b X; }} types {{ c/d x y; }} }} }} }}")).unwrap();
+        let s = &c.servers[0];
+        let get = |l: &Level, ext: &str| l.types.as_ref().map(|t| (t.len(), t.get(ext).cloned()));
+        assert_eq!(get(&s.level, "htm"), Some((110, Some("text/html".into()))));
+        assert_eq!(get(&s.locations[0].level, "htm"), Some((0, None)));
+        assert_eq!(get(&s.locations[1].level, "x"), Some((2, Some("c/d".into()))));
+        assert_eq!(build_text("http { types { a/b { } } }").unwrap_err(), "unexpected \"{\" in t.conf:1");
     }
 
     #[test]
