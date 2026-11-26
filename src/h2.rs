@@ -385,6 +385,7 @@ struct Connection {
     goaway: bool,
     keepalive: (u64, Duration, Duration),
     priorities: usize,
+    refused: usize,
 }
 
 impl Connection {
@@ -489,6 +490,8 @@ impl Connection {
         self.last_sid = sid;
         if depends.is_some() || !self.nodes.contains_key(&sid) { let (on, weight) = depends.unwrap_or((0, 16)); self.depend(sid, on, weight); }
         let refused = self.streams.len() >= CONCURRENT;
+        self.refused += usize::from(refused);
+        if self.refused > CONCURRENT + 1 { return Err(NO_ERROR) }
         self.requests += u64::from(!refused);
         if !refused { self.priorities += CONCURRENT; }
         let (requests, timeout, time) = self.keepalive;
@@ -648,7 +651,7 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
     let lingers = level.lingering_close.is_some();
     let send = crate::http::send_timeout(level);
     let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
-    let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive, priorities: CONCURRENT.max(100) };
+    let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive, priorities: CONCURRENT.max(100), refused: 0 };
     frame(&mut c.out, SETTINGS, 0, 0, &[0, 3, 0, 0, 0, CONCURRENT as u8, 0, 4, 0, 1, 0, 0, 0, 5, 0, 0xff, 0xff, 0xff]);
     frame(&mut c.out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2383,7 +2386,7 @@ mod tests {
 
     fn connection() -> Connection {
         let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
-        Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits: (4, 8192), send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive: (2, Duration::from_secs(75), Duration::from_secs(3600)), priorities: CONCURRENT.max(100) }
+        Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits: (4, 8192), send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive: (2, Duration::from_secs(75), Duration::from_secs(3600)), priorities: CONCURRENT.max(100), refused: 0 }
     }
 
     #[test]
@@ -2399,6 +2402,18 @@ mod tests {
         assert_eq!((c.nodes[&1].0, c.nodes[&5].0, c.nodes[&7].0), (7, 7, 0));
         c.depend(9, 11, 16);
         assert_eq!(c.nodes[&9].0, 0);
+    }
+
+    #[test]
+    fn too_many_refused_streams_end_the_connection() {
+        let mut c = Connection { keepalive: (1000, Duration::from_secs(75), Duration::from_secs(3600)), ..connection() };
+        let get = [0x82, 0x86, 0x84, 0x41, 0x01, b'h'];
+        for sid in (1..=CONCURRENT as u32 * 2).step_by(2) { assert_eq!(c.frame(HEADERS, END_HEADERS | END_STREAM, sid, &get), Ok(())); }
+        let first = CONCURRENT as u32 * 2 + 1;
+        for sid in (first..first + (CONCURRENT as u32 + 1) * 2).step_by(2) { assert_eq!(c.frame(HEADERS, END_HEADERS | END_STREAM, sid, &get), Ok(())); }
+        assert_eq!((c.streams.len(), c.refused), (CONCURRENT, CONCURRENT + 1));
+        let last = first + (CONCURRENT as u32 + 1) * 2;
+        assert_eq!((c.frame(HEADERS, END_HEADERS | END_STREAM, last, &get), c.last_sid), (Err(NO_ERROR), last));
     }
 
     #[test]
