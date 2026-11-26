@@ -1,5 +1,3 @@
-//! twinx: an HTTP server that reads nginx's configuration and behaves as nginx does.
-
 mod body;
 mod cache;
 mod clock;
@@ -26,17 +24,12 @@ use std::sync::Arc;
 
 use libc::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, c_int, pid_t, sigset_t};
 
-/// What `-V` prints: Test::Nginx reads it to tell which modules twinx has.
 const CONFIGURE: &str = "--with-http_ssl_module --with-http_v2_module --without-http_fastcgi_module --without-http_uwsgi_module \
 --with-http_gunzip_module --with-http_gzip_static_module --without-http_scgi_module --without-http_grpc_module --without-http_memcached_module";
 
-/// The TLS library line of `-V`. twinx does TLS with rustls; nginx-tests reads
-/// "with OpenSSL <version>" to tell which TLS features there are, so it names
-/// the version of the reference nginx, whose features twinx takes after.
-/// Servers are selected by the name clients send with SNI, as nginx says it does.
+/// nginx-tests reads "with OpenSSL <version>" to tell which TLS features there are.
 const TLS_LIBRARY: &str = "built with TLS by rustls, compatible with OpenSSL 3.5.7\nTLS SNI support enabled";
 
-/// The command line, as nginx takes it.
 #[derive(Debug, PartialEq)]
 struct Args {
     prefix: PathBuf,
@@ -59,21 +52,17 @@ fn args(list: &[String]) -> Result<Args, String> {
     Ok(Args { prefix: p.into(), conf: c.into(), error_log: e.into(), globals: g, version })
 }
 
-/// Reads the configuration: the -g directives first, then the file. The directories it
-/// keeps temporary files in are made.
 fn load(a: &Args) -> Result<conf::Config, String> {
     let file = a.prefix.join(&a.conf);
     let text = std::fs::read_to_string(&file).map_err(|e| format!("open() \"{}\" failed ({e})", file.display()))?;
     let mut main = config::parse(&a.globals, Path::new("command line"))?;
     main.extend(config::parse(&text, &file)?);
-    // As in nginx, errors go to the file of -e, or its default, when no other is given.
     if !main.iter().any(|d| d.name == "error_log") { main.extend(config::parse(&format!("error_log \"{}\" error;", a.error_log.display()), &file)?); }
     let config = conf::build(&main, &a.prefix)?;
     spool::make_dirs(&config.temp_paths)?;
     Ok(config)
 }
 
-/// The signals the master and its worker wait for. They are blocked, and taken with `sigwait`.
 fn signal_set() -> sigset_t {
     // SAFETY: the set is initialised by sigemptyset before it is used.
     unsafe {
@@ -91,9 +80,6 @@ fn wait_signal(set: &sigset_t) -> c_int {
     sig
 }
 
-/// Runs as nginx does with `master_process on`: the master opens the sockets, writes the pid file and
-/// handles the signals; a worker process serves the requests, so a signal sent to the worker alone
-/// ends only the worker, and the master and its pid file stay.
 fn run(a: &Args) -> Result<(), String> {
     let config = Arc::new(load(a)?);
     let mut listeners = http::bind(&config, &[])?;
@@ -103,9 +89,6 @@ fn run(a: &Args) -> Result<(), String> {
     let pid = &config.pid;
     std::fs::write(pid, format!("{}\n", std::process::id())).map_err(|e| format!("open() \"{}\" failed ({e})", pid.display()))?;
     let mut worker = spawn(&config, &listeners, &set)?;
-    // HUP reloads the configuration: a worker starts with the new one, on the sockets it shares with the
-    // old configuration, and the old worker is shut down. A configuration that cannot be loaded leaves the
-    // old worker serving, as in nginx.
     let sig = loop {
         let sig = wait_signal(&set);
         if sig != SIGHUP { break sig }
@@ -123,15 +106,13 @@ fn run(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
-/// Starts a worker process. It serves until it gets QUIT, TERM or INT, then exits.
 fn spawn(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> Result<pid_t, String> {
     // SAFETY: the master has no other threads, so the child starts in a consistent state.
     let child = unsafe { libc::fork() };
     forked(child, config, listeners, set)
 }
 
-/// Goes on in both processes after fork(). It is a function of its own, not inlined, so that each
-/// process counts what it runs here in its own coverage profile.
+/// Not inlined, so that each process counts what it runs here in its own coverage profile.
 #[inline(never)]
 fn forked(child: pid_t, config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> Result<pid_t, String> {
     if child == 0 { worker(config, listeners, set) }
@@ -139,25 +120,18 @@ fn forked(child: pid_t, config: &Arc<conf::Config>, listeners: &[(TcpListener, S
 }
 
 fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> ! {
-    // worker_rlimit_nofile: as in nginx, a failure leaves the limit as it was.
     let limit = config.rlimit_nofile.map(|n| libc::rlimit { rlim_cur: n, rlim_max: n });
     // SAFETY: setrlimit() only reads the structure it is given.
     if let Some(l) = limit { unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &l) }; }
-    // working_directory: as in nginx 1.30, a worker that cannot change to it logs an alert and exits
-    // with the fatal code 2, and the master does not start it again.
     if let Some((dir, Err(e))) = config.working_directory.as_ref().map(|d| (d, std::env::set_current_dir(d))) {
         let reason = e.to_string().split(" (os error").next().unwrap_or_default().to_string();
         alert(config, &format!("chdir(\"{}\") failed ({}: {reason})", dir.display(), e.raw_os_error().unwrap_or(0)));
         std::process::exit(2)
     }
-    // The worker's event loop, on this one thread: it is made after fork(), as
-    // the master has to stay single-threaded to fork.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap_or_else(|e| fail(&e.to_string(), None));
     tokio::task::LocalSet::new().block_on(&runtime, async {
         let accepting = http::accept(config.clone(), listeners).unwrap_or_else(|e| fail(&e, None));
         let signals = signal_fd(set).unwrap_or_else(|e| fail(&format!("signalfd() failed ({e})"), None));
-        // A worker ignores HUP, which only the master acts on. QUIT shuts it down
-        // gracefully; TERM and INT end it at once.
         let mut sig = SIGHUP;
         while sig == SIGHUP { sig = next_signal(&signals).await }
         if sig == SIGQUIT { http::shut_down(accepting, config.shutdown_timeout).await }
@@ -165,8 +139,6 @@ fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], s
     std::process::exit(0)
 }
 
-/// A signalfd for the signals of the set, which stay blocked: the event loop
-/// reads them from it as they come.
 fn signal_fd(set: &sigset_t) -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
     use std::os::fd::FromRawFd;
     // SAFETY: set is a valid signal set; the descriptor returned is owned by nothing else.
@@ -176,7 +148,6 @@ fn signal_fd(set: &sigset_t) -> std::io::Result<tokio::io::unix::AsyncFd<std::os
     unsafe { tokio::io::unix::AsyncFd::register_with_interest(std::os::fd::OwnedFd::from_raw_fd(fd), tokio::io::Interest::READABLE) }.map_err(|e| e.into_parts().1)
 }
 
-/// The next signal of a signalfd; TERM when it cannot be read.
 async fn next_signal(fd: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>) -> c_int {
     use std::os::fd::AsRawFd;
     loop {
@@ -199,25 +170,21 @@ fn main() {
     if let Err(e) = run(&a) { fail(&e, Some(&a.prefix.join(&a.error_log))) }
 }
 
-/// Reports an error as nginx does, on standard error and in the error log, and exits.
 fn fail(msg: &str, log: Option<&Path>) -> ! {
     emerg(msg, log);
     std::process::exit(1)
 }
 
-/// Writes an alert to the error logs of the main block.
 fn alert(config: &conf::Config, msg: &str) {
     log(&config.alert_logs, "alert", msg)
 }
 
-/// Writes a message of a level to error logs.
 fn log(logs: &[Arc<std::fs::File>], level: &str, msg: &str) {
     let time = chrono::Local::now().format("%Y/%m/%d %H:%M:%S");
     let line = format!("{time} [{level}] {}#0: {msg}\n", std::process::id());
     logs.iter().for_each(|f| { let _ = (&**f).write_all(line.as_bytes()); });
 }
 
-/// Reports an error on standard error and in the error log.
 fn emerg(msg: &str, log: Option<&Path>) {
     eprintln!("twinx: [emerg] {msg}");
     let time = chrono::Local::now().format("%Y/%m/%d %H:%M:%S");
@@ -258,7 +225,6 @@ mod tests {
     fn takes_blocked_signals() {
         let set = signal_set();
         assert!([SIGQUIT, SIGTERM, SIGINT].iter().all(|&s| unsafe { libc::sigismember(&set, s) } == 1));
-        // Blocked in this thread only, and raised for this thread, so other tests do not see it.
         unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()); libc::raise(SIGINT) };
         assert_eq!(wait_signal(&set), SIGINT);
     }
@@ -271,7 +237,6 @@ mod tests {
             let fd = signal_fd(&set).unwrap();
             unsafe { libc::raise(SIGHUP) };
             assert_eq!(next_signal(&fd).await, SIGHUP);
-            // Nothing else is pending until the next one comes.
             assert!(tokio::time::timeout(std::time::Duration::from_millis(50), next_signal(&fd)).await.is_err());
             unsafe { libc::raise(SIGQUIT) };
             assert_eq!(next_signal(&fd).await, SIGQUIT);
