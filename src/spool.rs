@@ -1,19 +1,13 @@
-//! The files what has come of proxied answers is kept in while their clients are behind.
-
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Error, ErrorKind};
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// How much of a file is read at once: the buffers of output_buffers.
 const PIECE: u64 = 2 * 32768;
 
-/// The number of the next temporary file.
 static NEXT: AtomicU32 = AtomicU32::new(1);
 
-/// A path for a new temporary file: its number in ten digits, in the subdirectories
-/// the levels name, each taken from the end of the name (levels 1 2: 2/00/0000000002).
 pub fn temp_path(dir: &Path, levels: &[usize]) -> PathBuf {
     numbered(dir, levels, NEXT.fetch_add(1, Ordering::Relaxed))
 }
@@ -26,13 +20,11 @@ fn numbered(dir: &Path, levels: &[usize], n: u32) -> PathBuf {
     path.join(name)
 }
 
-/// What nginx says of a call that failed.
 fn failed(call: &str, path: &Path, e: &Error) -> String {
     let text = e.to_string();
     format!("{call} \"{}\" failed ({}: {})", path.display(), e.raw_os_error().unwrap_or(0), text.split(" (os error").next().unwrap_or_default())
 }
 
-/// Makes the directories of temporary files that are not there, as ngx_create_paths() does.
 pub fn make_dirs(dirs: &[PathBuf]) -> Result<(), String> {
     for dir in dirs {
         match DirBuilder::new().mode(0o700).create(dir) {
@@ -43,9 +35,6 @@ pub fn make_dirs(dirs: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
-/// The file of one answer: where files are made, how large it may be, all that was ever
-/// written counting, and how much is written at once; how much was written to it and
-/// read from it, and how much there was of it when it was last read.
 #[derive(Debug)]
 pub struct Spool<'a> { dir: &'a Path, levels: &'a [usize], max: u64, pub at_once: usize, file: Option<(File, PathBuf)>, written: u64, read: u64, seen: u64 }
 
@@ -54,18 +43,14 @@ impl<'a> Spool<'a> {
         Spool { dir, levels, max: max as u64, at_once, file: None, written: 0, read: 0, seen: 0 }
     }
 
-    /// How much more may be written.
     pub fn room(&self) -> u64 {
         self.max.saturating_sub(self.written)
     }
 
-    /// How much is to be read.
     pub fn left(&self) -> u64 {
         self.written - self.read
     }
 
-    /// Writes data of so many buffers to the end of the file, which is made first if there is
-    /// none: then its path is given.
     pub fn write(&mut self, data: &[u8], buffers: usize) -> Result<Option<&Path>, String> {
         let made = self.file.is_none();
         let (file, path) = match &mut self.file {
@@ -77,7 +62,6 @@ impl<'a> Spool<'a> {
         Ok(made.then_some(path))
     }
 
-    /// Reads the next piece.
     pub fn read(&mut self, to: &mut Vec<u8>) -> Result<(), String> {
         let Some((file, path)) = &self.file else { return Ok(()) };
         to.resize(PIECE.min(self.left()) as usize, 0);
@@ -87,14 +71,11 @@ impl<'a> Spool<'a> {
         Ok(())
     }
 
-    /// What there was not yet when it was last read will not be.
     pub fn drop_unseen(&mut self) {
         self.written = self.seen.max(self.read);
     }
 }
 
-/// A new file, which has no name any more, as ngx_create_temp_file() makes it, with the
-/// directories it takes.
 fn create(dir: &Path, levels: &[usize]) -> Result<(File, PathBuf), String> {
     let mut path = temp_path(dir, levels);
     loop {
@@ -103,7 +84,7 @@ fn create(dir: &Path, levels: &[usize]) -> Result<(File, PathBuf), String> {
                 let _ = std::fs::remove_file(&path);
                 return Ok((file, path))
             }
-            // One another worker made, or that was left there: not all of those are tried.
+            // Taken by another worker or left behind: skip ahead rather than try each next number.
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 NEXT.fetch_add(std::process::id(), Ordering::Relaxed);
                 path = temp_path(dir, levels);
@@ -140,7 +121,6 @@ mod tests {
         let dirs = [dir.clone(), dir.join("a")];
         make_dirs(&dirs).unwrap();
         assert!(dirs.iter().all(|d| d.metadata().unwrap().permissions().mode() & 0o777 == 0o700));
-        // What is there is left as it is, a file too; the directories around one are not made.
         std::fs::write(dir.join("b"), "").unwrap();
         make_dirs(&[dir.join("a"), dir.join("b")]).unwrap();
         let missing = dir.join("c/d");
@@ -155,16 +135,13 @@ mod tests {
         let mut s = Spool::new((&dir, &[1, 2]), 100_000, 8192);
         assert_eq!((s.room(), s.left()), (100_000, 0));
         let path = s.write(&[b'a'; 40_000], 10).unwrap().unwrap().to_path_buf();
-        // It is made with its directories, and has no name.
         assert!(path.starts_with(&dir) && path.parent().unwrap().exists() && !path.exists(), "{path:?}");
         assert_eq!(s.file.as_ref().unwrap().0.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(s.write(&[b'b'; 40_000], 10).unwrap(), None);
-        // It is read in pieces, in order, and all that was written counts.
         let mut piece = Vec::new();
         s.read(&mut piece).unwrap();
         assert!(piece.len() == 65_536 && piece[..40_000] == [b'a'; 40_000] && piece[40_000..] == [b'b'; 25_536]);
         assert_eq!((s.left(), s.room()), (14_464, 20_000));
-        // What was written since is dropped, what was there before is not.
         s.write(&[b'c'; 20_000], 5).unwrap();
         assert_eq!((s.left(), s.room()), (34_464, 0));
         s.drop_unseen();
