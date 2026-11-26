@@ -124,6 +124,7 @@ files = [
 # (harness/nginx-tests/extra).
 [stage6]
 files = [
+  "twinx_ssl_verify_client_sessions.t",
   "twinx_internal.t",
   "twinx_answers_left.t", "twinx_cache_answers.t", "twinx_cache_buffering.t",
   "twinx_cache_control.t", "twinx_cache_fields.t", "twinx_cache_h2.t",
