@@ -144,4 +144,5 @@ files = [
   "twinx_alias_rewrite.t",
   "twinx_listen_ipv6only.t",
   "twinx_ssl_client_sigalg.t",
+  "twinx_worker_processes.t",
 ]
