@@ -190,6 +190,56 @@ impl Crl {
     }
 }
 
+/// Resumes a session made under another server name, which rustls refuses and OpenSSL does when the session context is the same.
+#[derive(Debug)]
+struct Renamed<T: ?Sized>(Arc<T>, Option<String>, Arc<Mutex<Option<String>>>);
+
+impl<T: ?Sized> Renamed<T> {
+    fn rename(&self, value: Vec<u8>) -> Option<Vec<u8>> {
+        let n = usize::from(*value.get(1).filter(|_| value[0] == 1).unwrap_or(&0));
+        let (was, rest) = match *value.first()? { 0 => (None, value.get(1..)?), 1 => (Some(String::from_utf8_lossy(value.get(2..2 + n)?).into_owned()), value.get(2 + n..)?), _ => return None };
+        *self.2.lock().unwrap() = was;
+        let name = self.1.as_deref().map(str::as_bytes).filter(|n| n.len() <= 255);
+        Some(name.map_or_else(|| vec![0], |n| [&[1, n.len() as u8][..], n].concat()).into_iter().chain(rest.iter().copied()).collect())
+    }
+}
+
+impl rustls::server::ProducesTickets for Renamed<dyn rustls::server::ProducesTickets> {
+    fn enabled(&self) -> bool {
+        self.0.enabled()
+    }
+
+    fn lifetime(&self) -> u32 {
+        self.0.lifetime()
+    }
+
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        self.0.encrypt(plain)
+    }
+
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        self.rename(self.0.decrypt(cipher)?)
+    }
+}
+
+impl rustls::server::StoresServerSessions for Renamed<dyn rustls::server::StoresServerSessions> {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        self.0.put(key, value)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.rename(self.0.get(key)?)
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.rename(self.0.take(key)?)
+    }
+
+    fn can_cache(&self) -> bool {
+        self.0.can_cache()
+    }
+}
+
 /// Keeps a session a TLS 1.3 client resumes, as OpenSSL does; rustls's cache would drop it.
 #[derive(Debug)]
 struct Kept(Arc<dyn rustls::server::StoresServerSessions>);
@@ -300,10 +350,11 @@ impl Rotated {
     }
 }
 
-/// Servers with other certificates keep their sessions apart in a zone or ticket keys they share.
-fn context(keys: &[Arc<rustls::sign::CertifiedKey>]) -> [u8; 32] {
+/// Servers with other certificates or client CAs keep their sessions apart in a zone or ticket keys they share.
+fn context(keys: &[Arc<rustls::sign::CertifiedKey>], cas: &[DistinguishedName]) -> [u8; 32] {
     let mut c = ring::digest::Context::new(&ring::digest::SHA256);
     keys.iter().flat_map(|k| &k.cert).for_each(|d| c.update(d));
+    cas.iter().for_each(|n| c.update(n.as_ref()));
     c.finish().as_ref().try_into().unwrap_or_default()
 }
 
@@ -580,10 +631,11 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     let versions: Vec<_> = [&rustls::version::TLS12, &rustls::version::TLS13].into_iter().zip(options.protocols).filter_map(|(v, on)| on.then_some(v)).collect();
     let (versions, fixed) = if versions.is_empty() { (vec![&rustls::version::TLS13], Vec::new()) } else { (versions, fixed) };
     let builder = ServerConfig::builder_with_provider(Arc::new(suites)).with_protocol_versions(&versions).map_err(|e| e.to_string())?;
-    let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms, ca_names(options.client_ca.as_deref())?))) } else { builder.with_no_client_auth() };
+    let cas = if options.verify { ca_names(options.client_ca.as_deref())? } else { Vec::new() };
+    let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms, cas.clone()))) } else { builder.with_no_client_auth() };
     let mut fixed = Fixed::new(fixed);
     if let Some(stapling) = &options.stapling { fixed.1 = fixed.0.iter().map(|k| Staple::new(k, stapling, &trusted)).collect::<Result<_, _>>()?; }
-    let context = context(&fixed.0);
+    let context = context(&fixed.0, &cas);
     let mut config = builder.with_cert_resolver(Arc::new(fixed));
     config.ignore_client_order = options.prefer;
     config.cert_compressors = if options.compress { vec![rustls::compress::ZLIB_COMPRESSOR] } else { Vec::new() };
@@ -619,6 +671,7 @@ impl ServerTls {
 pub struct Session {
     pub protocol: String,
     pub server_name: String,
+    pub resumed_name: Option<String>,
     pub reused: bool,
     pub verify: String,
     pub subject: Option<String>,
@@ -814,6 +867,10 @@ async fn handshake<'a>(mut tcp: TcpStream, config: &'a Config, listen: SocketAdd
     let curves = hello.named_groups().unwrap_or_default().iter().map(|g| curve(u16::from(*g))).collect::<Vec<_>>().join(":");
     let mut for_connection = (*tls.for_connection(addrs, &name)?).clone();
     let h2 = crate::http::http2(config, listen, server).then_some(&b"h2"[..]);
+    let was = Arc::new(Mutex::new(None));
+    let current = hello.server_name().map(str::to_string);
+    for_connection.ticketer = Arc::new(Renamed(for_connection.ticketer.clone(), current.clone(), was.clone()));
+    for_connection.session_storage = Arc::new(Renamed(for_connection.session_storage.clone(), current, was.clone()));
     for_connection.alpn_protocols = h2.into_iter().chain([&b"http/1.1"[..], b"http/1.0", b"http/0.9"]).map(<[u8]>::to_vec).collect();
     let mut id = None;
     let start = tokio_rustls::StartHandshake::from_parts(accepted, tcp);
@@ -830,7 +887,8 @@ async fn handshake<'a>(mut tcp: TcpStream, config: &'a Config, listen: SocketAdd
     let reused = conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed);
     let alpn = String::from_utf8_lossy(conn.alpn_protocol().unwrap_or_default()).into_owned();
     let id = id.iter().map(|b| format!("{b:02x}")).collect();
-    Some((stream, tls, Session { protocol, server_name: sent.unwrap_or(name), reused, id, cipher, ciphers, curve, curves, alpn, ..Session::default() }))
+    let resumed_name = (reused && protocol == "TLSv1.2").then(|| was.lock().unwrap().take()).flatten();
+    Some((stream, tls, Session { protocol, server_name: sent.unwrap_or(name), resumed_name, reused, id, cipher, ciphers, curve, curves, alpn, ..Session::default() }))
 }
 
 #[derive(Debug)]
@@ -1245,6 +1303,21 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 4q04yOy8aX97GVjXKn4C5xldyA0=
 -----END CERTIFICATE-----
 ";
+
+    #[test]
+    fn resumes_sessions_under_the_name_the_client_sends() {
+        let was = Arc::new(Mutex::new(None));
+        let renamed = |name: Option<&str>| Renamed(Arc::new(()), name.map(str::to_string), was.clone());
+        assert_eq!(renamed(Some("same")).rename(b"\x01\x01arest".to_vec()), Some(b"\x01\x04samerest".to_vec()));
+        assert_eq!(was.lock().unwrap().take().as_deref(), Some("a"));
+        assert_eq!(renamed(None).rename(b"\x01\x01arest".to_vec()), Some(b"\x00rest".to_vec()));
+        assert_eq!(renamed(Some("b")).rename(b"\x00rest".to_vec()), Some(b"\x01\x01brest".to_vec()));
+        assert_eq!(*was.lock().unwrap(), None);
+        assert_eq!([b"\x02".to_vec(), b"\x01\x05a".to_vec(), Vec::new()].map(|v| renamed(None).rename(v)), [None, None, None]);
+        let cas = |n: &[u8]| vec![DistinguishedName::from(n.to_vec())];
+        assert_eq!(context(&[], &cas(b"a")), context(&[], &cas(b"a")));
+        assert_ne!(context(&[], &cas(b"a")), context(&[], &cas(b"b")));
+    }
 
     #[test]
     fn names_each_client_ca_once() {
