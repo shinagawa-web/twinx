@@ -306,7 +306,7 @@ impl Upstream {
         let Some(keepalive) = &self.keepalive else { return };
         let now = Instant::now();
         if conn.requests >= keepalive.requests || now.duration_since(conn.opened) > keepalive.time { return }
-        if CLOSING.get() || !conn.quiet() { return }
+        if CLOSING.get() || !conn.stream.drained() { return }
         let mut cache = self.cache.lock().unwrap();
         if cache.waker.as_ref().is_some_and(|w| !conn.register(w)) { return }
         if cache.idle.len() >= keepalive.max { cache.idle.pop_back(); }
@@ -624,7 +624,8 @@ mod tests {
                 act(&b_other);
                 pause(20);
                 u.put(b, addr.into(), 0);
-                assert!(idle(&u) == 0 && closed(&b_other));
+                wait(|| idle(&u) == 0).await;
+                assert!(closed(&b_other));
                 let (b, b_other, _) = open(&l).await;
                 u.put(a.unwrap(), addr.into(), 0);
                 u.put(b, addr.into(), 0);
