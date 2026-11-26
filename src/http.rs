@@ -171,29 +171,78 @@ fn number() -> u64 {
 }
 
 pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> Result<Vec<JoinHandle<()>>, String> {
-    let mut tasks = Vec::new();
     // Each listening socket and the channel to the master take a place in nginx.
     PLACES.with_borrow_mut(|p| (p.total, p.free, p.logs) = (config.connections, config.connections.saturating_sub(listeners.len() + 1), config.warn_logs.clone()));
-    for (listener, addr) in listeners {
+    let mut listening = Listening::new(listeners).map_err(|e| e.to_string())?;
+    let addrs: Vec<(SocketAddr, bool)> = listeners.iter().map(|(_, a)| (*a, config.servers.iter().any(|s| s.ssl.contains(a)))).collect();
+    Ok(vec![tokio::task::spawn_local(async move {
+        loop {
+            let (i, accepted) = listening.next().await;
+            let (addr, tls) = addrs[i];
+            // Out of descriptors, say: accept() is tried again a little later.
+            let Ok((stream, peer)) = accepted.and_then(|(s, peer)| s.set_nonblocking(true).and_then(|()| TcpStream::from_std(s)).map(|s| (s, peer))) else { tokio::time::sleep(Duration::from_millis(10)).await; continue };
+            let seat = match seat() {
+                Ok(seat) => seat,
+                Err(n) => { drop(stream); refused(&config, addr, n); continue }
+            };
+            let (config, fresh) = (config.clone(), Busy::new());
+            let local = if addr.ip().is_unspecified() { stream.local_addr().unwrap_or(addr) } else { addr };
+            tokio::task::spawn_local(SEAT.scope(seat, Box::pin(serving(config, stream, tls, (addr, local, (peer, number())), fresh))));
+        }
+    })])
+}
+
+/// The listening sockets in an epoll of this worker's own, so that the kernel wakes one worker for each new connection.
+struct Listening {
+    epoll: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    sockets: Vec<(TcpListener, u64)>,
+}
+
+impl Listening {
+    fn new(listeners: &[(TcpListener, SocketAddr)]) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: a plain system call; the descriptor it returns is owned by nothing else.
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 { return Err(std::io::Error::last_os_error()) }
+        // SAFETY: fd is a new descriptor of this process.
+        let epoll = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
         // The socket keeps the options it was opened with; the event loop needs it non-blocking.
-        let listener = listener.try_clone().and_then(|l| l.set_nonblocking(true).and_then(|()| tokio::net::TcpListener::from_std(l))).map_err(|e| e.to_string())?;
-        let (addr, config) = (*addr, config.clone());
-        let tls = config.servers.iter().any(|s| s.ssl.contains(&addr));
-        tasks.push(tokio::task::spawn_local(async move {
-            loop {
-                // Out of descriptors, say: accept() is tried again a little later.
-                let Ok((stream, peer)) = listener.accept().await else { tokio::time::sleep(Duration::from_millis(10)).await; continue };
-                let seat = match seat() {
-                    Ok(seat) => seat,
-                    Err(n) => { drop(stream); refused(&config, addr, n); continue }
-                };
-                let (config, fresh) = (config.clone(), Busy::new());
-                let local = if addr.ip().is_unspecified() { stream.local_addr().unwrap_or(addr) } else { addr };
-                tokio::task::spawn_local(SEAT.scope(seat, Box::pin(serving(config, stream, tls, (addr, local, (peer, number())), fresh))));
-            }
-        }));
+        let sockets = listeners.iter().map(|(l, _)| l.try_clone().and_then(|l| l.set_nonblocking(true).map(|()| (l, 0)))).collect::<std::io::Result<Vec<_>>>()?;
+        for (i, (l, _)) in sockets.iter().enumerate() { watch(&epoll, l, i, libc::EPOLL_CTL_ADD)? }
+        // SAFETY: the AsyncFd owns the descriptor and closes it.
+        let epoll = unsafe { tokio::io::unix::AsyncFd::register_with_interest(epoll, tokio::io::Interest::READABLE) }.map_err(|e| e.into_parts().1)?;
+        Ok(Self { epoll, sockets })
     }
-    Ok(tasks)
+
+    async fn next(&mut self) -> (usize, std::io::Result<(std::net::TcpStream, SocketAddr)>) {
+        use std::os::fd::AsRawFd;
+        loop {
+            let Ok(mut ready) = self.epoll.readable().await else { return std::future::pending().await };
+            let mut event = libc::epoll_event { events: 0, u64: 0 };
+            // SAFETY: event has room for the one event asked for.
+            if unsafe { libc::epoll_wait(self.epoll.as_raw_fd(), &mut event, 1, 0) } < 1 { ready.clear_ready(); continue }
+            let i = event.u64 as usize;
+            let (listener, accepts) = &mut self.sockets[i];
+            match listener.accept() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return (i, Err(e)),
+                Ok(got) => {
+                    *accepts += 1;
+                    // The kernel wakes the worker that added the socket first: adding it again now and then lets the others take their turn.
+                    if *accepts % 16 == 1 && watch(self.epoll.get_ref(), listener, i, libc::EPOLL_CTL_DEL).is_ok() { let _ = watch(self.epoll.get_ref(), listener, i, libc::EPOLL_CTL_ADD); }
+                    return (i, Ok(got))
+                }
+            }
+        }
+    }
+}
+
+fn watch(epoll: &std::os::fd::OwnedFd, listener: &TcpListener, i: usize, op: i32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut event = libc::epoll_event { events: (libc::EPOLLIN | libc::EPOLLEXCLUSIVE) as u32, u64: i as u64 };
+    // SAFETY: both descriptors are open, and event is read only.
+    if unsafe { libc::epoll_ctl(epoll.as_raw_fd(), op, listener.as_raw_fd(), &mut event) } < 0 { return Err(std::io::Error::last_os_error()) }
+    Ok(())
 }
 
 fn refused(config: &Config, addr: SocketAddr, n: usize) {
@@ -3145,6 +3194,24 @@ pub(crate) mod tests {
 
     pub(crate) fn at_once<T: Send>(cases: impl IntoIterator<Item = T>, each: impl Fn(T) + Sync) {
         thread::scope(|s| cases.into_iter().for_each(|case| drop(s.spawn(|| each(case)))));
+    }
+
+    #[test]
+    fn accepts_from_the_socket_epoll_reports() {
+        let (a, b) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+        let addrs = [a.local_addr().unwrap(), b.local_addr().unwrap()];
+        block_on(async {
+            let mut listening = Listening::new(&[(a, addrs[0]), (b, addrs[1])]).unwrap();
+            let client = TcpStream::connect(addrs[1]).unwrap();
+            let (i, got) = listening.next().await;
+            assert_eq!((i, got.unwrap().1), (1, client.local_addr().unwrap()));
+            // Past the sixteenth, the socket has been added again.
+            for _ in 0..17 {
+                let client = TcpStream::connect(addrs[0]).unwrap();
+                let (i, got) = listening.next().await;
+                assert_eq!((i, got.unwrap().1), (0, client.local_addr().unwrap()));
+            }
+        });
     }
 
     #[test]
