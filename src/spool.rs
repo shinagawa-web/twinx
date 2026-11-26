@@ -82,13 +82,16 @@ impl<'a> Spool<'a> {
 }
 
 fn create(dir: &Path, levels: &[usize]) -> Result<(File, PathBuf), String> {
+    let (file, path) = open_new(dir, levels)?;
+    let _ = std::fs::remove_file(&path);
+    Ok((file, path))
+}
+
+pub fn open_new(dir: &Path, levels: &[usize]) -> Result<(File, PathBuf), String> {
     let mut path = temp_path(dir, levels);
     loop {
         match OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path) {
-            Ok(file) => {
-                let _ = std::fs::remove_file(&path);
-                return Ok((file, path))
-            }
+            Ok(file) => return Ok((file, path)),
             // Taken by another worker or left behind: skip ahead rather than try each next number.
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 NEXT.fetch_add(std::process::id(), Ordering::Relaxed);

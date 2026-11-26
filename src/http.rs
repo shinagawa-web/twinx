@@ -19,7 +19,7 @@ use crate::vars::{Part, Template};
 use crate::expires;
 use crate::upstream::{Addr, Conn, Held, Peer, Upstream};
 use crate::vars::{Request, Sent};
-use crate::spool::{Spool, temp_path};
+use crate::spool::{Spool, open_new};
 use crate::stream::{Flush, Stream, Writing, at_once, buffer, read_into, read_more, read_until, recycle, unless_closed, within, write_all};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
@@ -565,10 +565,14 @@ fn keep_body(r: &mut Request, level: &Level, body: Vec<u8>, fits: bool) -> Resul
     let framed = header(r, "content-length").is_some() || header(r, "transfer-encoding").is_some();
     let to_file = (!body.is_empty() || framed) && (level.body_in_file_only || !fits);
     if !to_file { r.body = body; return Ok(()); }
-    let path = temp_path(&level.body_temp_path, &level.body_temp_levels);
-    let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, &body));
-    if let Err(e) = written { error_log(level, r, &format!("open() \"{}\" failed ({e})", path.display())); return Err(500); }
-    r.body_file = Some(path);
+    let written = open_new(&level.body_temp_path, &level.body_temp_levels).and_then(|(mut file, path)| match file.write_all(&body) {
+        Ok(()) => Ok(path),
+        Err(e) => Err(crate::spool::failed("write()", &path, &e)),
+    });
+    match written {
+        Ok(path) => r.body_file = Some(path),
+        Err(e) => { error_log(level, r, &e); return Err(500); }
+    }
     Ok(())
 }
 
@@ -582,11 +586,12 @@ struct Spill {
 
 impl Spill {
     fn open(r: &Request, level: &Level, length: Option<u64>) -> Spill {
-        let path = temp_path(&level.body_temp_path, &level.body_temp_levels);
-        let file = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::File::create(&path));
-        if let Err(e) = &file { error_log(level, r, &format!("open() \"{}\" failed ({e})", path.display())); }
+        let (file, path) = match open_new(&level.body_temp_path, &level.body_temp_levels) {
+            Ok((file, path)) => (Some(file), path),
+            Err(e) => { error_log(level, r, &e); (None, PathBuf::new()) }
+        };
         let n = length.unwrap_or(0);
-        Spill { path, file: file.ok(), length: n, left: n, chunked: length.is_none().then_some(0) }
+        Spill { path, file, length: n, left: n, chunked: length.is_none().then_some(0) }
     }
 
     fn write(&mut self, r: &Request, level: &Level, buf: &mut Vec<u8>) -> Result<bool, u16> {
@@ -6293,6 +6298,28 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(chunks(b"\rX", 2, 0, 100), Err(400));
         assert_eq!(chunks(b"c\r\n", 0, 90, 100), Err(413));
         assert_eq!(chunks(b"bc\r\n2\r\nd", 4, 1, 100), Ok((b"bcd".to_vec(), 8, 3, false)));
+    }
+
+    #[test]
+    fn bodies_go_past_files_that_are_there() {
+        let dir = std::env::temp_dir().join(format!("twinx-body-taken-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let next: u32 = crate::spool::temp_path(&dir, &[]).file_name().unwrap().to_str().unwrap().parse().unwrap();
+        let taken: Vec<_> = (next + 1..next + 100).map(|n| dir.join(format!("{n:010}"))).collect();
+        for p in &taken { std::fs::write(p, "x").unwrap(); }
+        let level = Level { body_buffer: 4, body_temp_path: dir.clone(), ..Level::default() };
+        let (_, mut r) = request("GET / HTTP/1.0\n\n");
+        keep_body(&mut r, &level, b"abcde".to_vec(), false).unwrap();
+        let kept = r.body_file.unwrap();
+        let (_, mut r) = request("POST / HTTP/1.0\nContent-Length: 3\n\n");
+        let (mut s, mut buf) = (Spill::open(&r, &level, Some(3)), b"abc".to_vec());
+        assert_eq!(s.write(&r, &level, &mut buf), Ok(true));
+        s.done(&mut r).unwrap();
+        let spilled = r.body_file.unwrap();
+        assert_eq!((std::fs::read(&kept).unwrap(), std::fs::read(&spilled).unwrap()), (b"abcde".to_vec(), b"abc".to_vec()));
+        assert!(!taken.contains(&kept) && !taken.contains(&spilled));
+        for p in &taken { assert_eq!(std::fs::read(p).unwrap(), b"x"); }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
