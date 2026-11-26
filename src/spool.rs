@@ -2,14 +2,11 @@ use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Error, ErrorKind};
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 const PIECE: u64 = 2 * 32768;
 
-static NEXT: AtomicU32 = AtomicU32::new(1);
-
 pub fn temp_path(dir: &Path, levels: &[usize]) -> PathBuf {
-    numbered(dir, levels, NEXT.fetch_add(1, Ordering::Relaxed))
+    numbered(dir, levels, crate::shm::temp_number(1) as u32)
 }
 
 fn numbered(dir: &Path, levels: &[usize], n: u32) -> PathBuf {
@@ -94,7 +91,7 @@ pub fn open_new(dir: &Path, levels: &[usize]) -> Result<(File, PathBuf), String>
             Ok(file) => return Ok((file, path)),
             // Taken by another worker or left behind: skip ahead rather than try each next number.
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                NEXT.fetch_add(std::process::id(), Ordering::Relaxed);
+                crate::shm::temp_number(std::process::id().into());
                 path = temp_path(dir, levels);
             }
             Err(e) => {
@@ -175,7 +172,7 @@ mod tests {
     fn files_that_are_there_are_left() {
         let dir = dir("left");
         std::fs::create_dir_all(&dir).unwrap();
-        let next = NEXT.load(Ordering::Relaxed);
+        let next = crate::shm::last_temp_number() as u32 + 1;
         for n in next..next + 100 { std::fs::write(dir.join(format!("{n:010}")), "x").unwrap(); }
         let mut s = Spool::new((&dir, &[]), 100, 100);
         s.write(b"abc", 1).unwrap();
