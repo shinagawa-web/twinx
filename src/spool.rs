@@ -26,6 +26,11 @@ pub fn make_dirs(dirs: &[PathBuf], owner: Option<u32>) -> Result<(), String> {
     for dir in dirs {
         match DirBuilder::new().mode(0o700).create(dir) {
             Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(failed("mkdir()", dir, &e)),
+            // A link whose directory is missing, as when an empty volume is mounted where the image's links lead.
+            Err(_) if !dir.exists() => {
+                let to = std::fs::read_link(dir).map(|to| dir.parent().unwrap_or(dir).join(to)).map_err(|e| failed("readlink()", dir, &e))?;
+                DirBuilder::new().mode(0o700).create(&to).map_err(|e| failed("mkdir()", &to, &e))?;
+            }
             _ => {}
         }
         let Some(uid) = owner else { continue };
@@ -128,6 +133,9 @@ mod tests {
         assert!(dirs.iter().all(|d| d.metadata().unwrap().permissions().mode() & 0o777 == 0o700));
         std::fs::write(dir.join("b"), "").unwrap();
         make_dirs(&[dir.join("a"), dir.join("b")], None).unwrap();
+        std::os::unix::fs::symlink("e", dir.join("link")).unwrap();
+        make_dirs(&[dir.join("link")], None).unwrap();
+        assert_eq!(dir.join("e").metadata().unwrap().permissions().mode() & 0o777, 0o700);
         let missing = dir.join("c/d");
         assert_eq!(make_dirs(&[missing.clone()], None), Err(format!("mkdir() \"{}\" failed (2: No such file or directory)", missing.display())));
         std::fs::remove_dir_all(&dir).unwrap();
