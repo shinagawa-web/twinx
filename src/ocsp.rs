@@ -1,8 +1,3 @@
-//! OCSP checks of clients' certificates (ssl_ocsp, ssl_ocsp_responder,
-//! ssl_ocsp_cache), made as nginx makes them once a client's certificate
-//! has verified: each certificate of the chain but the last is asked about
-//! of its responder, with the certificate that issued it.
-
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -10,14 +5,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 use x509_parser::prelude::*;
 
-/// What ssl_ocsp checks, and how.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ocsp {
-    /// ssl_ocsp leaf: only the client's own certificate is checked, not its issuers.
     pub leaf: bool,
-    /// ssl_ocsp_responder: the URL asked instead of the one each certificate names.
     pub responder: Option<String>,
-    /// ssl_ocsp_cache: the zone statuses are kept in, by its name.
     pub cache: Option<String>,
 }
 
@@ -28,16 +19,11 @@ pub enum Status {
     Unknown,
 }
 
-/// The statuses kept by ssl_ocsp_cache, by zone and certificate ID, with the
-/// time until which they hold.
 static CACHE: Mutex<BTreeMap<(String, Vec<u8>), (Status, i64)>> = Mutex::new(BTreeMap::new());
 
-/// How long connecting to a responder and reading its answer may take.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 impl Ocsp {
-    /// Checks a verified chain, the client's certificate first: an error as
-    /// $ssl_client_verify words it after "FAILED:".
     pub fn check(&self, chain: &[X509Certificate]) -> Result<(), &'static str> {
         let n = if self.leaf { chain.len().min(2) } else { chain.len() };
         for pair in chain[..n].windows(2) {
@@ -46,7 +32,6 @@ impl Ocsp {
         Ok(())
     }
 
-    /// The status of a certificate: kept in the cache, or asked of the responder.
     fn status(&self, cert: &X509Certificate, issuer: &X509Certificate) -> Option<Status> {
         let (id, now) = (cert_id(cert, issuer), chrono::Utc::now().timestamp());
         let key = self.cache.clone().map(|zone| (zone, id.clone()));
@@ -59,16 +44,10 @@ impl Ocsp {
     }
 }
 
-/// An OCSP request for one certificate, by its CertID.
 pub fn request(id: &[u8]) -> Vec<u8> {
     der(0x30, &der(0x30, &der(0x30, &der(0x30, id))))
 }
 
-/// What stapling a server's certificate (ssl_stapling) asks, as nginx finds
-/// it: the responder's URL (ssl_stapling_responder, or the one the certificate
-/// names), the request, the certificate's CertID and its issuer, found among
-/// the certificates sent with it, or else among the trusted ones
-/// (ssl_trusted_certificate). None without an issuer or a responder.
 pub fn stapled(chain: &[rustls::pki_types::CertificateDer], trusted: &[rustls::pki_types::CertificateDer], responder_url: Option<&str>) -> Option<(String, Vec<u8>, Vec<u8>, Vec<u8>)> {
     let cert = X509Certificate::from_der(chain.first()?).ok()?.1;
     let issued = |d: &&rustls::pki_types::CertificateDer| X509Certificate::from_der(d).is_ok_and(|(_, c)| c.subject().as_raw() == cert.issuer().as_raw() && cert.verify_signature(Some(c.public_key())).is_ok());
@@ -77,10 +56,6 @@ pub fn stapled(chain: &[rustls::pki_types::CertificateDer], trusted: &[rustls::p
     Some((responder_url.map(str::to_string).or_else(|| responder(&cert))?, request(&id), id, issuer_der.to_vec()))
 }
 
-/// The response a responder gives for stapling (ssl_stapling) and until when
-/// it holds, as nginx takes it: the certificate's status must be good. With
-/// ssl_stapling_verify (check) its signer is checked as ssl_ocsp checks it;
-/// without, only its signature is (OpenSSL's OCSP_NOVERIFY).
 pub fn staple(url: &str, (request, id, issuer): (&[u8], &[u8], &[u8]), check: bool, now: i64) -> Option<(Vec<u8>, Option<i64>)> {
     let body = fetch(url, request)?;
     let (status, next) = verify(&body, id, &X509Certificate::from_der(issuer).ok()?.1, now, check)?;
@@ -91,14 +66,12 @@ fn sha1(data: &[u8]) -> Vec<u8> {
     ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data).as_ref().to_vec()
 }
 
-/// A DER element of a tag and its contents.
 fn der(tag: u8, content: &[u8]) -> Vec<u8> {
     let len = content.len().to_be_bytes();
     let len: Vec<u8> = if content.len() < 128 { vec![content.len() as u8] } else { let l: Vec<u8> = len.into_iter().skip_while(|b| *b == 0).collect(); [vec![0x80 | l.len() as u8], l].concat() };
     [&[tag][..], &len, content].concat()
 }
 
-/// A DER element: its tag, its contents, the whole of it, and what follows it.
 fn tlv(d: &[u8]) -> Option<(u8, &[u8], &[u8], &[u8])> {
     let (&tag, rest) = d.split_first()?;
     let (&first, rest) = rest.split_first()?;
@@ -108,30 +81,23 @@ fn tlv(d: &[u8]) -> Option<(u8, &[u8], &[u8], &[u8])> {
     Some((tag, content, &d[..2 + n + len], &rest[n + len..]))
 }
 
-/// The elements of a sequence's contents: the tag, contents and whole of each.
 fn items(mut d: &[u8]) -> Option<Vec<(u8, &[u8], &[u8])>> {
     let mut out = Vec::new();
     while let Some((tag, content, whole, rest)) = tlv(d).filter(|_| !d.is_empty()) { out.push((tag, content, whole)); d = rest; }
     d.is_empty().then_some(out)
 }
 
-/// A certificate's CertID, as OpenSSL's OCSP_cert_to_id makes it: SHA-1 of the
-/// issuer's name and of its key, and the serial number.
 fn cert_id(cert: &X509Certificate, issuer: &X509Certificate) -> Vec<u8> {
     const SHA1: &[u8] = &[0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00];
     let key = sha1(&issuer.public_key().subject_public_key.data);
     der(0x30, &[SHA1, &der(0x04, &sha1(cert.issuer().as_raw())), &der(0x04, &key), &der(0x02, cert.raw_serial())].concat())
 }
 
-/// The OCSP responder a certificate names in its Authority Information Access.
 fn responder(cert: &X509Certificate) -> Option<String> {
     let ocsp = |d: &AccessDescription| match &d.access_location { GeneralName::URI(u) if d.access_method == oid_registry::OID_PKIX_ACCESS_DESCRIPTOR_OCSP => Some(u.to_string()), _ => None };
     cert.extensions().iter().find_map(|e| match e.parsed_extension() { ParsedExtension::AuthorityInfoAccess(a) => a.accessdescs.iter().find_map(ocsp), _ => None })
 }
 
-/// Asks the responder of an http URL, whose host is an address, as nginx
-/// does: with GET, the request in base64, escaped, after the URL's path; the
-/// body of a 200 answer of type application/ocsp-response.
 fn fetch(url: &str, request: &[u8]) -> Option<Vec<u8>> {
     let rest = url.strip_prefix("http://")?;
     let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
@@ -155,12 +121,6 @@ fn fetch(url: &str, request: &[u8]) -> Option<Vec<u8>> {
     (ok && typed).then(|| answer[at..].to_vec())
 }
 
-/// The status a responder's answer gives of a certificate, and the time
-/// until which it holds, as OpenSSL takes it with OCSP_basic_verify and
-/// OCSP_check_validity for nginx: a successful basic response, signed by the
-/// certificate's issuer or by a responder it issued a certificate for OCSP
-/// signing (unless check is false), valid now with five minutes' leeway;
-/// the status and its next update, if there is one.
 fn verify(body: &[u8], id: &[u8], issuer: &X509Certificate, now: i64, check: bool) -> Option<(Status, Option<i64>)> {
     const BASIC: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
     let response = items(tlv(body)?.1)?;
