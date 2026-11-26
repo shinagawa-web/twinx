@@ -1963,8 +1963,8 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         None => None,
     };
     let to_host = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
-    let main = level.proxy_cache_key.as_ref().map_or_else(|| format!("{}://{host}{uri}", if p.ssl { "https" } else { "http" }), |k| k.render(r, &to_host));
-    let key = cache.map_or_else(|| main.clone(), |z| z.resolve(&main, &r.headers));
+    let main = if cache.is_some() { level.proxy_cache_key.as_ref().map_or_else(|| format!("{}://{host}{uri}", if p.ssl { "https" } else { "http" }), |k| k.render(r, &to_host)) } else { String::new() };
+    let key = cache.map_or_else(String::new, |z| z.resolve(&main, &r.headers));
     let any_set = |t: &[Template]| t.iter().any(|t| !matches!(t.render(r, &to_host).as_str(), "" | "0"));
     let bypass = cache.is_some() && any_set(&level.proxy_cache_bypass);
     let ignored = |name: &str| level.proxy_ignore_headers.iter().any(|i| i == name);
@@ -2044,7 +2044,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     req.extend_from_slice(&body);
     let bind = level.proxy_bind.as_ref().map(|(a, t)| (a.render(r, &Sent::default()), *t)).filter(|(a, _)| !a.is_empty());
     let Some(bind) = bind.map(|(a, t)| crate::conf::local_addr(&a).map(|a| (a, t))).map_or(Some(None), |b| b.map(Some)) else { return special(500) };
-    let rate = |resp: &Response| crate::conf::size(&level.proxy_limit_rate.render(r, &Sent { upstream: resp.upstream.clone(), ..Sent::default() })).unwrap_or(0);
+    let rate = |resp: &Response| crate::conf::size(&level.proxy_limit_rate.fixed().map_or_else(|| Cow::Owned(level.proxy_limit_rate.render(r, &Sent { upstream: resp.upstream.clone(), ..Sent::default() })), Cow::Borrowed)).unwrap_or(0);
     let (mut tried, mut answer, mut addrs, mut times, mut bytes) = (vec![false; up.peers.len()], None, Vec::new(), Vec::new(), Vec::new());
     let (mut statuses, limit, first, mut failed) = (Vec::new(), level.proxy_next_upstream_tries, Instant::now(), "error");
     let (mut tries, next) = (if limit > 0 { up.tries().min(limit) } else { up.tries() }, |cond: &str| level.proxy_next_upstream.iter().any(|c| c == cond));
@@ -2177,7 +2177,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let target = args.map_or_else(|| uri.clone(), |a| format!("{uri}?{a}"));
         return Response { internal: Some(Box::new((target, (!named).then_some(uri)))), as_get: !named, ..resp };
     }
-    let kept = (resp.ctype.as_deref().map(str::to_string), resp.headers.clone());
+    let kept = cache.map(|_| (resp.ctype.as_deref().map(str::to_string), resp.headers.clone()));
     location_headers(r, level, &mut resp);
     resp.unconditional = cache.is_none() || scarce;
     let no_cache = any_set(&level.proxy_no_cache);
@@ -2186,7 +2186,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let now = crate::clock::seconds();
     let said = cache.filter(|_| cacheable).and_then(|_| crate::cache::said(&resp.upstream, &level.proxy_ignore_headers, now));
     let valid = said.and_then(|(until, updating)| until.or_else(|| crate::cache::validity(&level.proxy_cache_valid, resp.status).map(|t| now.saturating_add(t.as_secs() as i64))).map(|u| (u, updating)));
-    if let Some((zone, valid)) = cache.zip(valid).filter(|_| !precondition_fails(r, &resp)) {
+    if let Some(((zone, valid), kept)) = cache.zip(valid).zip(kept).filter(|_| !precondition_fails(r, &resp)) {
         if header(r, "range").is_some() || r.shared.updater { finish(&mut resp, (level, r)).await; }
         let length = resp.upstream.iter().find(|h| h.0.eq_ignore_ascii_case("content-length")).and_then(|h| h.1.parse().ok());
         if has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, true, length.is_some()); }
