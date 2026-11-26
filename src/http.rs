@@ -2707,8 +2707,8 @@ fn parse(r: &mut Request, head: &[u8], level: &Level, h2: bool) -> Result<(), u1
     if target.bytes().any(|c| c < 0x20 || c == 0x7f) { return Err(400); }
     let target = target.split('#').next().unwrap_or_default();
     if h2 && !target.starts_with('/') { return Err(400); }
-    let path = match target.split_once("://") {
-        Some((_, rest)) if !target.starts_with('/') => {
+    let path = match (!target.starts_with('/')).then(|| target.split_once("://")).flatten() {
+        Some((_, rest)) => {
             let (authority, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
             r.host = Some(valid_host(authority).ok_or(400u16)?);
             if path.starts_with('/') { path.to_string() } else { format!("/{path}") }
@@ -2717,9 +2717,11 @@ fn parse(r: &mut Request, head: &[u8], level: &Level, h2: bool) -> Result<(), u1
     };
     if !path.starts_with('/') { return Err(400); }
     let mut uri = Cow::Borrowed(path.split('?').next().unwrap_or_default());
-    if uri.contains('%') { uri = decode(&uri).filter(|u| !u.contains('\0')).ok_or(400u16)?.into(); }
-    if level.merge_slashes && uri.contains("//") { uri = merge_slashes(&uri).into(); }
-    if uri.contains("/.") { uri = dots(&uri).ok_or(400u16)?.into(); }
+    let marks = |u: &str| u.bytes().fold((false, false, false, 0), |(p, s, d, b), c| (p || c == b'%', s || b == b'/' && c == b'/', d || b == b'/' && c == b'.', c));
+    let (percent, mut slashes, mut dot, _) = marks(&uri);
+    if percent { uri = decode(&uri).filter(|u| !u.contains('\0')).ok_or(400u16)?.into(); (_, slashes, dot, _) = marks(&uri); }
+    if level.merge_slashes && slashes { uri = merge_slashes(&uri).into(); }
+    if dot { uri = dots(&uri).ok_or(400u16)?.into(); }
     r.uri = uri.into_owned();
     r.target = path;
     if method == "TRACE" { return Err(405); }
