@@ -25,11 +25,16 @@ fn failed(call: &str, path: &Path, e: &Error) -> String {
     format!("{call} \"{}\" failed ({}: {})", path.display(), e.raw_os_error().unwrap_or(0), text.split(" (os error").next().unwrap_or_default())
 }
 
-pub fn make_dirs(dirs: &[PathBuf]) -> Result<(), String> {
+pub fn make_dirs(dirs: &[PathBuf], owner: Option<u32>) -> Result<(), String> {
     for dir in dirs {
         match DirBuilder::new().mode(0o700).create(dir) {
             Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(failed("mkdir()", dir, &e)),
             _ => {}
+        }
+        let Some(uid) = owner else { continue };
+        if let Err(e) = std::os::unix::fs::chown(dir, Some(uid), None) {
+            let text = e.to_string();
+            return Err(format!("chown(\"{}\", {uid}) failed ({}: {})", dir.display(), e.raw_os_error().unwrap_or(0), text.split(" (os error").next().unwrap_or_default()));
         }
     }
     Ok(())
@@ -119,12 +124,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = dir("dirs");
         let dirs = [dir.clone(), dir.join("a")];
-        make_dirs(&dirs).unwrap();
+        make_dirs(&dirs, None).unwrap();
         assert!(dirs.iter().all(|d| d.metadata().unwrap().permissions().mode() & 0o777 == 0o700));
         std::fs::write(dir.join("b"), "").unwrap();
-        make_dirs(&[dir.join("a"), dir.join("b")]).unwrap();
+        make_dirs(&[dir.join("a"), dir.join("b")], None).unwrap();
         let missing = dir.join("c/d");
-        assert_eq!(make_dirs(&[missing.clone()]), Err(format!("mkdir() \"{}\" failed (2: No such file or directory)", missing.display())));
+        assert_eq!(make_dirs(&[missing.clone()], None), Err(format!("mkdir() \"{}\" failed (2: No such file or directory)", missing.display())));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

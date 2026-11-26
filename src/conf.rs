@@ -27,6 +27,7 @@ pub const LEVELS: &[&str] = &["debug", "info", "notice", "warn", "error", "crit"
 const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("daemon", MAIN, 1, 1, false),
     ("pid", MAIN, 1, 1, false),
+    ("user", MAIN, 1, 2, false),
     ("ssl_object_cache_inheritable", MAIN, 1, 1, false),
     ("worker_rlimit_nofile", MAIN, 1, 1, false),
     ("worker_processes", MAIN, 1, 1, false),
@@ -520,10 +521,20 @@ pub struct Config {
     pub rlimit_nofile: Option<u64>,
     pub shutdown_timeout: Option<Duration>,
     pub working_directory: Option<PathBuf>,
+    pub user: Option<User>,
+    pub warnings: Vec<String>,
+    pub emerg_logs: Vec<Arc<File>>,
     pub alert_logs: Vec<Arc<File>>,
     pub notice_logs: Vec<Arc<File>>,
     pub temp_paths: Vec<PathBuf>,
     pub servers: Vec<Server>,
+}
+
+#[derive(Debug)]
+pub struct User {
+    pub name: std::ffi::CString,
+    pub uid: libc::uid_t,
+    pub gid: libc::gid_t,
 }
 
 struct Builder<'a> {
@@ -545,7 +556,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), zones: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new(), location_no_uri: false, listens: HashMap::new(), ssl_zones: HashMap::new() };
-    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, alert_logs: Vec::new(), notice_logs: Vec::new(), temp_paths: Vec::new(), servers: Vec::new() };
+    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, user: None, warnings: Vec::new(), emerg_logs: Vec::new(), alert_logs: Vec::new(), notice_logs: Vec::new(), temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
     crate::tls::new_configuration(inheritable);
@@ -555,8 +566,14 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
         let log = b.error_log(d)?;
         b.errors.push(log);
     }
+    // SAFETY: geteuid() always succeeds.
+    let root = unsafe { libc::geteuid() } == 0;
     for (i, d) in main.iter().enumerate() {
         b.check(d, MAIN)?;
+        if d.name == "user" && !root {
+            config.warnings.push(format!("the \"user\" directive makes sense only if the master process runs with super-user privileges, ignored in {}", d.at));
+            continue;
+        }
         once(&main[..i], d)?;
         match d.name.as_str() {
             "pid" => config.pid = b.path(&d.args[0]),
@@ -565,9 +582,11 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
             "worker_processes" => if d.args[0] != "auto" && d.args[0].parse::<u32>().is_err() { return Err(format!("invalid value \"{}\" in \"worker_processes\" directive in {}", d.args[0], d.at)) },
             "worker_shutdown_timeout" => config.shutdown_timeout = Some(millis(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?),
             "working_directory" => config.working_directory = Some(d.args[0].clone().into()),
+            "user" => config.user = Some(user(d)?),
             "error_log" => {
                 let file = b.open(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?;
                 let level = d.args.get(1).map(|l| LEVELS.iter().position(|v| v == l));
+                config.emerg_logs.push(file.clone());
                 if level.is_none_or(|l| l <= Some(6)) { config.alert_logs.push(file.clone()) }
                 if level.is_none_or(|l| l <= Some(2)) { config.notice_logs.push(file) }
             }
@@ -1154,6 +1173,27 @@ impl Builder<'_> {
         let upstream = upstream.map_err(|_| format!("host not found in upstream \"{host}\""))?;
         Ok(Proxy { host: host.to_string(), ssl, upstream, uri, url: None, groups: HashMap::new(), implicit: Implicit::default() })
     }
+}
+
+fn user(d: &Directive) -> Result<User, String> {
+    let failed = |call: &str, name: &str| {
+        let e = std::io::Error::last_os_error();
+        let text = e.to_string();
+        let reason = match e.raw_os_error() { Some(0) | None => String::new(), Some(n) => format!(" ({n}: {})", text.split(" (os error").next().unwrap_or_default()) };
+        format!("{call}(\"{name}\") failed{reason} in {}", d.at)
+    };
+    let group = d.args.get(1).unwrap_or(&d.args[0]);
+    let (Ok(name), Ok(group_name)) = (std::ffi::CString::new(d.args[0].as_str()), std::ffi::CString::new(group.as_str())) else { return Err(failed("getpwnam", &d.args[0])) };
+    // SAFETY: errno is this thread's own; getpwnam() reads a string ended by a zero byte and returns static data or null.
+    let pwd = unsafe { *libc::__errno_location() = 0; libc::getpwnam(name.as_ptr()) };
+    if pwd.is_null() { return Err(failed("getpwnam", &d.args[0])) }
+    // SAFETY: pwd is not null, read before the next call that may change what it points to.
+    let uid = unsafe { (*pwd).pw_uid };
+    // SAFETY: as for getpwnam() above.
+    let grp = unsafe { *libc::__errno_location() = 0; libc::getgrnam(group_name.as_ptr()) };
+    if grp.is_null() { return Err(failed("getgrnam", group)) }
+    // SAFETY: grp is not null.
+    Ok(User { name, uid, gid: unsafe { (*grp).gr_gid } })
 }
 
 fn once(before: &[Directive], d: &Directive) -> Result<(), String> {
@@ -1878,6 +1918,16 @@ mod tests {
         assert_eq!(build_text("worker_rlimit_nofile 32; http { }").unwrap().rlimit_nofile, Some(32));
         assert_eq!(build_text("http { }").unwrap().rlimit_nofile, None);
         assert_eq!(build_text("worker_rlimit_nofile x;").unwrap_err(), "invalid number in t.conf:1");
+    }
+
+    #[test]
+    fn user() {
+        // SAFETY: geteuid() always succeeds.
+        if unsafe { libc::geteuid() } == 0 { return }
+        let c = build_text("user nobody;\nuser nosuchuser nosuchgroup; http { }").unwrap();
+        let warning = "the \"user\" directive makes sense only if the master process runs with super-user privileges, ignored in t.conf:";
+        assert_eq!(c.warnings, [format!("{warning}1"), format!("{warning}2")]);
+        assert!(c.user.is_none());
     }
 
     #[test]
