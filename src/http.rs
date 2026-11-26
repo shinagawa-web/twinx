@@ -569,12 +569,25 @@ const PIECE: u64 = 32768;
 struct FileBody { file: std::fs::File, path: PathBuf, start: u64, len: u64, coder: Option<Box<Coder>> }
 
 impl FileBody {
-    fn read(&self, at: u64, buf: &mut [u8], (r, level): (&Request, &Level)) -> bool {
-        let got = self.file.read_at(buf, self.start + at);
+    fn read(&self, at: u64, buf: &mut [u8], asked: (&Request, &Level)) -> bool {
+        self.got(self.file.read_at(buf, self.start + at), buf.len(), asked)
+    }
+
+    fn read_spare(&self, at: u64, buf: &mut Vec<u8>, len: usize, asked: (&Request, &Level)) -> bool {
+        let spare = buf.spare_capacity_mut()[..len].as_mut_ptr().cast();
+        // SAFETY: pread writes at most len bytes into the spare capacity.
+        let got = usize::try_from(unsafe { libc::pread(std::os::fd::AsRawFd::as_raw_fd(&self.file), spare, len, (self.start + at) as libc::off_t) });
+        let got = got.map_err(|_| std::io::Error::last_os_error());
+        // SAFETY: pread wrote that many bytes past the length.
+        if let Ok(n) = got { unsafe { buf.set_len(buf.len() + n) } }
+        self.got(got, len, asked)
+    }
+
+    fn got(&self, got: std::io::Result<usize>, len: usize, (r, level): (&Request, &Level)) -> bool {
         let path = self.path.display();
         match got {
-            Ok(n) if n == buf.len() => return true,
-            Ok(n) => log_at(level, r, "alert", &format!("pread() read only {n} of {} from \"{path}\" while sending response to client", buf.len()), ""),
+            Ok(n) if n == len => return true,
+            Ok(n) => log_at(level, r, "alert", &format!("pread() read only {n} of {len} from \"{path}\" while sending response to client"), ""),
             Err(e) => log_at(level, r, "crit", &format!("pread() \"{path}\" failed {} while sending response to client", os_error(&e)), ""),
         }
         false
@@ -583,9 +596,9 @@ impl FileBody {
 
 fn load(r: &Request, level: &Level, resp: &mut Response) {
     let Some(file) = resp.file.take() else { return };
-    let mut body = vec![0; file.len as usize];
+    let mut body = Vec::with_capacity(file.len as usize);
     // One read gives less than 2 GB.
-    if body.chunks_mut(1 << 30).enumerate().all(|(i, part)| file.read((i as u64) << 30, part, (r, level))) { resp.body = body; return }
+    if (0..file.len).step_by(1 << 30).all(|at| file.read_spare(at, &mut body, (file.len - at).min(1 << 30) as usize, (r, level))) { resp.body = body; return }
     resp.cut = Some(Box::new(Cut { length: None, malformed: true, failed: None }));
 }
 
@@ -1887,7 +1900,9 @@ fn file_at(level: &Level, r: &Request, path: PathBuf) -> Response {
     let ctype = TYPES.iter().find(|t| t.0 == ext).map_or_else(|| level.default_type.clone().into(), |t| t.1.into());
     let mut headers = vec![("Last-Modified".to_string(), modified)];
     headers.extend(gz.as_ref().map(|_| ("Content-Encoding".to_string(), "gzip".to_string())));
-    headers.push(("ETag".to_string(), format!("\"{mtime:x}-{:x}\"", meta.len())));
+    let mut etag = String::with_capacity(36);
+    let _ = std::fmt::Write::write_fmt(&mut etag, format_args!("\"{mtime:x}-{:x}\"", meta.len()));
+    headers.push(("ETag".to_string(), etag));
     headers.push(("Accept-Ranges".to_string(), "bytes".to_string()));
     let file = Some(Box::new(FileBody { file, path: gz.unwrap_or(path), start: 0, len: meta.len(), coder: None }));
     Response { status: 200, ctype: Some(ctype), headers, file, vary, ranges: true, ..Response::default() }
