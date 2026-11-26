@@ -1,6 +1,3 @@
-//! nginx's configuration language: tokens, the directive tree, and the errors
-//! nginx reports for malformed files.
-
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,12 +13,9 @@ pub struct Directive {
     pub name: String,
     pub args: Vec<String>,
     pub block: Option<Vec<Directive>>,
-    /// Where the directive is, as nginx names it in messages: "<file>:<line>".
     pub at: String,
 }
 
-/// Splits configuration text into tokens with their line numbers, unescaping
-/// words the way ngx_conf_read_token() does.
 pub fn tokenize(text: &str) -> Result<Vec<(Tok, usize)>, (String, usize)> {
     let b = text.as_bytes();
     let (mut out, mut i, mut line) = (Vec::new(), 0, 1);
@@ -79,7 +73,6 @@ fn unescape(raw: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Builds the directive tree of one file, or the message nginx gives for it.
 pub fn parse(text: &str, file: &Path) -> Result<Vec<Directive>, String> {
     let at = |line: usize| format!("{}:{}", file.display(), line);
     let toks = tokenize(text).map_err(|(msg, line)| format!("{msg} in {}", at(line)))?;
