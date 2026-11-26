@@ -509,6 +509,7 @@ pub struct Server {
     pub tls: Option<crate::tls::ServerTls>,
     pub defaults: Vec<SocketAddr>,
     pub backlogs: Vec<(SocketAddr, i32)>,
+    pub ipv6only_off: Vec<SocketAddr>,
     pub http2: Vec<SocketAddr>,
     pub named: bool,
 }
@@ -704,7 +705,7 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), children: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), http2: Vec::new(), named: false };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), children: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), ipv6only_off: Vec::new(), http2: Vec::new(), named: false };
         self.level(block, SRV, &mut s.level)?;
         let mut listens = Vec::new();
         for d in block {
@@ -731,6 +732,16 @@ impl Builder<'_> {
                         let n = a.parse::<i32>().ok().filter(|n| *n != 0).ok_or_else(|| format!("invalid backlog \"{a}\" in {}", d.at))?;
                         s.backlogs.extend(addrs.iter().map(|addr| (*addr, n)));
                     }
+                    let mut ipv6only = true;
+                    for a in d.args[1..].iter().filter_map(|a| a.strip_prefix("ipv6only=")) {
+                        ipv6only = match a {
+                            "on" => true,
+                            "off" => false,
+                            _ if a.starts_with('o') => return Err(format!("invalid ipv6only flags \"{a}\" in {}", d.at)),
+                            _ => return Err(format!("invalid parameter \"ipv6only={a}\" in {}", d.at)),
+                        };
+                    }
+                    if !ipv6only { s.ipv6only_off.extend(&addrs); }
                     s.listen.extend(addrs);
                 }
                 "server_name" => {
@@ -1808,6 +1819,15 @@ mod tests {
         for bad in ["x", "0"] {
             let e = build_text(&format!("events {{}} http {{ server {{ listen 127.0.0.1:8080 backlog={bad}; }} }}")).unwrap_err();
             assert!(e.starts_with(&format!("invalid backlog \"{bad}\" in ")), "{e}");
+        }
+    }
+
+    #[test]
+    fn listen_ipv6only() {
+        let c = build_text("events {} http { server { listen [::]:8080 ipv6only=off; listen [::]:8081 ipv6only=on; listen [::]:8082; } }").unwrap();
+        assert_eq!(c.servers[0].ipv6only_off, vec!["[::]:8080".parse::<SocketAddr>().unwrap()]);
+        for (bad, e) in [("ox", "invalid ipv6only flags \"ox\" in "), ("x", "invalid parameter \"ipv6only=x\" in ")] {
+            assert!(build_text(&format!("events {{}} http {{ server {{ listen [::]:8080 ipv6only={bad}; }} }}")).unwrap_err().starts_with(e));
         }
     }
 
