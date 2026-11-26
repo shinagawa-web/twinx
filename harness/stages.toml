@@ -146,6 +146,7 @@ files = [
   "twinx_proxy_ssl_plain_upstream.t",
   "twinx_alias_rewrite.t",
   "twinx_listen_ipv6only.t",
+  "twinx_command_line.t",
   "twinx_ssl_client_sigalg.t",
   "twinx_worker_processes.t",
   "twinx_worker_restart.t",
