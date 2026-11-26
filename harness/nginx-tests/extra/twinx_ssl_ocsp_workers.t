@@ -168,18 +168,44 @@ is(asked(8081), 1, 'after reload, the responder not asked again');
 
 sub connections {
 	my ($port) = @_;
-	my ($n, %pids) = (0);
+	my ($n, $failed, $first, %pids) = (0, 0);
 
-	for (1 .. 100) {
-		my $r = get($port);
-		return ($n, scalar keys %pids)
-			unless defined $r && $r =~ /^X-Answered: SUCCESS (\d+)\r$/m;
-		$n++;
-		$pids{$1}++;
-		last if keys %pids == 2 && $n >= 10;
+	my $verified = sub {
+		for (1 .. 5) {
+			my $r = get($port);
+			return $failed = 1
+				unless defined $r && $r =~ /^X-Answered: SUCCESS (\d+)\r$/m;
+			$n++;
+			$pids{$1}++;
+			$first //= $1;
+		}
+	};
+
+	$verified->();
+
+	if (!$failed) {
+		stop($first);
+		$verified->();
+		kill 'CONT', $first;
 	}
 
 	return ($n, scalar keys %pids);
+}
+
+# A stopped worker is not woken for new connections, so they reach another one.
+sub stop {
+	my ($pid) = @_;
+	kill 'STOP', $pid;
+
+	for (1 .. 100) {
+		last unless grep {
+			my $f;
+			!(open($f, '<', $_) && <$f> =~ /^\d+ \(.*\) T /);
+		} glob "/proc/$pid/task/*/stat";
+		select undef, undef, undef, 0.01;
+	}
+
+	return $pid;
 }
 
 sub asked {

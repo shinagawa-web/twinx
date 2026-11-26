@@ -54,10 +54,14 @@ $t->run();
 
 my %pids;
 
-for (1 .. 100) {
-	my $r = http_get('/');
-	$pids{$1}++ if defined $r && $r =~ /pid=(\d+)$/;
-	last if keys %pids == 2;
+my $first = answered();
+$pids{$first}++ if defined $first;
+
+if (defined $first) {
+	stop($first);
+	my $other = answered();
+	kill 'CONT', $first;
+	$pids{$other}++ if defined $other;
 }
 
 my $master = $t->read_file('nginx.pid');
@@ -70,5 +74,28 @@ $t->stop();
 
 is(join(',', grep { kill 0, $_ } sort keys %pids), '',
 	'stop, every worker exited');
+
+###############################################################################
+
+sub answered {
+	my $r = http_get('/');
+	return defined $r && $r =~ /pid=(\d+)$/ ? $1 : undef;
+}
+
+# A stopped worker is not woken for new connections, so they reach another one.
+sub stop {
+	my ($pid) = @_;
+	kill 'STOP', $pid;
+
+	for (1 .. 100) {
+		last unless grep {
+			my $f;
+			!(open($f, '<', $_) && <$f> =~ /^\d+ \(.*\) T /);
+		} glob "/proc/$pid/task/*/stat";
+		select undef, undef, undef, 0.01;
+	}
+
+	return $pid;
+}
 
 ###############################################################################

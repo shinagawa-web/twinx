@@ -99,15 +99,18 @@ like($log, qr/\[notice\] \d+#\d+: worker process $kept exited with code 0/,
 
 sub answers {
 	my ($done) = @_;
-	my %pids;
+	my (%pids, @stopped);
 
 	for (1 .. 100) {
 		my $r = http_get('/');
-		$pids{$1}++ if defined $r && $r =~ /pid=(\d+)$/;
+		my ($pid) = defined $r ? $r =~ /pid=(\d+)$/ : ();
+		$pids{$pid}++ if defined $pid;
 		last if $done->(\%pids);
-		select undef, undef, undef, 0.05;
+		push @stopped, stop($pid) if defined $pid;
+		select undef, undef, undef, 0.05 unless defined $pid;
 	}
 
+	kill 'CONT', @stopped;
 	return %pids;
 }
 
@@ -120,6 +123,22 @@ sub gone {
 	}
 
 	return 0;
+}
+
+# A stopped worker is not woken for new connections, so they reach another one.
+sub stop {
+	my ($pid) = @_;
+	kill 'STOP', $pid;
+
+	for (1 .. 100) {
+		last unless grep {
+			my $f;
+			!(open($f, '<', $_) && <$f> =~ /^\d+ \(.*\) T /);
+		} glob "/proc/$pid/task/*/stat";
+		select undef, undef, undef, 0.01;
+	}
+
+	return $pid;
 }
 
 ###############################################################################
