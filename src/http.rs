@@ -1055,6 +1055,7 @@ fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> S
         let target = format!("{uri}{args}");
         to.to_mut().redirect(uri, target);
         to.shared.rewritten.store(true, std::sync::atomic::Ordering::Relaxed);
+        to.set_internal();
         (s.changed, s.moved) = (rw.flag != Flag::Break, true);
         if rw.flag != Flag::Next { return Stop::Yes; }
     }
@@ -1064,6 +1065,7 @@ fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> S
 async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Box<Response>, &'a Level, Option<Request>) {
     match parsed {
         Err(status) => return (Box::new(special(status)), level, None),
+        Ok(()) if level.internal && !r.internal() => return (Box::new(special(404)), level, None),
         Ok(()) if auto => return (Box::new(redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r)))), level, None),
         Ok(()) => {}
     }
@@ -1187,6 +1189,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             }
             let status = ep.status.unwrap_or(if (494..=497).contains(&resp.status) { 400 } else { resp.status });
             to.shared.err_status.store(status, std::sync::atomic::Ordering::Relaxed);
+            to.set_internal();
             let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
             redirected = to;
             base = &*redirected;
@@ -1401,6 +1404,7 @@ async fn post_action(server: &Server, r: &Request, level: &Level, client: Option
     let named = server.locations.iter().find(|l| matches!(l.kind, Match::Named) && &l.path == url);
     let mut to = r.clone();
     if named.is_none() { to.redirect(url.split('?').next().unwrap_or_default().to_string(), url.clone()); }
+    to.set_internal();
     let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
     answer(server, &to, Ok(()), found, client).await;
 }
@@ -1931,6 +1935,7 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
     while let Some(internal) = resp.internal.take() {
         let (target, uri) = *internal;
         redirects += 1;
+        to.set_internal();
         let proxied = resp.proxied;
         if proxied { to.to_mut().upstream = std::mem::take(&mut resp.upstream); }
         let kept = (proxied || !resp.headers.is_empty() || resp.ctype.is_some()).then(|| (std::mem::take(&mut resp.headers), resp.ctype.take()));
@@ -3869,6 +3874,23 @@ pub(crate) mod tests {
         assert!(b.starts_with("HTTP/1.1 302 ") && b.contains("Location: x\r\n") && b.ends_with("\r\n\r\nt"), "{b}");
         let c = get("/c");
         assert!(c.contains("Location: y\r\n") && !c.contains("Location: x"), "{c}");
+    }
+
+    #[test]
+    fn internal_locations_answer_only_redirected_requests() {
+        let text = "http { server { rewrite ^/s/ /i/s; error_page 404 /p/404; location /i/ { internal; return 200 i; } \
+                    location /p/ { internal; return 200 p; location /p/n/ { return 200 n; } } \
+                    location /e/ { error_page 403 = /i/e; return 403; } location /r/ { rewrite ^ /i/r last; } location /a/ { set $args x; return 200 a; } } }";
+        let config = crate::conf::build(&crate::config::parse(&format!("events {{ }} {}", text), std::path::Path::new("t")).unwrap(), &std::env::temp_dir()).unwrap();
+        let s = &config.servers[0];
+        let get = |target: &str| exchanged(s, target);
+        let i = get("/i/a");
+        assert!(i.starts_with("HTTP/1.1 404 ") && i.ends_with("\r\n\r\np"), "{i}");
+        assert!(get("/p/n/a").starts_with("HTTP/1.1 404 "));
+        for (target, body) in [("/e/a", "i"), ("/r/a", "i"), ("/s/a", "i"), ("/a/a", "a")] {
+            let got = get(target);
+            assert!(got.starts_with("HTTP/1.1 200 ") && got.ends_with(&format!("\r\n\r\n{body}")), "{target}: {got}");
+        }
     }
 
     #[test]
