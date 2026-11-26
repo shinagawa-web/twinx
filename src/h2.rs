@@ -722,11 +722,11 @@ pub fn give_back(slot: &Slot, home: Home) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Session { id: u32, window: i64, initial: i64, recv: i64 }
+pub struct Session { id: u32, window: i64, initial: i64, recv: i64, skipped: u64 }
 
 impl Default for Session {
     fn default() -> Session {
-        Session { id: 1, window: 65535, initial: 65535, recv: MAX_WINDOW }
+        Session { id: 1, window: 65535, initial: 65535, recv: MAX_WINDOW, skipped: 0 }
     }
 }
 
@@ -738,7 +738,7 @@ pub type Slot = Arc<std::sync::Mutex<Ending>>;
 pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot, framing: Framing) {
     let kept = conn.h2.take();
     let (up, mut out) = (&mut conn.stream, if kept.is_none() { PREFACE.to_vec() } else { Vec::new() });
-    let Session { id, mut window, mut initial, mut recv } = kept.as_deref().copied().unwrap_or_default();
+    let Session { id, mut window, mut initial, mut recv, mut skipped } = kept.as_deref().copied().unwrap_or_default();
     let (mut buf, mut got) = (Vec::new(), Vec::new());
     let end = loop {
         if let Some(n) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break n }
@@ -766,6 +766,7 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
     let mut ended = body == Body::Length(0);
     header_frames(&mut out, id, &block, 16384, ended);
     let (mut stream_window, mut stream_recv, mut pending, mut finished) = (initial, MAX_WINDOW, Vec::new(), ended);
+    let mut data_sent = 0;
     let (mut table, mut answer) = (Table { entries: VecDeque::new(), size: 0, used: 0, limit: 0 }, None::<(u8, Vec<u8>)>);
     let (mut headed, mut size, mut deaf) = (false, 0, false);
     let (mut no_body, mut bodiless, mut keep, mut rest) = (head_method, false, true, None);
@@ -782,7 +783,7 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
             if ended || n == 0 && !last { break }
             ended = last;
             frame(&mut out, DATA, if ended { END_STREAM } else { 0 }, id, &pending[at..at + n]);
-            (at, window, stream_window) = (at + n, window - n as i64, stream_window - n as i64);
+            (at, window, stream_window, data_sent) = (at + n, window - n as i64, stream_window - n as i64, data_sent + 9 + n as u64);
         }
         pending.drain(..at);
         if ended { slot.lock().unwrap().sent = true; }
@@ -816,7 +817,7 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
             let (len, kind, flags, sid) = (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize, got[3], got[4], u32::from_be_bytes([got[5], got[6], got[7], got[8]]) & 0x7fff_ffff);
             let block = sid == id && matches!(kind, HEADERS | CONTINUATION) && !headed;
             let misplaced = if sid == 0 { matches!(kind, DATA | HEADERS | CONTINUATION | RST_STREAM) } else { matches!(kind, SETTINGS | PING | GOAWAY) };
-            failed = wrong_length(kind, flags, len) || block && size + 9 + len > head_size || sid == id && (kind == DATA && !headed || done && !matches!(kind, RST_STREAM | WINDOW_UPDATE)) || sid != id && sid != 0 || misplaced || kind == PUSH_PROMISE || kind == DATA && len as i64 > recv.min(stream_recv) || answer.is_some() != (kind == CONTINUATION);
+            failed = wrong_length(kind, flags, len) || block && size + 9 + len > head_size || sid == id && (kind == DATA && !headed || done && !matches!(kind, RST_STREAM | WINDOW_UPDATE)) || sid != id && sid != 0 && !(sid < id && matches!(kind, RST_STREAM | WINDOW_UPDATE)) || misplaced || kind == PUSH_PROMISE || kind == DATA && len as i64 > recv.min(stream_recv) || answer.is_some() != (kind == CONTINUATION);
             if failed || got.len() < 9 + len { break }
             if block { size += 9 + len; }
             let p: Vec<u8> = got.drain(..9 + len).skip(9).collect();
@@ -832,7 +833,7 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
                 }
                 PING if flags & ACK == 0 => frame(&mut out, PING, ACK, 0, &p),
                 PING => failed = true,
-                WINDOW_UPDATE => {
+                WINDOW_UPDATE if sid == 0 || sid == id => {
                     let of = if sid == 0 { &mut window } else { &mut stream_window };
                     *of += i64::from(word(0) & 0x7fff_ffff);
                     failed = *of > MAX_WINDOW;
@@ -889,9 +890,13 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
         if failed || done { slot.lock().unwrap().end = if failed { End::Failed } else { End::Whole }; }
         if pipe.write_all(&to_pipe).await.is_err() || failed { return }
         if done {
+            // An upstream that skipped what was sent on streams it reset can count that against a flood limit, and the reset can come after the answer.
+            skipped += data_sent;
+            ended |= reset;
+            keep &= skipped < 4 << 20;
             let mut sent = async || out.is_empty() || at_once(async { up.write_all(&out).await.is_ok() && up.flush().await.is_ok() }).await == Some(true);
             if !keep || deaf || !ended || !got.is_empty() || bodiless && !out.is_empty() || !sent().await { return }
-            conn.h2 = Some(Box::new(Session { id: id + 2, window, initial, recv }));
+            conn.h2 = Some(Box::new(Session { id: id + 2, window, initial, recv, skipped }));
             let mut ending = slot.lock().unwrap();
             match ending.home.take() {
                 Some((up, addr, tag, _)) => up.put(conn, addr, tag),
@@ -1445,14 +1450,23 @@ mod tests {
         let settings = framed(SETTINGS, 0, 0, &[&[0, 4][..], &word(3), &[0, 1], &word(0)].concat());
         let (sent, end, kept) = exchange(None, post, [settings, framed(WINDOW_UPDATE, 0, 0, &word(9)), head(1, 0), framed(DATA, END_STREAM, 1, b"ok")].concat());
         assert!(sent.starts_with(PREFACE) && sent.ends_with(&framed(SETTINGS, ACK, 0, &[])) && end == End::Whole);
-        let session = Session { id: 3, window: 65535 - 5 + 9, initial: 3, recv: MAX_WINDOW - 2 };
+        let session = Session { id: 3, window: 65535 - 5 + 9, initial: 3, recv: MAX_WINDOW - 2, skipped: 14 };
         assert_eq!(kept, Some(session));
         let (sent, end, kept) = exchange(kept, post, [framed(WINDOW_UPDATE, 0, 3, &word(2)), head(3, END_STREAM)].concat());
         let data = [framed(DATA, 0, 3, b"abc"), framed(DATA, END_STREAM, 3, b"de")].concat();
         assert!(sent[3..9] == [HEADERS, END_HEADERS, 0, 0, 0, 3] && sent.ends_with(&data[..12]) && end == End::Whole && kept.is_none());
+        let answered = [head(3, 0), framed(DATA, END_STREAM, 3, b"ok")].concat();
+        let reset = [answered.clone(), framed(RST_STREAM, 0, 3, &word(0))].concat();
+        let (sent, end, kept) = exchange(Some(session), post, reset.clone());
+        assert!(sent.ends_with(&data[..12]) && end == End::Whole);
+        assert_eq!(kept, Some(Session { id: 5, window: session.window - 3, recv: MAX_WINDOW - 4, skipped: 26, ..session }));
+        assert_eq!(exchange(Some(session), post, answered).2, None);
+        assert_eq!(exchange(Some(Session { skipped: (4 << 20) - 12, ..session }), post, reset).2, None);
         let (sent, _, kept) = exchange(Some(session), get, [head(3, 0), framed(DATA, END_STREAM, 3, b"ok")].concat());
         assert!(sent[3..9] == [HEADERS, END_HEADERS | END_STREAM, 0, 0, 0, 3]);
         assert_eq!(kept, Some(Session { id: 5, recv: MAX_WINDOW - 4, ..session }));
+        let late = [framed(RST_STREAM, 0, 3, &word(0)), framed(WINDOW_UPDATE, 0, 3, &word(1)), head(5, 0), framed(DATA, END_STREAM, 5, b"ok")].concat();
+        assert_eq!(exchange(Some(Session { id: 5, ..session }), get, late).2, Some(Session { id: 7, recv: MAX_WINDOW - 4, ..session }));
         let little = Session { recv: MAX_WINDOW / 4 + 1, ..session };
         let answer = |data: &[u8]| [head(3, 0), framed(DATA, 0, 3, data), framed(DATA, END_STREAM, 3, b"")].concat();
         assert_eq!(exchange(Some(little), get, answer(b"a")).2, Some(Session { id: 5, recv: MAX_WINDOW / 4, ..session }));
@@ -1461,7 +1475,7 @@ mod tests {
         assert!(sent.ends_with(&grown) && kept == Some(Session { id: 5, recv: MAX_WINDOW, ..session }));
         let (_, end, kept) = exchange(Some(Session { recv: 1, ..session }), get, answer(b"ab"));
         assert_eq!((end, kept), (End::Failed, None));
-        for frame in [framed(WINDOW_UPDATE, 0, 1, &word(1)), framed(RST_STREAM, 0, 1, &word(0)), framed(DATA, 0, 5, b"a"), framed(DATA, 0, 0, b"a"), framed(PING, ACK, 0, &[0; 8])] {
+        for frame in [framed(DATA, 0, 5, b"a"), framed(DATA, 0, 0, b"a"), framed(PING, ACK, 0, &[0; 8])] {
             let (_, end, kept) = exchange(Some(session), get, [frame, head(3, END_STREAM)].concat());
             assert_eq!((end, kept), (End::Failed, None));
         }
