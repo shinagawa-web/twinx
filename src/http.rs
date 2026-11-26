@@ -1717,9 +1717,9 @@ fn browser(ua: &str) -> (bool, bool) {
 
 async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u16>, found: Found<'a>, mut client: Option<&mut Stream>) -> (Response, &'a Level, Cow<'r, Request>) {
     let mut to = Cow::Borrowed(r);
-    let named = server.locations.iter().any(|l| matches!(l.kind, Match::Named) && std::ptr::eq(&l.level, found.1));
+    let rewrite = !server.level.script.is_empty() && !(server.named && server.locations.iter().any(|l| matches!(l.kind, Match::Named) && std::ptr::eq(&l.level, found.1)));
     let (mut resp, mut level) = match parsed {
-        Ok(()) if !named => match Box::pin(server_rewrite(server, &mut to, found, client.as_deref_mut())).await {
+        Ok(()) if rewrite => match Box::pin(server_rewrite(server, &mut to, found, client.as_deref_mut())).await {
             Ok(found) => Box::pin(respond(&to, parsed, found, client.as_deref_mut())).await,
             Err(answered) => answered,
         },
