@@ -2022,11 +2022,13 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &sent))).collect();
     let is_set = |name: &str| set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
     let method = level.proxy_method.as_ref().map_or_else(|| if cache.is_some() && level.proxy_cache_convert_head && r.method == "HEAD" { "GET".to_string() } else { r.method.clone() }, |m| m.render(r, &sent));
-    let mut req = format!("{method} {uri} HTTP/1.{}\r\n", level.proxy_http_11 as u8);
-    set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
-    if !is_set("host") { req += &format!("Host: {host}\r\n"); }
+    let room = method.len() + uri.len() + host.len() + body.len() + 128 + set.iter().map(|(n, v)| n.len() + v.len() + 4).sum::<usize>() + r.headers.iter().map(|(n, v)| n.len() + v.len() + 4).sum::<usize>();
+    let mut req = String::with_capacity(room);
+    req.extend([method.as_str(), " ", uri.as_str(), if level.proxy_http_11 { " HTTP/1.1\r\n" } else { " HTTP/1.0\r\n" }]);
+    set.iter().filter(|h| !h.1.is_empty()).for_each(|(n, v)| req.extend([n.as_str(), ": ", v.as_str(), "\r\n"]));
+    if !is_set("host") { req.extend(["Host: ", host.as_str(), "\r\n"]); }
     let revalidate = stale.is_some() && level.proxy_cache_revalidate && !bypass && !scarce && !far;
-    stale.iter().filter(|_| revalidate).flat_map(|e| e.conditions()).filter(|(n, _)| !is_set(n)).for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
+    stale.iter().filter(|_| revalidate).flat_map(|e| e.conditions()).filter(|(n, _)| !is_set(n)).for_each(|(n, v)| req.extend([n, ": ", v.as_str(), "\r\n"]));
     let mut unread = r.shared.unread.lock().unwrap();
     let chunked = unread.as_ref().is_some_and(|u| u.chunked.is_some());
     let length = match &set_body {
@@ -2042,10 +2044,12 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let body = if pass_body && chunked && !body.is_empty() { chunk(&body) } else { body };
     const DROPPED: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "expect", "upgrade"];
     const WHOLE: &[&str] = &["if-modified-since", "if-unmodified-since", "if-none-match", "if-match", "range", "if-range"];
-    let dropped = |n: &str| DROPPED.contains(&n) || cache.is_some() && !scarce && !far && WHOLE.contains(&n);
-    let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !dropped(&n.to_ascii_lowercase()) && !is_set(n));
-    passed.for_each(|(n, v)| req += &format!("{n}: {v}\r\n"));
-    let mut req = crate::vars::bytes(&(req + "\r\n"));
+    let among = |names: &[&str], n: &str| names.iter().any(|d| d.eq_ignore_ascii_case(n));
+    let dropped = |n: &str| among(DROPPED, n) || cache.is_some() && !scarce && !far && among(WHOLE, n);
+    let passed = r.headers.iter().filter(|_| level.proxy_pass_request_headers).filter(|(n, _)| !dropped(n) && !is_set(n));
+    passed.for_each(|(n, v)| req.extend([n.as_str(), ": ", v.as_str(), "\r\n"]));
+    req.push_str("\r\n");
+    let mut req = if crate::vars::plain(req.as_bytes()) { req.into_bytes() } else { crate::vars::bytes(&req) };
     req.extend_from_slice(&body);
     let bind = level.proxy_bind.as_ref().map(|(a, t)| (a.render(r, &Sent::default()), *t)).filter(|(a, _)| !a.is_empty());
     let Some(bind) = bind.map(|(a, t)| crate::conf::local_addr(&a).map(|a| (a, t))).map_or(Some(None), |b| b.map(Some)) else { return special(500) };
