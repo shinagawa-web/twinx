@@ -123,13 +123,20 @@ is($pids, 2, 'shared cache, TLSv1.3 ticket, both workers answered');
 
 my ($maker, $made) = session(8445, 'TLSv1_2');
 my (%seen, $as_nginx);
-for (1 .. 100) {
-	my ($w, $r) = get(8445, $made) =~ /^(\d+) (\S) TLSv1.2$/m
-		or next;
-	$seen{$w}++;
-	$as_nginx++ if ($w == $maker) == ($r eq 'r');
-	$maker = $w if $r ne 'r';
-	last if keys %seen == 2 && $_ >= 10;
+my $made_by = sub {
+	for (1 .. 5) {
+		my ($w, $r) = get(8445, $made) =~ /^(\d+) (\S) TLSv1.2$/m
+			or next;
+		$seen{$w}++;
+		$as_nginx++ if ($w == $maker) == ($r eq 'r');
+		$maker = $w if $r ne 'r';
+	}
+};
+$made_by->();
+if (defined $maker) {
+	my $stopped = stop($maker);
+	$made_by->();
+	kill 'CONT', $stopped;
 }
 my $all = 0;
 $all += $_ for values %seen;
@@ -178,18 +185,44 @@ sub get {
 
 sub resumed {
 	my ($port, $ctx) = @_;
-	my (%pids, $reused, $answered);
+	my (%pids, $reused, $answered, $first);
 
-	for (1 .. 100) {
-		my ($w, $r) = get($port, $ctx) =~ /^(\d+) (\S) TLSv1/m
-			or next;
-		$answered++;
-		$pids{$w}++;
-		$reused++ if $r eq 'r';
-		last if keys %pids == 2 && $_ >= 10;
+	my $resume = sub {
+		for (1 .. 5) {
+			my ($w, $r) = get($port, $ctx) =~ /^(\d+) (\S) TLSv1/m
+				or next;
+			$answered++;
+			$pids{$w}++;
+			$first //= $w;
+			$reused++ if $r eq 'r';
+		}
+	};
+
+	$resume->();
+
+	if (defined $first) {
+		stop($first);
+		$resume->();
+		kill 'CONT', $first;
 	}
 
 	return (scalar keys %pids, $reused // 0, $answered // -1);
+}
+
+# A stopped worker is not woken for new connections, so they reach another one.
+sub stop {
+	my ($pid) = @_;
+	kill 'STOP', $pid;
+
+	for (1 .. 100) {
+		last unless grep {
+			my $f;
+			!(open($f, '<', $_) && <$f> =~ /^\d+ \(.*\) T /);
+		} glob "/proc/$pid/task/*/stat";
+		select undef, undef, undef, 0.01;
+	}
+
+	return $pid;
 }
 
 ###############################################################################

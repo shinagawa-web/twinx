@@ -82,21 +82,30 @@ ok(@$bda && different($bda) == @$bda && min(@$bda) > max(@$bd),
 ###############################################################################
 
 sub counted {
-	my (@c, @bd, %pids);
+	my (@c, @bd, $first);
 
-	for (1 .. 100) {
-		my $r = http(<<EOF);
+	my $count = sub {
+		for (1 .. 5) {
+			my $r = http(<<EOF);
 GET /t.html HTTP/1.0
 Host: localhost
 Range: bytes=0-0,2-2
 
 EOF
-		next unless defined $r
-			&& $r =~ /^X-Counted: (\d+) (\d+)\r$/m;
-		push @c, $1;
-		$pids{$2}++;
-		push @bd, $1 if $r =~ /boundary=(\d+)\r$/m;
-		last if keys %pids == 2 && @c >= 10;
+			next unless defined $r
+				&& $r =~ /^X-Counted: (\d+) (\d+)\r$/m;
+			push @c, $1;
+			$first //= $2;
+			push @bd, $1 if $r =~ /boundary=(\d+)\r$/m;
+		}
+	};
+
+	$count->();
+
+	if (defined $first) {
+		stop($first);
+		$count->();
+		kill 'CONT', $first;
 	}
 
 	return (\@c, \@bd);
@@ -105,6 +114,22 @@ EOF
 sub different {
 	my %seen = map { $_ => 1 } @{$_[0]};
 	return scalar keys %seen;
+}
+
+# A stopped worker is not woken for new connections, so they reach another one.
+sub stop {
+	my ($pid) = @_;
+	kill 'STOP', $pid;
+
+	for (1 .. 100) {
+		last unless grep {
+			my $f;
+			!(open($f, '<', $_) && <$f> =~ /^\d+ \(.*\) T /);
+		} glob "/proc/$pid/task/*/stat";
+		select undef, undef, undef, 0.01;
+	}
+
+	return $pid;
 }
 
 ###############################################################################

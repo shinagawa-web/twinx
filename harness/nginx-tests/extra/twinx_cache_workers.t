@@ -115,21 +115,40 @@ is(asked('bg_slow'), 2, 'background update, upstream asked twice');
 ###############################################################################
 
 sub workers {
-	my (%pids, @open);
+	my ($s, $first) = worker() or return;
 
-	for (1 .. 50) {
-		my $s = IO::Socket::INET->new(
-			Proto => 'tcp',
-			PeerAddr => '127.0.0.1:' . port(8080)
-		) or last;
-		my $r = get($s, '/pid') or last;
-		my ($pid) = $r =~ /^X-Pid: (\d+)\r$/m or last;
-		push @open, $s;
-		$pids{$pid} ||= $s;
-		return values %pids if keys %pids == 2;
+	stop($first);
+	my ($o, $other) = worker();
+	kill 'CONT', $first;
+
+	return ($s, $o) if $other && $other != $first;
+	return;
+}
+
+sub worker {
+	my $s = IO::Socket::INET->new(
+		Proto => 'tcp',
+		PeerAddr => '127.0.0.1:' . port(8080)
+	) or return;
+	my $r = get($s, '/pid') or return;
+	my ($pid) = $r =~ /^X-Pid: (\d+)\r$/m or return;
+	return ($s, $pid);
+}
+
+# A stopped worker is not woken for new connections, so they reach another one.
+sub stop {
+	my ($pid) = @_;
+	kill 'STOP', $pid;
+
+	for (1 .. 100) {
+		last unless grep {
+			my $f;
+			!(open($f, '<', $_) && <$f> =~ /^\d+ \(.*\) T /);
+		} glob "/proc/$pid/task/*/stat";
+		select undef, undef, undef, 0.01;
 	}
 
-	return;
+	return $pid;
 }
 
 sub get {
