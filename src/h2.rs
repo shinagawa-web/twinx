@@ -774,14 +774,18 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
     loop {
         if finished { buf.clear(); }
         finished |= body.take(&mut buf, &mut pending);
+        let can = pending.len().min(window.min(stream_window).max(0) as usize);
+        out.reserve(can + can.div_ceil(16384) * 9);
+        let mut at = 0;
         loop {
-            let n = pending.len().min(16384).min(window.min(stream_window).max(0) as usize);
-            let last = finished && n == pending.len();
+            let n = (pending.len() - at).min(16384).min(window.min(stream_window).max(0) as usize);
+            let last = finished && at + n == pending.len();
             if ended || n == 0 && !last { break }
             ended = last;
-            frame(&mut out, DATA, if ended { END_STREAM } else { 0 }, id, &pending.drain(..n).collect::<Vec<_>>());
-            (window, stream_window) = (window - n as i64, stream_window - n as i64);
+            frame(&mut out, DATA, if ended { END_STREAM } else { 0 }, id, &pending[at..at + n]);
+            (at, window, stream_window) = (at + n, window - n as i64, stream_window - n as i64);
         }
+        pending.drain(..at);
         if ended { slot.lock().unwrap().sent = true; }
         let (frames, had) = (std::mem::take(&mut out), buf.len());
         if !frames.is_empty() && !deaf {
