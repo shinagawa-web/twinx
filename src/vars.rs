@@ -25,6 +25,7 @@ pub struct Shared {
     pub gzip: std::sync::Mutex<Option<(u64, u64)>>,
     pub nodelay: std::sync::atomic::AtomicBool,
     pub rewritten: std::sync::atomic::AtomicBool,
+    pub internal: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -121,6 +122,10 @@ impl Request {
     }
 
     pub fn rewritten(&self) -> bool { self.shared.rewritten.load(std::sync::atomic::Ordering::Relaxed) }
+
+    pub fn internal(&self) -> bool { self.shared.internal.load(std::sync::atomic::Ordering::Relaxed) }
+
+    pub fn set_internal(&self) { self.shared.internal.store(true, std::sync::atomic::Ordering::Relaxed) }
 
     pub fn request_uri(&self) -> &str { self.shared.unparsed.get().unwrap_or(&self.target) }
 

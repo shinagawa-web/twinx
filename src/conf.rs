@@ -88,6 +88,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("error_page", HSL | LIF, 2, usize::MAX, false),
     ("proxy_pass", LOC | LIF | LMT, 1, 1, false),
     ("limit_except", LOC, 1, usize::MAX, true),
+    ("internal", LOC, 0, 0, false),
     ("ssl_certificate", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_key", HTTP | SRV, 1, 1, false),
     ("ssl_certificate_compression", HTTP | SRV, 1, 1, false),
@@ -335,6 +336,7 @@ pub struct Level {
     pub post_action: Option<String>,
     pub alias: Option<PathBuf>,
     pub alias_len: Option<usize>,
+    pub internal: bool,
     pub alias_vars: Option<Template>,
     pub try_files: Option<Arc<TryFiles>>,
     pub absolute_redirect: bool,
@@ -871,6 +873,7 @@ impl Builder<'_> {
                 }
                 "try_files" => level.try_files = Some(Arc::new(try_files(&d.args).map_err(at)?)),
                 "absolute_redirect" => level.absolute_redirect = flag(d).map_err(at)?,
+                "internal" => level.internal = true,
                 "server_tokens" => level.server_tokens = d.args[0] == "build" || flag(d).map_err(|_| at(format!("invalid value \"{}\" in \"server_tokens\" directive, it must be \"on\", \"off\" or \"build\"", d.args[0])))?,
                 "lingering_close" => level.lingering_close = [("off", None), ("on", Some(false)), ("always", Some(true))].into_iter().find(|v| v.0 == d.args[0]).ok_or_else(|| at(format!("invalid value \"{}\" in \"lingering_close\" directive, it must be \"off\", \"on\" or \"always\"", d.args[0])))?.1,
                 "server_name_in_redirect" => level.server_name_in_redirect = flag(d).map_err(at)?,
@@ -2576,6 +2579,10 @@ mod tests {
         refused(server("location @a { location /b { } }"), "location \"/b\" cannot be inside the named location \"@a\"");
         refused(server("location /a { location @b { } }"), "named location \"@b\" can be on the server level only");
         refused(server("rewrite ^ \"\";"), "empty replacement");
+        refused(server("location / { internal; internal; }"), "\"internal\" directive is duplicate");
+        refused(server("location / { internal on; }"), "invalid number of arguments in \"internal\" directive");
+        refused(server("internal;"), "\"internal\" directive is not allowed here");
+        refused(server("location / { if ($uri) { internal; } }"), "\"internal\" directive is not allowed here");
         refused(server("location / { proxy_pass http://127.0.0.1:0; }"), "invalid port in upstream \"127.0.0.1:0\"");
         let uri = "\"proxy_pass\" cannot have URI part in location given by regular expression, or inside named location, or inside \"if\" statement, or inside \"limit_except\" block";
         refused(server("location / { limit_except GET { proxy_pass http://127.0.0.1:8081/a; } }"), uri);
