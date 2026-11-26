@@ -892,7 +892,7 @@ struct Cut { length: Option<usize>, malformed: bool, failed: Option<String> }
 struct Rest { conn: Conn, answer: Vec<u8>, end: usize, length: Option<usize>, chunked: bool, rate: u64, started: Instant, wait: Option<Duration>, keep: bool, home: Option<(Arc<Upstream>, Addr, usize)>, held: Option<Held>, trailers: Option<Trailers>, slot: Option<crate::h2::Slot>, sizes: Result<Sizes, usize>, coder: Option<Box<Coder>>, to: Option<(&'static str, Addr, String)>, store: Option<Box<Store>> }
 
 #[derive(Debug)]
-struct Store { zone: Arc<crate::cache::Zone>, keys: (String, String), head: (u16, Option<String>, Vec<(String, String)>), told: (Option<usize>, Option<String>, Vec<(String, String)>), times: (i64, i64, i64), vary: (Vec<String>, Vec<(String, String)>), raw: Vec<u8>, lock: Option<tokio::sync::OwnedMutexGuard<()>> }
+struct Store { zone: Arc<crate::cache::Zone>, keys: (String, String), head: (u16, Option<String>, Vec<(String, String)>), told: (Option<usize>, Option<String>, Vec<(String, String)>), times: (i64, i64, i64), vary: (Vec<String>, Vec<(String, String)>), raw: Vec<u8>, lock: Option<crate::cache::Held> }
 
 impl Store {
     fn put(self, body: Vec<u8>) {
