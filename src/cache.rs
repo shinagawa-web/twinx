@@ -150,7 +150,7 @@ impl Zone {
 
     fn kept<'a>(&self, entries: &'a mut HashMap<String, Entry>, key: &str) -> Option<&'a Entry> {
         let Some(dir) = &self.dir else { return entries.get(key) };
-        if entries.contains_key(key) && std::fs::read(self.file(dir, key)).ok().and_then(|b| decode(&b)).is_none_or(|(k, _)| k != key) { entries.remove(key); }
+        if entries.contains_key(key) && !holds(&self.file(dir, key), key) { entries.remove(key); }
         entries.get(key)
     }
 
@@ -245,6 +245,24 @@ fn decode(b: &[u8]) -> Option<(String, Entry)> {
     let upstream = headers.split_off(count.parse::<usize>().ok()?.min(headers.len()));
     let vary = vary.split(',').filter(|n| !n.is_empty()).map(str::to_string).collect();
     Some((key, Entry { status: status.parse().ok()?, ctype: (typed == "true").then_some(ctype), headers, body, length: length.parse().ok(), line: (lined == "true").then_some(line), upstream, until: until.parse().ok()?, updating: updating.parse().ok()?, error: error.parse().ok()?, vary, variant }))
+}
+
+fn holds(file: &std::path::Path, key: &str) -> bool {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(file) else { return false };
+    let Ok(size) = f.metadata().map(|m| m.len()) else { return false };
+    let mut r = std::io::BufReader::new(f);
+    let number = |r: &mut std::io::BufReader<std::fs::File>| { let mut n = [0u8; 8]; r.read_exact(&mut n).ok().map(|()| u64::from_le_bytes(n)).filter(|&n| n <= size) };
+    let (Some(count), Some(n)) = (number(&mut r), number(&mut r)) else { return false };
+    let mut first = vec![0u8; key.len()];
+    if count < 13 || n != key.len() as u64 || r.read_exact(&mut first).is_err() || first != key.as_bytes() { return false }
+    let mut end = 16 + n;
+    for i in 1..=count {
+        let Some(n) = number(&mut r) else { return false };
+        end += 8 + n;
+        if end > size || (i < count && r.seek_relative(n as i64).is_err()) { return false }
+    }
+    true
 }
 
 pub fn valid(args: &[String], time: Duration) -> Result<Vec<(Option<u16>, Duration)>, String> {
@@ -425,6 +443,11 @@ mod tests {
         assert!(file.is_file() && again.file(&dir, "n") == file);
         std::fs::write(&file, b"garbage").unwrap();
         assert!(again.get("n").is_none() && again.stale("n").is_none());
+        again.put(("c", "c"), (200, None, Vec::new(), b"cut".to_vec()), (None, None, Vec::new()), valid, (Vec::new(), &[]));
+        let whole = std::fs::read(again.file(&dir, "c")).unwrap();
+        assert!(again.get("c").is_some());
+        std::fs::write(again.file(&dir, "c"), &whole[..whole.len() - 1]).unwrap();
+        assert!(again.stale("c").is_none());
         std::fs::remove_file(again.file(&dir, "k")).unwrap();
         assert!(again.stale("k").is_none());
         let _ = std::fs::remove_dir_all(&dir);
