@@ -2418,10 +2418,12 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let (mut answer, mut chunk) = (Vec::new(), vec![0u8; 4096]);
     send_up(s, req, send).await?;
     bytes[2] = req.len() as u64;
-    let answered = match s { Stream::Tcp(tcp) => std::os::fd::AsFd::as_fd(tcp).try_clone_to_owned().ok().and_then(|fd| TcpStream::from_std(fd.into()).ok()), _ => None };
     let mut cut = false;
-    if let Some(u) = unread { bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other(String::new()))?, max, (s, send), answered.as_ref()).await?; cut = u.cut; }
-    drop(answered);
+    if let Some(u) = unread {
+        let answered = match s { Stream::Tcp(tcp) => std::os::fd::AsFd::as_fd(tcp).try_clone_to_owned().ok().and_then(|fd| TcpStream::from_std(fd.into()).ok()), _ => None };
+        bytes[2] += pass_body(u, client.as_deref_mut().ok_or(Other(String::new()))?, max, (s, send), answered.as_ref()).await?;
+        cut = u.cut;
+    }
     let (head, end, status) = loop {
         let end = loop {
             let buf = &answer[..answer.len().min(level.proxy_buffer_size)];
