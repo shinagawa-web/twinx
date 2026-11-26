@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use x509_parser::prelude::*;
 
@@ -19,7 +19,77 @@ pub enum Status {
     Unknown,
 }
 
-static CACHE: Mutex<BTreeMap<(String, Vec<u8>), (Status, i64)>> = Mutex::new(BTreeMap::new());
+struct Entry {
+    len: usize,
+    key: [u8; 128],
+    status: u8,
+    valid: i64,
+    stored: u64,
+}
+
+struct Head {
+    lock: AtomicBool,
+    stored: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct Zone {
+    head: &'static Head,
+    entries: *mut Entry,
+    n: usize,
+}
+
+// SAFETY: the entries are only touched while the lock in head is held.
+unsafe impl Send for Zone {}
+
+static ZONES: Mutex<Vec<(String, u64, Zone)>> = Mutex::new(Vec::new());
+
+/// Made while the master reads the configuration, so that the workers it forks next share it.
+pub fn zone(name: &str, size: u64) -> Result<(), String> {
+    let mut zones = ZONES.lock().unwrap();
+    if zones.iter().any(|z| z.0 == name && z.1 == size) { return Ok(()) }
+    let head = crate::shm::shared(Head { lock: AtomicBool::new(false), stored: AtomicU64::new(0) })?;
+    let n = usize::try_from(size).unwrap_or(usize::MAX) / size_of::<Entry>();
+    let entries = crate::shm::zeroed(n * size_of::<Entry>())?.cast::<Entry>();
+    zones.retain(|z| z.0 != name);
+    zones.push((name.to_string(), size, Zone { head, entries, n }));
+    Ok(())
+}
+
+impl Zone {
+    fn find(name: &str) -> Option<Zone> {
+        ZONES.lock().unwrap().iter().find(|z| z.0 == name).map(|z| z.2)
+    }
+
+    fn locked<R>(&self, f: impl FnOnce(&mut [Entry]) -> R) -> R {
+        while self.head.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { std::thread::yield_now() }
+        // SAFETY: zeroed memory is a table of empty entries, and the lock gives this thread the only access to it.
+        let r = f(unsafe { std::slice::from_raw_parts_mut(self.entries, self.n) });
+        self.head.lock.store(false, Ordering::Release);
+        r
+    }
+
+    fn lookup(&self, key: &[u8], now: i64) -> Option<Status> {
+        self.locked(|entries| {
+            let e = entries.iter_mut().find(|e| e.len > 0 && &e.key[..e.len] == key)?;
+            if e.valid > now { return Some([Status::Good, Status::Revoked, Status::Unknown][usize::from(e.status)]) }
+            e.len = 0;
+            None
+        })
+    }
+
+    fn store(&self, key: &[u8], status: Status, valid: i64, now: i64) {
+        if valid < now || key.len() > 128 { return }
+        let stored = self.head.stored.fetch_add(1, Ordering::Relaxed) + 1;
+        self.locked(|entries| {
+            let same = entries.iter().position(|e| e.len > 0 && &e.key[..e.len] == key);
+            let Some(at) = same.or_else(|| entries.iter().position(|e| e.len == 0)).or_else(|| (0..entries.len()).min_by_key(|&i| entries[i].stored)) else { return };
+            let mut e = Entry { len: key.len(), key: [0; 128], status: status as u8, valid, stored };
+            e.key[..key.len()].copy_from_slice(key);
+            entries[at] = e;
+        })
+    }
+}
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -34,12 +104,11 @@ impl Ocsp {
 
     fn status(&self, cert: &X509Certificate, issuer: &X509Certificate) -> Option<Status> {
         let (id, now) = (cert_id(cert, issuer), chrono::Utc::now().timestamp());
-        let key = self.cache.clone().map(|zone| (zone, id.clone()));
-        if let Some((status, _)) = key.as_ref().and_then(|k| CACHE.lock().unwrap().get(k).copied()).filter(|e| e.1 > now) { return Some(status) }
+        let zone = self.cache.as_deref().and_then(Zone::find);
+        if let Some(status) = zone.and_then(|z| z.lookup(&id, now)) { return Some(status) }
         let url = self.responder.clone().or_else(|| responder(cert))?;
         let (status, next) = verify(&fetch(&url, &request(&id))?, &id, issuer, now, true)?;
-        let valid = next.unwrap_or(now + 3600);
-        if let Some(key) = key { CACHE.lock().unwrap().insert(key, (status, valid)); }
+        if let Some(z) = zone { z.store(&id, status, next.unwrap_or(now + 3600), now) }
         Some(status)
     }
 }

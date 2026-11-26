@@ -1519,7 +1519,9 @@ fn conf_commands(commands: &[(String, String)], options: &mut crate::tls::Option
 fn ocsp_cache(value: &str) -> Result<Option<String>, String> {
     if value == "off" { return Ok(None) }
     let zone = value.strip_prefix("shared:").and_then(|z| z.rsplit_once(':')).filter(|(name, n)| !name.is_empty() && size(n).is_ok());
-    zone.map(|(name, _)| Some(name.to_string())).ok_or_else(|| format!("invalid value \"{value}\""))
+    let (name, n) = zone.ok_or_else(|| format!("invalid value \"{value}\""))?;
+    crate::ocsp::zone(name, size(n)?)?;
+    Ok(Some(name.to_string()))
 }
 
 fn flag(d: &Directive) -> Result<bool, String> {
