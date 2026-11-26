@@ -124,8 +124,14 @@ pub async fn at_once<F: Future>(f: F) -> Option<F::Output> {
     std::future::poll_fn(|cx| Poll::Ready(match f.as_mut().poll(cx) { Poll::Ready(out) => Some(out), Poll::Pending => None })).await
 }
 
-pub async fn read_ready<S: AsyncRead + Unpin>(s: &mut S, buf: &mut [u8]) -> Option<std::io::Result<usize>> {
-    at_once(s.read(buf)).await
+pub async fn read_more<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, max: usize) -> std::io::Result<usize> {
+    buf.reserve(max);
+    let mut spare = ReadBuf::uninit(&mut buf.spare_capacity_mut()[..max]);
+    std::future::poll_fn(|cx| Pin::new(&mut *s).poll_read(cx, &mut spare)).await?;
+    let n = spare.filled().len();
+    // SAFETY: the reader filled the first n bytes past the length.
+    unsafe { buf.set_len(buf.len() + n) };
+    Ok(n)
 }
 
 thread_local! {
@@ -278,10 +284,11 @@ mod tests {
             assert_eq!(read_into(&mut s, &mut buf, Some(Duration::from_millis(50))).await, 0);
             other.write_all(b"x").await.unwrap();
             assert_eq!((read_into(&mut s, &mut buf, None).await, buf.as_slice()), (1, &b"x"[..]));
-            assert!(read_ready(&mut s, &mut buf).await.is_none());
+            buf.clear();
+            assert!(at_once(read_more(&mut s, &mut buf, 1)).await.is_none());
             other.write_all(b"y").await.unwrap();
             s.tcp().unwrap().readable().await.unwrap();
-            assert!(matches!(read_ready(&mut s, &mut buf).await, Some(Ok(1))) && buf == b"y");
+            assert!(matches!(at_once(read_more(&mut s, &mut buf, 1)).await, Some(Ok(1))) && buf == b"y");
             assert_eq!(within(Some(Duration::from_millis(10)), std::future::pending::<()>()).await, None);
             let data = vec![b'x'; 1 << 24];
             assert!(matches!(write_once(&mut s, &[IoSlice::new(&data)], None).await, Some(n) if (1..data.len()).contains(&n)));

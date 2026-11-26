@@ -20,7 +20,7 @@ use crate::expires;
 use crate::upstream::{Addr, Conn, Held, Peer, Upstream};
 use crate::vars::{Request, Sent};
 use crate::spool::{Spool, temp_path};
-use crate::stream::{Stream, Writing, at_once, buffer, read_into, read_ready, read_until, recycle, unless_closed, within, write_all};
+use crate::stream::{Stream, Writing, at_once, buffer, read_into, read_more, read_until, recycle, unless_closed, within, write_all};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
 
@@ -1353,14 +1353,15 @@ struct Incoming<'a> { rest: &'a mut Option<Box<Rest>>, read: &'a mut usize, resp
 impl Incoming<'_> {
     async fn next(&mut self, waits: bool) -> bool {
         let Some(from) = self.rest.as_mut() else { return false };
-        if self.buf.is_empty() { self.buf.resize(from.sizes.map_or_else(|n| n, |s| 65536.min(s.first.saturating_add(s.count.saturating_mul(s.size)))).max(1), 0); }
-        let part = if self.intake.rate > 0 { self.buffers.at_once() } else { self.buffers.room() }.min(self.buf.len());
-        let part = &mut self.buf[..part];
+        let size = from.sizes.map_or_else(|n| n, |s| 65536.min(s.first.saturating_add(s.count.saturating_mul(s.size)))).max(1);
+        let part = if self.intake.rate > 0 { self.buffers.at_once() } else { self.buffers.room() }.min(size);
+        self.buf.clear();
         let got = if waits {
-            read_piece(&mut from.conn.stream, part, (&mut self.intake, *self.read), from.wait).await
+            read_piece(&mut from.conn.stream, &mut self.buf, part, (&mut self.intake, *self.read), from.wait).await
         } else {
-            match read_ready(&mut from.conn.stream, part).await { Some(got) => got, None => return false }
+            match at_once(read_more(&mut from.conn.stream, &mut self.buf, part)).await { Some(got) => got, None => return false }
         };
+        let part = &self.buf[..];
         self.ended = !matches!(got, Ok(1..));
         let all = got.is_ok() || self.came;
         self.failed = got.is_err();
@@ -2424,7 +2425,7 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     let s = &mut conn.stream;
     let (wait, send) = (Some(level.proxy_read_timeout).filter(|t| !t.is_zero()), Some(level.proxy_send_timeout).filter(|t| !t.is_zero()));
     let unsent = || conn.slot.as_ref().and_then(|slot| { let e = slot.lock().unwrap(); (!e.sent).then(|| e.moved.unwrap_or(start)) });
-    let (mut answer, mut chunk) = (Vec::new(), vec![0u8; 4096]);
+    let mut answer = Vec::new();
     send_up(s, req, send).await?;
     bytes[2] = req.len() as u64;
     let mut cut = false;
@@ -2439,10 +2440,10 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
             if line_end(buf).is_some_and(|at| status_code(&buf[..at]).is_none()) { break None }
             if let Some(end) = line_end(buf).and_then(|at| lines_end(buf, at)) { break Some(end); }
             if answer.len() >= level.proxy_buffer_size { return Err(invalid("upstream sent too big header")); }
-            let room = (level.proxy_buffer_size - answer.len()).min(chunk.len());
+            let room = (level.proxy_buffer_size - answer.len()).min(4096);
             let closed = async { match client.as_deref().filter(|_| watch) { Some(c) => crate::stream::gone(c).await, None => std::future::pending().await } };
             let closed = async { tokio::select! { () = closed => true, () = halted() => false } };
-            let n = tokio::select! {
+            tokio::select! {
                 biased;
                 gone = closed => {
                     let action = if answer.is_empty() { "sending request to upstream" } else { READING_HEAD };
@@ -2451,14 +2452,13 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
                 n = async { loop {
                     let last = unsent();
                     let time = match (last, send) { (Some(at), Some(t)) => Some(t.saturating_sub(at.elapsed())), (Some(_), None) => None, (None, _) => wait };
-                    match within(time, s.read(&mut chunk[..room])).await { None if last.is_some() && unsent() != last => {} None => break Err(if last.is_some() { SENDING } else { READING_HEAD }), Some(n) => break Ok(n) }
+                    match within(time, read_more(s, &mut answer, room)).await { None if last.is_some() && unsent() != last => {} None => break Err(if last.is_some() { SENDING } else { READING_HEAD }), Some(n) => break Ok(n) }
                 } } => match n.map_err(TimedOut)? {
                     Ok(0) => return Err(Closed(format!("{PREMATURE} while {READING_HEAD}"))),
-                    Ok(n) => n,
+                    Ok(_) => {}
                     Err(e) => return Err(Closed(format!("{} while {READING_HEAD}", read_failed("recv", &e)))),
                 },
-            };
-            answer.extend_from_slice(&chunk[..n]);
+            }
             bytes[1] = answer.len() as u64;
         };
         let Some(end) = end else {
@@ -2532,11 +2532,11 @@ fn upstream_header(line: &str) -> Option<(&str, &str)> {
 }
 
 async fn read_body(s: &mut Stream, after: &[u8], length: Option<usize>, chunked: bool, rate: u64, wait: Option<Duration>, slot: Option<&crate::h2::Slot>) -> (Vec<u8>, usize, bool, Option<Box<Cut>>, String) {
-    let (mut intake, mut chunk, mut failed, mut malformed, mut why) = (Intake::new(rate, after.len()), vec![0u8; 4096], false, false, PREMATURE.to_string());
+    let (mut intake, mut chunk, mut failed, mut malformed, mut why) = (Intake::new(rate, after.len()), Vec::new(), false, false, PREMATURE.to_string());
     let (mut body, mut data, mut read) = (Body::new(length.filter(|_| slot.is_none()).map(|n| n as u64), chunked), Vec::new(), after.len());
     let mut came = body.take(after, &mut data);
     while came == Came::More {
-        let n = match read_piece(s, &mut chunk, (&mut intake, read), wait).await {
+        let n = match read_piece(s, &mut chunk, 4096, (&mut intake, read), wait).await {
             Ok(n) => n,
             Err(e) => { (failed, why) = (true, read_failed("readv", &e)); break }
         };
@@ -2582,9 +2582,10 @@ impl Intake {
     }
 }
 
-async fn read_piece(s: &mut Stream, buf: &mut [u8], (intake, read): (&mut Intake, usize), wait: Option<Duration>) -> std::io::Result<usize> {
-    let limit = intake.limit(read).await.min(buf.len());
-    let got = within(wait, s.read(&mut buf[..limit])).await.unwrap_or_else(|| Err(std::io::ErrorKind::TimedOut.into()));
+async fn read_piece(s: &mut Stream, buf: &mut Vec<u8>, max: usize, (intake, read): (&mut Intake, usize), wait: Option<Duration>) -> std::io::Result<usize> {
+    let limit = intake.limit(read).await.min(max);
+    buf.clear();
+    let got = within(wait, read_more(s, buf, limit)).await.unwrap_or_else(|| Err(std::io::ErrorKind::TimedOut.into()));
     if let Ok(n) = got { intake.took(n); }
     got
 }
