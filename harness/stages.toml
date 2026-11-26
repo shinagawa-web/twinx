@@ -127,6 +127,7 @@ files = [
   "twinx_ssl_verify_client_sessions.t",
   "twinx_internal.t",
   "twinx_ssl_session_shared.t",
+  "twinx_types.t",
   "twinx_answers_left.t", "twinx_cache_answers.t", "twinx_cache_buffering.t",
   "twinx_cache_control.t", "twinx_cache_fields.t", "twinx_cache_h2.t",
   "twinx_cache_hit.t", "twinx_cache_key.t", "twinx_cache_methods_conditions.t",
