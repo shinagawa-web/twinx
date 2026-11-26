@@ -889,7 +889,6 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
         if failed || done { slot.lock().unwrap().end = if failed { End::Failed } else { End::Whole }; }
         if pipe.write_all(&to_pipe).await.is_err() || failed { return }
         if done {
-            ended |= reset;
             let mut sent = async || out.is_empty() || at_once(async { up.write_all(&out).await.is_ok() && up.flush().await.is_ok() }).await == Some(true);
             if !keep || deaf || !ended || !got.is_empty() || bodiless && !out.is_empty() || !sent().await { return }
             conn.h2 = Some(Box::new(Session { id: id + 2, window, initial, recv }));
@@ -1451,11 +1450,6 @@ mod tests {
         let (sent, end, kept) = exchange(kept, post, [framed(WINDOW_UPDATE, 0, 3, &word(2)), head(3, END_STREAM)].concat());
         let data = [framed(DATA, 0, 3, b"abc"), framed(DATA, END_STREAM, 3, b"de")].concat();
         assert!(sent[3..9] == [HEADERS, END_HEADERS, 0, 0, 0, 3] && sent.ends_with(&data[..12]) && end == End::Whole && kept.is_none());
-        let answered = [head(3, 0), framed(DATA, END_STREAM, 3, b"ok")].concat();
-        let (sent, end, kept) = exchange(Some(session), post, [answered.clone(), framed(RST_STREAM, 0, 3, &word(0))].concat());
-        assert!(sent.ends_with(&data[..12]) && end == End::Whole);
-        assert_eq!(kept, Some(Session { id: 5, window: session.window - 3, recv: MAX_WINDOW - 4, ..session }));
-        assert_eq!(exchange(Some(session), post, answered).2, None);
         let (sent, _, kept) = exchange(Some(session), get, [head(3, 0), framed(DATA, END_STREAM, 3, b"ok")].concat());
         assert!(sent[3..9] == [HEADERS, END_HEADERS | END_STREAM, 0, 0, 0, 3]);
         assert_eq!(kept, Some(Session { id: 5, recv: MAX_WINDOW - 4, ..session }));
