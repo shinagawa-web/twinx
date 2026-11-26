@@ -103,20 +103,35 @@ pub async fn until<F: Future>(deadline: impl Fn() -> Option<Instant>, f: F) -> O
     }).await
 }
 
-pub async fn read_into<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, time: Option<Duration>) -> usize {
-    read_until(s, buf, || time.and_then(|t| Instant::now().checked_add(t))).await
+async fn reset_until<F: Future>(timer: &mut Option<Pin<Box<tokio::time::Sleep>>>, deadline: impl Fn() -> Option<Instant>, f: F) -> Option<F::Output> {
+    let (mut f, mut armed) = (std::pin::pin!(f), false);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(out) = f.as_mut().poll(cx) { return Poll::Ready(Some(out)) }
+        if !armed && let Some(d) = deadline() {
+            armed = true;
+            match timer { Some(t) => t.as_mut().reset(d.into()), None => *timer = Some(Box::pin(tokio::time::sleep_until(d.into()))) }
+        }
+        match timer.as_mut().filter(|_| armed) { Some(t) => t.as_mut().poll(cx).map(|()| None), None => Poll::Pending }
+    }).await
 }
 
-pub async fn read_until<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, deadline: impl Fn() -> Option<Instant>) -> usize {
-    let read = std::future::poll_fn(|cx| {
+pub async fn read_into<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, time: Option<Duration>) -> usize {
+    until(|| time.and_then(|t| Instant::now().checked_add(t)), lend(s, buf)).await.and_then(Result::ok).unwrap_or(0)
+}
+
+pub async fn read_until<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, timer: &mut Option<Pin<Box<tokio::time::Sleep>>>, deadline: impl Fn() -> Option<Instant>) -> usize {
+    reset_until(timer, deadline, lend(s, buf)).await.and_then(Result::ok).unwrap_or(0)
+}
+
+fn lend<'a, S: AsyncRead + Unpin>(s: &'a mut S, buf: &'a mut Vec<u8>) -> impl Future<Output = std::io::Result<usize>> + 'a {
+    std::future::poll_fn(move |cx| {
         let lent = buf.capacity() == 0;
         if lent { *buf = buffer(); }
         buf.reserve(4096);
         let read = std::pin::pin!(s.read_buf(buf)).poll(cx);
         if lent && read.is_pending() { recycle(std::mem::take(buf)); }
         read
-    });
-    until(deadline, read).await.and_then(Result::ok).unwrap_or(0)
+    })
 }
 
 pub async fn at_once<F: Future>(f: F) -> Option<F::Output> {
@@ -180,6 +195,18 @@ pub fn sendfile(tcp: &TcpStream, file: &std::fs::File, at: u64, n: usize) -> std
             n => Ok(n as usize),
         }
     })
+}
+
+pub trait Flush {
+    fn needs_flush(&self) -> bool;
+}
+
+impl Flush for Stream {
+    fn needs_flush(&self) -> bool { !matches!(self, Stream::Tcp(_)) }
+}
+
+impl Flush for Writing<'_, '_> {
+    fn needs_flush(&self) -> bool { self.0.borrow().needs_flush() }
 }
 
 pub struct Writing<'a, 'b>(pub &'a RefCell<&'b mut Stream>);
