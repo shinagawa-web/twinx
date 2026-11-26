@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,6 +19,7 @@ pub struct Entry {
     error: i64,
     vary: Vec<String>,
     variant: String,
+    stamp: Option<(u64, i64, i64, u64)>,
 }
 
 impl Entry {
@@ -100,15 +104,74 @@ pub fn variant(names: &[String], request: &[(String, String)]) -> String {
     }).collect()
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Zone {
     dir: Option<std::path::PathBuf>,
     levels: Vec<usize>,
     entries: Mutex<HashMap<String, Entry>>,
-    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    since: Mutex<HashMap<String, Instant>>,
-    uses: Mutex<HashMap<String, u64>>,
-    refreshing: Mutex<std::collections::HashSet<String>>,
+    keys: Keys,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    taken: bool,
+    md5: [u8; 16],
+    uses: u64,
+    held: bool,
+    since: i64,
+    refreshing: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Keys {
+    lock: &'static AtomicBool,
+    slots: *mut Slot,
+    n: usize,
+}
+
+// SAFETY: the slots are only touched while the lock is held.
+unsafe impl Send for Keys {}
+unsafe impl Sync for Keys {}
+
+static TABLES: Mutex<Vec<(String, Keys)>> = Mutex::new(Vec::new());
+
+impl Keys {
+    /// Made while the master reads the configuration, so that the workers it forks next share it.
+    fn shared(dir: &std::path::Path, name: &str, size: u64) -> Result<Keys, String> {
+        let (id, mut tables) = (format!("{name}:{size}:{}", dir.display()), TABLES.lock().unwrap());
+        if let Some(t) = tables.iter().find(|t| t.0 == id) { return Ok(t.1) }
+        let keys = Keys::new(size)?;
+        tables.push((id, keys));
+        Ok(keys)
+    }
+
+    fn new(size: u64) -> Result<Keys, String> {
+        let n = usize::try_from(size.saturating_mul(8000) >> 20).unwrap_or(usize::MAX).max(1);
+        Ok(Keys { lock: crate::shm::shared(AtomicBool::new(false))?, slots: crate::shm::zeroed(n.saturating_mul(size_of::<Slot>()))?.cast(), n })
+    }
+
+    fn with<R>(self, key: &str, f: impl FnOnce(&mut Slot) -> R) -> R {
+        use md5::Digest;
+        let md5: [u8; 16] = md5::Md5::digest(key.as_bytes()).into();
+        let home = (u64::from_le_bytes(md5[..8].try_into().unwrap()) % self.n as u64) as usize;
+        while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { std::thread::yield_now() }
+        // SAFETY: zeroed memory is a table of free slots, and the lock gives this thread the only access to it.
+        let slots = unsafe { std::slice::from_raw_parts_mut(self.slots, self.n) };
+        let at = (0..self.n.min(64)).map(|i| (home + i) % self.n).find(|&i| !slots[i].taken || slots[i].md5 == md5).unwrap_or(home);
+        if !slots[at].taken || slots[at].md5 != md5 { slots[at] = Slot { taken: true, md5, ..Slot::default() } }
+        let r = f(&mut slots[at]);
+        self.lock.store(false, Ordering::Release);
+        r
+    }
+}
+
+#[derive(Debug)]
+pub struct Held(Keys, String);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.with(&self.1, |s| s.held = false);
+    }
 }
 
 pub struct Refresh<'a>(&'a Zone, String);
@@ -128,16 +191,8 @@ impl Refresh<'_> {
 pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Zone {
-    pub fn at(dir: std::path::PathBuf, levels: &[usize]) -> Zone {
-        fn files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
-            for f in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-                if f.file_type().is_ok_and(|t| t.is_dir()) { files(&f.path(), found) } else { found.push(f.path()) }
-            }
-        }
-        let mut found = Vec::new();
-        files(&dir, &mut found);
-        let entries = found.iter().filter_map(|f| decode(&std::fs::read(f).ok()?)).collect();
-        Zone { dir: Some(dir), levels: levels.to_vec(), entries: Mutex::new(entries), ..Zone::default() }
+    pub fn at(dir: std::path::PathBuf, levels: &[usize], (name, size): (&str, u64)) -> Result<Zone, String> {
+        Ok(Zone { keys: Keys::shared(&dir, name, size)?, dir: Some(dir), levels: levels.to_vec(), entries: Mutex::default() })
     }
 
     fn file(&self, dir: &std::path::Path, key: &str) -> std::path::PathBuf {
@@ -150,7 +205,13 @@ impl Zone {
 
     fn kept<'a>(&self, entries: &'a mut HashMap<String, Entry>, key: &str) -> Option<&'a Entry> {
         let Some(dir) = &self.dir else { return entries.get(key) };
-        if entries.contains_key(key) && !holds(&self.file(dir, key), key) { entries.remove(key); }
+        let file = std::fs::File::open(self.file(dir, key)).ok();
+        let stamp = file.as_ref().and_then(|f| f.metadata().ok()).map(|m| (m.ino(), m.mtime(), m.mtime_nsec(), m.len()));
+        if stamp.is_none() || entries.get(key).and_then(|e| e.stamp) != stamp {
+            entries.remove(key);
+            let read = file.and_then(|mut f| { let mut b = Vec::new(); f.read_to_end(&mut b).ok().map(|_| b) });
+            if let Some((k, e)) = read.and_then(|b| decode(&b)).filter(|(k, _)| k == key) { entries.insert(k, Entry { stamp, ..e }); }
+        }
         entries.get(key)
     }
 
@@ -177,18 +238,15 @@ impl Zone {
     }
 
     pub fn refresh(&self, key: &str) -> Option<Refresh<'_>> {
-        self.refreshing.lock().unwrap().insert(key.to_string()).then(|| Refresh(self, key.to_string()))
+        self.keys.with(key, |s| !std::mem::replace(&mut s.refreshing, true)).then(|| Refresh(self, key.to_string()))
     }
 
     pub fn release(&self, key: &str) {
-        self.refreshing.lock().unwrap().remove(key);
+        self.keys.with(key, |s| s.refreshing = false);
     }
 
     pub fn used(&self, key: &str) -> u64 {
-        let mut uses = self.uses.lock().unwrap();
-        let n = uses.entry(key.to_string()).or_default();
-        *n += 1;
-        *n
+        self.keys.with(key, |s| { s.uses += 1; s.uses })
     }
 
     pub fn renew(&self, key: &str, (until, updating): (i64, i64), vary: Option<(Vec<String>, &[(String, String)])>) {
@@ -202,23 +260,28 @@ impl Zone {
     pub fn put(&self, (key, at): (&str, &str), (status, ctype, headers, body): (u16, Option<String>, Vec<(String, String)>, Vec<u8>), (length, line, upstream): (Option<usize>, Option<String>, Vec<(String, String)>), (until, updating, error): (i64, i64, i64), (vary, request): (Vec<String>, &[(String, String)])) {
         let variant = variant(&vary, request);
         let key = if at == key || (!vary.is_empty() && at == format!("{key}\n{variant}")) { at } else { key };
-        let e = Entry { status, ctype, headers, body: Arc::new(body), length, line, upstream, until, updating, error, vary, variant };
+        let e = Entry { status, ctype, headers, body: Arc::new(body), length, line, upstream, until, updating, error, vary, variant, stamp: None };
         self.save(key, &e);
         self.entries.lock().unwrap().insert(key.to_string(), e);
     }
 
-    pub async fn lock(&self, key: &str, wait: Duration, age: Duration) -> Option<Option<tokio::sync::OwnedMutexGuard<()>>> {
-        let lock = self.locks.lock().unwrap().entry(key.to_string()).or_default().clone();
-        let deadline = Instant::now() + wait;
-        let since = || self.since.lock().unwrap().get(key).copied();
-        let begin = || { self.since.lock().unwrap().insert(key.to_string(), Instant::now()); };
+    pub async fn lock(&self, key: &str, wait: Duration, age: Duration) -> Option<Option<Held>> {
+        let (deadline, age) = (Instant::now() + wait, i64::try_from(age.as_millis()).unwrap_or(i64::MAX));
         loop {
-            let asked = since();
-            let aged = asked.map_or(deadline, |t| (t + age).min(deadline));
-            if let Some(held) = crate::stream::until(|| Some(aged), lock.clone().lock_owned()).await { begin(); return Some(Some(held)) }
-            if Instant::now() >= deadline { return None }
-            // Another request that waited may have taken over first: then wait for its age.
-            if since() == asked { begin(); return Some(None) }
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+            let (took, since) = self.keys.with(key, |s| {
+                let took = if !s.held { s.held = true; Some(true) } else { (s.since.saturating_add(age) <= now).then_some(false) };
+                if took.is_some() { s.since = now }
+                (took, s.since)
+            });
+            match took {
+                Some(true) => return Some(Some(Held(self.keys, key.to_string()))),
+                Some(false) => return Some(None),
+                None if Instant::now() >= deadline => return None,
+                None => {}
+            }
+            let aged = Duration::from_millis(u64::try_from(since.saturating_add(age) - now).unwrap_or(0));
+            tokio::time::sleep(aged.min(deadline.saturating_duration_since(Instant::now())).min(Duration::from_millis(500))).await;
         }
     }
 }
@@ -244,25 +307,7 @@ fn decode(b: &[u8]) -> Option<(String, Entry)> {
     let mut headers: Vec<(String, String)> = strings[13..].chunks_exact(2).map(|h| (h[0].clone(), h[1].clone())).collect();
     let upstream = headers.split_off(count.parse::<usize>().ok()?.min(headers.len()));
     let vary = vary.split(',').filter(|n| !n.is_empty()).map(str::to_string).collect();
-    Some((key, Entry { status: status.parse().ok()?, ctype: (typed == "true").then_some(ctype), headers, body, length: length.parse().ok(), line: (lined == "true").then_some(line), upstream, until: until.parse().ok()?, updating: updating.parse().ok()?, error: error.parse().ok()?, vary, variant }))
-}
-
-fn holds(file: &std::path::Path, key: &str) -> bool {
-    use std::io::Read;
-    let Ok(f) = std::fs::File::open(file) else { return false };
-    let Ok(size) = f.metadata().map(|m| m.len()) else { return false };
-    let mut r = std::io::BufReader::new(f);
-    let number = |r: &mut std::io::BufReader<std::fs::File>| { let mut n = [0u8; 8]; r.read_exact(&mut n).ok().map(|()| u64::from_le_bytes(n)).filter(|&n| n <= size) };
-    let (Some(count), Some(n)) = (number(&mut r), number(&mut r)) else { return false };
-    let mut first = vec![0u8; key.len()];
-    if count < 13 || n != key.len() as u64 || r.read_exact(&mut first).is_err() || first != key.as_bytes() { return false }
-    let mut end = 16 + n;
-    for i in 1..=count {
-        let Some(n) = number(&mut r) else { return false };
-        end += 8 + n;
-        if end > size || (i < count && r.seek_relative(n as i64).is_err()) { return false }
-    }
-    true
+    Some((key, Entry { status: status.parse().ok()?, ctype: (typed == "true").then_some(ctype), headers, body, length: length.parse().ok(), line: (lined == "true").then_some(line), upstream, until: until.parse().ok()?, updating: updating.parse().ok()?, error: error.parse().ok()?, vary, variant, stamp: None }))
 }
 
 pub fn valid(args: &[String], time: Duration) -> Result<Vec<(Option<u16>, Duration)>, String> {
@@ -280,6 +325,12 @@ pub fn validity(valid: &[(Option<u16>, Duration)], status: u16) -> Option<Durati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Default for Zone {
+        fn default() -> Zone {
+            Zone { dir: None, levels: Vec::new(), entries: Mutex::default(), keys: Keys::new(1 << 20).unwrap() }
+        }
+    }
 
     fn strings(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
@@ -370,7 +421,7 @@ mod tests {
 
     #[test]
     fn conditions_of_what_is_kept() {
-        let entry = |status, headers: &[(&str, &str)]| Entry { status, ctype: None, headers: h(headers), body: Arc::default(), length: None, line: None, upstream: Vec::new(), until: 0, updating: 0, error: 0, vary: Vec::new(), variant: String::new() };
+        let entry = |status, headers: &[(&str, &str)]| Entry { status, ctype: None, headers: h(headers), body: Arc::default(), length: None, line: None, upstream: Vec::new(), until: 0, updating: 0, error: 0, vary: Vec::new(), variant: String::new(), stamp: None };
         let both = [("Last-Modified", "Mon, 02 Mar 2015 17:20:58 GMT"), ("ETag", "\"x\"")];
         assert_eq!(entry(200, &both).conditions(), [("If-Modified-Since", "Mon, 02 Mar 2015 17:20:58 GMT".to_string()), ("If-None-Match", "\"x\"".to_string())]);
         assert_eq!(entry(206, &both[1..]).conditions(), [("If-None-Match", "\"x\"".to_string())]);
@@ -424,14 +475,14 @@ mod tests {
     fn kept_in_files() {
         let dir = std::env::temp_dir().join(format!("twinx-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let z = Zone::at(dir.clone(), &[1, 2]);
+        let z = Zone::at(dir.clone(), &[1, 2], ("t", 1 << 20)).unwrap();
         let valid = (crate::clock::seconds() + 60, 5, 7);
         let headers = h(&[("ETag", "\"x\""), ("Vary", "Foo")]);
         z.put(("k", "k"), (200, Some("text/plain".into()), headers.clone(), b"body".to_vec()), (None, None, Vec::new()), valid, (vec!["foo".into()], &h(&[("Foo", "1")])));
         z.put(("n", "n"), (404, None, Vec::new(), Vec::new()), (Some(3), Some("404 Gone".into()), h(&[("X-A", "a"), ("X-A", "b")])), valid, (Vec::new(), &[]));
         z.renew("n", (valid.0 + 1, 0), None);
         std::fs::write(dir.join("junk"), b"x").unwrap();
-        let again = Zone::at(dir.clone(), &[1, 2]);
+        let again = Zone::at(dir.clone(), &[1, 2], ("t", 1 << 20)).unwrap();
         let e = again.get("k").unwrap();
         assert_eq!((e.status, e.ctype.as_deref(), e.headers.clone(), (*e.body).clone(), e.updating, e.error), (200, Some("text/plain"), headers, b"body".to_vec(), 5, 7));
         assert_eq!(again.resolve("k", &h(&[("Foo", "2")])), "k\nfoo:2\n");

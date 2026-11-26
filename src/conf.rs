@@ -691,12 +691,13 @@ impl Builder<'_> {
         let mut cache_paths: Vec<(PathBuf, String)> = Vec::new();
         for d in block.iter().filter(|d| d.name == "proxy_cache_path") {
             self.check(d, HTTP)?;
-            let (name, levels) = cache_path(&d.args[1..]).map_err(|e| format!("{e} in {}", d.at))?;
+            let ((name, size), levels) = cache_path(&d.args[1..]).map_err(|e| format!("{e} in {}", d.at))?;
             if self.zones.contains_key(&name) { return Err(format!("duplicate zone \"{name}\" in {}", d.at)); }
             let path = self.path(d.args[0].strip_suffix('/').unwrap_or(&d.args[0]));
             if let Some((_, first)) = cache_paths.iter().find(|p| p.0 == path) { return Err(format!("the same path name \"{}\" used in {first} and in {at} in {at}", path.display(), at = d.at)); }
             cache_paths.push((path.clone(), d.at.clone()));
-            self.zones.insert(name, Arc::new(crate::cache::Zone::at(path, &levels)));
+            let zone = crate::cache::Zone::at(path, &levels, (&name, size))?;
+            self.zones.insert(name, Arc::new(zone));
         }
         // Named captures of server names are variables everywhere, so they are known first.
         let names = block.iter().filter(|d| d.name == "server").flat_map(|d| d.block.iter().flatten()).filter(|d| d.name == "server_name");
@@ -1597,7 +1598,7 @@ fn check_proxy_buffers(l: &Level) -> Result<(), String> {
     Ok(())
 }
 
-fn cache_path(args: &[String]) -> Result<(String, Vec<usize>), String> {
+fn cache_path(args: &[String]) -> Result<((String, u64), Vec<usize>), String> {
     let (mut zone, mut levels) = (None, Vec::new());
     for a in args {
         let Some((name, value)) = a.split_once('=') else { return Err(format!("invalid parameter \"{a}\"")) };
@@ -1612,7 +1613,7 @@ fn cache_path(args: &[String]) -> Result<(String, Vec<usize>), String> {
                 let (n, s) = value.split_once(':').ok_or_else(|| format!("invalid keys zone size \"{a}\""))?;
                 let s = size(s).map_err(|_| format!("invalid keys zone size \"{a}\""))?;
                 if s < 2 * page_size() { return Err(format!("keys zone \"{a}\" is too small")); }
-                zone = Some(n.to_string()).filter(|n| !n.is_empty());
+                zone = Some((n.to_string(), s)).filter(|z| !z.0.is_empty());
                 true
             }
             "inactive" => crate::expires::parse_time(value).is_some(),
