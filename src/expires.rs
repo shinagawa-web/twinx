@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, Timelike};
+use chrono::{Local, Timelike};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expires {
@@ -34,7 +34,23 @@ pub fn parse(v: &str) -> Option<Expires> {
 }
 
 pub fn http_date(t: i64) -> String {
-    DateTime::from_timestamp(t, 0).unwrap_or_default().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    let (days, secs) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+    let (era, day) = ((days + 719_468).div_euclid(146_097), (days + 719_468).rem_euclid(146_097));
+    let year = (day - day / 1460 + day / 36_524 - day / 146_096) / 365;
+    let day = day - (365 * year + year / 4 - year / 100);
+    let month = (5 * day + 2) / 153;
+    let (day, year) = (day - (153 * month + 2) / 5 + 1, era * 400 + year + i64::from(month >= 10));
+    // The years chrono can hold; it gives the epoch for the others.
+    if !(-262_143..=262_142).contains(&year) { return http_date(0) }
+    let (w, m) = (days.rem_euclid(7) as usize * 3, month as usize * 3);
+    let mut b = *b"Thu, 01 Jan 1970 00:00:00 GMT";
+    b[..3].copy_from_slice(&b"ThuFriSatSunMonTueWed"[w..w + 3]);
+    b[8..11].copy_from_slice(&b"MarAprMayJunJulAugSepOctNovDecJanFeb"[m..m + 3]);
+    for (at, n, v) in [(5, 2, day), (12, 4, year.rem_euclid(10_000)), (17, 2, secs / 3600), (20, 2, secs / 60 % 60), (23, 2, secs % 60)] {
+        (0..n).fold(v, |v, i| { b[at + n - 1 - i] = b'0' + (v % 10) as u8; v / 10 });
+    }
+    let s = String::from_utf8(b.to_vec()).unwrap_or_default();
+    if (0..10_000).contains(&year) { s } else { format!("{}{year:+05}{}", &s[..12], &s[16..]) }
 }
 
 pub fn http_time(s: &str) -> Option<i64> {
@@ -145,6 +161,22 @@ mod tests {
         for bad in ["", "wrong", "Sun, 06 Nov 1994 08:49:3", "Sun, 06 Xov 1994 08:49:37 GMT", "Sun, 06/Nov/1994 08:49:37 GMT", "Sun, 06 Nov 1994 24:00:00 GMT",
             "Fri, 29 Feb 2019 00:00:00 GMT", "Sun, 31 Apr 1994 00:00:00 GMT", "Sun, 06 Nov 1994 08-49-37 GMT", "Sun Nov  6 08:49:37 94", "Sun Nov 6 08:49:37 1994"[..22].as_ref()] {
             assert_eq!(http_time(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn http_dates_as_chrono_formats_them() {
+        let expected = |t: i64| chrono::DateTime::from_timestamp(t, 0).unwrap_or_default().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let (min, max) = (chrono::NaiveDateTime::MIN.and_utc().timestamp(), chrono::NaiveDateTime::MAX.and_utc().timestamp());
+        let mut times = vec![i64::MIN, i64::MAX, min - 1, min, max, max + 1, -62_167_219_201, -62_167_219_200, 253_402_300_799, 253_402_300_800];
+        let mut r = 1u64;
+        let mut random = |n: i64| { r = r.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407); (r >> 1) as i64 % n };
+        for day in -3653..47_847 {
+            times.extend([day * 86_400, day * 86_400 + 86_399, day * 86_400 + random(86_400)]);
+        }
+        times.extend((0..200_000).map(|_| random(2 * max) - max));
+        for t in times {
+            assert_eq!(http_date(t), expected(t), "{t}");
         }
     }
 
