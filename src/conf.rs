@@ -533,6 +533,7 @@ pub struct Config {
     pub alert_logs: Vec<Arc<File>>,
     pub notice_logs: Vec<Arc<File>>,
     pub warn_logs: Vec<Arc<File>>,
+    pub logs: Vec<(PathBuf, Arc<File>)>,
     pub connections: usize,
     pub workers: usize,
     pub temp_paths: Vec<PathBuf>,
@@ -565,7 +566,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), zones: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new(), location_no_uri: false, listens: HashMap::new(), ssl_zones: HashMap::new() };
-    let mut config = Config { daemon: true, pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, user: None, warnings: Vec::new(), emerg_logs: Vec::new(), alert_logs: Vec::new(), notice_logs: Vec::new(), warn_logs: Vec::new(), connections: 512, workers: 1, temp_paths: Vec::new(), servers: Vec::new() };
+    let mut config = Config { daemon: true, pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, user: None, warnings: Vec::new(), emerg_logs: Vec::new(), alert_logs: Vec::new(), notice_logs: Vec::new(), warn_logs: Vec::new(), logs: Vec::new(), connections: 512, workers: 1, temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
     crate::tls::new_configuration(inheritable);
@@ -621,6 +622,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     listening.dedup();
     if config.connections < listening.len() + 1 { return Err(format!("{} worker_connections are not enough for {} listening sockets", config.connections, listening.len())); }
     config.temp_paths = b.temp_paths.into_iter().map(|t| t.0).collect();
+    config.logs = b.logs.into_iter().collect();
     Ok(config)
 }
 
