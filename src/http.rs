@@ -299,8 +299,17 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
                     let room = room as usize;
                     u32::try_from(in_memory(level.body_buffer, length.is_none(), buf.len().min(room), room)).unwrap_or(u32::MAX)
                 };
+                // A body bound for a file goes there as it comes, so that a connection holds little more than client_body_buffer_size of it.
+                let spills = length.filter(|&n| n > 0 && !unbuffered(level, false) && (level.body_in_file_only || n > room as u64 || (origin.is_some() && n > level.body_buffer)));
+                let mut spill: Option<Spill> = None;
                 loop {
-                    match take_body(&buf, length, level.max_body) {
+                    if let Some(s) = spill.as_mut() {
+                        s.write(&r, level, &mut buf);
+                        if let Some(s) = spill.take_if(|s| s.left == 0) { r.length += s.length as usize; break s.done(&mut r); }
+                    } else if let Some(n) = spills.filter(|&n| buf.len() as u64 > level.body_buffer && (buf.len() as u64) < n) {
+                        spill = Some(Spill::open(&r, level, n));
+                        continue;
+                    } else { match take_body(&buf, length, level.max_body) {
                         Ok(None) => {}
                         Ok(Some((body, used))) => {
                             r.length += used;
@@ -310,8 +319,11 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
                             break keep_body(&mut r, level, body, fits);
                         }
                         Err(status) => break Err(status),
+                    } }
+                    if read_into(&mut stream, &mut buf, None).await == 0 {
+                        if let Some(s) = spill { s.remove(level); }
+                        return;
                     }
-                    if read_into(&mut stream, &mut buf, None).await == 0 { return; }
                 }
             }
         };
@@ -439,6 +451,42 @@ fn keep_body(r: &mut Request, level: &Level, body: Vec<u8>, fits: bool) -> Resul
     if let Err(e) = written { error_log(level, r, &format!("open() \"{}\" failed ({e})", path.display())); return Err(500); }
     r.body_file = Some(path);
     Ok(())
+}
+
+struct Spill {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    length: u64,
+    left: u64,
+}
+
+impl Spill {
+    fn open(r: &Request, level: &Level, length: u64) -> Spill {
+        let path = temp_path(&level.body_temp_path, &level.body_temp_levels);
+        let file = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::File::create(&path));
+        if let Err(e) = &file { error_log(level, r, &format!("open() \"{}\" failed ({e})", path.display())); }
+        Spill { path, file: file.ok(), length, left: length }
+    }
+
+    fn write(&mut self, r: &Request, level: &Level, buf: &mut Vec<u8>) {
+        let n = self.left.min(buf.len() as u64) as usize;
+        if let Some(Err(e)) = self.file.as_mut().map(|f| f.write_all(&buf[..n])) {
+            error_log(level, r, &format!("open() \"{}\" failed ({e})", self.path.display()));
+            self.file = None;
+        }
+        buf.drain(..n);
+        self.left -= n as u64;
+    }
+
+    fn done(self, r: &mut Request) -> Result<(), u16> {
+        if self.file.is_none() { let _ = std::fs::remove_file(&self.path); return Err(500); }
+        r.body_file = Some(self.path);
+        Ok(())
+    }
+
+    fn remove(self, level: &Level) {
+        if !level.body_in_file_only || level.body_clean { let _ = std::fs::remove_file(&self.path); }
+    }
 }
 
 fn in_memory(buffer: u64, chunked: bool, preread: usize, room: usize) -> u64 {
@@ -6004,6 +6052,25 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let level = Level { body_buffer: 4, body_temp_path: std::env::current_exe().unwrap(), ..Level::default() };
         let (_, mut r) = request("GET / HTTP/1.0\n\n");
         assert_eq!(keep_body(&mut r, &level, b"abcde".to_vec(), false), Err(500));
+    }
+
+    #[test]
+    fn writes_bodies_to_files_as_they_come() {
+        let dir = std::env::temp_dir().join(format!("twinx-spill-{}", std::process::id()));
+        let level = Level { body_buffer: 4, body_temp_path: dir, ..Level::default() };
+        let (_, mut r) = request("POST / HTTP/1.0\nContent-Length: 8\n\n");
+        let (mut s, mut buf) = (Spill::open(&r, &level, 8), b"abcde".to_vec());
+        s.write(&r, &level, &mut buf);
+        buf.extend_from_slice(b"fghGET");
+        s.write(&r, &level, &mut buf);
+        assert_eq!((buf.as_slice(), s.left), (&b"GET"[..], 0));
+        s.done(&mut r).unwrap();
+        assert_eq!(std::fs::read(r.body_file.unwrap()).unwrap(), b"abcdefgh");
+        let level = Level { body_buffer: 4, body_temp_path: std::env::current_exe().unwrap(), ..Level::default() };
+        let (_, mut r) = request("POST / HTTP/1.0\nContent-Length: 3\n\n");
+        let (mut s, mut buf) = (Spill::open(&r, &level, 3), b"abc".to_vec());
+        s.write(&r, &level, &mut buf);
+        assert_eq!((buf.len(), s.done(&mut r), r.body_file), (0, Err(500), None));
     }
 
     #[test]
