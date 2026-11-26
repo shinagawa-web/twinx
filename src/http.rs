@@ -2488,14 +2488,13 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
     const HOP: &[&str] = &["connection", "keep-alive", "transfer-encoding", "content-length"];
     for line in upstream_lines(&head) {
         let (name, value) = upstream_header(line).ok_or_else(|| invalid(&invalid_header(line)))?;
-        let (lower, value) = (name.to_ascii_lowercase(), value.to_string());
-        resp.upstream.push((name.to_string(), value.clone()));
-        if lower == "content-type" { resp.ctype = Some(value.into()); continue; }
-        let again = ["expires", "etag", "last-modified"].contains(&lower.as_str()) && resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case(&lower));
-        if !again && !HOP.contains(&lower.as_str()) { resp.headers.push((name.to_string(), value)); }
+        resp.upstream.push((name.to_string(), value.to_string()));
+        if name.eq_ignore_ascii_case("content-type") { resp.ctype = Some(value.to_string().into()); continue; }
+        let again = ["expires", "etag", "last-modified"].iter().any(|h| name.eq_ignore_ascii_case(h)) && resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case(name));
+        if !again && !HOP.iter().any(|h| name.eq_ignore_ascii_case(h)) { resp.headers.push((name.to_string(), value.to_string())); }
     }
     if status == 101 && upgrade { return Ok((Response { body: answer[end..].to_vec(), tunnel: Some(conn.stream), ..resp }, None)); }
-    let values = |name: &str| resp.upstream.iter().filter(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone()).collect::<Vec<_>>();
+    let values = |name: &str| resp.upstream.iter().filter(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.as_str()).collect::<Vec<_>>();
     let (length, chunked) = match (&values("content-length")[..], &values("transfer-encoding")[..]) {
         ([], []) => (None, false),
         ([l], []) => (Some(l.bytes().all(|b| b.is_ascii_digit()).then(|| l.parse::<usize>().ok()).flatten().ok_or_else(|| invalid(&invalid_length(&resp.upstream)))?), false),
@@ -2521,8 +2520,8 @@ async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut cl
 
 fn hidden(hide: &[String], pass: &[String], name: &str) -> bool {
     const HIDDEN: &[&str] = &["date", "server", "x-pad", "x-accel-expires", "x-accel-redirect", "x-accel-limit-rate", "x-accel-buffering", "x-accel-charset"];
-    let lower = name.to_ascii_lowercase();
-    (HIDDEN.contains(&lower.as_str()) || hide.contains(&lower)) && !pass.contains(&lower)
+    let is = |h: &String| h.eq_ignore_ascii_case(name);
+    (HIDDEN.iter().any(|h| h.eq_ignore_ascii_case(name)) || hide.iter().any(is)) && !pass.iter().any(is)
 }
 
 fn upstream_lines(head: &str) -> impl Iterator<Item = &str> {
@@ -2598,8 +2597,8 @@ fn ended_over_h2(slot: &crate::h2::Slot) -> (bool, bool) {
     (end != crate::h2::End::Whole, end == crate::h2::End::Failed)
 }
 
-fn closes(version: &str, connection: &[String]) -> bool {
-    !matches!(version.strip_prefix("HTTP/1.").map(str::as_bytes), Some([b'1'..=b'9'])) || connection.iter().any(|v| v.to_ascii_lowercase().contains("close"))
+fn closes(version: &str, connection: &[&str]) -> bool {
+    !matches!(version.strip_prefix("HTTP/1.").map(str::as_bytes), Some([b'1'..=b'9'])) || connection.iter().any(|v| v.as_bytes().windows(5).any(|w| w.eq_ignore_ascii_case(b"close")))
 }
 
 fn bound(peer: &SocketAddr, (local, transparent): (SocketAddr, bool)) -> Option<socket2::Socket> {
@@ -5217,8 +5216,7 @@ pub(crate) mod tests {
             ("HTTP/1.1", &["close"], true), ("HTTP/1.1", &["Close"], true), ("HTTP/1.1", &["keep-alive, CLOSE"], true), ("HTTP/1.1", &["disclosed"], true),
             ("HTTP/1.1", &["keep-alive", "close"], true),
         ] {
-            let values: Vec<String> = connection.iter().map(|v| v.to_string()).collect();
-            assert_eq!(closes(version, &values), is, "{version} {connection:?}");
+            assert_eq!(closes(version, connection), is, "{version} {connection:?}");
         }
     }
 
