@@ -444,9 +444,11 @@ fn overflow(head: &[u8], first: usize, buffers: impl Fn(Option<&str>) -> (usize,
         let end = head[line..].iter().position(|&c| c == b'\n').map(|i| line + i + 1);
         // The line fits in the buffer, or the buffer is not full yet.
         if end.unwrap_or(head.len()) <= start + cap && (end.is_some() || head.len() < start + cap) {
-            let text = String::from_utf8_lossy(&head[line..end.unwrap_or(head.len())]).into_owned();
-            if let Some((name, value)) = text.split_once(':').filter(|_| line > 0) {
-                if name.eq_ignore_ascii_case("host") { host = valid_host(value.trim_matches([' ', '\t', '\r', '\n'])); }
+            let text = &head[line..end.unwrap_or(head.len())];
+            if let Some(colon) = text.iter().position(|&c| c == b':').filter(|_| line > 0) {
+                if text[..colon].eq_ignore_ascii_case(b"host") {
+                    host = valid_host(String::from_utf8_lossy(&text[colon + 1..]).trim_matches([' ', '\t', '\r', '\n']));
+                }
             }
             match end { Some(end) => { line = end; continue } None => return Ok(start + cap) }
         }
