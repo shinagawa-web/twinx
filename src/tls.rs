@@ -963,7 +963,10 @@ impl ClientCertVerifier for AnyClient {
     }
 
     // Only a client that does not take TLS 1.3 has this called.
-    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> { rustls::crypto::verify_tls12_signature(m, c, d, &self.0) }
+    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        signed(1, dss.scheme);
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
 
     fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
         signed(1, dss.scheme);

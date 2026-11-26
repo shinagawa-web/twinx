@@ -138,4 +138,5 @@ files = [
   "twinx_proxy_xar_escape.t", "twinx_range_values.t", "twinx_variables_left.t",
   "twinx_proxy_ssl_plain_upstream.t",
   "twinx_alias_rewrite.t",
+  "twinx_ssl_client_sigalg.t",
 ]
