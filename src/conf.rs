@@ -482,7 +482,7 @@ pub struct Location {
     pub path: String,
     pub level: Level,
     pub auto_redirect: bool,
-    pub parent: Option<usize>,
+    pub children: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -500,6 +500,7 @@ pub struct Server {
     pub name: String,
     pub level: Level,
     pub locations: Vec<Location>,
+    pub children: Vec<usize>,
     pub ssl: Vec<SocketAddr>,
     pub tls: Option<crate::tls::ServerTls>,
     pub defaults: Vec<SocketAddr>,
@@ -679,7 +680,7 @@ impl Builder<'_> {
     }
 
     fn server(&mut self, block: &[Directive], parent: &Level) -> Result<Server, String> {
-        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), http2: Vec::new() };
+        let mut s = Server { listen: Vec::new(), names: Vec::new(), name: String::new(), level: parent.clone(), locations: Vec::new(), children: Vec::new(), ssl: Vec::new(), tls: None, defaults: Vec::new(), backlogs: Vec::new(), http2: Vec::new() };
         self.level(block, SRV, &mut s.level)?;
         let mut listens = Vec::new();
         for d in block {
@@ -733,17 +734,17 @@ impl Builder<'_> {
         let named = files.iter().any(|(cert, key)| [cert, key].iter().any(|p| p.to_string_lossy().contains('$')));
         s.tls = (!files.is_empty()).then(|| crate::tls::server((&files, l.ssl_password_file.as_deref()), named.then(|| l.ssl_certificate_cache.clone()), &trust, options)).transpose()?;
         let level = s.level.clone();
-        self.locations(block, None, &level, &mut s.locations)?;
+        s.children = self.locations(block, None, &level, &mut s.locations)?;
         Ok(s)
     }
 
-    fn locations(&mut self, block: &[Directive], around: Option<(Kind, &str, usize)>, parent: &Level, out: &mut Vec<Location>) -> Result<(), String> {
+    fn locations(&mut self, block: &[Directive], around: Option<(Kind, &str)>, parent: &Level, out: &mut Vec<Location>) -> Result<Vec<usize>, String> {
+        let mut children = Vec::new();
         for d in block.iter().filter(|d| d.name == "location") {
             let mut level = Level { proxy: None, try_files: None, script: Vec::new(), limit_except: None, ..parent.clone() };
             let inner = d.block.as_deref().unwrap_or_default();
             let (kind, path) = location(&d.args).map_err(|e| format!("{e} in {}", d.at))?;
-            nested(&kind, &path, around.map(|(k, n, _)| (k, n))).map_err(|e| format!("{e} in {}", d.at))?;
-            let parent_index = around.map(|a| a.2);
+            nested(&kind, &path, around).map_err(|e| format!("{e} in {}", d.at))?;
             self.location = d.args.last().cloned().unwrap_or_default();
             self.location_no_uri = matches!(kind, Match::Regex(_) | Match::Named);
             self.level(inner, LOC, &mut level)?;
@@ -752,10 +753,11 @@ impl Builder<'_> {
             let name = path.clone();
             let around = match &kind { Match::Exact => Kind::Exact, Match::Named => Kind::Named, Match::Regex(_) => Kind::Regex, _ => Kind::Prefix };
             let index = out.len();
-            out.push(Location { kind, path, level: level.clone(), auto_redirect, parent: parent_index });
-            self.locations(inner, Some((around, &name, index)), &level, out)?;
+            out.push(Location { kind, path, level: level.clone(), auto_redirect, children: Vec::new() });
+            out[index].children = self.locations(inner, Some((around, &name)), &level, out)?;
+            children.push(index);
         }
-        Ok(())
+        Ok(children)
     }
 
     fn level(&mut self, block: &[Directive], ctx: u16, level: &mut Level) -> Result<(), String> {

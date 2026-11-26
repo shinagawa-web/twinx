@@ -2835,7 +2835,7 @@ fn location<'a>(server: &'a Server, uri: &str) -> Found<'a> {
 
 fn search<'a>(server: &'a Server, uri: &str) -> (Found<'a>, Option<usize>) {
     let mut search = Search { found: None, regex: None };
-    let redirect = search.level(&server.locations, None, uri) == Ended::Redirect;
+    let redirect = search.level(&server.locations, &server.children, uri) == Ended::Redirect;
     let found = search.found.map_or(("", &server.level, false), |i| (server.locations[i].path.as_str(), &server.locations[i].level, redirect));
     (found, search.regex)
 }
@@ -2846,29 +2846,36 @@ enum Ended { Exact, Redirect, Other }
 struct Search { found: Option<usize>, regex: Option<usize> }
 
 impl Search {
-    fn level(&mut self, locs: &[crate::conf::Location], parent: Option<usize>, uri: &str) -> Ended {
-        let here = || locs.iter().enumerate().filter(move |(_, l)| l.parent == parent);
-        if let Some((i, _)) = here().find(|(_, l)| matches!(l.kind, Match::Exact) && l.path == uri) {
-            self.found = Some(i);
-            return Ended::Exact;
+    fn level(&mut self, locs: &[crate::conf::Location], inside: &[usize], uri: &str) -> Ended {
+        let (mut equal, mut redirect, mut longest) = (false, None, None::<usize>);
+        for &i in inside {
+            let l = &locs[i];
+            if l.path == uri {
+                if matches!(l.kind, Match::Exact) {
+                    self.found = Some(i);
+                    return Ended::Exact;
+                }
+                equal |= !matches!(l.kind, Match::Regex(_));
+            }
+            if redirect.is_none() && l.auto_redirect && !uri.is_empty() && l.path.strip_prefix(uri) == Some("/") { redirect = Some(i); }
+            let prefix = matches!(l.kind, Match::Prefix | Match::NoRegex) && uri.starts_with(l.path.as_str());
+            if prefix && longest.is_none_or(|j| l.path.len() >= locs[j].path.len()) { longest = Some(i); }
         }
-        let equal = here().any(|(_, l)| !matches!(l.kind, Match::Regex(_)) && l.path == uri);
-        if let Some((i, _)) = here().find(|(_, l)| l.auto_redirect && !equal && !uri.is_empty() && l.path.strip_prefix(uri) == Some("/")) {
+        if let Some(i) = redirect.filter(|_| !equal) {
             self.found = Some(i);
             return Ended::Redirect;
         }
-        let longest = here().filter(|(_, l)| matches!(l.kind, Match::Prefix | Match::NoRegex) && uri.starts_with(l.path.as_str())).max_by_key(|(_, l)| l.path.len());
         let mut noregex = false;
-        if let Some((i, l)) = longest {
+        if let Some(i) = longest {
             self.found = Some(i);
-            noregex = matches!(l.kind, Match::NoRegex);
-            let step = self.level(locs, Some(i), uri);
+            noregex = matches!(locs[i].kind, Match::NoRegex);
+            let step = self.level(locs, &locs[i].children, uri);
             if step != Ended::Other { return step; }
         }
         if noregex { return Ended::Other; }
-        let Some((i, _)) = here().find(|(_, l)| matches!(&l.kind, Match::Regex(re) if re.is_match(&crate::vars::bytes(uri)))) else { return Ended::Other };
+        let Some(&i) = inside.iter().find(|&&i| matches!(&locs[i].kind, Match::Regex(re) if re.is_match(&crate::vars::bytes(uri)))) else { return Ended::Other };
         (self.found, self.regex) = (Some(i), Some(i));
-        self.level(locs, Some(i), uri);
+        self.level(locs, &locs[i].children, uri);
         Ended::Exact
     }
 }
