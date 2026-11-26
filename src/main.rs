@@ -55,7 +55,7 @@ fn args(list: &[String]) -> Result<Args, String> {
 fn load(a: &Args) -> Result<conf::Config, String> {
     let file = a.prefix.join(&a.conf);
     let text = std::fs::read_to_string(&file).map_err(|e| format!("open() \"{}\" failed ({e})", file.display()))?;
-    let mut main = config::parse(&a.globals, Path::new("command line"))?;
+    let mut main = config::parse_in(&a.globals, Path::new("command line"), file.parent().unwrap_or(Path::new("")))?;
     main.extend(config::parse(&text, &file)?);
     if !main.iter().any(|d| d.name == "error_log") { main.extend(config::parse(&format!("error_log \"{}\" error;", a.error_log.display()), &file)?); }
     let config = conf::build(&main, &a.prefix)?;

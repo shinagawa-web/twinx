@@ -125,6 +125,7 @@ files = [
 [stage6]
 files = [
   "twinx_ssl_verify_client_sessions.t",
+  "twinx_include.t",
   "twinx_internal.t",
   "twinx_user.t",
   "twinx_ssl_session_shared.t",
