@@ -230,45 +230,87 @@ pub struct ServerTls {
 pub struct Sessions {
     pub tickets: bool,
     pub cache: bool,
-    pub shared: bool,
+    pub zone: Option<&'static crate::shm::Zone>,
     pub timeout: u64,
 }
 
 impl Default for Sessions {
     fn default() -> Sessions {
-        Sessions { tickets: true, cache: false, shared: false, timeout: 300 }
+        Sessions { tickets: true, cache: false, zone: None, timeout: 300 }
+    }
+}
+
+#[derive(Debug)]
+struct Shared(&'static crate::shm::Zone, u64, [u8; 32]);
+
+impl Shared {
+    fn key(&self, id: &[u8]) -> Vec<u8> {
+        [&self.2[..], id].concat()
+    }
+}
+
+impl rustls::server::StoresServerSessions for Shared {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        self.0.put(&self.key(&key), &value, now() + self.1)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(&self.key(key), now())
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.get(key)
+    }
+
+    fn can_cache(&self) -> bool {
+        true
     }
 }
 
 #[derive(Debug)]
 struct Rotated {
-    rotate: Option<u64>,
+    zone: Option<(&'static crate::shm::Zone, u64)>,
     file: Vec<TicketKey>,
-    keys: Mutex<(u64, TicketKey, Option<TicketKey>)>,
+    fixed: TicketKey,
 }
 
 impl Rotated {
     /// Made in the master, so that the workers forked from it start with the same key.
-    fn new(rotate: Option<u64>, file: Vec<TicketKey>) -> Result<Rotated, String> {
-        Ok(Rotated { rotate, file, keys: Mutex::new((rotate.map_or(u64::MAX, |t| now() + t), TicketKey::random()?, None)) })
+    fn new(zone: Option<(&'static crate::shm::Zone, u64)>, file: Vec<TicketKey>) -> Result<Rotated, String> {
+        Ok(Rotated { zone, file, fixed: TicketKey::random()? })
+    }
+
+    fn keys(&self) -> Option<Vec<TicketKey>> {
+        let Some((zone, timeout)) = self.zone else { return None };
+        let now = now();
+        zone.ticket_keys(now, now + timeout, || random_key().ok())?.iter().map(TicketKey::raw).collect()
     }
 
     fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
         if let Some(key) = self.file.first() { return key.seal(plain) }
-        let mut keys = self.keys.lock().unwrap();
-        let now = now();
-        if now >= keys.0 {
-            let old = std::mem::replace(&mut keys.1, TicketKey::random().ok()?);
-            (keys.0, keys.2) = (self.rotate.map_or(u64::MAX, |t| now + t), Some(old));
-        }
-        keys.1.seal(plain)
+        if self.zone.is_some() { return self.keys()?.first()?.seal(plain) }
+        self.fixed.seal(plain)
     }
 
     fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
-        if !self.file.is_empty() { return self.file.iter().find(|k| cipher.starts_with(&k.name))?.open(cipher) }
-        let keys = self.keys.lock().unwrap();
-        std::iter::once(&keys.1).chain(&keys.2).find(|k| cipher.starts_with(&k.name))?.open(cipher)
+        let open = |keys: &[TicketKey]| keys.iter().find(|k| cipher.starts_with(&k.name))?.open(cipher);
+        if !self.file.is_empty() { return open(&self.file) }
+        if self.zone.is_some() { return open(&self.keys()?) }
+        open(std::slice::from_ref(&self.fixed))
     }
+}
+
+/// Servers with other certificates keep their sessions apart in a zone they share.
+fn context(keys: &[Arc<rustls::sign::CertifiedKey>]) -> [u8; 32] {
+    let mut c = ring::digest::Context::new(&ring::digest::SHA256);
+    keys.iter().flat_map(|k| &k.cert).for_each(|d| c.update(d));
+    c.finish().as_ref().try_into().unwrap_or_default()
+}
+
+fn random_key() -> Result<[u8; 48], String> {
+    let mut data = [0u8; 48];
+    provider().secure_random.fill(&mut data).map_err(|_| "no random bytes for a session ticket key")?;
+    Ok(data)
 }
 
 #[derive(Debug)]
@@ -285,9 +327,11 @@ impl TicketKey {
     }
 
     fn random() -> Result<TicketKey, String> {
-        let mut data = [0u8; 48];
-        provider().secure_random.fill(&mut data).map_err(|_| "no random bytes for a session ticket key")?;
-        Ok(TicketKey { name: data[..16].try_into().map_err(|_| "short")?, key: ring::aead::LessSafeKey::new(ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &data[16..]).map_err(|_| "bad key")?) })
+        TicketKey::raw(&random_key()?).ok_or_else(|| "bad key".to_string())
+    }
+
+    fn raw(data: &[u8; 48]) -> Option<TicketKey> {
+        Some(TicketKey { name: data[..16].try_into().ok()?, key: ring::aead::LessSafeKey::new(ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &data[16..]).ok()?) })
     }
 
     fn seal(&self, plain: &[u8]) -> Option<Vec<u8>> {
@@ -539,13 +583,18 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     let builder = if options.verify { builder.with_client_cert_verifier(Arc::new(AnyClient(provider().signature_verification_algorithms, ca_names(options.client_ca.as_deref())?))) } else { builder.with_no_client_auth() };
     let mut fixed = Fixed::new(fixed);
     if let Some(stapling) = &options.stapling { fixed.1 = fixed.0.iter().map(|k| Staple::new(k, stapling, &trusted)).collect::<Result<_, _>>()?; }
+    let context = context(&fixed.0);
     let mut config = builder.with_cert_resolver(Arc::new(fixed));
     config.ignore_client_order = options.prefer;
     config.cert_compressors = if options.compress { vec![rustls::compress::ZLIB_COMPRESSOR] } else { Vec::new() };
     let sessions = options.sessions;
-    config.session_storage = if sessions.cache { Arc::new(Kept(rustls::server::ServerSessionMemoryCache::new(20480))) } else { Arc::new(rustls::server::NoServerSessionStorage {}) };
+    config.session_storage = match sessions.zone {
+        Some(zone) => Arc::new(Shared(zone, sessions.timeout, context)),
+        None if sessions.cache => Arc::new(Kept(rustls::server::ServerSessionMemoryCache::new(20480))),
+        None => Arc::new(rustls::server::NoServerSessionStorage {}),
+    };
     let file = options.ticket_keys.iter().map(|f| TicketKey::load(f)).collect::<Result<Vec<_>, _>>()?;
-    let keys = Rotated::new(sessions.shared.then_some(sessions.timeout), file)?;
+    let keys = Rotated::new(sessions.zone.map(|z| (z, sessions.timeout)), file)?;
     if sessions.tickets { config.ticketer = Arc::new(Timed(keys, sessions.timeout)); }
     Ok(ServerTls { config: Arc::new(config), trusted, crls: options.crl.as_deref().map(crls).transpose()?, depth: options.depth, named, ocsp: options.ocsp })
 }
@@ -1348,17 +1397,33 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn shared_ticket_keys_rotate_after_the_timeout() {
-        let keys = Rotated::new(Some(10), Vec::new()).unwrap();
+        let zone = crate::shm::zone("rotate", 32768).unwrap();
+        let keys = Rotated::new(Some((zone, 10)), Vec::new()).unwrap();
         let first = keys.encrypt(b"a").unwrap();
         assert_eq!(&keys.encrypt(b"b").unwrap()[..16], &first[..16]);
-        keys.keys.lock().unwrap().0 = now();
-        let next = keys.encrypt(b"c").unwrap();
+        let other = Rotated::new(Some((zone, 10)), Vec::new()).unwrap();
+        assert_eq!(other.decrypt(&first), Some(b"a".to_vec()));
+        let fresh = || random_key().ok();
+        let [current, ..] = zone.ticket_keys(now() + 5, now() + 15, fresh).unwrap();
+        assert_eq!(&current[..16], &first[..16]);
+        let [next, previous, _] = zone.ticket_keys(now() + 11, now() + 21, fresh).unwrap();
         assert_ne!(&next[..16], &first[..16]);
-        assert_eq!((keys.decrypt(&first), keys.decrypt(&next), keys.decrypt(b"x")), (Some(b"a".to_vec()), Some(b"c".to_vec()), None));
+        assert_eq!((&previous[..16], keys.decrypt(&first)), (&first[..16], Some(b"a".to_vec())));
         let fixed = Rotated::new(None, Vec::new()).unwrap();
-        let first = fixed.encrypt(b"a").unwrap();
-        fixed.keys.lock().unwrap().0 = now() + 1;
-        assert_eq!(&fixed.encrypt(b"b").unwrap()[..16], &first[..16]);
+        assert_eq!(&fixed.encrypt(b"b").unwrap()[..16], &fixed.encrypt(b"a").unwrap()[..16]);
+        assert_eq!(keys.decrypt(b"x"), None);
+    }
+
+    #[test]
+    fn shared_sessions_expire_and_make_room() {
+        let zone = crate::shm::zone("sessions", 4096).unwrap();
+        assert!(zone.put(b"a", b"one", now() + 10) && zone.put(b"b", &[1; 300], now() + 10));
+        assert_eq!((zone.get(b"a", now()), zone.get(b"b", now()).map(|v| v.len()), zone.get(b"a", now() + 11)), (Some(b"one".to_vec()), Some(300), None));
+        assert!(zone.put(b"a", b"two", now() + 10));
+        assert_eq!(zone.get(b"a", now()), Some(b"two".to_vec()));
+        for i in 0..20u8 { assert!(zone.put(&[i], b"x", now() + 10)) }
+        assert_eq!((zone.get(b"b", now()), zone.get(&[19], now())), (None, Some(b"x".to_vec())));
+        assert!(!zone.put(b"c", &[0; 4096], now()));
     }
 
     #[test]
@@ -1368,7 +1433,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         std::fs::write(&short, [b'1'; 48]).unwrap();
         std::fs::write(&long, [b'2'; 80]).unwrap();
         std::fs::write(&bad, b"1").unwrap();
-        let keys = Rotated::new(Some(10), vec![TicketKey::load(&long).unwrap(), TicketKey::load(&short).unwrap()]).unwrap();
+        let keys = Rotated::new(None, vec![TicketKey::load(&long).unwrap(), TicketKey::load(&short).unwrap()]).unwrap();
         let ticket = keys.encrypt(b"a").unwrap();
         assert_eq!((&ticket[..16], keys.decrypt(&ticket)), (&[b'2'; 16][..], Some(b"a".to_vec())));
         let other = Rotated::new(None, vec![TicketKey::load(&short).unwrap()]).unwrap();
