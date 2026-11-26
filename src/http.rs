@@ -1900,7 +1900,11 @@ fn file_at(level: &Level, r: &Request, path: PathBuf) -> Response {
     let modified = expires::http_date(mtime as i64);
     const TYPES: &[(&str, &str)] = &[("html", "text/html"), ("gif", "image/gif"), ("jpg", "image/jpeg")];
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
-    let ctype = TYPES.iter().find(|t| t.0 == ext).map_or_else(|| level.default_type.clone().into(), |t| t.1.into());
+    let ctype = match &level.types {
+        Some(types) => types.get(ext).or_else(|| types.get(&ext.to_ascii_lowercase())).map(|t| t.clone().into()),
+        None => TYPES.iter().find(|t| t.0.eq_ignore_ascii_case(ext)).map(|t| t.1.into()),
+    };
+    let ctype = ctype.unwrap_or_else(|| level.default_type.clone().into());
     let mut headers = vec![("Last-Modified".to_string(), modified)];
     headers.extend(gz.as_ref().map(|_| ("Content-Encoding".to_string(), "gzip".to_string())));
     let mut etag = String::with_capacity(36);
