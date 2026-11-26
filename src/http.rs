@@ -1212,10 +1212,9 @@ fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
 
 fn precondition_fails(r: &Request, resp: &Response) -> bool {
     if resp.status != 200 || resp.unconditional { return false; }
-    let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
-    let (modified, etag) = (sent("last-modified").and_then(|t| expires::http_time(&t)), sent("etag"));
-    header(r, "if-unmodified-since").is_some_and(|t| !modified.zip(expires::http_time(t)).is_some_and(|(m, t)| t >= m))
-        || header(r, "if-match").is_some_and(|v| !etag_match(v, etag.as_deref(), false))
+    let sent = |name: &str| resp.headers.iter().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.as_str());
+    header(r, "if-unmodified-since").is_some_and(|t| !sent("last-modified").and_then(expires::http_time).zip(expires::http_time(t)).is_some_and(|(m, t)| t >= m))
+        || header(r, "if-match").is_some_and(|v| !etag_match(v, sent("etag"), false))
 }
 
 fn range(r: &Request, level: &Level, resp: &mut Response) {
