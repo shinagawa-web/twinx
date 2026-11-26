@@ -1,25 +1,16 @@
-//! The expires directive: the Expires and Cache-Control headers it sets.
-
 use chrono::{DateTime, Local, Timelike};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expires {
     Off,
-    /// epoch and max: a fixed Expires time and Cache-Control value.
     Fixed(i64, &'static str),
-    /// A time from now.
     Access(i64),
-    /// A time from the Last-Modified time (from now when there is none).
     Modified(i64),
-    /// A time of day, "@15h30m".
     Daily(i64),
 }
 
-/// A time such as "2048", "1h30m" or "10s", in seconds, as ngx_parse_time() reads it.
 pub fn parse_time(s: &str) -> Option<i64> {
     const UNITS: &[(char, i64)] = &[('y', 31_536_000), ('M', 2_592_000), ('w', 604_800), ('d', 86_400), ('h', 3600), ('m', 60), ('s', 1)];
-    // The units go from the largest to the smallest, as the steps of ngx_parse_time() do.
-    // Spaces may follow a unit, as in "1m 30s".
     let (mut total, mut number, mut next, mut unit) = (0i64, String::new(), 0, false);
     for c in s.chars() {
         if c.is_ascii_digit() { (number, unit) = (number + &c.to_string(), false); continue; }
@@ -32,7 +23,6 @@ pub fn parse_time(s: &str) -> Option<i64> {
     (!s.is_empty()).then_some(total + rest)
 }
 
-/// The value of the directive ("modified 1h", "@12h", "-1d", "epoch", ...), None when invalid.
 pub fn parse(v: &str) -> Option<Expires> {
     let (modified, v) = v.strip_prefix("modified ").map_or((false, v), |rest| (true, rest.trim()));
     let fixed = [("epoch", Expires::Fixed(1, "no-cache")), ("max", Expires::Fixed(2_145_916_555, "max-age=315360000")), ("off", Expires::Off)];
@@ -47,20 +37,12 @@ pub fn http_date(t: i64) -> String {
     DateTime::from_timestamp(t, 0).unwrap_or_default().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
-/// The time an HTTP date gives, as ngx_parse_http_time() reads it: "Sun, 06 Nov
-/// 1994 08:49:37 GMT" (RFC 1123), "Sunday, 06-Nov-94 08:49:37 GMT" (RFC 850, a
-/// year below 70 in the 2000s) or "Sun Nov  6 08:49:37 1994" (asctime). The day
-/// of the week is not looked at, the month only by as many of its letters as
-/// tell it from the others, and nothing after the time (or the year of asctime)
-/// is, the zone included.
 pub fn http_time(s: &str) -> Option<i64> {
     const MDAYS: [i64; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let b = s.as_bytes();
     let at = |i: usize| b.get(i).copied().unwrap_or(0);
     let digits = |i: usize, n: usize| (i..i + n).try_fold(0i64, |v, j| at(j).is_ascii_digit().then(|| v * 10 + i64::from(at(j) - b'0')));
-    // A comma ends the day of the week of RFC 1123 and RFC 850, a space that of asctime.
     let stop = b.iter().position(|&c| c == b',' || c == b' ');
-    // The separator of the day, month and year: a space, a dash, or none for asctime.
     let (mut fmt, mut day, mut year) = (0u8, 0, 0);
     let mut p = stop.unwrap_or(b.len()) + 1;
     while at(p) == b' ' { p += 1; }
@@ -92,7 +74,6 @@ pub fn http_time(s: &str) -> Option<i64> {
     Some(days * 86_400 + hour * 3600 + min * 60 + sec)
 }
 
-/// The Expires and Cache-Control values, given the response's Last-Modified time.
 pub fn headers(e: Expires, last_modified: Option<i64>) -> Option<(String, String)> {
     let now = crate::clock::seconds();
     let (expires, cc) = match e {
@@ -111,7 +92,6 @@ pub fn headers(e: Expires, last_modified: Option<i64>) -> Option<(String, String
     Some((http_date(expires), cc))
 }
 
-/// The start of the local day after which `secs` into the day comes next.
 fn next_day_start(secs: i64) -> i64 {
     let now = Local::now();
     let today = now.timestamp() - now.num_seconds_from_midnight() as i64;
@@ -128,7 +108,6 @@ mod tests {
         assert_eq!(parse_time("1m1m30"), Some(150));
         assert_eq!(parse_time("30s1m"), None);
         assert_eq!(parse_time("1d1y"), None);
-        // Spaces may follow a unit, not a number.
         assert_eq!(parse_time("1m 30s"), Some(90));
         assert_eq!(parse_time("1m  30"), Some(90));
         assert_eq!(parse_time("1 m"), None);
