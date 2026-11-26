@@ -87,7 +87,7 @@ fn signal_set() -> sigset_t {
     unsafe {
         let mut set = std::mem::zeroed();
         libc::sigemptyset(&mut set);
-        for s in [SIGQUIT, SIGTERM, SIGINT, SIGHUP] { libc::sigaddset(&mut set, s); }
+        for s in [SIGQUIT, SIGTERM, SIGINT, SIGHUP, SIGUSR1] { libc::sigaddset(&mut set, s); }
         set
     }
 }
@@ -115,6 +115,12 @@ fn run(a: &Args) -> Result<(), String> {
     let sig = loop {
         let sig = wait_signal(&master);
         if sig == SIGCHLD { reap(&config, &listeners, &set, &mut workers, &mut old); continue }
+        if sig == SIGUSR1 {
+            reopen(&config, config.user.as_ref().map(|u| u.uid));
+            // SAFETY: a plain system call on the process ids of the workers.
+            workers.iter().for_each(|&w| unsafe { libc::kill(w, SIGUSR1); });
+            continue
+        }
         if sig != SIGHUP { break sig }
         log(&config.notice_logs, "notice", "reconfiguring");
         let Ok((new, open)) = load(a).map(Arc::new).and_then(|c| Ok((c.clone(), http::bind(&c, &listeners)?))).map_err(|e| emerg(&e, Some(&a.prefix.join(&a.error_log)))) else { continue };
@@ -219,13 +225,38 @@ fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], s
         let accepting = http::accept(config.clone(), listeners).unwrap_or_else(|e| fail(&e, None));
         let signals = signal_fd(set).unwrap_or_else(|e| fail(&format!("signalfd() failed ({e})"), None));
         let mut sig = SIGHUP;
-        while sig == SIGHUP { sig = next_signal(&signals).await }
+        while sig == SIGHUP || sig == SIGUSR1 {
+            sig = next_signal(&signals).await;
+            if sig == SIGUSR1 { reopen(config, None) }
+        }
         if sig == SIGQUIT {
             log(&config.notice_logs, "notice", "gracefully shutting down");
             http::shut_down(accepting, config.shutdown_timeout).await
         }
     });
     std::process::exit(0)
+}
+
+fn reopen(config: &conf::Config, owner: Option<libc::uid_t>) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    log(&config.notice_logs, "notice", "reopening logs");
+    for (path, file) in &config.logs {
+        let new = match OpenOptions::new().create(true).append(true).open(path) {
+            Ok(new) => new,
+            Err(e) => { log(&config.emerg_logs, "emerg", &spool::failed("open()", path, &e)); continue }
+        };
+        if let Some(uid) = owner {
+            let owned = std::fs::metadata(path).map_err(|e| spool::failed("stat()", path, &e)).and_then(|m| {
+                if m.uid() != uid { std::os::unix::fs::chown(path, Some(uid), None).map_err(|e| spool::failed("chown()", path, &e))? }
+                if m.mode() & 0o600 != 0o600 { std::fs::set_permissions(path, std::fs::Permissions::from_mode(m.mode() | 0o600)).map_err(|e| spool::failed("chmod()", path, &e))? }
+                Ok(())
+            });
+            if let Err(e) = owned { log(&config.emerg_logs, "emerg", &e); continue }
+        }
+        // SAFETY: both are open descriptors of this process; the one every holder of the file writes to now names the new file.
+        unsafe { libc::dup3(new.as_raw_fd(), file.as_raw_fd(), libc::O_CLOEXEC) };
+    }
 }
 
 fn switch_user(config: &conf::Config, u: &conf::User) {
