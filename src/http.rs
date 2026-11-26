@@ -834,7 +834,7 @@ enum Stop<'a> {
     No,
     Yes,
     Return(u16, &'a Template),
-    Answer(Response),
+    Answer(Box<Response>),
 }
 
 fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> Stop<'a> {
@@ -869,8 +869,8 @@ fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> S
             None if rw.add_args && !old.is_empty() => format!("?{old}"),
             None => String::new(),
         };
-        if rw.redirect { return Stop::Answer(redirect(rw.status, format!("{uri}{args}"))); }
-        if uri.is_empty() { error_log(s.level, to, "the rewritten URI has a zero length"); return Stop::Answer(special(500)); }
+        if rw.redirect { return Stop::Answer(Box::new(redirect(rw.status, format!("{uri}{args}")))); }
+        if uri.is_empty() { error_log(s.level, to, "the rewritten URI has a zero length"); return Stop::Answer(Box::new(special(500))); }
         let target = format!("{uri}{args}");
         to.to_mut().redirect(uri, target);
         (s.changed, s.moved) = (rw.flag != Flag::Break, true);
@@ -879,10 +879,10 @@ fn script<'a>(to: &mut Cow<'_, Request>, ops: &'a [Op], s: &mut Script<'a>) -> S
     Stop::No
 }
 
-async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Response, &'a Level) {
+async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto): Found<'a>, mut client: Option<&mut Stream>) -> (Box<Response>, &'a Level) {
     match parsed {
-        Err(status) => return (special(status), level),
-        Ok(()) if auto => return (redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r))), level),
+        Err(status) => return (Box::new(special(status)), level),
+        Ok(()) if auto => return (Box::new(redirect(301, format!("{}/{}", escape_uri(&r.uri), args(r)))), level),
         Ok(()) => {}
     }
     if crate::vars::files_used() {
@@ -896,11 +896,11 @@ async fn respond<'a>(r: &Request, parsed: Result<(), u16>, (prefix, level, auto)
     let mut s = Script { level, changed: false, moved: false, proxied: level.proxy.is_some() };
     let stop = script(&mut to, &level.script, &mut s);
     let (level, moved) = (s.level, s.moved);
-    if s.proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration", ""); return (special(500), level); }
+    if s.proxied && level.proxy.is_none() { log_at(level, r, "alert", "no upstream configuration", ""); return (Box::new(special(500)), level); }
     if let Some(resp) = ended(&to, level, prefix, stop, client.as_deref_mut()).await { return (resp, level); }
-    if s.changed { let to = to.into_owned(); return (Response { internal: Some(Box::new((to.target, Some(to.uri)))), rewritten: true, ..Response::default() }, level); }
+    if s.changed { let to = to.into_owned(); return (Box::new(Response { internal: Some(Box::new((to.target, Some(to.uri)))), rewritten: true, ..Response::default() }), level); }
     let resp = match level.proxy.as_deref().filter(|p| moved && p.uri.is_some() && level.try_files.is_none()) {
-        Some(p) => Box::pin(async { proxy(&Proxy { uri: None, ..p.clone() }, level, &to, prefix, client).await }).await,
+        Some(p) => Box::new(Box::pin(async { proxy(&Proxy { uri: None, ..p.clone() }, level, &to, prefix, client).await }).await),
         None => serve(&to, level, prefix, None, client).await,
     };
     (resp, level)
@@ -931,8 +931,8 @@ fn escape_args(s: &str) -> String {
     crate::vars::bytes(s).into_iter().map(|c| if plain(c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
 }
 
-async fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Template)>, client: Option<&mut Stream>) -> Response {
-    match (ret, &level.proxy, level.try_files.as_deref()) {
+async fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Template)>, client: Option<&mut Stream>) -> Box<Response> {
+    Box::new(match (ret, &level.proxy, level.try_files.as_deref()) {
         (Some((code, text)), _, _) if REDIRECTS.contains(&code) => redirect(code, text.render(r, &Sent::default())),
         (Some((code, text)), _, _) if text.0.is_empty() && code >= 400 => special(code),
         (Some((code, text)), _, _) => {
@@ -942,7 +942,7 @@ async fn serve(r: &Request, level: &Level, prefix: &str, ret: Option<(u16, &Temp
         (None, _, Some(tf)) => try_files(tf, level, r, prefix, client).await,
         (None, Some(p), None) => Box::pin(proxy(p, level, r, prefix, client)).await,
         (None, None, None) => file(level, r, prefix),
-    }
+    })
 }
 
 async fn try_files(tf: &TryFiles, level: &Level, r: &Request, prefix: &str, client: Option<&mut Stream>) -> Response {
@@ -982,8 +982,9 @@ fn args(r: &Request) -> &str {
 
 async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Result<(), u16>, found: Found<'_>, local: SocketAddr, ahead: &[u8]) -> Option<Duration> {
     let redirected;
+    let mut base = r;
     let (mut resp, mut level, mut last) = answer(server, r, parsed, found, Some(&mut *stream)).await;
-    if precondition_fails(r, &resp) { resp = special(412); }
+    if precondition_fails(r, &resp) { *resp = special(412); }
     let intercepted = !resp.proxied || level.proxy_intercept_errors;
     if let Some(ep) = level.error_page.iter().find(|e| e.codes.contains(&resp.status)).filter(|_| intercepted) {
         let auth = |h: &&(String, String)| resp.proxied && resp.status == 401 && h.0.eq_ignore_ascii_case("www-authenticate");
@@ -1001,17 +1002,18 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
             to.shared.err_status.store(status, std::sync::atomic::Ordering::Relaxed);
             let found = named.map_or_else(|| located(server, &to, &to.uri), |l| (l.path.as_str(), &l.level, false));
             redirected = to;
+            base = &*redirected;
             (resp, level, last) = Box::pin(answer(server, &redirected, Ok(()), found, Some(&mut *stream))).await;
             if !resp.generated && status != 0 { (resp.status, resp.status_line) = (status, None); }
             if !resp.proxied { resp.headers.retain(|h| !(h.0.eq_ignore_ascii_case("last-modified") && ![200, 206, 304].contains(&resp.status) || h.0.eq_ignore_ascii_case("accept-ranges") && resp.status != 200)); }
             let own = resp.headers.iter().any(|h| h.0.eq_ignore_ascii_case("location"));
             resp.headers.splice(0..0, kept.into_iter().filter(|h| !own || !h.0.eq_ignore_ascii_case("location")));
         } else {
-            resp = if url.starts_with('@') { special(500) } else { redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url) };
+            *resp = if url.starts_with('@') { special(500) } else { redirect(ep.status.filter(|s| REDIRECTS.contains(s)).unwrap_or(302), url) };
         }
     }
     if (495..=497).contains(&resp.status) && resp.generated { resp.status = 400; }
-    let r = &*last;
+    let r = last.as_deref().unwrap_or(base);
     not_modified(r, level, &mut resp);
     let absolute = level.absolute_redirect && !resp.relative;
     if let Some(h) = resp.headers.iter_mut().find(|h| h.0.eq_ignore_ascii_case("location") && h.1.starts_with('/')).filter(|_| absolute) {
@@ -1169,7 +1171,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     if written && level.post_action.is_some() { Box::pin(post_action(server, r, level, Some(stream))).await; }
     if !level.access_log.is_empty() {
         let status = if resp.http09 { 9 } else { resp.status };
-        let sent = Sent { status, bytes, body, complete: written && !cut, ..so_far(resp, trailers) };
+        let sent = Sent { status, bytes, body, complete: written && !cut, ..so_far(*resp, trailers) };
         level.access_log.iter().for_each(|log| log.write(level, r, &sent));
     }
     recycle(out);
@@ -1729,7 +1731,7 @@ fn browser(ua: &str) -> (bool, bool) {
     (msie6, msie.is_none() && !opera && !other && has(b, b"Safari/") && has(b, b"Mac OS X"))
 }
 
-async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u16>, found: Found<'a>, mut client: Option<&mut Stream>) -> (Response, &'a Level, Cow<'r, Request>) {
+async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u16>, found: Found<'a>, mut client: Option<&mut Stream>) -> (Box<Response>, &'a Level, Option<Box<Request>>) {
     let mut to = Cow::Borrowed(r);
     let rewrite = !server.level.script.is_empty() && !(server.named && server.locations.iter().any(|l| matches!(l.kind, Match::Named) && std::ptr::eq(&l.level, found.1)));
     let (mut resp, mut level) = match parsed {
@@ -1756,7 +1758,7 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
             if rewritten || redirects > 10 { Ok(found) } else { Box::pin(server_rewrite(server, &mut to, found, client.as_deref_mut())).await }
         };
         (resp, level) = match found {
-            _ if redirects > 10 || (target.starts_with('@') && named.is_none()) => (special(500), level),
+            _ if redirects > 10 || (target.starts_with('@') && named.is_none()) => (Box::new(special(500)), level),
             Ok(found) => Box::pin(respond(&to, Ok(()), found, client.as_deref_mut())).await,
             Err(answered) => answered,
         };
@@ -1766,10 +1768,10 @@ async fn answer<'a, 'r>(server: &'a Server, r: &'r Request, parsed: Result<(), u
             if proxied || resp.upstream.is_empty() { resp.upstream = to.upstream.clone(); }
         }
     }
-    (resp, level, to)
+    (resp, level, match to { Cow::Borrowed(_) => None, Cow::Owned(to) => Some(Box::new(to)) })
 }
 
-async fn server_rewrite<'a>(server: &'a Server, to: &mut Cow<'_, Request>, found: Found<'a>, client: Option<&mut Stream>) -> Result<Found<'a>, (Response, &'a Level)> {
+async fn server_rewrite<'a>(server: &'a Server, to: &mut Cow<'_, Request>, found: Found<'a>, client: Option<&mut Stream>) -> Result<Found<'a>, (Box<Response>, &'a Level)> {
     if server.level.script.is_empty() { return Ok(found); }
     let mut s = Script { level: &server.level, changed: false, moved: false, proxied: false };
     let stop = script(to, &server.level.script, &mut s);
@@ -1780,7 +1782,7 @@ async fn server_rewrite<'a>(server: &'a Server, to: &mut Cow<'_, Request>, found
     }
 }
 
-async fn ended(to: &Request, level: &Level, prefix: &str, stop: Stop<'_>, client: Option<&mut Stream>) -> Option<Response> {
+async fn ended(to: &Request, level: &Level, prefix: &str, stop: Stop<'_>, client: Option<&mut Stream>) -> Option<Box<Response>> {
     match stop {
         Stop::Return(code, text) => Some(serve(to, level, prefix, Some((code, text)), client).await),
         Stop::Answer(resp) => Some(resp),
@@ -5500,7 +5502,7 @@ pub(crate) mod tests {
 
     async fn answered(server: &Server, head: &str) -> Response {
         let (parsed, r) = request(head);
-        answer(server, &r, parsed, located(server, &r, &r.uri), None).await.0
+        *answer(server, &r, parsed, located(server, &r, &r.uri), None).await.0
     }
 
     #[test]
@@ -6713,7 +6715,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         let answer = |target: &str| {
             let (_, r) = request(&format!("GET {target} HTTP/1.0\n\n"));
             let (resp, _, last) = block_on(answer(s, &r, Ok(()), location(s, &r.uri), None));
-            (resp.status, last.into_owned().target)
+            (resp.status, last.map_or(r.target, |to| to.target))
         };
         assert_eq!(answer("/m/?a"), (200, "/m/two.html?a".to_string()));
         assert_eq!(answer("/abs/").1, "/m/localhost");
