@@ -294,3 +294,8 @@ Kinds:
 | 2026-11-26 | After stage 6 | correction | An investigation was given 90 minutes and had nothing after 40 | Investigations stop at 30 minutes and report what they have (#367) |
 | 2026-11-26 | After stage 6 | decision | No scenario of twinx-perf above nginx in CPU per request, by the end of the day | Plan #397; each cause found by profiling against nginx gets an issue of its own |
 | 2026-11-26 | After stage 6 | finding | A 1 MB HIT of proxy_cache cost 2.7 times what it did in v0.5.0 | Since #344 a HIT read its whole file to check its key; #416 |
+| 2026-11-26 | Stage 6 | decision | The schedule runs again from 17:00 JST (08:00Z) | Stage 6 has files added during the day that twinx does not pass yet |
+| 2026-11-26 | After stage 6 | decision | The first release is distributed as one container image used as the official nginx image is (#451, #458) | Before it, include, user, types, worker_connections and ipv6only were added, as the image's nginx.conf needs them |
+| 2026-11-26 | After stage 6 | correction | worker_processes was accepted and ignored: one worker whatever the number | #471, #472, #481; what workers share, #475 to #479 |
+| 2026-11-26 | After stage 6 | decision | twinx-perf measures twinx against nginx only, with scenarios named when a run is started; nginx only with tags; no load tests in the VM | twinx-perf #11 to #16; one pull request's run is about 5 minutes |
+| 2026-11-26 | After stage 6 | decision | No performance runs for the rest of the day; tomorrow nginx's baseline, then a v0.6.0 tag, then what to improve from the numbers | #397 closed |
