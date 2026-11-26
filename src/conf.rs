@@ -522,6 +522,7 @@ pub const LISTEN_BACKLOG: i32 = 511;
 
 #[derive(Debug)]
 pub struct Config {
+    pub daemon: bool,
     pub pid: PathBuf,
     pub rlimit_nofile: Option<u64>,
     pub shutdown_timeout: Option<Duration>,
@@ -564,7 +565,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), zones: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new(), location_no_uri: false, listens: HashMap::new(), ssl_zones: HashMap::new() };
-    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, user: None, warnings: Vec::new(), emerg_logs: Vec::new(), alert_logs: Vec::new(), notice_logs: Vec::new(), warn_logs: Vec::new(), connections: 512, workers: 1, temp_paths: Vec::new(), servers: Vec::new() };
+    let mut config = Config { daemon: true, pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, user: None, warnings: Vec::new(), emerg_logs: Vec::new(), alert_logs: Vec::new(), notice_logs: Vec::new(), warn_logs: Vec::new(), connections: 512, workers: 1, temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
     crate::tls::new_configuration(inheritable);
@@ -584,6 +585,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
         }
         once(&main[..i], d)?;
         match d.name.as_str() {
+            "daemon" => config.daemon = flag(d).map_err(|e| format!("{e} in {}", d.at))?,
             "pid" => config.pid = b.path(&d.args[0]),
             "worker_rlimit_nofile" => config.rlimit_nofile = Some(d.args[0].parse().map_err(|_| format!("invalid number in {}", d.at))?),
             // SAFETY: sysconf() only reads a system value.

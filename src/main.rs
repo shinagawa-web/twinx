@@ -90,6 +90,7 @@ fn run(a: &Args) -> Result<(), String> {
     let mut master = set;
     // SAFETY: the master is single-threaded here; blocking signals has no other effect on it.
     unsafe { libc::sigaddset(&mut master, SIGCHLD); libc::sigprocmask(libc::SIG_BLOCK, &master, std::ptr::null_mut()) };
+    if config.daemon { daemon()? }
     let pid = config.pid.clone();
     std::fs::write(&pid, format!("{}\n", std::process::id())).map_err(|e| format!("open() \"{}\" failed ({e})", pid.display()))?;
     let mut workers = spawn(&config, &listeners, &set)?;
@@ -108,6 +109,19 @@ fn run(a: &Args) -> Result<(), String> {
     };
     stop(&config, &[workers, old].concat(), sig);
     let _ = std::fs::remove_file(&pid);
+    Ok(())
+}
+
+fn daemon() -> Result<(), String> {
+    let failed = |call: &str| format!("{call} failed ({})", std::io::Error::last_os_error());
+    // SAFETY: the master has no other threads, and the parent only exits.
+    match unsafe { libc::fork() } { -1 => return Err(failed("fork()")), 0 => {} _ => std::process::exit(0) }
+    // SAFETY: plain system calls on this process and its standard descriptors.
+    if unsafe { libc::setsid() } == -1 { return Err(failed("setsid()")) }
+    let null = OpenOptions::new().read(true).write(true).open("/dev/null").map_err(|e| format!("open(\"/dev/null\") failed ({e})"))?;
+    for (fd, name) in [(0, "STDIN"), (1, "STDOUT")] {
+        if unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&null), fd) } == -1 { return Err(failed(&format!("dup2({name})"))) }
+    }
     Ok(())
 }
 
