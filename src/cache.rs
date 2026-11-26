@@ -7,7 +7,7 @@ pub struct Entry {
     pub status: u16,
     pub ctype: Option<String>,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: Arc<Vec<u8>>,
     pub length: Option<usize>,
     pub line: Option<String>,
     pub upstream: Vec<(String, String)>,
@@ -202,7 +202,7 @@ impl Zone {
     pub fn put(&self, (key, at): (&str, &str), (status, ctype, headers, body): (u16, Option<String>, Vec<(String, String)>, Vec<u8>), (length, line, upstream): (Option<usize>, Option<String>, Vec<(String, String)>), (until, updating, error): (i64, i64, i64), (vary, request): (Vec<String>, &[(String, String)])) {
         let variant = variant(&vary, request);
         let key = if at == key || (!vary.is_empty() && at == format!("{key}\n{variant}")) { at } else { key };
-        let e = Entry { status, ctype, headers, body, length, line, upstream, until, updating, error, vary, variant };
+        let e = Entry { status, ctype, headers, body: Arc::new(body), length, line, upstream, until, updating, error, vary, variant };
         self.save(key, &e);
         self.entries.lock().unwrap().insert(key.to_string(), e);
     }
@@ -239,7 +239,7 @@ fn decode(b: &[u8]) -> Option<(String, Entry)> {
     let mut at = 8;
     let mut field = || { let n = u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?) as usize; let f = b.get(at + 8..(at + 8).checked_add(n)?)?; at += 8 + n; Some(f) };
     let strings = (0..count).map(|_| field().and_then(|f| String::from_utf8(f.to_vec()).ok())).collect::<Option<Vec<String>>>()?;
-    let body = field()?.to_vec();
+    let body = Arc::new(field()?.to_vec());
     let [key, status, until, updating, error, vary, variant, typed, ctype, length, lined, line, count] = <[String; 13]>::try_from(strings.get(..13)?.to_vec()).ok()?;
     let mut headers: Vec<(String, String)> = strings[13..].chunks_exact(2).map(|h| (h[0].clone(), h[1].clone())).collect();
     let upstream = headers.split_off(count.parse::<usize>().ok()?.min(headers.len()));
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn conditions_of_what_is_kept() {
-        let entry = |status, headers: &[(&str, &str)]| Entry { status, ctype: None, headers: h(headers), body: Vec::new(), length: None, line: None, upstream: Vec::new(), until: 0, updating: 0, error: 0, vary: Vec::new(), variant: String::new() };
+        let entry = |status, headers: &[(&str, &str)]| Entry { status, ctype: None, headers: h(headers), body: Arc::default(), length: None, line: None, upstream: Vec::new(), until: 0, updating: 0, error: 0, vary: Vec::new(), variant: String::new() };
         let both = [("Last-Modified", "Mon, 02 Mar 2015 17:20:58 GMT"), ("ETag", "\"x\"")];
         assert_eq!(entry(200, &both).conditions(), [("If-Modified-Since", "Mon, 02 Mar 2015 17:20:58 GMT".to_string()), ("If-None-Match", "\"x\"".to_string())]);
         assert_eq!(entry(206, &both[1..]).conditions(), [("If-None-Match", "\"x\"".to_string())]);
@@ -397,9 +397,9 @@ mod tests {
         let other = z.resolve("k", &deflate);
         assert_ne!(other, "k");
         z.put(("k", &other), answer("d"), (None, None, Vec::new()), valid, (names.clone(), &deflate));
-        assert_eq!((z.get("k").unwrap().body, z.get(&other).unwrap().body), (b"g".to_vec(), b"d".to_vec()));
+        assert_eq!((&**z.get("k").unwrap().body, &**z.get(&other).unwrap().body), (b"g".as_slice(), b"d".as_slice()));
         z.put(("k", &other), answer("n"), (None, None, Vec::new()), valid, (Vec::new(), &deflate));
-        assert_eq!((z.resolve("k", &deflate), z.get("k").unwrap().body), ("k".to_string(), b"n".to_vec()));
+        assert_eq!((z.resolve("k", &deflate), &**z.get("k").unwrap().body), ("k".to_string(), b"n".as_slice()));
     }
 
     #[test]
@@ -415,7 +415,7 @@ mod tests {
         std::fs::write(dir.join("junk"), b"x").unwrap();
         let again = Zone::at(dir.clone(), &[1, 2]);
         let e = again.get("k").unwrap();
-        assert_eq!((e.status, e.ctype.as_deref(), e.headers.clone(), e.body.clone(), e.updating, e.error), (200, Some("text/plain"), headers, b"body".to_vec(), 5, 7));
+        assert_eq!((e.status, e.ctype.as_deref(), e.headers.clone(), (*e.body).clone(), e.updating, e.error), (200, Some("text/plain"), headers, b"body".to_vec(), 5, 7));
         assert_eq!(again.resolve("k", &h(&[("Foo", "2")])), "k\nfoo:2\n");
         assert_eq!(again.get("n").map(|e| (e.status, e.ctype, e.until, e.length)), Some((404, None, valid.0 + 1, Some(3))));
         assert_eq!(again.get("n").map(|e| (e.line, e.upstream)), Some((Some("404 Gone".into()), h(&[("X-A", "a"), ("X-A", "b")]))));
@@ -453,10 +453,10 @@ mod tests {
         let z = Zone::default();
         let now = crate::clock::seconds();
         z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (None, None, Vec::new()), (now + 60, 0, 0), (Vec::new(), &[]));
-        assert_eq!(z.get("k").unwrap().body, b"x");
+        assert_eq!(*z.get("k").unwrap().body, b"x");
         z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (None, None, Vec::new()), (now - 10, 0, 0), (Vec::new(), &[]));
         assert!(z.get("k").is_none());
-        assert_eq!(z.stale("k").unwrap().body, b"x");
+        assert_eq!(*z.stale("k").unwrap().body, b"x");
         assert!(!z.stale("k").unwrap().updating());
         z.put(("k", "k"), (200, None, Vec::new(), b"x".to_vec()), (None, None, Vec::new()), (now - 10, 60, 0), (Vec::new(), &[]));
         assert!(z.stale("k").unwrap().updating() && !z.stale("k").unwrap().erring());

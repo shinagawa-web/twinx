@@ -522,6 +522,7 @@ struct Response {
     ctype: Option<Cow<'static, str>>,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    cached: Option<Arc<Vec<u8>>>,
     file: Option<Box<FileBody>>,
     vary: bool,
     tunnel: Option<Stream>,
@@ -553,7 +554,11 @@ struct Response {
 
 impl Response {
     fn len(&self) -> usize {
-        self.file.as_ref().map_or(self.body.len(), |f| f.len as usize)
+        self.file.as_ref().map_or(self.bytes().len(), |f| f.len as usize)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.cached.as_deref().unwrap_or(&self.body)
     }
 }
 
@@ -1102,7 +1107,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         if !crate::vars::plain(&out) { out = crate::vars::bytes(&String::from_utf8_lossy(&out)); }
     }
     let head_len = out.len();
-    let body_len = if r.method == "HEAD" || silent { 0 } else { resp.body.len() };
+    let body_len = if r.method == "HEAD" || silent { 0 } else { resp.bytes().len() };
     if chunked && body_len > 0 { out.extend_from_slice(format!("{body_len:x}\r\n").as_bytes()); }
     let ending = |resp: &Response, to: &mut Vec<u8>| {
         let mut trailers = r.shared.trailers.lock().unwrap().clone();
@@ -1134,7 +1139,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
         if chunked && body_len > 0 { tail.extend_from_slice(b"\r\n"); }
         trailers = if chunked && !cut { ending(&resp, &mut tail) } else { Vec::new() };
         (bytes, body) = (out.len() + body_len + tail.len(), body_len + if cut { out.len() - head_len + tail.len() } else { 0 });
-        written = send(stream, &[&out, &resp.body[..body_len], &tail], &mut { pace }, send_timeout(level)).await;
+        written = send(stream, &[&out, &resp.bytes()[..body_len], &tail], &mut { pace }, send_timeout(level)).await;
         data = body_len;
     }
     if h2 { (bytes, body) = (bytes.min(head_len).saturating_sub("Transfer-Encoding: chunked\r\n".len()) + data + trailers.iter().map(|(n, v)| n.len() + v.len() + 4).sum::<usize>(), data); }
@@ -1201,7 +1206,7 @@ fn not_modified(r: &Request, level: &Level, resp: &mut Response) {
     let (ims, inm) = (header(r, "if-modified-since"), header(r, "if-none-match"));
     let same = |t: &str| level.if_modified_since.zip(modified).is_some_and(|(before, m)| expires::http_time(t).is_some_and(|t| t == m || before && t > m));
     if (ims.is_none() && inm.is_none()) || ims.is_some_and(|t| !same(t)) || inm.is_some_and(|v| !etag_match(v, etag.as_deref(), true)) { return; }
-    (resp.status, resp.ctype, resp.body, resp.file, resp.rest, resp.cut, resp.told) = (304, None, Vec::new(), None, None, None, None);
+    (resp.status, resp.ctype, resp.body, resp.cached, resp.file, resp.rest, resp.cut, resp.told) = (304, None, Vec::new(), None, None, None, None, None);
     resp.headers.retain(|h| !h.0.eq_ignore_ascii_case("accept-ranges") && !h.0.eq_ignore_ascii_case("content-encoding"));
 }
 
@@ -1237,7 +1242,7 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
         match &mut resp.file {
             Some(file) => (file.start, file.len) = (file.start + start, end - start),
             None if resp.told.is_some() => resp.told = Some(Some((end - start) as usize)),
-            None => resp.body = resp.body[start as usize..end as usize].to_vec(),
+            None => (resp.body, resp.cached) = (resp.bytes()[start as usize..end as usize].to_vec(), None),
         }
         return;
     }
@@ -1247,10 +1252,10 @@ fn range(r: &Request, level: &Level, resp: &mut Response) {
     let mut body = Vec::new();
     for (start, end) in ranges {
         body.extend_from_slice(format!("\r\n--{boundary}\r\n{ctype}Content-Range: bytes {start}-{}/{len}\r\n\r\n", end - 1).as_bytes());
-        body.extend_from_slice(resp.body.get(start as usize..end as usize).unwrap_or_default());
+        body.extend_from_slice(resp.bytes().get(start as usize..end as usize).unwrap_or_default());
     }
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    (resp.body, resp.ctype) = (body, Some(format!("multipart/byteranges; boundary={boundary}").into()));
+    (resp.body, resp.cached, resp.ctype) = (body, None, Some(format!("multipart/byteranges; boundary={boundary}").into()));
 }
 
 fn ranges_asked(r: &Request, resp: &Response) -> Option<(u64, Result<Option<Vec<(u64, u64)>>, ()>)> {
@@ -1898,20 +1903,20 @@ fn recoded(resp: &mut Response) {
 }
 
 fn gzip(r: &Request, level: &Level, resp: &mut Response) {
-    if (resp.body.len() as u64) < level.gzip_min_length || !gzips(level, resp) { return; }
+    if (resp.bytes().len() as u64) < level.gzip_min_length || !gzips(level, resp) { return; }
     resp.vary = true;
     if !gzip_ok(r, level) { return; }
     recoded(resp);
     resp.headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
     let (mut coder, mut body) = (Coder::gzip(Some(r.shared.clone())), Vec::new());
     loop {
-        let all = coder.code(&resp.body, false, false).unwrap_or(true);
+        let all = coder.code(resp.bytes(), false, false).unwrap_or(true);
         if all { let _ = coder.end(); }
         body.extend_from_slice(coder.ready());
         coder.written();
         if all { break }
     }
-    (resp.body, resp.unknown_length) = (body, true);
+    (resp.body, resp.cached, resp.unknown_length) = (body, None, true);
 }
 
 fn gzips(level: &Level, resp: &Response) -> bool {
@@ -1924,9 +1929,9 @@ fn gzips(level: &Level, resp: &Response) -> bool {
 fn gunzip(resp: &mut Response) -> bool {
     recoded(resp);
     let mut body = Vec::new();
-    let read = flate2::read::MultiGzDecoder::new(resp.body.as_slice()).read_to_end(&mut body);
-    let ended = !resp.body.is_empty() && !read.is_err_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof);
-    resp.body = body;
+    let read = flate2::read::MultiGzDecoder::new(resp.bytes()).read_to_end(&mut body);
+    let ended = !resp.bytes().is_empty() && !read.is_err_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof);
+    (resp.body, resp.cached) = (body, None);
     if let Some(cut) = &mut resp.cut { cut.length = None; }
     ended
 }
@@ -1966,9 +1971,9 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let ignored = |name: &str| level.proxy_ignore_headers.iter().any(|i| i == name);
     let hit = |e: crate::cache::Entry| {
         let status_line = e.line.map(|l| Box::new(crate::vars::bytes(&l).into_boxed_slice()));
-        let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, body: e.body, proxied: true, proxy_host: Some(host.clone()), status_line, upstream: e.upstream, ..Response::default() };
+        let mut resp = Response { status: e.status, ctype: e.ctype.map(Into::into), headers: e.headers, cached: Some(e.body), proxied: true, proxy_host: Some(host.clone()), status_line, upstream: e.upstream, ..Response::default() };
         location_headers(r, level, &mut resp);
-        if let Some(n) = e.length.filter(|&n| n != resp.body.len()) { resp.told = Some(Some(n)); }
+        if let Some(n) = e.length.filter(|&n| n != resp.bytes().len()) { resp.told = Some(Some(n)); }
         resp.unknown_length = e.length.is_none();
         if level.proxy_force_ranges || has_header(&resp, "accept-ranges") { allow_ranges(&mut resp, false, e.length.is_some()); }
         if let Some(rate) = resp.upstream.iter().filter(|_| !ignored("x-accel-limit-rate")).find(|h| h.0.eq_ignore_ascii_case("x-accel-limit-rate")).and_then(|h| h.1.parse().ok()) { r.shared.limit_rate.set(rate); }
