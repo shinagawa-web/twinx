@@ -599,6 +599,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
         }
     }
     if !main.iter().any(|d| d.name == "events") { return Err("no \"events\" section in configuration".into()); }
+    if root && config.user.is_none() { config.user = Some(default_user()?) }
     config.temp_paths = b.temp_paths.into_iter().map(|t| t.0).collect();
     Ok(config)
 }
@@ -1188,17 +1189,26 @@ impl Builder<'_> {
 }
 
 fn user(d: &Directive) -> Result<User, String> {
+    account(&d.args[0], d.args.get(1).unwrap_or(&d.args[0]), &format!(" in {}", d.at))
+}
+
+fn default_user() -> Result<User, String> {
+    // SAFETY: getgrnam() reads a string ended by a zero byte and returns static data or null.
+    let group = if unsafe { libc::getgrnam(c"nobody".as_ptr()).is_null() && !libc::getgrnam(c"nogroup".as_ptr()).is_null() } { "nogroup" } else { "nobody" };
+    account("nobody", group, "")
+}
+
+fn account(user: &str, group: &str, at: &str) -> Result<User, String> {
     let failed = |call: &str, name: &str| {
         let e = std::io::Error::last_os_error();
         let text = e.to_string();
         let reason = match e.raw_os_error() { Some(0) | None => String::new(), Some(n) => format!(" ({n}: {})", text.split(" (os error").next().unwrap_or_default()) };
-        format!("{call}(\"{name}\") failed{reason} in {}", d.at)
+        format!("{call}(\"{name}\") failed{reason}{at}")
     };
-    let group = d.args.get(1).unwrap_or(&d.args[0]);
-    let (Ok(name), Ok(group_name)) = (std::ffi::CString::new(d.args[0].as_str()), std::ffi::CString::new(group.as_str())) else { return Err(failed("getpwnam", &d.args[0])) };
+    let (Ok(name), Ok(group_name)) = (std::ffi::CString::new(user), std::ffi::CString::new(group)) else { return Err(failed("getpwnam", user)) };
     // SAFETY: errno is this thread's own; getpwnam() reads a string ended by a zero byte and returns static data or null.
     let pwd = unsafe { *libc::__errno_location() = 0; libc::getpwnam(name.as_ptr()) };
-    if pwd.is_null() { return Err(failed("getpwnam", &d.args[0])) }
+    if pwd.is_null() { return Err(failed("getpwnam", user)) }
     // SAFETY: pwd is not null, read before the next call that may change what it points to.
     let uid = unsafe { (*pwd).pw_uid };
     // SAFETY: as for getpwnam() above.
@@ -1940,6 +1950,17 @@ mod tests {
         let warning = "the \"user\" directive makes sense only if the master process runs with super-user privileges, ignored in t.conf:";
         assert_eq!(c.warnings, [format!("{warning}1"), format!("{warning}2")]);
         assert!(c.user.is_none());
+        assert!(build_text("http { }").unwrap().user.is_none());
+    }
+
+    #[test]
+    fn default_user() {
+        let u = super::default_user().unwrap();
+        // SAFETY: as in account().
+        let nobody = unsafe { &*libc::getpwnam(c"nobody".as_ptr()) };
+        assert_eq!((u.name.as_c_str(), u.uid), (c"nobody", nobody.pw_uid));
+        assert_eq!(account("nosuchuser", "nogroup", "").unwrap_err(), "getpwnam(\"nosuchuser\") failed");
+        assert_eq!(account("nobody", "nosuchgroup", "").unwrap_err(), "getgrnam(\"nosuchgroup\") failed");
     }
 
     #[test]
