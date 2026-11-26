@@ -1,10 +1,3 @@
-//! HTTP/2 (RFC 9113) on a connection without TLS that starts with its
-//! preface, when http2 is on, as nginx's HTTP/2 module speaks it: its
-//! settings, the header blocks it reads (HPACK, RFC 7541) and writes, its flow
-//! control, and the errors it answers with. Each stream's request is passed,
-//! as an HTTP/1 request of version HTTP/2.0, to a connection of its own over a
-//! pipe in memory, and the answer that comes back is sent on the stream as it comes.
-
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -21,7 +14,6 @@ use crate::upstream::{Conn, Upstream};
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-// Frame types, flags and error codes (RFC 9113, 6 and 7).
 const DATA: u8 = 0;
 const HEADERS: u8 = 1;
 const PRIORITY: u8 = 2;
@@ -46,37 +38,23 @@ const FRAME_SIZE_ERROR: u32 = 6;
 const REFUSED_STREAM: u32 = 7;
 const COMPRESSION_ERROR: u32 = 9;
 const ENHANCE_YOUR_CALM: u32 = 11;
-/// Not an error: a header block that has not come whole may still be one.
 const AGAIN: u32 = u32::MAX;
 
-/// The largest window, and nginx's settings: the window of a stream
-/// (http2_body_preread_size), the streams at a time (http2_max_concurrent_streams).
 const MAX_WINDOW: i64 = (1 << 31) - 1;
 const PREREAD: i64 = 65536;
 const CONCURRENT: usize = 128;
-/// How much of an answer's body may wait for the client's windows before no more of it is taken.
 const WAITING: usize = 65536;
-/// client_header_timeout's default: how long a connection waits for its first request.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
-/// The largest HPACK table nginx keeps of what the client sends.
 const TABLE_SIZE: usize = 4096;
 
 type Fields = Vec<(Vec<u8>, Vec<u8>)>;
-/// The listening, local and remote addresses of a connection, this with its number in
-/// error logs, and its TLS session.
 pub type Addrs = (SocketAddr, SocketAddr, (SocketAddr, u64), Option<Arc<crate::tls::Session>>);
-/// How an answer ended: whole, with the trailers that follow it, or cut off.
 #[derive(Debug, PartialEq)]
 enum Ended { Whole(Fields), Cut }
-/// What has come of a stream's answer: at first the header block of its head, and whether
-/// it comes in chunks, which trailers may follow; then so much of its body; at last
-/// how it ended. One that ends without a head resets the stream.
 #[derive(Debug, Default, PartialEq)]
 struct Part { head: Option<(Vec<u8>, bool)>, data: Vec<u8>, ended: Option<Ended> }
-/// What an exchange tells of a stream: how its body is read, then its answer, part by part.
 enum Told { Reading(Reading), Answer(Part) }
 
-/// HPACK's static table (RFC 7541, appendix A).
 static STATIC: [(&str, &str); 61] = [
     (":authority", ""), (":method", "GET"), (":method", "POST"), (":path", "/"),
     (":path", "/index.html"), (":scheme", "http"), (":scheme", "https"), (":status", "200"),
@@ -96,7 +74,6 @@ static STATIC: [(&str, &str); 61] = [
     ("www-authenticate", ""),
 ];
 
-/// The Huffman code of each octet (RFC 7541, appendix B): the code and its length in bits.
 static HUFFMAN: [(u32, u8); 256] = [
     (0x1ff8, 13), (0x7fffd8, 23), (0xfffffe2, 28), (0xfffffe3, 28), (0xfffffe4, 28), (0xfffffe5, 28), (0xfffffe6, 28), (0xfffffe7, 28),
     (0xfffffe8, 28), (0xffffea, 24), (0x3ffffffc, 30), (0xfffffe9, 28), (0xfffffea, 28), (0x3ffffffd, 30), (0xfffffeb, 28), (0xfffffec, 28),
@@ -132,8 +109,6 @@ static HUFFMAN: [(u32, u8); 256] = [
     (0x7ffffeb, 27), (0xffffffe, 28), (0x7ffffec, 27), (0x7ffffed, 27), (0x7ffffee, 27), (0x7ffffef, 27), (0x7fffff0, 27), (0x3ffffee, 26),
 ];
 
-/// The Huffman codes of each length: that, the first code, the end of them, as the first
-/// bits of 32, and their octets, as the codes of a length follow one another.
 fn symbols() -> &'static [(u32, u32, u32, Vec<u8>)] {
     static SYMBOLS: OnceLock<Vec<(u32, u32, u32, Vec<u8>)>> = OnceLock::new();
     SYMBOLS.get_or_init(|| (5..=30).filter_map(|len| {
@@ -143,7 +118,6 @@ fn symbols() -> &'static [(u32, u32, u32, Vec<u8>)] {
     }).collect())
 }
 
-/// Writes a string, Huffman encoded, as nginx does it, only when that is shorter.
 fn write_string(out: &mut Vec<u8>, s: &[u8], lower: bool) {
     let octet = |c: u8| if lower { c.to_ascii_lowercase() } else { c };
     let len = s.iter().map(|&c| usize::from(HUFFMAN[usize::from(octet(c))].1)).sum::<usize>().div_ceil(8);
@@ -161,13 +135,10 @@ fn write_string(out: &mut Vec<u8>, s: &[u8], lower: bool) {
     if bits > 0 { out.push((acc << (8 - bits)) as u8 | 0xff >> bits); }
 }
 
-/// Decodes a Huffman encoded string to the end of out, as nginx decodes it: what is left after
-/// the last octet is padding of ones, of whatever length, but not the code of EOS.
 fn unhuffman(src: &[u8], out: &mut Vec<u8>) -> bool {
     let (mut src, mut acc, mut bits) = (src.iter(), 0u64, 0u32);
     loop {
         while bits < 32 && let Some(&b) = src.next() { (acc, bits) = (acc << 8 | u64::from(b), bits + 8); }
-        // The next 32 bits, of which those past the end are ones.
         let next = if bits < 32 { (acc << (32 - bits)) as u32 | u32::MAX >> bits } else { (acc >> (bits - 32)) as u32 };
         match symbols().iter().find(|s| next < s.2 && s.0 <= bits) {
             Some((len, first, _, octets)) => { out.push(octets[((next >> (32 - len)) - first) as usize]); bits -= len; }
@@ -176,10 +147,6 @@ fn unhuffman(src: &[u8], out: &mut Vec<u8>) -> bool {
     }
 }
 
-/// An integer of a header block with a prefix of so many bits (RFC 7541, 5.1),
-/// as nginx reads it: of four octets at most, or a compression error; one the
-/// block ends in is a frame size error. The block has the length given, of
-/// which what is given has come.
 fn integer(block: &[u8], at: &mut usize, bits: u8, length: usize) -> Result<usize, u32> {
     let (rest, prefix, length) = (&block[*at..], (1 << bits) - 1, length - *at);
     let mut value = usize::from(rest[0]) & prefix;
@@ -192,7 +159,6 @@ fn integer(block: &[u8], at: &mut usize, bits: u8, length: usize) -> Result<usiz
     Err(if end >= length { FRAME_SIZE_ERROR } else if end == 4 { COMPRESSION_ERROR } else { AGAIN })
 }
 
-/// Writes an integer with a prefix of so many bits after the bits of first.
 fn write_integer(out: &mut Vec<u8>, first: u8, bits: u8, mut value: usize) {
     let prefix = (1 << bits) - 1;
     if value < prefix { out.push(first | value as u8); return }
@@ -202,13 +168,9 @@ fn write_integer(out: &mut Vec<u8>, first: u8, bits: u8, mut value: usize) {
     out.push(value as u8);
 }
 
-/// The table of the fields the client added (RFC 7541, 2.3.2), newest first, as nginx keeps it.
 #[derive(Clone)]
-/// The dynamic table of a decoder: its fields, newest first, its size, what they use of it,
-/// and the most a size update may make it, the size the decoder announced.
 struct Table { entries: VecDeque<(Vec<u8>, Vec<u8>)>, size: usize, used: usize, limit: usize }
 
-/// The fields of a header block: their names and values, one after another, and where each of those ends.
 #[derive(Default)]
 struct Block { bytes: Vec<u8>, ends: Vec<(usize, usize)> }
 
@@ -229,7 +191,6 @@ impl Table {
         while self.used > size { let (n, v) = self.entries.pop_back().unwrap_or_default(); self.used -= n.len() + v.len() + 32; }
     }
 
-    /// Adds a field; one larger than the table empties it.
     fn add(&mut self, name: &[u8], value: &[u8]) {
         let size = name.len() + value.len() + 32;
         self.evict(self.size.saturating_sub(size));
@@ -238,18 +199,10 @@ impl Table {
         self.used += size;
     }
 
-    /// The fields of a header block of the length given, of which what is given
-    /// has come, or the connection error it is. Each field is at most the size
-    /// of a buffer of large_client_header_buffers, and all of them the size of
-    /// all those buffers.
     fn decode(&mut self, block: &[u8], length: usize, limits: (usize, usize)) -> Result<Fields, u32> {
         self.block(block, length, limits, None).map(|b| b.fields().map(|(n, v)| (n.to_vec(), v.to_vec())).collect())
     }
 
-    /// The fields of a header block, as decode() gives them. Of a request's, given where to
-    /// tell it, a field may make nginx answer the request with 400 at once, and read the rest of
-    /// the block as for no stream: then it skips the name of a field it does not add to the
-    /// table, and takes for it the length of the last string it kept, which must not be 0.
     fn block(&mut self, block: &[u8], length: usize, (number, size): (usize, usize), mut dropped: Option<&mut bool>) -> Result<Block, u32> {
         let (mut fields, mut at, mut left) = (Block { bytes: Vec::with_capacity(256), ends: Vec::with_capacity(16) }, 0, number * size);
         let (mut seen, mut last) = ([false; 4], usize::MAX);
@@ -264,7 +217,6 @@ impl Table {
             Ok(())
         };
         while at < block.len() {
-            // An indexed field, a literal one added to the table, a table size update, or a literal one.
             let (bits, add) = match block[at] { 0x80.. => (7, false), 0x40.. => (6, true), 0x20.. => (5, false), _ => (4, false) };
             let index = integer(block, &mut at, bits, length)?;
             if bits == 5 {
@@ -294,24 +246,16 @@ impl Table {
     }
 }
 
-/// Whether a field of a request makes nginx answer it with 400 as soon as it comes: a
-/// character it refuses, or a pseudo-header field it does not know, has had, or that is
-/// empty. Those it has had are kept in seen.
 fn drops(name: &[u8], value: &[u8], seen: &mut [bool; 4]) -> bool {
     let Some(own) = name.strip_prefix(b":") else { return refused(name, value) };
     let Some(i) = [&b"method"[..], b"scheme", b"path", b"authority"].iter().position(|p| *p == own) else { return true };
     refused(name, value) || std::mem::replace(&mut seen[i], true) || value.is_empty()
 }
 
-/// Whether a field has a character in its name or value that nginx refuses.
 fn refused(name: &[u8], value: &[u8]) -> bool {
     name.strip_prefix(b":").unwrap_or(name).iter().any(|&c| c <= 0x20 || c == 0x7f || c == b':' || c.is_ascii_uppercase()) || value.iter().any(|c| matches!(c, 0 | b'\n' | b'\r'))
 }
 
-/// The status of the head of a proxied server's answer; none when nginx refuses its
-/// fields: the only pseudo-header field is :status, before the others, of three digits,
-/// not one of 1xx but 103. Content-Length and Transfer-Encoding, of an answer, have no
-/// spaces, which would be lost on the way.
 fn status(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<u16> {
     let mut status = None;
     for (name, value) in fields {
@@ -327,11 +271,6 @@ fn status(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<u16> {
     status
 }
 
-/// The request of a stream as HTTP/1 writes it, without the empty line, with
-/// the version HTTP/2.0, whether it has Content-Length, and how many of its
-/// lines it makes; none for one nginx refuses with 400. The pseudo-header
-/// fields give the request line and the host, and cookie fields are joined
-/// into one, as nginx does.
 fn request<'a>(fields: impl Iterator<Item = (&'a [u8], &'a [u8])>, end: bool) -> Option<(Vec<u8>, bool, usize)> {
     let mut pseudo: [Option<&[u8]>; 4] = [None; 4];
     let (mut lines, mut cookies, mut host, mut length) = (Vec::new(), Vec::new(), None, None);
@@ -346,11 +285,9 @@ fn request<'a>(fields: impl Iterator<Item = (&'a [u8], &'a [u8])>, end: bool) ->
         lines.push((name, value));
     }
     let [Some(method), Some(scheme), Some(path), authority] = pseudo else { return None };
-    // A method has only upper case letters, "_" and "-", as ngx_http_v2_parse_method() checks.
     if !method.iter().all(|&c| c.is_ascii_uppercase() || c == b'_' || c == b'-') { return None }
     let scheme_char = |(i, &c): (usize, &u8)| c.is_ascii_alphabetic() || i > 0 && (c.is_ascii_digit() || b"+-.".contains(&c));
     let valid = scheme.iter().enumerate().all(scheme_char) && path.iter().all(|&c| c > 0x20 && c != 0x7f);
-    // Content-Length with a stream that has ended is a body that did not come.
     let missing = end && length.and_then(|l| std::str::from_utf8(l).ok()?.parse::<u64>().ok()).is_some_and(|n| n > 0);
     if !valid || missing || host.or(authority).is_none() || authority.zip(host).is_some_and(|(a, h)| a != h) { return None }
     let mut head = Vec::with_capacity(512);
@@ -362,8 +299,6 @@ fn request<'a>(fields: impl Iterator<Item = (&'a [u8], &'a [u8])>, end: bool) ->
     Some((head, length.is_some(), usize::from(!cookies.is_empty()) + usize::from(host.is_none())))
 }
 
-/// The status and headers of an HTTP/1 answer's head, without those only
-/// HTTP/1 connections have.
 fn answer_head(head: &[u8]) -> Option<(u16, Vec<(&[u8], &[u8])>)> {
     let mut lines = head.split(|&c| c == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let status = std::str::from_utf8(lines.next()?.split(|&c| c == b' ').nth(1)?).ok()?.parse().ok()?;
@@ -376,9 +311,6 @@ fn answer_head(head: &[u8]) -> Option<(u16, Vec<(&[u8], &[u8])>)> {
     Some((status, headers))
 }
 
-/// The header block of an answer as nginx writes it: the status, then the
-/// headers it has its own places for, added to the client's table, then the
-/// others in order, their names in lower case.
 fn header_block(status: u16, headers: &[(&[u8], &[u8])]) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);
     match [200, 204, 206, 304, 400, 404, 500].iter().position(|&s| s == status) {
@@ -397,8 +329,6 @@ fn header_block(status: u16, headers: &[(&[u8], &[u8])]) -> Vec<u8> {
     out
 }
 
-/// Writes fields as literals not added to the table, their names in lower
-/// case, as nginx writes the headers it has no place for and trailers.
 fn literals<'a, T: AsRef<[u8]> + 'a>(out: &mut Vec<u8>, fields: impl Iterator<Item = &'a (T, T)>) {
     for (name, value) in fields {
         out.push(0);
@@ -407,8 +337,6 @@ fn literals<'a, T: AsRef<[u8]> + 'a>(out: &mut Vec<u8>, fields: impl Iterator<It
     }
 }
 
-/// Writes a header block in a HEADERS frame and as many CONTINUATION frames
-/// as it takes, none larger than the client takes; the HEADERS frame ends the stream or not.
 fn header_frames(out: &mut Vec<u8>, sid: u32, block: &[u8], frame_size: usize, end: bool) {
     let mut parts = block.chunks(frame_size).peekable();
     let mut kind = HEADERS;
@@ -419,7 +347,6 @@ fn header_frames(out: &mut Vec<u8>, sid: u32, block: &[u8], frame_size: usize, e
     }
 }
 
-/// Writes a frame.
 fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, sid: u32, payload: &[u8]) {
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
     out.extend_from_slice(&[kind, flags]);
@@ -427,17 +354,6 @@ fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, sid: u32, payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
-/// A stream: the windows it sends and receives with, its request until it is
-/// passed on (none for one refused with 400), where its body goes as it comes
-/// until it ends, and what is to take it; the length the client declared of
-/// it, how much came, whether it goes in chunks (it has no length), and
-/// whether it turned out longer or shorter; then, once the head of the answer
-/// has been sent, what came of its body, how much of that has been sent, how it
-/// ended, and whether a frame has ended the stream; the exchange is told how much of
-/// the body has been sent in all, some of it later, and that the stream has gone. Of the answers it may get, only that of the exchange so numbered is
-/// taken. Until how its body is read is known, what comes of it is preread,
-/// and its window is not updated. The length of its header block is that of
-/// its request's head ($request_length), as in nginx.
 #[derive(Default)]
 struct Open {
     send: i64, recv: i64, head: Option<(Vec<u8>, bool, usize)>, ended: bool, reading: Option<Reading>,
@@ -445,53 +361,33 @@ struct Open {
     declared: Option<u64>, got: u64, chunked: bool, bad: bool,
     answer: Option<Vec<u8>>, sent: usize, end: Option<Ended>, closed: bool, taken: Option<watch::Sender<usize>>, untold: usize,
     number: u64, exchange: u32, block: usize,
-    /// When its body ended before how it is read was known: whether more came after the end.
     early: Option<bool>,
-    /// Whether it is answered with 400 at once, as its request is refused.
     at_once: bool,
 }
 
-/// The state of an HTTP/2 connection.
 struct Connection {
     out: Vec<u8>,
     streams: BTreeMap<u32, Open>,
-    /// The streams whose request heads have come whole, to be passed on; those
-    /// whose bodies turned out longer or shorter than declared, to be answered with 400.
     ready: Vec<u32>,
     bad: Vec<u32>,
-    /// A header block that waits for its CONTINUATION frames: its stream, the
-    /// flags of its HEADERS frame, what came of it, and whether the stream was refused.
     block: Option<(u32, u8, Vec<u8>, bool)>,
     last_sid: u32,
     table: Table,
-    /// The stream each stream depends on (0: none), and its weight.
     nodes: HashMap<u32, (u32, u16)>,
-    /// large_client_header_buffers of the default server of the address.
     limits: (usize, usize),
-    /// The window the client gives the connection, and each new stream; the
-    /// largest frame it takes; the window it has of the connection.
     send: i64,
     window: i64,
     frame_size: usize,
     recv: i64,
-    /// Whether the client changed its table size: the next header block starts with an update to 0.
     table_update: bool,
-    /// When the connection was made, the requests it has had, and whether it
-    /// sent GOAWAY: it then takes no new stream and closes once those it has are answered.
     started: Instant,
     requests: u64,
     goaway: bool,
-    /// keepalive_requests, keepalive_timeout and keepalive_time of the default server of the address.
     keepalive: (u64, Duration, Duration),
-    /// How many more PRIORITY frames it takes: nginx's priority_limit, which each stream raises.
     priorities: usize,
 }
 
 impl Connection {
-    /// Makes a stream depend on another with a weight, as nginx's
-    /// ngx_http_v2_set_dependency() does: on the root when the other is not
-    /// known; a stream it depends on itself depends then on what it did;
-    /// an exclusive dependency takes the other's dependents.
     fn depend(&mut self, sid: u32, on: u32, weight: u16) {
         let (exclusive, on) = (on >> 31 == 1, on & 0x7fff_ffff);
         let parent = if self.nodes.contains_key(&on) { on } else { 0 };
@@ -501,22 +397,18 @@ impl Connection {
         self.nodes.insert(sid, (parent, weight));
     }
 
-    /// The streams a stream depends on, nearest first.
     fn ancestors(&self, mut sid: u32) -> Vec<u32> {
         let mut list = Vec::new();
         while let Some(&(parent, _)) = self.nodes.get(&sid).filter(|_| sid != 0 && list.len() <= self.nodes.len()) { list.push(parent); sid = parent; }
         list
     }
 
-    /// Where nginx queues a stream's frames: by how deep it depends, then by
-    /// its share of the weights, the larger first.
     fn rank(&self, sid: u32) -> (usize, f64) {
         let path = [&[sid][..], &self.ancestors(sid)].concat();
         let share = path.iter().filter_map(|s| self.nodes.get(s)).map(|n| f64::from(n.1) / 256.0).product::<f64>();
         (path.len() - 1, -share)
     }
 
-    /// Sends GOAWAY without an error, with the last stream it has taken.
     fn goaway(&mut self) {
         frame(&mut self.out, GOAWAY, 0, 0, &[self.last_sid.to_be_bytes(), NO_ERROR.to_be_bytes()].concat());
         self.goaway = true;
@@ -527,7 +419,6 @@ impl Connection {
         self.streams.remove(&sid);
     }
 
-    /// Reads the frames that have come whole, or gives the connection error they are.
     fn read(&mut self, buf: &mut Vec<u8>) -> Result<(), u32> {
         let mut at = 0;
         let read = loop {
@@ -542,13 +433,10 @@ impl Connection {
         read
     }
 
-    /// The error a header block is before its HEADERS frame has come whole, as
-    /// nginx, which reads it as it comes, finds it.
     fn early(&mut self, [kind, flags]: [u8; 2], sid: u32, p: &[u8], len: usize) -> Result<(), u32> {
         let skip = usize::from(flags & PADDED != 0) + if flags & PRIORITY_FLAG != 0 { 5 } else { 0 };
         if kind != HEADERS || self.block.is_some() || p.len() <= skip { return Ok(()) }
         let length = len.saturating_sub(skip + if flags & PADDED != 0 { usize::from(p[0]) } else { 0 });
-        // A field may go on in a CONTINUATION frame when this one does not end the block.
         let whole = if flags & END_HEADERS != 0 { length } else { usize::MAX };
         match self.table.clone().block(&p[skip..p.len().min(skip + length)], whole, self.limits, Some(&mut false)) {
             Err(code) if code != AGAIN => { self.last_sid = sid; Err(code) }
@@ -557,12 +445,10 @@ impl Connection {
     }
 
     fn frame(&mut self, kind: u8, flags: u8, sid: u32, p: &[u8]) -> Result<(), u32> {
-        // A header block goes on only in CONTINUATION frames of its stream.
         if self.block.as_ref().is_some_and(|b| kind != CONTINUATION || b.0 != sid) { return Err(PROTOCOL_ERROR) }
         if self.block.is_some() { return self.header_block(flags, p) }
         let size = match kind { PRIORITY => p.len() == 5, RST_STREAM | WINDOW_UPDATE => p.len() == 4, PING => p.len() == 8, GOAWAY => p.len() >= 8, _ => true };
         if !size { return Err(FRAME_SIZE_ERROR) }
-        // Frames of a stream, of the connection, and those a client does not send.
         let stray = matches!(kind, PRIORITY | RST_STREAM) && sid == 0 || matches!(kind, PING | GOAWAY) && sid != 0 || matches!(kind, PUSH_PROMISE | CONTINUATION);
         let word = |at: usize| u32::from_be_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]);
         if stray || kind == PRIORITY && word(0) & 0x7fff_ffff == sid { return Err(PROTOCOL_ERROR) }
@@ -585,7 +471,6 @@ impl Connection {
         }
     }
 
-    /// Adds a frame's part of the header block, and takes the request once it has come whole.
     fn header_block(&mut self, flags: u8, p: &[u8]) -> Result<(), u32> {
         let Some((_, first, block, _)) = &mut self.block else { return Ok(()) };
         *first |= flags;
@@ -595,9 +480,7 @@ impl Connection {
 
     fn headers(&mut self, flags: u8, sid: u32, p: &[u8]) -> Result<(), u32> {
         let (pad, priority) = (usize::from(flags & PADDED != 0), if flags & PRIORITY_FLAG != 0 { 5 } else { 0 });
-        // A header block cannot be empty.
         if p.len() <= pad + priority { return Err(FRAME_SIZE_ERROR) }
-        // After GOAWAY, a new stream is not taken.
         if self.goaway { return Ok(()) }
         let padding = if pad == 1 { usize::from(p[0]) } else { 0 };
         if padding > p.len() - pad - priority { return Err(PROTOCOL_ERROR) }
@@ -606,8 +489,6 @@ impl Connection {
         self.last_sid = sid;
         if depends.is_some() || !self.nodes.contains_key(&sid) { let (on, weight) = depends.unwrap_or((0, 16)); self.depend(sid, on, weight); }
         let refused = self.streams.len() >= CONCURRENT;
-        // As in nginx, a stream that reaches keepalive_requests or keepalive_time,
-        // or any with keepalive_timeout 0, is the last the connection takes.
         self.requests += u64::from(!refused);
         if !refused { self.priorities += CONCURRENT; }
         let (requests, timeout, time) = self.keepalive;
@@ -616,16 +497,13 @@ impl Connection {
         self.header_block(flags, &p[pad + priority..p.len() - padding])
     }
 
-    /// Takes a request once its header block has come whole.
     fn headers_done(&mut self) -> Result<(), u32> {
         let Some((sid, flags, block, refused)) = self.block.take() else { return Ok(()) };
         let mut dropped = false;
         let fields = self.table.block(&block, block.len(), self.limits, Some(&mut dropped));
-        // A request nginx answered with 400 before an error later in its block is still answered so.
         let (fields, error) = match fields { Err(code) if dropped && !refused => (Block::default(), Some(code)), fields => (fields?, None) };
         if refused { self.rst(sid, REFUSED_STREAM); return Ok(()) }
         let ended = flags & END_STREAM != 0;
-        // As nginx does, the request is passed on once its head has come, and its body as it comes.
         let head = request(fields.fields(), ended);
         let declared = fields.fields().find(|f| f.0 == b"content-length").and_then(|f| std::str::from_utf8(f.1).ok()?.parse().ok());
         let chunked = head.as_ref().is_some_and(|h| !h.1) && !ended;
@@ -644,23 +522,16 @@ impl Connection {
         if self.recv < MAX_WINDOW / 4 { frame(&mut self.out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - self.recv) as u32).to_be_bytes()); self.recv = MAX_WINDOW; }
         let Some(s) = self.streams.get_mut(&sid) else { return Ok(()) };
         if size > s.recv { self.rst(sid, FLOW_CONTROL_ERROR); return Ok(()) }
-        // What comes after the end waits until how the body is read is known: nginx, which
-        // answers a stream whose body it discards before it reads on, does not see it.
         if s.ended && s.early.is_some() { s.early = Some(true); return Ok(()) }
         if s.ended { self.rst(sid, STREAM_CLOSED); return Ok(()) }
         let data = &p[usize::from(padding > 0)..p.len() - padding.saturating_sub(1)];
         (s.ended, s.got) = (flags & END_STREAM != 0, s.got + data.len() as u64);
         if s.ended && s.reading.is_none() { s.early = Some(false); }
-        // A body longer than declared, or one that ends shorter, is answered with 400, as nginx does; one discarded is not looked at.
         if !s.bad && s.reading != Some(Reading::Discarded) && s.declared.is_some_and(|n| s.got > n || s.ended && s.got < n) { (s.bad, s.body, s.exchange) = (true, None, s.exchange + 1); self.bad.push(sid); }
-        // Without a length, each frame's data is a chunk; the end, the last chunk.
         let mut part = if s.chunked && !data.is_empty() { [format!("{:x}\r\n", data.len()).as_bytes(), data, b"\r\n"].concat() } else { data.to_vec() };
         if s.chunked && s.ended { part.extend_from_slice(b"0\r\n\r\n"); }
         if let Some(body) = &s.body { let _ = body.send(part); }
         if s.ended { s.body = None; return Ok(()) }
-        // As nginx does: a body read into buffers has the window opened as wide
-        // as it goes, again once a quarter of it is left; one passed on as it
-        // comes has what came given back; one preread or discarded, nothing.
         match s.reading {
             Some(Reading::Buffered) => {
                 s.recv -= size;
@@ -673,12 +544,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Learns how a stream's body is read, and opens its window as nginx does.
     fn reading(&mut self, sid: u32, reading: Reading) {
         let Some(s) = self.streams.get_mut(&sid) else { return };
         s.reading = Some(reading);
-        // A body discarded did not end, for nginx, before the stream was answered; one read
-        // that went on after its end closes the stream.
         match s.early.take() { Some(_) if reading == Reading::Discarded => s.ended = false, Some(true) => return self.rst(sid, STREAM_CLOSED), _ => {} }
         let to = match reading { Reading::Buffered => MAX_WINDOW, Reading::Unbuffered => PREREAD, Reading::Discarded => return };
         if !s.ended && s.recv < to { frame(&mut self.out, WINDOW_UPDATE, 0, sid, &((to - s.recv) as u32).to_be_bytes()); s.recv = to; }
@@ -716,10 +584,6 @@ impl Connection {
         Ok(())
     }
 
-    /// Takes what has come of a stream's answer: sends its head, in HEADERS and
-    /// CONTINUATION frames no larger than the client takes, and keeps the rest to be
-    /// sent as the windows let; a stream without an answer is reset. The HEADERS
-    /// frame ends the stream of an answer that is whole, has no body and is not in chunks.
     fn answer(&mut self, sid: u32, part: Part) {
         let Some(s) = self.streams.get_mut(&sid) else { return };
         if let Some((mut block, chunked)) = part.head {
@@ -736,17 +600,11 @@ impl Connection {
         s.end = part.ended;
     }
 
-    /// Takes what an exchange tells of a stream, unless it is not the one whose answer
-    /// the stream gets, and sends what the windows let of it.
     fn told(&mut self, (sid, number, told): (u32, u32, Told)) {
         if self.streams.get(&sid).is_none_or(|s| s.exchange != number) { return }
         match told { Told::Reading(r) => self.reading(sid, r), Told::Answer(part) => { self.answer(sid, part); self.send(sid); } }
     }
 
-    /// Sends what the windows let of the bodies of answers, in DATA frames no larger
-    /// than the client takes, and forgets the streams answered whole. The last DATA
-    /// frame ends the stream of one that is whole, an empty one when that shows only
-    /// later, and its trailers if it has any; one cut off is reset, as in nginx.
     fn send_data(&mut self) {
         let waits = |s: &Open| s.answer.as_ref().is_some_and(|body| s.sent < body.len() || s.end.is_some());
         let mut order: Vec<_> = self.streams.iter().filter(|(_, s)| waits(s)).map(|(&sid, _)| (self.rank(sid), sid)).collect();
@@ -754,7 +612,6 @@ impl Connection {
         order.into_iter().for_each(|(_, sid)| self.send(sid));
     }
 
-    /// Sends what the windows let of the body of a stream's answer.
     fn send(&mut self, sid: u32) {
         let Some(s) = self.streams.get_mut(&sid) else { return };
         let Some(body) = &mut s.answer else { return };
@@ -765,11 +622,9 @@ impl Connection {
             frame(&mut self.out, DATA, if s.closed { END_STREAM } else { 0 }, sid, &body[s.sent..s.sent + n]);
             (s.sent, s.send, self.send, s.untold) = (s.sent + n, s.send - n as i64, self.send - n as i64, s.untold + n);
         }
-        // The exchange waits for that only when, for all it knows, too much waits.
         let held = s.untold > 0 && s.untold + body.len() - s.sent >= WAITING;
         if let Some(taken) = s.taken.as_ref().filter(|_| held) { taken.send_modify(|t| *t += std::mem::take(&mut s.untold)); }
         if s.sent < body.len() { return }
-        // What has been sent is not kept.
         (*body, s.sent) = (Vec::new(), 0);
         match s.end.take() {
             Some(Ended::Cut) => return self.rst(sid, INTERNAL_ERROR),
@@ -782,42 +637,31 @@ impl Connection {
             _ => {}
         }
         if !s.closed { return }
-        // A stream answered whole before its request ended is reset without an error, as nginx does.
         if !s.ended { frame(&mut self.out, RST_STREAM, 0, sid, &NO_ERROR.to_be_bytes()); }
         self.streams.remove(&sid);
     }
 }
 
-/// Serves an HTTP/2 connection, with what was read of it already, its
-/// listening, local and remote addresses.
-/// The connection counts as busy while it lives: a worker shutting down
-/// gracefully sends GOAWAY on it, and waits until it has answered its streams.
 pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, addrs: Addrs, _busy: Option<Busy>) {
     let level = &crate::http::default_server(&config, addrs.0).level;
     let (limits, keepalive) = (level.large_header_buffers, (level.keepalive_requests, level.keepalive_timeout, level.keepalive_time));
-    // lingering_close on or always: closing, it reads what the client still sends.
     let lingers = level.lingering_close.is_some();
     let send = crate::http::send_timeout(level);
     let table = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
     let mut c = Connection { out: Vec::new(), streams: BTreeMap::new(), ready: Vec::new(), bad: Vec::new(), block: None, last_sid: 0, table, nodes: HashMap::new(), limits, send: 65535, window: 65535, frame_size: 16384, recv: MAX_WINDOW, table_update: false, started: Instant::now(), requests: 0, goaway: false, keepalive, priorities: CONCURRENT.max(100) };
-    // nginx's settings: the streams at a time, the window of each, the largest frame it takes; and the largest window of the connection.
     frame(&mut c.out, SETTINGS, 0, 0, &[0, 3, 0, 0, 0, CONCURRENT as u8, 0, 4, 0, 1, 0, 0, 0, 5, 0, 0xff, 0xff, 0xff]);
     frame(&mut c.out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    // The connection error that ends the connection once the requests refused at once are answered.
     let (mut preface, mut failed) = (false, None);
-    // As in nginx (tcp_nodelay), what is written does not wait for the client to acknowledge what was before.
     if let Some(tcp) = stream.tcp().filter(|_| level.tcp_nodelay) { let _ = tcp.set_nodelay(true); }
     loop {
         if crate::http::shutting() && !c.goaway { c.goaway(); }
         let read = if failed.is_some() { Ok(()) } else if preface { c.read(&mut buf) } else if buf.len() < PREFACE.len() { Ok(()) } else if buf.starts_with(PREFACE) { preface = true; buf.drain(..PREFACE.len()); c.read(&mut buf) } else { Err(PROTOCOL_ERROR) };
-        // One answered in part already is reset, as nginx does.
         let (bad, answered): (Vec<u32>, Vec<u32>) = std::mem::take(&mut c.bad).into_iter().partition(|sid| c.streams.get(sid).is_none_or(|s| s.answer.is_none()));
         answered.into_iter().for_each(|sid| c.rst(sid, INTERNAL_ERROR));
         let bad = bad.into_iter().map(|sid| (sid, true));
         for (sid, bad) in std::mem::take(&mut c.ready).into_iter().map(|sid| (sid, false)).chain(bad) {
             let Some(s) = c.streams.get_mut(&sid) else { continue };
-            // A stream whose body turned out longer or shorter with its head is only answered with 400.
             if s.bad && !bad { continue }
             let (request, made, taker) = match s.head.take().filter(|_| !bad) {
                 Some((mut head, _, made)) => {
@@ -825,7 +669,6 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
                     head.extend_from_slice(b"\r\n");
                     (head, made + usize::from(s.chunked), s.taker.take())
                 }
-                // A line HTTP/1 refuses, for the answer nginx gives with 400.
                 None => (b"-\r\n\r\n".to_vec(), 0, None),
             };
             let (tx, config, addrs, number) = (tx.clone(), config.clone(), addrs.clone(), s.exchange);
@@ -837,7 +680,6 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
             tokio::task::spawn_local(exchange(config, request, taker, addrs, origin, tell, sent));
         }
         c.send_data();
-        // As nginx answers a request it refuses before it reads on, that answer comes before the error.
         failed = failed.or(read.err());
         if let Some(code) = failed.filter(|_| !c.streams.values().any(|s| s.at_once)) {
             frame(&mut c.out, GOAWAY, 0, 0, &[c.last_sid.to_be_bytes(), code.to_be_bytes()].concat());
@@ -846,47 +688,31 @@ pub async fn serve(config: Arc<Config>, mut stream: Stream, mut buf: Vec<u8>, ad
             return;
         }
         let out = std::mem::take(&mut c.out);
-        // A client that takes nothing of it for send_timeout of the default server loses the connection.
         if !out.is_empty() && !write_all(&mut stream, &out, send).await { return }
         recycle(out);
-        // After GOAWAY, the connection closes once its streams are answered.
         if c.goaway && c.streams.is_empty() { return crate::http::close(&mut stream, lingers).await }
         tokio::select! {
             n = stream.read_buf(&mut buf), if failed.is_none() => if n.unwrap_or(0) == 0 { return },
             Some(told) = rx.recv() => {
                 c.out = buffer();
                 c.told(told);
-                // What other streams have by now goes in the same write, up to the size of a TLS record.
+                // Up to the size of a TLS record.
                 while c.out.len() < 16384 && let Ok(told) = rx.try_recv() { c.told(told); }
             }
             () = crate::http::SHUTDOWN.notified() => {}
-            // A connection without streams for keepalive_timeout is closed with GOAWAY, as nginx does;
-            // before its first request, it has client_header_timeout from when it was made.
             () = tokio::time::sleep(if c.requests == 0 { HEADER_TIMEOUT.saturating_sub(c.started.elapsed()) } else { c.keepalive.1 }), if c.streams.is_empty() && c.block.is_none() && !c.keepalive.1.is_zero() => c.goaway(),
         }
     }
 }
 
-/// How the stream of a proxied server's answer ended: as END_STREAM ends it; before
-/// that, as the connection closed; or with a frame, or the end of the stream, that fails it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum End { Whole, #[default] Closed, Failed }
 
-/// What is known of a proxied server's answer once the pipe that passes it has
-/// closed, besides what came on it: how its stream ended, its trailers, and whether
-/// its head ended it; the connection, if it may be used for another request, and
-/// where it goes then, with how long each read of the rest of its answer may wait, once
-/// that is known: whichever comes first waits for the other; and whether the request has
-/// been sent whole, body and all, or else when a write of it last went.
 #[derive(Debug, Default)]
 pub struct Ending { pub end: End, pub trailers: Vec<(String, String)>, pub bodiless: bool, conn: Option<Conn>, home: Option<Home>, pub sent: bool, pub moved: Option<std::time::Instant> }
 
-/// The upstream whose connection it is, the server's address and the location, and
-/// how long a read may wait.
 type Home = (Arc<Upstream>, crate::upstream::Addr, usize, Option<Duration>);
 
-/// Gives the connection of an answer that is not read any more back for other requests,
-/// once its stream has ended so that it may be.
 pub fn give_back(slot: &Slot, home: Home) {
     let mut ending = slot.lock().unwrap();
     match ending.conn.take() {
@@ -895,35 +721,20 @@ pub fn give_back(slot: &Slot, home: Home) {
     }
 }
 
-/// What stays with a connection to a proxied server from one request to the next, as nginx
-/// keeps it: the number of the next stream, the windows the server gives the connection and
-/// each new stream, and what is left of the connection's own. Its header blocks need nothing:
-/// neither side may use a dynamic table.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Session { id: u32, window: i64, initial: i64, recv: i64 }
 
 impl Default for Session {
-    /// That of a new connection.
     fn default() -> Session {
         Session { id: 1, window: 65535, initial: 65535, recv: MAX_WINDOW }
     }
 }
 
-/// How the request that comes on the pipe is to be passed over HTTP/2: whether its
-/// Host is the one of the proxied server, to go as :authority, and how its body comes
-/// after the head, whatever its headers say.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Framing { pub authority: bool, pub chunked: bool, pub length: u64 }
 
-/// Where what passes the answer tells it what reads the answer.
 pub type Slot = Arc<std::sync::Mutex<Ending>>;
 
-/// proxy_http_version 2: passes the HTTP/1 request that comes on a pipe to the
-/// proxied server, as the one stream of an HTTP/2 connection at a time, and its
-/// answer back on the pipe, as HTTP/1 that ends when the pipe closes; the trailers
-/// that follow it, how it ended, and the connection that may be kept, go in the slot. The
-/// frames of the head have the size of proxy_buffer_size at most. Whatever goes wrong
-/// closes both, and so does the answer not being wanted any more.
 pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot, framing: Framing) {
     let kept = conn.h2.take();
     let (up, mut out) = (&mut conn.stream, if kept.is_none() { PREFACE.to_vec() } else { Vec::new() });
@@ -939,8 +750,6 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
     let mut line = lines.next().unwrap_or_default().split(|&c| c == b' ');
     let (method, path) = (std::str::from_utf8(line.next().unwrap_or_default()).unwrap_or_default(), line.next().unwrap_or_default());
     let mut fields = vec![(b":method".to_vec(), method.as_bytes().to_vec()), (b":scheme".to_vec(), scheme.as_bytes().to_vec()), (b":path".to_vec(), path.to_vec())];
-    // The headers go as they are, those proxy_set_header sets that only HTTP/1 has too, as in
-    // nginx; the Host it gives of its own is :authority. How the body comes is told apart.
     let mut body = if framing.chunked { Body::Chunked(0, false) } else { Body::Length(framing.length) };
     for (name, value) in lines.filter_map(|l| l.iter().position(|&c| c == b':').map(|at| (l[..at].to_ascii_lowercase(), l[at + 1..].trim_ascii()))) {
         match &name[..] {
@@ -950,7 +759,6 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
     }
     buf.drain(..end + 4);
     if kept.is_none() {
-        // nginx's settings: no dynamic table, no pushes, and the window of a stream as large as it goes.
         frame(&mut out, SETTINGS, 0, 0, &[0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 4, 0x7f, 0xff, 0xff, 0xff]);
         frame(&mut out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
     }
@@ -958,23 +766,15 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
     literals(&mut block, fields.iter());
     let mut ended = body == Body::Length(0);
     header_frames(&mut out, id, &block, 16384, ended);
-    // The windows of the stream, and the body to send.
     let (mut stream_window, mut stream_recv, mut pending, mut finished) = (initial, MAX_WINDOW, Vec::new(), ended);
     let (mut table, mut answer) = (Table { entries: VecDeque::new(), size: 0, used: 0, limit: 0 }, None::<(u8, Vec<u8>)>);
-    // Whether the head of the answer, not one of 1xx, has come: a header block after it has the trailers;
-    // the bytes of the frames of the head so far; and whether the server takes no more.
     let (mut headed, mut size, mut deaf) = (false, 0, false);
-    // Whether the answer has no body, whatever follows its head; whether its head ended it;
-    // whether the connection may be kept, as far as the head says and the server takes more
-    // streams; and how long a read may wait once the answer is not read any more.
     let (mut no_body, mut bodiless, mut keep, mut rest) = (method == "HEAD", false, true, None);
-    // What the Content-Length of the answer, if it counts, has that has not come.
     let mut left = None::<u64>;
     loop {
         if finished { buf.clear(); }
         finished |= body.take(&mut buf, &mut pending);
         loop {
-            // Frames are of 16384 bytes at most, whatever larger ones the server takes, as nginx's.
             let n = pending.len().min(16384).min(window.min(stream_window).max(0) as usize);
             let last = finished && n == pending.len();
             if ended || n == 0 && !last { break }
@@ -982,27 +782,22 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
             frame(&mut out, DATA, if ended { END_STREAM } else { 0 }, id, &pending.drain(..n).collect::<Vec<_>>());
             (window, stream_window) = (window - n as i64, stream_window - n as i64);
         }
-        // Once the request has gone whole, the wait for the answer begins.
         if ended { slot.lock().unwrap().sent = true; }
         let (frames, had) = (std::mem::take(&mut out), buf.len());
         if !frames.is_empty() && !deaf {
             tokio::select! {
-                // What the server sent before it took no more is still to be read.
                 sent = within(rest.flatten(), up.write_all(&frames)) => { deaf = !matches!(sent, Some(Ok(()))); slot.lock().unwrap().moved = Some(std::time::Instant::now()); }
                 () = unwanted(&mut pipe, &mut buf), if rest.is_none() => return,
             }
             if buf.len() > had { continue }
         }
-        // A read takes as much as a buffer of nginx's proxy_buffer_size would.
         got.reserve(4096);
         tokio::select! {
-            // The pipe ends when the answer is not wanted any more, or all of it but the end of its stream came.
             n = pipe.read_buf(&mut buf), if rest.is_none() => if n.unwrap_or(0) == 0 {
                 rest = slot.lock().unwrap().home.as_ref().map(|h| h.3);
                 if rest.is_none() || !keep || !ended { return }
             },
             n = within(rest.flatten(), up.read_buf(&mut got)) => if n.and_then(Result::ok).unwrap_or(0) == 0 {
-                // What came of the data of a frame cut off goes on too.
                 if let Some(&[a, b, c, DATA, flags, ..]) = got.get(..9).filter(|f| headed && f[5..] == id.to_be_bytes()) {
                     let (p, padded) = (&got[9..], usize::from(flags & PADDED != 0));
                     let padding = if padded == 1 { p.first().copied().unwrap_or(0) } else { 0 };
@@ -1012,16 +807,10 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
                 return
             },
         }
-        // What the frames of a read give is passed only once they all have been taken,
-        // those after the end of the stream too, so that what fails the stream drops
-        // the data that came with it, as nginx does, but not the head.
+        // What a read gives is passed once all its frames are taken, so what fails the stream drops the data that came with it.
         let (mut to_pipe, mut head_end, mut done, mut reset, mut failed) = (Vec::new(), 0, false, false, false);
         while got.len() >= 9 {
             let (len, kind, flags, sid) = (u32::from_be_bytes([0, got[0], got[1], got[2]]) as usize, got[3], got[4], u32::from_be_bytes([got[5], got[6], got[7], got[8]]) & 0x7fff_ffff);
-            // A head too long; data before it; frames of the stream after its end; those of other
-            // streams; those of the connection in a stream and those of a stream outside one; a
-            // push, which nginx's settings refuse; data the windows do not let come; and any other
-            // within a header block, or one that goes on without it.
             let block = sid == id && matches!(kind, HEADERS | CONTINUATION) && !headed;
             let misplaced = if sid == 0 { matches!(kind, DATA | HEADERS | CONTINUATION | RST_STREAM) } else { matches!(kind, SETTINGS | PING | GOAWAY) };
             failed = wrong_length(kind, flags, len) || block && size + 9 + len > head_size || sid == id && (kind == DATA && !headed || done && !matches!(kind, RST_STREAM | WINDOW_UPDATE)) || sid != id && sid != 0 || misplaced || kind == PUSH_PROMISE || kind == DATA && len as i64 > recv.min(stream_recv) || answer.is_some() != (kind == CONTINUATION);
@@ -1053,18 +842,15 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
                     let Ok(fields) = table.decode(&so_far, so_far.len(), (1000, 1 << 20)) else { failed = true; break };
                     done |= first & END_STREAM != 0;
                     if headed {
-                        // Trailers end the stream.
                         failed = !done || fields.iter().any(|(n, v)| n.starts_with(b":") || refused(n, v));
                         if failed { break }
                         slot.lock().unwrap().trailers.extend(fields.iter().map(|(n, v)| (crate::vars::text(n), crate::vars::text(v))));
                     } else {
-                        // Early hints do not end the stream.
                         let Some(status) = status(&fields).filter(|s| *s != 103 || !done) else { failed = true; break };
                         (headed, size) = (status != 103, 0);
                         let length = fields.iter().find(|f| f.0 == b"content-length" && method != "HEAD" && ![103, 204, 304].contains(&status));
                         left = length.and_then(|f| std::str::from_utf8(&f.1).ok()?.parse().ok());
                         no_body |= matches!(status, 204 | 304);
-                        // As in nginx, the head of an answer without a body must end it, and nothing come with it.
                         if headed && no_body && !(done && got.is_empty()) { keep = false; }
                         (bodiless, slot.lock().unwrap().bodiless) = (headed && done, headed && done);
                         let mut head = format!("HTTP/1.1 {status} \r\n").into_bytes();
@@ -1081,7 +867,6 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
                     to_pipe.extend_from_slice(data);
                     done |= flags & END_STREAM != 0;
                     (recv, stream_recv) = (recv - len as i64, stream_recv - len as i64);
-                    // As in nginx, the windows are made as large as they go once little of either is left.
                     if recv.min(stream_recv) < MAX_WINDOW / 4 {
                         for (sid, window) in [(0, &mut recv), (id, &mut stream_recv)] {
                             frame(&mut out, WINDOW_UPDATE, 0, sid, &((MAX_WINDOW - *window) as u32).to_be_bytes());
@@ -1089,9 +874,7 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
                         }
                     }
                 }
-                // A reset with NO_ERROR after the end of the stream is taken once; any other fails the answer.
                 RST_STREAM if sid == id => (failed, reset) = (word(0) != NO_ERROR || reset || !done, true),
-                // The connection goes away after the answer, unless the request is not among those taken.
                 GOAWAY => (failed, keep) = (word(0) & 0x7fff_ffff < id, false),
                 _ => {}
             }
@@ -1099,12 +882,9 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
         }
         failed |= done && left.is_some_and(|n| n > 0);
         if failed { to_pipe.truncate(head_end); }
-        // The slot says how the stream ended before the pipe closes.
         if failed || done { slot.lock().unwrap().end = if failed { End::Failed } else { End::Whole }; }
         if pipe.write_all(&to_pipe).await.is_err() || failed { return }
         if done {
-            // What is to be sent still goes if it does at once; after a head that ended the
-            // answer it does not, as in nginx.
             let mut sent = async || out.is_empty() || at_once(async { up.write_all(&out).await.is_ok() && up.flush().await.is_ok() }).await == Some(true);
             if !keep || deaf || !ended || !got.is_empty() || bodiless && !out.is_empty() || !sent().await { return }
             conn.h2 = Some(Box::new(Session { id: id + 2, window, initial, recv }));
@@ -1118,7 +898,6 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
     }
 }
 
-/// Whether the length of a frame of a proxied server is one nginx takes no frame of that kind with.
 fn wrong_length(kind: u8, flags: u8, len: usize) -> bool {
     let padded = usize::from(flags & PADDED != 0);
     len > 16384 || match kind {
@@ -1132,8 +911,6 @@ fn wrong_length(kind: u8, flags: u8, len: usize) -> bool {
     }
 }
 
-/// What a DATA, HEADERS or CONTINUATION frame has without its padding and priority;
-/// none when the padding is longer than the rest.
 fn unpadded(kind: u8, flags: u8, p: &[u8]) -> Option<&[u8]> {
     let padded = kind != CONTINUATION && flags & PADDED != 0;
     let skip = usize::from(padded) + if kind == HEADERS && flags & PRIORITY_FLAG != 0 { 5 } else { 0 };
@@ -1141,8 +918,6 @@ fn unpadded(kind: u8, flags: u8, p: &[u8]) -> Option<&[u8]> {
     p.get(skip..p.len().checked_sub(padding)?)
 }
 
-/// Waits until what reads the answer has gone, taking meanwhile what comes of the
-/// request, unless much of it is there already.
 async fn unwanted(pipe: &mut tokio::io::DuplexStream, buf: &mut Vec<u8>) {
     while buf.len() < 65536 {
         if pipe.read_buf(buf).await.unwrap_or(0) == 0 { return }
@@ -1150,13 +925,10 @@ async fn unwanted(pipe: &mut tokio::io::DuplexStream, buf: &mut Vec<u8>) {
     std::future::pending().await
 }
 
-/// How the body of a request or an answer passed on a pipe comes: so many bytes, or in
-/// chunks (what is left of the one it is in, and whether its line ends are to come).
 #[derive(PartialEq)]
 enum Body { Length(u64), Chunked(u64, bool) }
 
 impl Body {
-    /// Moves the data of what came of the body into what is to be sent, and tells whether it has all come.
     fn take(&mut self, buf: &mut Vec<u8>, to: &mut Vec<u8>) -> bool {
         let mut at = 0;
         let mut data = |left: &mut u64, at: &mut usize| {
@@ -1185,25 +957,16 @@ impl Body {
     }
 }
 
-/// The answer that comes on the pipe from the connection of an exchange: what came and
-/// is still to be looked at, whether it answers a HEAD request and so has no body,
-/// and, once its head is whole, how its body comes.
 struct Reply { buf: Vec<u8>, bodiless: bool, comes: Option<Comes> }
 
-/// How an answer comes: no more of it; its body, in chunks or of a length; the trailers;
-/// or a body that only the end of the pipe ends (a connection that was upgraded).
 enum Comes { Nothing, Body(Body), Trailers, Unframed }
 
 impl Reply {
-    /// Takes what has come into the part to be told, up to the end of the answer, or
-    /// to that of the pipe, which cuts it off when it comes before.
     fn take(&mut self, part: &mut Part, closed: bool) {
         if self.comes.is_none() {
             if let Some(end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 let Some((status, mut headers)) = answer_head(&self.buf[..end]) else { return part.ended = Some(Ended::Cut) };
-                // nginx's HTTP/2 header filter sends 204 without Content-Type and Content-Length.
                 headers.retain(|h| status != 204 || !h.0.eq_ignore_ascii_case(b"content-type") && !h.0.eq_ignore_ascii_case(b"content-length"));
-                // An answer without a length, or with trailers, comes chunked.
                 const CHUNKED: &[u8] = b"\r\ntransfer-encoding: chunked";
                 let chunked = self.buf[..end].windows(CHUNKED.len()).any(|w| w.eq_ignore_ascii_case(CHUNKED));
                 let length = headers.iter().find(|h| h.0.eq_ignore_ascii_case(b"content-length")).and_then(|h| std::str::from_utf8(h.1).ok()?.parse().ok());
@@ -1237,17 +1000,8 @@ impl Reply {
     }
 }
 
-/// Answers the request of a stream, as a connection of its own answers it,
-/// one made when the HTTP/2 connection was, of which it is the request so
-/// numbered; the request has so many header lines made, not sent by the client.
-/// Its body is passed as it comes, while the answer is read. What is there of the
-/// answer is told at once, and no more is read while too much of what was told is
-/// not sent. When the stream goes away before the answer has ended, so does all of it.
-/// It is all one task: an answer that does not wait for anything comes and is told the
-/// first time that runs.
 async fn exchange(config: Arc<Config>, request: Vec<u8>, body: Option<UnboundedReceiver<Vec<u8>>>, (listen, local, peer, ssl): Addrs, origin: Origin, tell: impl Fn(Part), mut sent: watch::Receiver<usize>) {
-    // The pipe holds a head of the answer of up to 16 KB besides as much of its body as may wait,
-    // so that one that does not wait for anything comes whole up to that, as nginx makes it at once.
+    // Room for a 16 KB head besides the body that may wait, so an answer that waits for nothing comes whole at once.
     let ((ours, end), (reads, reader)) = (tokio::io::duplex(WAITING + 16384), watch::channel(()));
     let theirs = Stream::Pipe(Pipe { end, reader: Some(Box::new(reader)) });
     let connection = Box::pin(crate::http::connection(&config, theirs, (listen, local, peer, ssl), Busy::new(), Some(Box::new(origin))));
@@ -1286,7 +1040,6 @@ async fn exchange(config: Arc<Config>, request: Vec<u8>, body: Option<UnboundedR
     tokio::join!(passes, connection, reads);
 }
 
-/// What tells of a stream's answer, and that it was cut off when the exchange goes before it has ended.
 struct Telling<F: Fn(Part)> { tell: F, ended: bool }
 
 impl<F: Fn(Part)> Telling<F> {
@@ -1308,7 +1061,6 @@ mod tests {
     use crate::http::tests::{CHUNKED, DELIMITED, GZ, LENGTH, Pieces, after_head, at_once, files, letters, listening, log_path, logged, member, passing, pieces_after, plays, sends, served_by, serves_files, serving_on, with_length};
     use crate::stream::within;
 
-    /// A string written Huffman encoded or not, and one decoded.
     fn encoded(s: &[u8], lower: bool) -> Vec<u8> {
         let mut out = Vec::new();
         write_string(&mut out, s, lower);
@@ -1320,14 +1072,11 @@ mod tests {
         unhuffman(s, &mut out).then(|| out.split_off(6))
     }
 
-    /// The header block of an answer, after an update of the table's size or not.
     fn header_block(status: u16, headers: &[(Vec<u8>, Vec<u8>)], table_update: bool) -> Vec<u8> {
         let headers: Vec<_> = headers.iter().map(|(n, v)| (&n[..], &v[..])).collect();
         [if table_update { &[0x20][..] } else { &[] }, &super::header_block(status, &headers)].concat()
     }
 
-    /// As upstream() does, on a new connection, for a request without a body, or with as
-    /// long a one as framing says.
     async fn upstream(up: Stream, pipe: tokio::io::DuplexStream, scheme: &str, head_size: usize, slot: Slot) {
         upstream_framed(up, pipe, (scheme, head_size, slot), GET).await
     }
@@ -1336,7 +1085,6 @@ mod tests {
         super::upstream(Conn::new(up, Instant::now()), pipe, scheme, head_size, slot, framing).await
     }
 
-    /// That of a request without a body whose Host is the proxied server's.
     const GET: Framing = Framing { authority: true, chunked: false, length: 0 };
 
     #[test]
@@ -1345,7 +1093,6 @@ mod tests {
         assert_eq!(encoded(b"{{{{{", false), b"\x05{{{{{");
         assert_eq!(encoded(b"X-Sent-Foo", true), encoded(b"x-sent-foo", false));
         assert_eq!(encoded(b"{{{{X", true), b"\x05{{{{x");
-        // Every octet, between others.
         for c in 0..=255 {
             let s = [&[b'0'; 80][..], &[c], b"a~e", &[c]].concat();
             let coded = encoded(&s, false);
@@ -1354,11 +1101,9 @@ mod tests {
             assert_eq!(decoded(&coded[1..]).unwrap(), s);
         }
         assert_eq!(decoded(&[0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]).unwrap(), b"www.example.com");
-        // A whole octet of padding, which nginx takes; EOS, which it does not; padding that is not ones.
         assert_eq!(decoded(&[0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xff]).unwrap(), b"localhost");
         assert_eq!(decoded(&[0xff, 0xff, 0xff, 0xff]), None);
         assert_eq!(decoded(&[0x00]), None);
-        // Every octet, and all of them.
         let coded = |octets: &[u8]| {
             let bits: String = octets.iter().map(|&c| { let (code, len) = HUFFMAN[usize::from(c)]; format!("{code:00$b}", usize::from(len)) }).collect();
             bits.as_bytes().chunks(8).map(|b| u8::from_str_radix(&format!("{:1<8}", std::str::from_utf8(b).unwrap()), 2).unwrap()).collect::<Vec<_>>()
@@ -1393,7 +1138,6 @@ mod tests {
         assert_eq!(t.decode(&[0x00, 0x03, b'a'], 3, (4, 8192)), Err(FRAME_SIZE_ERROR));
         assert_eq!(t.decode(&[0x00, 0x03, b'a', b'b', b'c', 0x00], 6, (1, 2)), Err(ENHANCE_YOUR_CALM));
         assert_eq!(t.decode(&[0x3f, 0xe2, 0x1f], 3, (4, 8192)), Err(COMPRESSION_ERROR));
-        // Shrinking the table drops what does not fit; an entry larger than it empties it.
         assert_eq!(t.decode(&[0x3f, 0x03], 2, (4, 8192)), Ok(Vec::new()));
         assert_eq!((t.entries.len(), t.used), (1, 34));
         t.add(b"long name", b"long value");
@@ -1443,7 +1187,6 @@ mod tests {
             let bridge = upstream_framed(Stream::Pipe(up.into()), theirs, ("http", 4096, slot.clone()), Framing { chunked: true, ..GET });
             let test = async {
                 ours.write_all(b"POST /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\nX-A: b\r\nX-C: \xff\xc3\r\n\r\n").await.unwrap();
-                // The server lets only a byte of the body go at first.
                 let mut out = Vec::new();
                 frame(&mut out, SETTINGS, 0, 0, &[0, 4, 0, 0, 0, 1, 0, 9, 0, 0, 0, 0]);
                 frame(&mut out, PING, 0, 0, b"12345678");
@@ -1453,7 +1196,6 @@ mod tests {
                 while !frames(&got).iter().any(|f| f.0 == PING) { server.read_buf(&mut got).await.unwrap(); }
                 ours.write_all(b"2\r\nab\r\n1;e\r\nc\r\n0\r\n\r\n").await.unwrap();
                 while !frames(&got).iter().any(|f| f.0 == DATA) { server.read_buf(&mut got).await.unwrap(); }
-                // The request has not gone whole while its body waits for the window.
                 assert!(!slot.lock().unwrap().sent);
                 out.clear();
                 frame(&mut out, WINDOW_UPDATE, 0, 1, &[0, 0, 0, 10]);
@@ -1468,9 +1210,7 @@ mod tests {
                 let fields = t.decode(&sent[2].2, sent[2].2.len(), (100, 100)).unwrap();
                 let text: Vec<_> = fields.iter().map(|(n, v)| format!("{}: {}", String::from_utf8_lossy(n), String::from_utf8_lossy(v))).collect();
                 assert_eq!(text[..6], [":method: POST", ":scheme: http", ":authority: h", ":path: /x", "connection: close", "x-a: b"]);
-                // Bytes that are not UTF-8 go as they came.
                 assert_eq!(fields[6], (b"x-c".to_vec(), b"\xff\xc3".to_vec()));
-                // The answer, padded, in parts.
                 out.clear();
                 let block = header_block(200, &[(b"x-b".to_vec(), b"c".to_vec())], false);
                 frame(&mut out, HEADERS, PADDED, 1, &[[1].as_slice(), &block[..1], &[0]].concat());
@@ -1494,7 +1234,6 @@ mod tests {
             let bridge = upstream(Stream::Pipe(up.into()), theirs, "http", 4096, slot.clone());
             let test = async {
                 ours.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
-                // An informational answer, the answer, and the trailers.
                 let mut out = Vec::new();
                 frame(&mut out, HEADERS, END_HEADERS, 1, &header_block(103, &[(b"link".to_vec(), b"<a>".to_vec())], false));
                 frame(&mut out, HEADERS, END_HEADERS, 1, &header_block(200, &[], false));
@@ -1514,24 +1253,18 @@ mod tests {
 
     #[test]
     fn tables_without_room() {
-        // A table of no size, as the bridge announces: updates to 0 only, and nothing is kept.
         let mut t = Table { entries: VecDeque::new(), size: 0, used: 0, limit: 0 };
         assert_eq!(t.decode(&[0x20, 0x48, 0x03, b'2', b'0', b'0'], 6, (10, 100)).unwrap(), [(b":status".to_vec(), b"200".to_vec())]);
         assert!(t.entries.is_empty() && t.field(62).is_none());
         assert_eq!(t.decode(&[0x21, 0x88], 2, (10, 100)), Err(COMPRESSION_ERROR));
     }
 
-    /// A frame.
     fn framed(kind: u8, flags: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         frame(&mut out, kind, flags, sid, payload);
         out
     }
 
-    /// What the bridge passes of the pieces a server sends, each once the one before
-    /// has been taken, and how it says the answer ended; the server keeps the
-    /// connection, or closes it, after them. The bridge ends by itself, or within a
-    /// second once what reads the answer has gone.
     fn passed(pieces: &[&[u8]], closes: bool) -> (String, End, Vec<(String, String)>) {
         let ((mut ours, theirs), (up, server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 20));
         let slot = Slot::default();
@@ -1563,14 +1296,11 @@ mod tests {
         let rst = |code: u32| framed(RST_STREAM, 0, 1, &code.to_be_bytes());
         let goaway = |last: u32| framed(GOAWAY, 0, 0, &[last.to_be_bytes(), [0; 4]].concat());
         let trailers = |flags: u8| { let mut block = Vec::new(); literals(&mut block, [(b"x-t".to_vec(), b"1".to_vec())].iter()); framed(HEADERS, END_HEADERS | flags, 1, &block) };
-        // The frames that follow the head and the data, apart or at once with them, and
-        // what is passed of the answer then, besides the head.
         let cases = [
             (vec![last.clone()], "ok!", "ok!", End::Whole),
             (vec![last.clone(), rst(NO_ERROR)], "ok!", "ok!", End::Whole),
             (vec![goaway(1), last.clone()], "ok!", "ok!", End::Whole),
             (vec![trailers(END_STREAM)], "ok", "ok", End::Whole),
-            // What comes with what fails the stream is dropped, but for the head.
             (vec![rst(INTERNAL_ERROR)], "ok", "", End::Failed),
             (vec![rst(NO_ERROR)], "ok", "", End::Failed),
             (vec![last.clone(), rst(INTERNAL_ERROR)], "ok", "", End::Failed),
@@ -1579,10 +1309,8 @@ mod tests {
             (vec![goaway(0)], "ok", "", End::Failed),
             (vec![trailers(0)], "ok", "", End::Failed),
             (vec![framed(WINDOW_UPDATE, 0, 0, &[0; 3])], "ok", "", End::Failed),
-            // The connection closing, whatever was said before, is not the end of the stream.
             (vec![], "ok", "ok", End::Closed),
             (vec![goaway(1)], "ok", "ok", End::Closed),
-            // Part of a frame.
             (vec![data[..10].to_vec()], "oko", "oko", End::Closed),
             (vec![framed(DATA, PADDED, 1, b"\x02okay..")[..15].to_vec()], "okokay", "okokay", End::Closed),
         ];
@@ -1593,18 +1321,15 @@ mod tests {
             let got = passed(&[&[&head[..], &data, &frames].concat()], end == End::Closed);
             assert_eq!((got.0, got.1), (text(at_once), end), "{frames:?}");
         }
-        // Before the head.
         for (frames, end) in [(rst(INTERNAL_ERROR), End::Failed), (rst(NO_ERROR), End::Failed), (goaway(0), End::Failed), (data.clone(), End::Failed), (goaway(1), End::Closed), (Vec::new(), End::Closed)] {
             assert_eq!(passed(&[&frames], end == End::Closed), (String::new(), end, Vec::new()), "{frames:?}");
         }
-        // In the head, which has no body, the end of the stream is that of the answer.
         assert_eq!(passed(&[&framed(HEADERS, END_HEADERS | END_STREAM, 1, &header_block(200, &[], false))], false).1, End::Whole);
         assert_eq!(passed(&[&head, &data, &trailers(END_STREAM)], false).2, [("x-t".to_string(), "1".to_string())]);
     }
 
     #[test]
     fn answers_are_read_after_a_write_fails() {
-        // The server has closed the connection once it has sent the answer, before any of it is taken.
         let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 20));
         let slot = Slot::default();
         let body = crate::stream::block_on(async {
@@ -1623,8 +1348,6 @@ mod tests {
 
     #[test]
     fn unwanted_answers_end_the_connection() {
-        // While the server sends nothing, before the head and in the body, and while it
-        // takes nothing of what is to be written.
         let head = framed(HEADERS, END_HEADERS, 1, &header_block(200, &[], false));
         let pings = framed(PING, 0, 0, &[0; 8]).repeat(200);
         for (sent, room) in [(Vec::new(), 1 << 16), (head.clone(), 1 << 16), ([head, pings].concat(), 256)] {
@@ -1670,14 +1393,12 @@ mod tests {
             framed(PING, 0, 0, &[0; 7]), framed(GOAWAY, 0, 0, &[0; 7]), framed(SETTINGS, 0, 0, &[0; 5]), framed(SETTINGS, ACK, 0, &[0; 6]),
             framed(SETTINGS, 0, 0, &setting(4, max + 1)), framed(WINDOW_UPDATE, 0, 0, &word(max - 65534)), framed(WINDOW_UPDATE, 0, 1, &word(max - 65534)),
             [framed(WINDOW_UPDATE, 0, 1, &word(max - 65535)), framed(SETTINGS, 0, 0, &setting(4, 65536))].concat(),
-            // Incomplete, invalid and endless header blocks.
             framed(HEADERS, END_HEADERS, 1, &[0x00, 0x05, b'x']), framed(HEADERS, END_HEADERS, 1, &[0xff, 0xff, 0xff, 0xff]),
         ];
         for frames in &wrong {
             assert_eq!((passed(&[frames], false).0, passed(&[frames], false).1), (String::new(), End::Failed), "{}", frames[..frames.len().min(20)].escape_ascii());
             assert_eq!(passed(&[&head, frames], false).1, End::Failed, "{}", frames[..frames.len().min(20)].escape_ascii());
         }
-        // Not wrong: the server may open the windows, and set anything else.
         let fine = [
             framed(DATA, PADDED, 1, &[3, 0, 0, 0]), framed(PRIORITY, 0, 1, &[0; 4]), framed(SETTINGS, ACK, 0, &[]), framed(WINDOW_UPDATE, 0, 1, &[0; 4]),
             framed(SETTINGS, 0, 0, &[setting(4, max), setting(4, 65535), setting(4, max)].concat()), framed(SETTINGS, 0, 0, &[setting(5, 0), setting(2, 2)].concat()),
@@ -1687,7 +1408,6 @@ mod tests {
             let last = framed(DATA, END_STREAM, 1, b"ok");
             assert_eq!(passed(&[&head, frames, &last], false), ("HTTP/1.1 200 \r\n\r\nok".to_string(), End::Whole, Vec::new()), "{}", frames[..frames.len().min(20)].escape_ascii());
         }
-        // The head has so many bytes, with its frames, in one or more of them.
         let field = |n: usize| { let mut block = Vec::new(); literals(&mut block, [(b":status".to_vec(), b"200".to_vec()), (b"x".to_vec(), vec![b'~'; n])].iter()); block };
         let long = |size: usize| (0..size).map(field).find(|b| b.len() == size).unwrap();
         assert_eq!(passed(&[&framed(HEADERS, END_HEADERS, 1, &long(4096 - 9))], true).1, End::Closed);
@@ -1700,8 +1420,6 @@ mod tests {
     fn what_stays_with_a_connection() {
         let head = |sid: u32, end: u8| framed(HEADERS, END_HEADERS | end, sid, &header_block(200, &[], false));
         let word = |n: u32| n.to_be_bytes();
-        // What a request sends on a connection, when the frames come at once, and how its
-        // answer ended and the connection that may be kept.
         let exchange = |session: Option<Session>, request: &'static str, frames: Vec<u8>| crate::stream::block_on(async move {
             let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
             let slot = Slot::default();
@@ -1720,8 +1438,6 @@ mod tests {
         });
         let get = "GET / HTTP/1.1\r\nHost: h\r\n\r\n";
         let post = "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nabcde";
-        // The preface is sent once, and the streams are numbered; SETTINGS are for every stream,
-        // those that shrink a window too, and the window of the connection is what is left of it.
         let settings = framed(SETTINGS, 0, 0, &[&[0, 4][..], &word(3), &[0, 1], &word(0)].concat());
         let (sent, end, kept) = exchange(None, post, [settings, framed(WINDOW_UPDATE, 0, 0, &word(9)), head(1, 0), framed(DATA, END_STREAM, 1, b"ok")].concat());
         assert!(sent.starts_with(PREFACE) && sent.ends_with(&framed(SETTINGS, ACK, 0, &[])) && end == End::Whole);
@@ -1729,12 +1445,10 @@ mod tests {
         assert_eq!(kept, Some(session));
         let (sent, end, kept) = exchange(kept, post, [framed(WINDOW_UPDATE, 0, 3, &word(2)), head(3, END_STREAM)].concat());
         let data = [framed(DATA, 0, 3, b"abc"), framed(DATA, END_STREAM, 3, b"de")].concat();
-        // The stream's end came with the window: the rest of the body is not sent any more.
         assert!(sent[3..9] == [HEADERS, END_HEADERS, 0, 0, 0, 3] && sent.ends_with(&data[..12]) && end == End::Whole && kept.is_none());
         let (sent, _, kept) = exchange(Some(session), get, [head(3, 0), framed(DATA, END_STREAM, 3, b"ok")].concat());
         assert!(sent[3..9] == [HEADERS, END_HEADERS | END_STREAM, 0, 0, 0, 3]);
         assert_eq!(kept, Some(Session { id: 5, recv: MAX_WINDOW - 4, ..session }));
-        // The windows of the answer grow once less than a quarter is left of one; nothing comes beyond them.
         let little = Session { recv: MAX_WINDOW / 4 + 1, ..session };
         let answer = |data: &[u8]| [head(3, 0), framed(DATA, 0, 3, data), framed(DATA, END_STREAM, 3, b"")].concat();
         assert_eq!(exchange(Some(little), get, answer(b"a")).2, Some(Session { id: 5, recv: MAX_WINDOW / 4, ..session }));
@@ -1743,20 +1457,14 @@ mod tests {
         assert!(sent.ends_with(&grown) && kept == Some(Session { id: 5, recv: MAX_WINDOW, ..session }));
         let (_, end, kept) = exchange(Some(Session { recv: 1, ..session }), get, answer(b"ab"));
         assert_eq!((end, kept), (End::Failed, None));
-        // Frames of other streams, the one before too, fail the answer.
         for frame in [framed(WINDOW_UPDATE, 0, 1, &word(1)), framed(RST_STREAM, 0, 1, &word(0)), framed(DATA, 0, 5, b"a"), framed(DATA, 0, 0, b"a"), framed(PING, ACK, 0, &[0; 8])] {
             let (_, end, kept) = exchange(Some(session), get, [frame, head(3, END_STREAM)].concat());
             assert_eq!((end, kept), (End::Failed, None));
         }
     }
 
-    /// What a server of HTTP/2 sends for a stream: at once, and once the client has its answer;
-    /// when that is empty too, it closes the connection.
     type Plays = fn(u32) -> (Vec<u8>, Option<Vec<u8>>);
 
-    /// The statuses of four requests, one after another, passed to a server that plays so, and
-    /// how many requests came on each connection to it; a connection on which another
-    /// request comes after it was closed counts it.
     fn kept(plays: Plays, method: &str, (upstream, location): (&str, &str)) -> (Vec<u16>, Vec<usize>) {
         use std::io::{Read, Write};
         use std::sync::{Mutex, atomic::{AtomicUsize, Ordering::SeqCst}};
@@ -1799,7 +1507,6 @@ mod tests {
             for n in 1..=4 {
                 client.write_all(format!("{method} / HTTP/1.1\r\nHost: a\r\n{length}").as_bytes()).await.unwrap();
                 let mut got = Vec::new();
-                // The body is ok, in a chunk or not, or that of an error page.
                 let whole = |got: &[u8]| {
                     let text = String::from_utf8_lossy(got).into_owned();
                     let (head, body) = text.split_once("\r\n\r\n")?;
@@ -1814,7 +1521,6 @@ mod tests {
                 statuses.push(status);
                 answered.store(n, SeqCst);
                 for _ in 0..5000 { if sent.load(SeqCst) >= n || status >= 500 { break } tokio::time::sleep(Duration::from_millis(1)).await; }
-                // What came is read; those that fail are not answered, but counted.
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 sent.store(n, SeqCst);
             }
@@ -1850,7 +1556,6 @@ mod tests {
             ("an unknown frame after the end", "GET", |i| with(i, framed(77, 0, 0, b"a")), kept_all),
             ("connection: close", "GET", |i| ([fields(i, &[("connection", "close")], 0), framed(DATA, END_STREAM, i, b"ok")].concat(), None), kept_all),
             ("a reset after the end with the head", "GET", |i| ([head(i, 200, END_STREAM), rst(i)].concat(), None), kept_all),
-            // Not kept: what is not read, or goes away.
             ("a reset later", "GET", |i| later(i, rst(i)), kept_none),
             ("windows later", "GET", |i| later(i, framed(WINDOW_UPDATE, 0, 0, &[0, 0, 0, 1])), kept_none),
             ("a ping later", "GET", |i| later(i, ping()), kept_none),
@@ -1871,15 +1576,12 @@ mod tests {
             assert!(statuses.iter().all(|s| *s < 300), "{case} {statuses:?}");
             assert_eq!(came, connections, "{case}");
         });
-        // One that is closed when the second request comes is tried again on another, once; with a reset, or
-        // when it goes away before the stream, it is not.
         let second: Plays = |i| if i == 1 { (ok(i), None) } else { (Vec::new(), Some(Vec::new())) };
         assert_eq!(kept(second, "GET", ("", "")), (vec![200; 4], vec![2, 2, 2, 1]));
         assert_eq!(kept(second, "GET", ("", "proxy_next_upstream off;")), (vec![200, 502, 200, 502], vec![2, 2]));
         assert_eq!(kept(second, "POST", ("", "")), (vec![200, 502, 200, 502], vec![2, 2]));
         let fails: [Plays; 2] = [|i| if i == 1 { (ok(i), None) } else { (goaway(1), None) }, |i| if i == 1 { (ok(i), None) } else { (rst(i), None) }];
         for fails in fails { assert_eq!(kept(fails, "GET", ("", "")), (vec![200, 502, 200, 502], vec![2, 2])); }
-        // The directives of the upstream, and an answer that is not used.
         let plain: Plays = |i| (ok(i), None);
         assert_eq!(kept(plain, "GET", ("keepalive_requests 3;", "")).1, [3, 1]);
         assert_eq!(kept(plain, "GET", ("keepalive 0;", "")).1, kept_none);
@@ -1909,11 +1611,9 @@ mod tests {
         let fields = names.iter().map(|n| (*n, "v")).chain(values.iter().map(|v| ("x", *v)));
         for field in fields {
             assert_eq!(passed(&[&[head(&[ok, field]), last.clone()].concat()], false), (String::new(), End::Failed, vec![]), "{field:?}");
-            // In early hints, and in what follows them, which goes after them.
             let hints = [(":status", "103"), field];
             assert_eq!(passed(&[&[head(&hints), head(&[ok]), last.clone()].concat()], false), (String::new(), End::Failed, vec![]), "{field:?}");
             assert_eq!(passed(&[&[head(&hints[..1]), head(&[ok, field])].concat()], false), ("HTTP/1.1 103 \r\n\r\n".to_string(), End::Failed, vec![]), "{field:?}");
-            // In trailers.
             let trailers = framed(HEADERS, END_HEADERS | END_STREAM, 1, &block(&[("x-t", "1"), field]));
             assert_eq!(passed(&[&head(&[ok]), &framed(DATA, 0, 1, b"ok"), &trailers], false), ("HTTP/1.1 200 \r\n\r\nok".to_string(), End::Failed, vec![]), "{field:?}");
         }
@@ -1926,17 +1626,14 @@ mod tests {
             &[(":status", "")], &[(":status", "20")], &[(":status", "0200")], &[(":status", "+20")], &[(":status", "2x0")], &[(":status", "000")], &[(":status", "100")], &[(":status", "101")], &[(":status", "199")],
             &[ok, ("content-length", " 2")], &[ok, ("content-length", "2 ")], &[ok, ("transfer-encoding", " chunked")],
         ] { assert_eq!(passed(&[&[head(fields), last.clone()].concat()], false), (String::new(), End::Failed, vec![]), "{fields:?}"); }
-        // An end of the stream with early hints, a head that only goes on, and one that another frame is in.
         for frames in [
             framed(HEADERS, END_HEADERS | END_STREAM, 1, &block(&[(":status", "103")])), framed(CONTINUATION, END_HEADERS, 1, &block(&[ok])),
             [framed(HEADERS, 0, 1, &block(&[ok])), head(&[("x", "1")])].concat(), [framed(HEADERS, 0, 1, &block(&[ok])), framed(PING, 0, 0, &[0; 8])].concat(),
         ] { assert_eq!(passed(&[&frames], false), (String::new(), End::Failed, vec![]), "{frames:?}"); }
-        // Not refused.
         for (field, line) in [(("x", "\t\u{7f}"), "x: \t\u{7f}\r\n"), (("x_(/", ""), "x_(/: \r\n"), (("connection", "close"), "connection: close\r\n"), ((":status", "999"), "")] {
             let (fields, status) = if line.is_empty() { (vec![field], "999") } else { (vec![ok, field], "200") };
             assert_eq!(passed(&[&[head(&fields), last.clone()].concat()], false), (format!("HTTP/1.1 {status} \r\n{line}\r\nok"), End::Whole, vec![]), "{field:?}");
         }
-        // The bytes of a trailer are kept.
         let trailers = framed(HEADERS, END_HEADERS | END_STREAM, 1, &[&[0, 1, b'x', 1], &[0xff][..]].concat());
         assert_eq!(passed(&[&[head(&[ok]), trailers].concat()], false).2, [("x".to_string(), crate::vars::text(&[0xff]))]);
     }
@@ -1959,8 +1656,6 @@ mod tests {
 
     #[test]
     fn headers_set_go_as_they_are() {
-        // A Host of its own goes as host, and Transfer-Encoding and Content-Length do not
-        // say how the body comes.
         for (framing, want, end) in [(Framing { authority: false, ..GET }, "host: h", END_STREAM), (Framing { length: 2, ..GET }, ":authority: h", 0)] {
             crate::stream::block_on(async {
                 let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
@@ -1981,7 +1676,6 @@ mod tests {
 
     #[test]
     fn bodies_go_in_frames_every_server_takes() {
-        // Whatever the largest frame the server says it takes, as nginx.
         for size in [0, 1, 100, 16384, 1 << 24] {
             crate::stream::block_on(async {
                 let ((mut ours, theirs), (up, mut server)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
@@ -2026,7 +1720,6 @@ mod tests {
                 let post = random(2) == 0;
                 ours.write_all(if post { b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc" } else { b"GET / HTTP/1.1\r\nHost: h\r\n\r\n" }).await.unwrap();
                 server.write_all(&sent).await.unwrap();
-                // The server keeps the connection, or closes it; what reads the answer goes, or not.
                 let (server, ours) = match random(3) { 0 => { drop(server); (None, Some(ours)) } 1 => { drop(ours); (Some(server), None) } _ => { drop((server, ours)); (None, None) } };
                 let framing = Framing { length: if post { 3 } else { 0 }, ..GET };
                 let ended = crate::stream::within(Some(Duration::from_secs(1)), upstream_framed(Stream::Pipe(up.into()), theirs, ("http", 4096, Slot::default()), framing)).await;
@@ -2051,7 +1744,6 @@ mod tests {
         assert_eq!(to, b"abcxabc");
     }
 
-    /// The parts told of an answer that comes in the pieces, after which the pipe closes or not.
     fn told(pieces: &[&[u8]], bodiless: bool, closes: bool) -> Part {
         let (mut reply, mut all) = (Reply { buf: Vec::new(), bodiless, comes: None }, Part::default());
         for piece in pieces.iter().chain([&&b""[..]].into_iter().filter(|_| closes)) {
@@ -2095,7 +1787,6 @@ mod tests {
             let bytes = answer.as_bytes();
             let one = told(&[bytes], bodiless, true);
             assert_eq!((String::from_utf8_lossy(&one.data).as_ref(), &one.ended), (data, &ended), "{answer}");
-            // However it is split, and its end does not wait for that of the pipe.
             assert_eq!(told(&bytes.chunks(1).collect::<Vec<_>>(), bodiless, true), one, "{answer}");
             for at in 1..bytes.len() { assert_eq!(told(&[&bytes[..at], &bytes[at..]], bodiless, true), one, "{answer} {at}"); }
             let early = if matches!(&ended, Some(Ended::Whole(_))) && !answer.contains("101") { ended } else { open };
@@ -2117,7 +1808,6 @@ mod tests {
             c.send_data();
             (c, sent)
         };
-        // What ends an answer comes with the last of it, or after it.
         let (mut c, _) = start(100);
         assert_eq!(kinds(&mut c.out), [(HEADERS, END_HEADERS, 1), (DATA, 0, 3)]);
         c.answer(1, part(b"de", whole()));
@@ -2138,7 +1828,6 @@ mod tests {
             c.send_data();
             assert_eq!((kinds(&mut c.out), c.streams.len()), (want, 0));
         }
-        // One cut off is reset once what came of it is sent; one without a head at once.
         let (mut c, _) = start(2);
         c.answer(1, part(b"de", Some(Ended::Cut)));
         c.send_data();
@@ -2150,7 +1839,6 @@ mod tests {
         c.streams.insert(1, Open::default());
         c.answer(1, part(b"", Some(Ended::Cut)));
         assert_eq!((kinds(&mut c.out), c.streams.len()), (vec![(RST_STREAM, 0, 4)], 0));
-        // What was sent is told when the exchange may wait for it, and the end of the stream.
         let (mut c, mut sent) = start(1 << 20);
         c.send = 1 << 20;
         c.answer(1, part(&vec![b'x'; WAITING - 4], None));
@@ -2159,7 +1847,6 @@ mod tests {
         c.answer(1, part(b"y", None));
         c.send_data();
         assert_eq!(*sent.borrow_and_update(), WAITING);
-        // At once, when that waits for the window.
         c.streams.get_mut(&1).unwrap().send = 1;
         c.answer(1, part(&vec![b'x'; WAITING], None));
         c.send_data();
@@ -2168,7 +1855,6 @@ mod tests {
         assert!(sent.has_changed().is_err());
     }
 
-    /// The frames that have come whole: kind, flags, stream and payload of each.
     fn frames_in(mut buf: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
         let mut all = Vec::new();
         while buf.len() >= 9 {
@@ -2180,17 +1866,13 @@ mod tests {
         all
     }
 
-    /// A client of HTTP/2, what has come and is not yet taken, and whether it has given
-    /// its answers' windows back as they came (those of its streams, of so many bytes at first).
     struct Client { s: tokio::net::TcpStream, buf: Vec<u8>, task: tokio::task::JoinHandle<()>, gives: bool }
 
     impl Client {
-        /// One of a server with the directives.
         async fn new(directives: &str, window: u32) -> Client {
             Client::new_by(&format!("http2 on; {directives}"), window).await
         }
 
-        /// One of what the http block has.
         async fn new_by(http: &str, window: u32) -> Client {
             let (mut s, task) = served_by(http).await;
             let settings = framed(SETTINGS, 0, 0, &[&[0, 4][..], &window.to_be_bytes()].concat());
@@ -2202,13 +1884,11 @@ mod tests {
             self.s.write_all(&frames.concat()).await.unwrap();
         }
 
-        /// Asks for "/" on a stream.
         async fn get(&mut self, sid: u32, method: &str) {
             let block = [&[0x86, 0x84, 0x41, 0x01, b'h', 0x02, method.len() as u8], method.as_bytes()].concat();
             self.send(&[framed(HEADERS, END_HEADERS | END_STREAM, sid, &block)]).await;
         }
 
-        /// The next frames of streams that come at once, none once the connection is closed.
         async fn next(&mut self) -> Vec<(u8, u8, u32, Vec<u8>)> {
             loop {
                 let frames = frames_in(&self.buf);
@@ -2222,8 +1902,6 @@ mod tests {
             }
         }
 
-        /// The frames of a stream up to its end, each with the milliseconds it came after
-        /// the first call of this; DATA in a row that came at once is in one.
         async fn all(&mut self, sid: u32) -> Vec<(u128, String)> {
             let (started, mut all) = (Instant::now(), Vec::new());
             loop {
@@ -2244,14 +1922,12 @@ mod tests {
             }
         }
 
-        /// Goes away, and waits until what serves it has ended.
         async fn close(self) {
             drop(self.s);
             within(Some(Duration::from_secs(2)), self.task).await.unwrap().unwrap();
         }
     }
 
-    /// The fields of a header block, without those that every answer has.
     fn fields_of(block: &[u8]) -> String {
         let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
         let fields = t.decode(block, block.len(), (4, 8192)).unwrap();
@@ -2259,12 +1935,10 @@ mod tests {
         fields.iter().filter(|f| !["server", "date", "content-type"].contains(&text(&f.0).as_str())).map(|f| format!("{}: {};", text(&f.0), text(&f.1))).collect()
     }
 
-    /// The same, without the times.
     fn texts(all: &[(u128, String)]) -> Vec<&str> {
         all.iter().map(|f| f.1.as_str()).collect()
     }
 
-    /// What one stream gets for a request of a server that sends the pieces.
     fn got(pieces: &Pieces, closes: bool, directives: &str, method: &str) -> Vec<(u128, String)> {
         let (addr, _count) = plays(pieces, closes);
         crate::stream::block_on(async {
@@ -2293,14 +1967,12 @@ mod tests {
         ], |(head, parts, closes, directives, want)| {
             let all = got(&after_head(head, parts, 200), closes, directives, "GET");
             assert_eq!(texts(&all), want, "{directives}");
-            // The head and the first part come at once, and so do the end of a body and its trailers.
             let start = all[0].0;
             for (i, part) in all.iter().enumerate().skip(1) {
                 let due = start + 200 * (i as u128 - 1).min(2);
                 assert!(part.0 + 20 >= due && part.0 < due + 150, "{i} {all:?}");
             }
         });
-        // With proxy_buffering on, the head does not wait for the body, which waits for a full buffer or its end.
         at_once([(length.as_str(), &["ab", "c", "d"][..], false, "", vec![OK4, "abcd|"]), (DELIMITED, &["ab", "cd", ""], true, "", vec![OK, "abcd|"]), (&length, &["", "ab", "cd"], false, "proxy_buffering off;", vec![OK4, "ab", "cd|"])], |(head, parts, closes, directives, want)| {
             let all = got(&after_head(head, parts, 200), closes, directives, "GET");
             assert!(texts(&all) == want && all[0].0 < 150 && all[1].0 >= 180, "{all:?}");
@@ -2323,7 +1995,6 @@ mod tests {
         c.streams.extend([(1, opened(0)), (3, opened(1)), (5, opened(0))]);
         let part = |data: &[u8], ended| Told::Answer(Part { head: Some((header_block(200, &[], false), false)), data: data.to_vec(), ended });
         let whole = || Some(Ended::Whole(Vec::new()));
-        // Each as it comes, whatever else waits; not that of an exchange of before, nor of a stream that has gone.
         c.told((5, 0, part(b"e", whole())));
         c.told((3, 0, part(b"old", whole())));
         c.told((1, 0, part(&[b'x'; 150], whole())));
@@ -2357,7 +2028,6 @@ mod tests {
                 c.close().await;
             });
         }
-        // What has no body ends with its head.
         let all = got(&vec![(0, length.into_bytes())], false, "", "HEAD");
         assert!(all.len() == 1 && all[0].1.ends_with('|'), "{all:?}");
         for (head, method, want) in [("204 No Content", "GET", ":status: 204;|"), ("204 No Content\r\nContent-Length: 5", "GET", ":status: 204;|"), ("304 Not Modified\r\nContent-Length: 5", "GET", ":status: 304;content-length: 5;|"), ("200 OK\r\nContent-Length: 5", "HEAD", ":status: 200;content-length: 5;|"), ("200 OK", "HEAD", ":status: 200;|")] {
@@ -2379,7 +2049,6 @@ mod tests {
         for (head, pieces, closes, directives, want) in [
             (&whole, gz.clone(), false, "gunzip on; proxy_buffering off;", vec![OK, &a, &end]),
             (&length(30000), vec![gz[0].clone(), Vec::new()], true, "gunzip on; proxy_buffering off;", vec![OK, &a, "reset 2"]),
-            // What ends before its time, or is malformed, after the head of the answer.
             (&half, vec![gz[0].clone(), gz[1][..5].to_vec()], false, "gunzip on; proxy_buffering off;", vec![OK, &a, "reset 2"]),
             (&with_bad, vec![gz[0].clone(), bad.clone()], false, "gunzip on; proxy_buffering off;", vec![OK, &a, "reset 2"]),
             (&with_bad, vec![[&gz[0][..], &bad].concat()], false, "gunzip on;", vec![OK, "reset 2"]),
@@ -2387,16 +2056,13 @@ mod tests {
         ] {
             let all = got(&pieces_after(head, &pieces), closes, &format!("{directives} access_log {} f;", log.display()), "GET");
             let mut texts = texts(&all);
-            // The end of the stream may come with the last of the body, or alone.
             let last = format!("{}|", texts[texts.len() - 2]);
             if texts.last() == Some(&"|") { texts.truncate(texts.len() - 2); texts.push(&last); }
             assert_eq!(texts, want, "{directives} {pieces:?}");
-            // $body_bytes_sent is what was decompressed, without what makes it chunks.
             let body: usize = want.iter().map(|w| w.trim_end_matches('|').len()).filter(|n| *n == 50).sum();
             let line = logged(&log);
             assert!(line.starts_with(&format!("200 {body} ")), "{line}");
         }
-        // To a client that takes gzip, each read flushed, the head with the beginning of it.
         let (addr, _count) = plays(&pieces_after(&with_length(100, ""), &[Vec::new(), a.clone().into_bytes(), b.clone().into_bytes()]), false);
         crate::stream::block_on(async {
             let mut c = Client::new(&passing(addr, &format!("gzip on; proxy_buffering off; access_log {} f;", log.display())), 1 << 20).await;
@@ -2438,7 +2104,6 @@ mod tests {
             (CHUNKED, &["2\r\nab\r\n", ""], true, "add_trailer X 1;", vec![OK, "ab", reset]),
             (DELIMITED, &["ab", "cd"], false, "proxy_read_timeout 1s;", vec![OK, reset]),
             (DELIMITED, &["ab", "cd"], false, "proxy_buffering off; proxy_read_timeout 1s;", vec![OK, "ab", "cd", reset]),
-            // Nothing more is sent of what is malformed, or nothing at all.
             (CHUNKED, &["2\r\nab\r\n", "zz\r\nz"], false, "", vec![OK, "ab", reset]),
             (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\nzz"], false, "", vec![OK, "ab", reset]),
             (CHUNKED, &["2\r\nab\r\nzz"], false, "", vec![reset]),
@@ -2513,7 +2178,6 @@ mod tests {
                 }
             }
             assert_eq!(came[0], 20000);
-            // The first goes on once it has a window again, and ends when it is reset.
             c.send(&[framed(WINDOW_UPDATE, 0, 1, &5000u32.to_be_bytes())]).await;
             while came[0] < 25000 { came[0] += c.next().await.iter().map(|f| f.3.len()).sum::<usize>(); }
             c.send(&[framed(RST_STREAM, 0, 1, &[0, 0, 0, 8])]).await;
@@ -2523,7 +2187,6 @@ mod tests {
         });
         let text = logged(&log);
         let lines: Vec<Vec<usize>> = text.lines().map(|l| l.split(' ').take(6).map(|n| n.parse().unwrap()).collect()).collect();
-        // What is on its way from the server to the client is held, some 64 KB in each place.
         assert!(lines.len() == 2 && lines[0][1] == size && lines[0][4] == size, "{text}");
         assert!((25000..250_000).contains(&lines[1][1]) && lines[1][4] < 250_000, "{text}");
     }
@@ -2552,8 +2215,6 @@ mod tests {
                 });
             }
         }
-        // Of a file no more is read than waits to be sent: what became shorter meanwhile is
-        // reset there. Another stream is answered meanwhile.
         std::fs::write(dir.join("f"), letters(4 << 20)).unwrap();
         crate::stream::block_on(async {
             let mut c = asks(0).await;
@@ -2582,7 +2243,6 @@ mod tests {
             let mut c = Client::new_by(&http, 1 << 30).await;
             c.send(&[framed(WINDOW_UPDATE, 0, 0, &(1u32 << 30).to_be_bytes())]).await;
             c.get(1, "GET").await;
-            // It reads nothing: once the buffers are full, a write waits for send_timeout and the connection ends.
             let started = Instant::now();
             within(Some(Duration::from_secs(10)), &mut c.task).await.expect("still served").unwrap();
             assert!(started.elapsed() >= Duration::from_secs(1), "{:?}", started.elapsed());
@@ -2598,7 +2258,6 @@ mod tests {
         let big = "x".repeat(8 << 20);
         for closes in [false, true] {
             for (pieces, directives, window, reads, status) in [
-                // Before the head, after it, in the body, while it is paced, and without a window.
                 (vec![(0, b"HTTP/1.1 200 OK\r\n".to_vec())], "", 1 << 20, 0, "499"),
                 (vec![(0, length.clone().into_bytes())], "", 1 << 20, 0, "200"),
                 (after_head(&length, &["ab"], 0), "", 1 << 20, 1, "200"),
@@ -2611,7 +2270,6 @@ mod tests {
                     let mut c = Client::new(&passing(addr, &format!("{directives} access_log {} f;", log.display())), window).await;
                     c.get(1, "GET").await;
                     if reads == 0 { tokio::time::sleep(Duration::from_millis(60)).await; } else { assert!(!c.next().await.is_empty()); }
-                    // Only a client that has gone, or the end of its connection, ends it.
                     assert_eq!(count.lock().unwrap()[1], 0);
                     let mut left = None;
                     if closes { c.close().await; } else { c.send(&[framed(RST_STREAM, 0, 1, &[0, 0, 0, 8])]).await; left = Some(c); }
@@ -2620,7 +2278,6 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     let text = logged(&log);
                     assert!(text.starts_with(&format!("{status} ")) && text.lines().count() == 1, "{text}");
-                    // The connection serves other streams.
                     if let Some(mut c) = left {
                         c.send(&[framed(PING, 0, 0, b"12345678")]).await;
                         let mut answered = false;
@@ -2638,7 +2295,6 @@ mod tests {
         let log = log_path("streams");
         let (length, data) = (LENGTH.replace("30000", "5000"), "x".repeat(2500));
         let to_log = format!("access_log {} f;", log.display());
-        // 2000 bytes, the head's with them, in each second of the clock, so 4000 at most when it ticks meanwhile.
         at_once(["limit_rate 2000;", "limit_rate 2000; proxy_limit_rate 1m;"], |directives| {
             let all = got(&after_head(&length, &[&data, &data], 100), false, &format!("{directives} {to_log}"), "GET");
             let last = all.last().unwrap().0;
@@ -2657,21 +2313,18 @@ mod tests {
             assert_eq!(line[..2], [200, data], "{head} {pieces:?}");
             bytes.push(line[2] - line[1]);
         }
-        // The head's bytes are the same, but for Content-Length, however the body comes; trailers count.
         let content_length = "Content-Length: 4\r\n".len();
         assert_eq!(bytes[1..], [bytes[0] - content_length, bytes[0] - content_length, bytes[0] + "Xyz: 123\r\n".len(), bytes[0] - content_length]);
     }
 
     #[test]
     fn trailers_come_after_the_body() {
-        // The kind and flags of each frame sent.
         let sent = |out: &[u8]| { let mut at = 0; std::iter::from_fn(|| { let len = u32::from_be_bytes([0, *out.get(at)?, out[at + 1], out[at + 2]]) as usize; let f = (out[at + 3], out[at + 4]); at += 9 + len; Some(f) }).collect::<Vec<_>>() };
         let trailer = |value: &[u8]| Some(vec![(b"X".to_vec(), value.to_vec())]);
         for (body, trailers, want) in [
             (&b"ab"[..], trailer(b"1"), vec![(HEADERS, END_HEADERS), (DATA, 0), (HEADERS, END_HEADERS | END_STREAM)]),
             (b"", trailer(b"1"), vec![(HEADERS, END_HEADERS), (HEADERS, END_HEADERS | END_STREAM)]),
             (b"", trailer(&[b'x'; 20000]), vec![(HEADERS, END_HEADERS), (HEADERS, END_STREAM), (CONTINUATION, END_HEADERS)]),
-            // Expected, but none made.
             (b"ab", Some(Vec::new()), vec![(HEADERS, END_HEADERS), (DATA, END_STREAM)]),
             (b"", Some(Vec::new()), vec![(HEADERS, END_HEADERS), (DATA, END_STREAM)]),
             (b"", None, vec![(HEADERS, END_HEADERS | END_STREAM)]),
@@ -2697,7 +2350,6 @@ mod tests {
         c.depend(1, 3, 16);
         c.depend(5, 0, 256);
         assert_eq!((c.rank(1), c.rank(3), c.rank(5)), ((2, -1.0 / 256.0), (1, -1.0 / 16.0), (1, -1.0)));
-        // Depending on its own dependent moves that one up; an exclusive dependency takes the others'.
         c.depend(3, 1, 16);
         assert_eq!((c.nodes[&1].0, c.nodes[&3].0), (0, 1));
         c.depend(7, 1 << 31, 16);
@@ -2720,7 +2372,6 @@ mod tests {
     #[test]
     fn keepalive() {
         let goaway = |last: u32| { let mut f = Vec::new(); frame(&mut f, GOAWAY, 0, 0, &[last.to_be_bytes(), [0; 4]].concat()); f };
-        // keepalive_requests 2: the second stream is the last, and one after it is not taken.
         let mut c = connection();
         let mut buf = Vec::new();
         frame(&mut buf, HEADERS, END_HEADERS | END_STREAM, 1, &[0x82, 0x86, 0x84, 0x41, 0x01, b'h']);
@@ -2730,7 +2381,6 @@ mod tests {
         assert_eq!(c.read(&mut buf), Ok(()));
         assert_eq!((c.goaway, c.last_sid, c.ready.clone(), c.streams[&3].number), (true, 3, vec![1, 3], 2));
         assert!(c.out.ends_with(&goaway(3)));
-        // keepalive_timeout 0 and keepalive_time: the first stream already is the last.
         for keepalive in [(9, Duration::ZERO, Duration::from_secs(9)), (9, Duration::from_secs(9), Duration::ZERO)] {
             let mut c = Connection { keepalive, started: Instant::now() - Duration::from_millis(1), ..connection() };
             assert_eq!(c.frame(HEADERS, END_HEADERS, 1, &[0x82]), Ok(()));
@@ -2740,18 +2390,15 @@ mod tests {
 
     #[test]
     fn fields_after_a_refused_one() {
-        // A literal field that names its pseudo-header field, with an empty value; one more field; a literal added to the table.
         let plain = |name: &[u8], value: &[u8]| [&[0, name.len() as u8][..], name, &[value.len() as u8], value].concat();
         let added = |name: &[u8], value: &[u8]| [&[0x40, name.len() as u8][..], name, &[value.len() as u8], value].concat();
         let decode = |block: &[u8]| { let mut dropped = false; let got = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE }.block(block, block.len(), (4, 8192), Some(&mut dropped)); (got.map(|b| b.ends.len()), dropped) };
-        // An empty one is the last string nginx kept when it skips the next name.
         assert_eq!(decode(&[plain(b":method", b""), plain(b":path", b"/")].concat()), (Err(PROTOCOL_ERROR), true));
         assert_eq!(decode(&[plain(b":method", b""), added(b":path", b"/")].concat()), (Ok(2), true));
         assert_eq!(decode(&[plain(b":method", b"G"), plain(b":method", b"G"), plain(b"x", b"y")].concat()), (Ok(3), true));
         assert_eq!(decode(&[plain(b":method", b"G"), plain(b"x", b"")].concat()), (Ok(2), false));
         let mut seen = [false; 4];
         assert_eq!([drops(b":method", b"G", &mut seen), drops(b":path", b"", &mut seen), drops(b":method", b"G", &mut seen), drops(b":x", b"G", &mut seen), drops(b"a\x01", b"b", &mut seen)], [false, true, true, true, true]);
-        // The request is answered with 400 before the error.
         let mut c = connection();
         let mut buf = Vec::new();
         frame(&mut buf, HEADERS, END_HEADERS | END_STREAM, 1, &[plain(b":method", b""), plain(b":path", b"/")].concat());
@@ -2769,7 +2416,6 @@ mod tests {
             assert_eq!(c.read(&mut buf), Ok(()));
             c.out.clear();
         };
-        // Discarded: it had not ended when nginx answered, which resets it without an error.
         for late in [false, true] {
             let mut c = connection();
             open(&mut c, late);
@@ -2777,7 +2423,6 @@ mod tests {
             c.reading(1, Reading::Discarded);
             assert!(!c.streams[&1].ended && c.out.is_empty());
         }
-        // Read: what came after the end closes it.
         let mut c = connection();
         open(&mut c, true);
         c.reading(1, Reading::Buffered);
@@ -2790,7 +2435,6 @@ mod tests {
 
     #[test]
     fn declared_lengths() {
-        // A body longer than its Content-Length, or one that ends shorter, is answered anew, with 400.
         for (data, flags) in [(&b"abc"[..], 0), (&b"a"[..], END_STREAM)] {
             let mut c = connection();
             let mut buf = Vec::new();
@@ -2799,7 +2443,6 @@ mod tests {
             assert_eq!(c.read(&mut buf), Ok(()));
             let s = &c.streams[&1];
             assert_eq!((c.bad.clone(), s.bad, s.exchange, s.declared, s.chunked), (vec![1], true, 1, Some(2), false));
-            // One discarded is not.
             let mut c = connection();
             c.streams.insert(1, Open { recv: PREREAD, declared: Some(2), reading: Some(Reading::Discarded), ..Open::default() });
             assert_eq!(c.data(flags, 1, data), Ok(()));
@@ -2816,7 +2459,6 @@ mod tests {
             assert_eq!(c.read(&mut buf), Ok(()));
             c.out.clear();
         };
-        // Preread, then read into buffers: the window opens as wide as it goes, again when a quarter is left.
         let mut c = connection();
         open(&mut c);
         c.reading(1, Reading::Buffered);
@@ -2825,7 +2467,6 @@ mod tests {
         c.out.clear();
         assert_eq!(c.data(0, 1, &[0; 20]), Ok(()));
         assert_eq!(&c.out[9..], &((MAX_WINDOW - MAX_WINDOW / 4 + 10) as u32).to_be_bytes());
-        // Passed on as it comes: what came is given back, frame by frame.
         let mut c = connection();
         open(&mut c);
         c.reading(1, Reading::Unbuffered);
@@ -2833,7 +2474,6 @@ mod tests {
         c.out.clear();
         assert_eq!(c.data(0, 1, &[0; 7]), Ok(()));
         assert_eq!(&c.out[9..], &7u32.to_be_bytes());
-        // Discarded: nothing; and answered whole before it ended, the stream is reset without an error.
         let mut c = connection();
         open(&mut c);
         c.reading(1, Reading::Discarded);
@@ -2858,10 +2498,8 @@ mod tests {
         buf.extend_from_slice(&[0, 0]);
         assert_eq!(c.read(&mut buf), Ok(()));
         assert_eq!((buf.len(), c.ready.clone(), c.frame_size, c.table_update), (2, vec![1], 16384, true));
-        // The header block, of both frames, is the request's head.
         assert_eq!(c.streams[&1].block, 6);
         let s = c.streams.get_mut(&1).unwrap();
-        // Without a length, the body goes on in chunks, one of each frame's data, then the last.
         let mut taker = s.taker.take().unwrap();
         let parts: Vec<_> = std::iter::from_fn(|| taker.try_recv().ok()).collect();
         assert_eq!((parts.concat(), s.body.is_none(), s.chunked, s.send), (b"1\r\na\r\n1\r\nb\r\n0\r\n\r\n".to_vec(), true, true, 65535 - 65525 + 5));
@@ -2884,20 +2522,17 @@ mod tests {
         let mut c = connection();
         (1..CONCURRENT).for_each(|_| assert_eq!(c.frame(PRIORITY, 0, 1, &priority), Ok(())));
         assert_eq!(c.frame(PRIORITY, 0, 1, &priority), Err(ENHANCE_YOUR_CALM));
-        // Each stream taken allows as many more as streams at a time.
         let mut c = connection();
         assert_eq!(c.frame(HEADERS, END_HEADERS | END_STREAM, 1, &[0x82, 0x86, 0x84, 0x41, 0x01, b'h']), Ok(()));
         (1..2 * CONCURRENT).for_each(|_| assert_eq!(c.frame(PRIORITY, 0, 3, &priority), Ok(())));
         assert_eq!(c.frame(PRIORITY, 0, 3, &priority), Err(ENHANCE_YOUR_CALM));
     }
 
-    /// A request for a path on a stream, which ends it or not.
     fn asking(sid: u32, method: &str, path: &str, end: bool) -> Vec<u8> {
         let block = [&[0x86, 0x41, 0x01, b'h', 0x02, method.len() as u8], method.as_bytes(), &[0x04, path.len() as u8], path.as_bytes()].concat();
         framed(HEADERS, END_HEADERS | if end { END_STREAM } else { 0 }, sid, &block)
     }
 
-    /// All the fields of a header block.
     fn all_fields(block: &[u8]) -> String {
         let mut t = Table { entries: VecDeque::new(), size: TABLE_SIZE, used: 0, limit: TABLE_SIZE };
         let fields = t.decode(block, block.len(), (4, 8192)).unwrap();
@@ -2916,7 +2551,6 @@ mod tests {
             }
             c.close().await;
         });
-        // A proxied 204 loses them too.
         let (addr, _count) = plays(&after_head("HTTP/1.1 204 No Content\r\nContent-Type: text/x\r\nContent-Length: 5\r\nX-A: b\r\n\r\n", &[""], 0), false);
         crate::stream::block_on(async {
             let mut c = Client::new(&passing(addr, ""), 1 << 20).await;
@@ -2956,7 +2590,6 @@ mod tests {
 
     #[test]
     fn fields_go_on_in_continuation_frames() {
-        // A HEADERS frame that has not come whole, a field going on past it.
         let block = [&[0x82, 0x86, 0x84, 0x00, 0x03][..], b"x-a", &[0x0a], b"abcde"].concat();
         let mut c = connection();
         let head = framed(HEADERS, END_STREAM, 1, &block);
@@ -2967,7 +2600,6 @@ mod tests {
             assert_eq!(c.read(&mut buf), Ok(()));
         }
         assert_eq!(c.ready, [1]);
-        // The block ends with it: the field is too long.
         let mut c = connection();
         let head = framed(HEADERS, END_STREAM | END_HEADERS, 1, &block);
         assert_eq!(c.read(&mut head[..head.len() - 2].to_vec()), Err(FRAME_SIZE_ERROR));
