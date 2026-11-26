@@ -272,3 +272,14 @@ Kinds:
 | 2026-11-25 | After stage 5 | decision | Performance comes after stage 6, from 2026-11-26 | Judgement is needed, the human decides what is done |
 | 2026-11-25 | Stage 6 | approval | Put the rest of the found behaviours into stage 6 as well, worded neutrally | The human sees the text of those that matter before they are published |
 | 2026-11-25 | Stage 6 | decision | Performance of v0.5.0 was measured | 63 of 66 scenarios use more CPU than v0.4.1 (one run); it is the material for the performance work |
+| 2026-11-25 | Stage 6 | approval | Three files whose subject matters were published after the human read their subtest names and commit messages | #331 |
+| 2026-11-25 | Stage 6 | decision | Stage 6 has to be done by the next morning; the 15 minutes before a run stay | The human expected it to be done that night; it was done at 00:53 JST (#361) |
+| 2026-11-25 | Stage 6 | finding | The judge of #331, which changes no src/, failed on one subtest of `twinx_cache_stale.t` and passed after main was merged into it | Not looked into; #336 had fixed a race in the background update of cached answers just before |
+| 2026-11-25 | Stage 6 | correction | The human was not told what was left out of the found behaviours before the agent counted them as done | Three files added for what was left (#339, #340, #341), the rest recorded |
+| 2026-11-25 | Stage 6 | decision | A test where twinx is stricter than nginx is not added (HEADERS in stream 0 from an HTTP/2 upstream) | twinx follows RFC 9113 there; the agent had asked for the test before it saw which way the difference went |
+| 2026-11-25 | Stage 6 | correction | The agent asked, unprompted, to take out a test it had called of little worth | Withdrawn; the human had asked only why tests are added |
+| 2026-11-25 | Stage 6 | approval | A test of Range values, published before twinx passed it | #347; the Fixer made it pass in #360 |
+| 2026-11-25 | Stage 6 | finding | twinx has no `internal` directive | Found while writing a test; no file of any stage uses it |
+| 2026-11-25 | Stage 6 | finding | The judge's comment job failed twice on #361 with a GitHub GraphQL error; the judge job passed | The Fixer read the verdict from the job's log; later runs found nothing to do |
+| 2026-11-26 | After stage 6 | decision | The schedule is paused after stage 6 | 234 of 234 files, 3844 of 3844 subtests at #361; seven runs between had nothing to do |
+| 2026-11-26 | After stage 6 | decision | No release after stage 6; the next one is not decided | v0.5.0 stays the latest |

@@ -1,6 +1,6 @@
 # One run of the loop
 
-The schedule runs stage 6 since 2026-11-25. A human may also start a run by hand; a run that has started goes ahead.
+The schedule is paused since 2026-11-25T23:17Z, after stage 6 was done (234 of 234 files, #361). A human may also start a run by hand; a run that has started goes ahead.
 
 A scheduled Claude Code session runs the loop as the Fixer, with model `claude-opus-5-5`, following `docs/fixer.md`.
 
