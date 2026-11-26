@@ -1094,7 +1094,7 @@ async fn exchange(stream: &mut Stream, server: &Server, r: &Request, parsed: Res
     if !silent && !http09(r.line.as_bytes()) && !resp.http09 {
         match resp.status_line.as_deref().map(|l| &**l).filter(|line| line.starts_with(format!("{status:03}").as_bytes())) {
             Some(line) => out.extend_from_slice(&[b"HTTP/1.1 ", line, b"\r\n"].concat()),
-            None => out.extend_from_slice(format!("HTTP/1.1 {status} {}\r\n", reason(status)).as_bytes()),
+            None => [b"HTTP/1.1 ", decimal(&mut [0; 20], status as u64).as_bytes(), b" ", reason(status).as_bytes(), b"\r\n"].iter().for_each(|p| out.extend_from_slice(p)),
         }
         let mut add = |parts: &[&str]| parts.iter().for_each(|p| out.extend_from_slice(p.as_bytes()));
         let server = if level.server_tokens { NAME } else { "twinx" };
