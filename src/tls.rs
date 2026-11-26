@@ -244,22 +244,30 @@ impl Default for Sessions {
 struct Rotated {
     rotate: Option<u64>,
     file: Vec<TicketKey>,
-    keys: Mutex<Option<(u64, Arc<dyn rustls::server::ProducesTickets>, Option<Arc<dyn rustls::server::ProducesTickets>>)>>,
+    keys: Mutex<(u64, TicketKey, Option<TicketKey>)>,
 }
 
 impl Rotated {
+    /// Made in the master, so that the workers forked from it start with the same key.
+    fn new(rotate: Option<u64>, file: Vec<TicketKey>) -> Result<Rotated, String> {
+        Ok(Rotated { rotate, file, keys: Mutex::new((rotate.map_or(u64::MAX, |t| now() + t), TicketKey::random()?, None)) })
+    }
+
     fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
         if let Some(key) = self.file.first() { return key.seal(plain) }
         let mut keys = self.keys.lock().unwrap();
         let now = now();
-        if keys.as_ref().is_none_or(|k| now >= k.0) { *keys = Some((self.rotate.map_or(u64::MAX, |t| now + t), rustls::crypto::ring::Ticketer::new().ok()?, keys.take().map(|k| k.1))); }
-        keys.as_ref()?.1.encrypt(plain)
+        if now >= keys.0 {
+            let old = std::mem::replace(&mut keys.1, TicketKey::random().ok()?);
+            (keys.0, keys.2) = (self.rotate.map_or(u64::MAX, |t| now + t), Some(old));
+        }
+        keys.1.seal(plain)
     }
 
     fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
         if !self.file.is_empty() { return self.file.iter().find(|k| cipher.starts_with(&k.name))?.open(cipher) }
         let keys = self.keys.lock().unwrap();
-        keys.iter().flat_map(|k| std::iter::once(&k.1).chain(&k.2)).find_map(|k| k.decrypt(cipher))
+        std::iter::once(&keys.1).chain(&keys.2).find(|k| cipher.starts_with(&k.name))?.open(cipher)
     }
 }
 
@@ -274,6 +282,12 @@ impl TicketKey {
         let data = std::fs::read(file).map_err(|e| format!("open() \"{}\" failed ({e})", file.display()))?;
         let (alg, key) = match data.len() { 48 => (&ring::aead::AES_128_GCM, &data[16..32]), 80 => (&ring::aead::AES_256_GCM, &data[48..]), _ => return Err(format!("\"{}\" must be 48 or 80 bytes", file.display())) };
         Ok(TicketKey { name: data[..16].try_into().map_err(|_| "short")?, key: ring::aead::LessSafeKey::new(ring::aead::UnboundKey::new(alg, key).map_err(|_| "bad key")?) })
+    }
+
+    fn random() -> Result<TicketKey, String> {
+        let mut data = [0u8; 48];
+        provider().secure_random.fill(&mut data).map_err(|_| "no random bytes for a session ticket key")?;
+        Ok(TicketKey { name: data[..16].try_into().map_err(|_| "short")?, key: ring::aead::LessSafeKey::new(ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &data[16..]).map_err(|_| "bad key")?) })
     }
 
     fn seal(&self, plain: &[u8]) -> Option<Vec<u8>> {
@@ -531,7 +545,7 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     let sessions = options.sessions;
     config.session_storage = if sessions.cache { Arc::new(Kept(rustls::server::ServerSessionMemoryCache::new(20480))) } else { Arc::new(rustls::server::NoServerSessionStorage {}) };
     let file = options.ticket_keys.iter().map(|f| TicketKey::load(f)).collect::<Result<Vec<_>, _>>()?;
-    let keys = Rotated { rotate: sessions.shared.then_some(sessions.timeout), file, keys: Mutex::new(None) };
+    let keys = Rotated::new(sessions.shared.then_some(sessions.timeout), file)?;
     if sessions.tickets { config.ticketer = Arc::new(Timed(keys, sessions.timeout)); }
     Ok(ServerTls { config: Arc::new(config), trusted, crls: options.crl.as_deref().map(crls).transpose()?, depth: options.depth, named, ocsp: options.ocsp })
 }
@@ -1334,16 +1348,16 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn shared_ticket_keys_rotate_after_the_timeout() {
-        let keys = Rotated { rotate: Some(10), file: Vec::new(), keys: Mutex::new(None) };
+        let keys = Rotated::new(Some(10), Vec::new()).unwrap();
         let first = keys.encrypt(b"a").unwrap();
         assert_eq!(&keys.encrypt(b"b").unwrap()[..16], &first[..16]);
-        keys.keys.lock().unwrap().as_mut().unwrap().0 = now();
+        keys.keys.lock().unwrap().0 = now();
         let next = keys.encrypt(b"c").unwrap();
         assert_ne!(&next[..16], &first[..16]);
         assert_eq!((keys.decrypt(&first), keys.decrypt(&next), keys.decrypt(b"x")), (Some(b"a".to_vec()), Some(b"c".to_vec()), None));
-        let fixed = Rotated { rotate: None, file: Vec::new(), keys: Mutex::new(None) };
+        let fixed = Rotated::new(None, Vec::new()).unwrap();
         let first = fixed.encrypt(b"a").unwrap();
-        fixed.keys.lock().unwrap().as_mut().unwrap().0 = now() + 1;
+        fixed.keys.lock().unwrap().0 = now() + 1;
         assert_eq!(&fixed.encrypt(b"b").unwrap()[..16], &first[..16]);
     }
 
@@ -1354,10 +1368,10 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         std::fs::write(&short, [b'1'; 48]).unwrap();
         std::fs::write(&long, [b'2'; 80]).unwrap();
         std::fs::write(&bad, b"1").unwrap();
-        let keys = Rotated { rotate: Some(10), file: vec![TicketKey::load(&long).unwrap(), TicketKey::load(&short).unwrap()], keys: Mutex::new(None) };
+        let keys = Rotated::new(Some(10), vec![TicketKey::load(&long).unwrap(), TicketKey::load(&short).unwrap()]).unwrap();
         let ticket = keys.encrypt(b"a").unwrap();
         assert_eq!((&ticket[..16], keys.decrypt(&ticket)), (&[b'2'; 16][..], Some(b"a".to_vec())));
-        let other = Rotated { rotate: None, file: vec![TicketKey::load(&short).unwrap()], keys: Mutex::new(None) };
+        let other = Rotated::new(None, vec![TicketKey::load(&short).unwrap()]).unwrap();
         let theirs = other.encrypt(b"b").unwrap();
         assert_eq!((keys.decrypt(&theirs), other.decrypt(&ticket)), (Some(b"b".to_vec()), None));
         let mut forged = theirs.clone();
@@ -1374,7 +1388,7 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
         assert_eq!(timed.fresh(stamped.clone()), Some(b"data".to_vec()));
         let old = [(now() - 11).to_be_bytes().as_slice(), b"data"].concat();
         assert_eq!((timed.fresh(old), timed.fresh(b"short".to_vec())), (None, None));
-        let tickets = Timed(Rotated { rotate: None, file: Vec::new(), keys: Mutex::new(None) }, 10);
+        let tickets = Timed(Rotated::new(None, Vec::new()).unwrap(), 10);
         use rustls::server::ProducesTickets;
         assert!(tickets.enabled() && tickets.lifetime() == 10);
         assert_eq!(tickets.decrypt(&tickets.encrypt(b"t").unwrap()), Some(b"t".to_vec()));
