@@ -89,28 +89,32 @@ fn run(a: &Args) -> Result<(), String> {
     unsafe { libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
     let pid = &config.pid;
     std::fs::write(pid, format!("{}\n", std::process::id())).map_err(|e| format!("open() \"{}\" failed ({e})", pid.display()))?;
-    let mut worker = spawn(&config, &listeners, &set)?;
+    let mut workers = spawn(&config, &listeners, &set)?;
     let sig = loop {
         let sig = wait_signal(&set);
         if sig != SIGHUP { break sig }
         let Ok((config, open)) = load(a).map(Arc::new).and_then(|c| Ok((c.clone(), http::bind(&c, &listeners)?))).map_err(|e| emerg(&e, Some(&a.prefix.join(&a.error_log)))) else { continue };
-        let old = std::mem::replace(&mut worker, spawn(&config, &open, &set)?);
+        let old = std::mem::replace(&mut workers, spawn(&config, &open, &set)?);
         listeners = open;
-        let mut status = 0;
-        // SAFETY: plain system calls on the old worker's process id: shut it down and wait for it.
-        unsafe { libc::kill(old, SIGQUIT); libc::waitpid(old, &mut status, 0) };
-        log(&config.notice_logs, "notice", &format!("worker process {old} exited with code {}", libc::WEXITSTATUS(status)));
+        for (pid, status) in stop(&old, SIGQUIT) { log(&config.notice_logs, "notice", &format!("worker process {pid} exited with code {}", libc::WEXITSTATUS(status))) }
     };
-    // SAFETY: plain system calls on the worker's process id: pass the signal on and wait for the worker.
-    unsafe { libc::kill(worker, sig); libc::waitpid(worker, std::ptr::null_mut(), 0) };
+    stop(&workers, sig);
     let _ = std::fs::remove_file(pid);
     Ok(())
 }
 
-fn spawn(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> Result<pid_t, String> {
-    // SAFETY: the master has no other threads, so the child starts in a consistent state.
-    let child = unsafe { libc::fork() };
-    forked(child, config, listeners, set)
+fn spawn(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], set: &sigset_t) -> Result<Vec<pid_t>, String> {
+    (0..config.workers).map(|_| {
+        // SAFETY: the master has no other threads, so the child starts in a consistent state.
+        let child = unsafe { libc::fork() };
+        forked(child, config, listeners, set)
+    }).collect()
+}
+
+fn stop(workers: &[pid_t], sig: c_int) -> Vec<(pid_t, c_int)> {
+    // SAFETY: plain system calls on the workers' process ids: pass the signal on to all, then wait for each.
+    workers.iter().for_each(|&w| unsafe { libc::kill(w, sig); });
+    workers.iter().map(|&w| { let mut status = 0; unsafe { libc::waitpid(w, &mut status, 0) }; (w, status) }).collect()
 }
 
 /// Not inlined, so that each process counts what it runs here in its own coverage profile.

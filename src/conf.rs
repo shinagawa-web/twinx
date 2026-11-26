@@ -533,6 +533,7 @@ pub struct Config {
     pub notice_logs: Vec<Arc<File>>,
     pub warn_logs: Vec<Arc<File>>,
     pub connections: usize,
+    pub workers: usize,
     pub temp_paths: Vec<PathBuf>,
     pub servers: Vec<Server>,
 }
@@ -563,7 +564,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), zones: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new(), location_no_uri: false, listens: HashMap::new(), ssl_zones: HashMap::new() };
-    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, user: None, warnings: Vec::new(), emerg_logs: Vec::new(), alert_logs: Vec::new(), notice_logs: Vec::new(), warn_logs: Vec::new(), connections: 512, temp_paths: Vec::new(), servers: Vec::new() };
+    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, user: None, warnings: Vec::new(), emerg_logs: Vec::new(), alert_logs: Vec::new(), notice_logs: Vec::new(), warn_logs: Vec::new(), connections: 512, workers: 1, temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
     crate::tls::new_configuration(inheritable);
@@ -585,8 +586,9 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
         match d.name.as_str() {
             "pid" => config.pid = b.path(&d.args[0]),
             "worker_rlimit_nofile" => config.rlimit_nofile = Some(d.args[0].parse().map_err(|_| format!("invalid number in {}", d.at))?),
-            // twinx serves every connection from one process, however many workers are asked for.
-            "worker_processes" => if d.args[0] != "auto" && d.args[0].parse::<u32>().is_err() { return Err(format!("invalid value \"{}\" in \"worker_processes\" directive in {}", d.args[0], d.at)) },
+            // SAFETY: sysconf() only reads a system value.
+            "worker_processes" if d.args[0] == "auto" => config.workers = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as usize,
+            "worker_processes" => config.workers = d.args[0].parse::<u32>().map_err(|_| format!("invalid value \"{}\" in \"worker_processes\" directive in {}", d.args[0], d.at))? as usize,
             "worker_shutdown_timeout" => config.shutdown_timeout = Some(millis(&d.args[0]).map_err(|e| format!("{e} in {}", d.at))?),
             "working_directory" => config.working_directory = Some(d.args[0].clone().into()),
             "user" => config.user = Some(user(d)?),
@@ -2000,7 +2002,8 @@ mod tests {
 
     #[test]
     fn worker_processes() {
-        assert!(build_text("worker_processes 2; http { }").is_ok() && build_text("worker_processes auto; http { }").is_ok());
+        assert_eq!(build_text("worker_processes 2; events { }").unwrap().workers, 2);
+        assert!(build_text("worker_processes auto; events { }").unwrap().workers >= 1);
         assert_eq!(build_text("worker_processes x;").unwrap_err(), "invalid value \"x\" in \"worker_processes\" directive in t.conf:1");
     }
 
