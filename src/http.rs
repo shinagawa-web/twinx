@@ -41,13 +41,15 @@ pub fn bind(config: &Config, open: &[(TcpListener, SocketAddr)]) -> Result<Vec<(
     let mut addrs: Vec<SocketAddr> = Vec::new();
     for addr in config.servers.iter().flat_map(|s| &s.listen) { if !addrs.contains(addr) { addrs.push(*addr) } }
     let backlog = |addr| config.servers.iter().flat_map(|s| &s.backlogs).find(|b| b.0 == addr).map_or(crate::conf::LISTEN_BACKLOG, |b| b.1);
-    let get = |addr| open.iter().find(|o| o.1 == addr).map_or_else(|| listen(addr, backlog(addr)), |o| o.0.try_clone());
+    let ipv6only = |addr| !config.servers.iter().any(|s| s.ipv6only_off.contains(&addr));
+    let get = |addr| open.iter().find(|o| o.1 == addr).map_or_else(|| listen(addr, backlog(addr), ipv6only(addr)), |o| o.0.try_clone());
     addrs.into_iter().map(|addr| get(addr).map(|l| (l, addr)).map_err(|e| format!("bind() to {addr} failed ({e})"))).collect()
 }
 
-fn listen(addr: SocketAddr, backlog: i32) -> std::io::Result<TcpListener> {
+fn listen(addr: SocketAddr, backlog: i32, ipv6only: bool) -> std::io::Result<TcpListener> {
     let socket = socket2::Socket::new(socket2::Domain::for_address(addr), socket2::Type::STREAM, None)?;
     socket.set_reuse_address(true)?;
+    if addr.is_ipv6() { socket.set_only_v6(ipv6only)?; }
     socket.bind(&addr.into())?;
     socket.listen(backlog)?;
     Ok(socket.into())
@@ -2991,11 +2993,11 @@ pub(crate) mod tests {
 
     #[test]
     fn listens_with_the_backlog() {
-        let l = listen("127.0.0.1:0".parse().unwrap(), 511).unwrap();
+        let l = listen("127.0.0.1:0".parse().unwrap(), 511, true).unwrap();
         let addr = l.local_addr().unwrap();
         let _client = TcpStream::connect(addr).unwrap();
         assert_eq!(l.accept().unwrap().1.ip(), addr.ip());
-        assert!(listen(addr, 511).is_err());
+        assert!(listen(addr, 511, true).is_err());
     }
 
     #[test]
