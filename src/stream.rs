@@ -1,6 +1,3 @@
-//! The connections twinx reads and writes: a client's or a proxied server's,
-//! over TCP or TLS, on the worker's event loop.
-
 use std::cell::RefCell;
 use std::io::IoSlice;
 use std::pin::Pin;
@@ -10,19 +7,14 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
-/// A connection: plain TCP, TLS taken from a client, or TLS to a proxied server.
 #[derive(Debug)]
 pub enum Stream {
     Tcp(TcpStream),
     Server(Box<tokio_rustls::server::TlsStream<TcpStream>>),
     Client(Box<tokio_rustls::client::TlsStream<TcpStream>>),
-    /// One end of a pipe in memory: a stream of an HTTP/2 connection, which
-    /// the other end passes as an HTTP/1 request and its answer.
     Pipe(Pipe),
 }
 
-/// One end of a pipe in memory, and what tells, if anything does, that what reads the
-/// answer at the other end has gone: the sender is dropped.
 #[derive(Debug)]
 pub struct Pipe { pub end: tokio::io::DuplexStream, pub reader: Option<Box<tokio::sync::watch::Receiver<()>>> }
 
@@ -33,14 +25,10 @@ impl From<tokio::io::DuplexStream> for Pipe {
 }
 
 impl Stream {
-    /// The TCP connection under it, which a pipe does not have.
     pub fn tcp(&self) -> Option<&TcpStream> {
         match self { Stream::Tcp(s) => Some(s), Stream::Server(s) => Some(s.get_ref().0), Stream::Client(s) => Some(s.get_ref().0), Stream::Pipe(_) => None }
     }
 
-    /// Whether TLS, if any, holds nothing back: there is no plaintext left to
-    /// read, it did not fail, and the peer has not closed it. Reading less than a
-    /// whole record leaves the rest there, where a peek at the socket does not see it.
     pub fn drained(&mut self) -> bool {
         let state = match self {
             Stream::Tcp(_) | Stream::Pipe(_) => return true,
@@ -50,16 +38,11 @@ impl Stream {
         state.is_ok_and(|s| s.plaintext_bytes_to_read() == 0 && !s.peer_has_closed())
     }
 
-    /// Whether something the peer sent is waiting to be read: plaintext TLS holds
-    /// (or an end or error it has to give), or data on the socket. The socket is
-    /// peeked at only when the event loop says it is readable, which an end of
-    /// file makes it too, with nothing to read; a wrong readiness is cleared.
     pub fn waiting(&mut self) -> bool {
         let peek = |tcp: &TcpStream| socket2::SockRef::from(tcp).peek(&mut [std::mem::MaybeUninit::uninit()]);
         !self.drained() || self.tcp().is_some_and(|tcp| matches!(tcp.try_io(tokio::io::Interest::READABLE, || peek(tcp)), Ok(1..)))
     }
 
-    /// Shuts down both directions of the TCP connection, whatever is still to be read or written.
     pub fn close(&self) {
         if let Some(tcp) = self.tcp() { let _ = socket2::SockRef::from(tcp).shutdown(std::net::Shutdown::Both); }
     }
@@ -75,12 +58,9 @@ impl AsyncRead for Stream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut ReadBuf) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let read = match this { Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf), Stream::Server(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Client(s) => Pin::new(&mut **s).poll_read(cx, buf), Stream::Pipe(s) => Pin::new(&mut s.end).poll_read(cx, buf) };
-        // What TLS answers to what it read, such as the alert refusing a
-        // renegotiation, is sent at once, not with the next write.
+        // A TLS alert answering what was read would otherwise wait for the next write.
         let wants = match this { Stream::Tcp(_) | Stream::Pipe(_) => false, Stream::Server(s) => s.get_ref().1.wants_write(), Stream::Client(s) => s.get_ref().1.wants_write() };
         if wants { let _ = Pin::new(&mut *this).poll_flush(cx); }
-        // A proxied server that closes the connection without close_notify ends it like
-        // any other, as with nginx's SSL_OP_IGNORE_UNEXPECTED_EOF.
         match read {
             Poll::Ready(Err(e)) if matches!(this, Stream::Client(_)) && e.kind() == std::io::ErrorKind::UnexpectedEof => Poll::Ready(Ok(())),
             read => read,
@@ -110,13 +90,10 @@ impl AsyncWrite for Stream {
     }
 }
 
-/// What a future gives, None when it does not end within the time (none: no limit).
 pub async fn within<F: Future>(time: Option<Duration>, f: F) -> Option<F::Output> {
     until(|| time.and_then(|t| Instant::now().checked_add(t)), f).await
 }
 
-/// What a future gives, None when it does not end before the deadline, which
-/// is asked for only once the future has to wait (none: no limit).
 pub async fn until<F: Future>(deadline: impl Fn() -> Option<Instant>, f: F) -> Option<F::Output> {
     let (mut f, mut sleep) = (std::pin::pin!(f), std::pin::pin!(None));
     std::future::poll_fn(|cx| {
@@ -126,14 +103,10 @@ pub async fn until<F: Future>(deadline: impl Fn() -> Option<Instant>, f: F) -> O
     }).await
 }
 
-/// Reads what comes into the end of buf, waiting at most the time for it;
-/// 0 when the connection closed, failed or the time passed.
 pub async fn read_into<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, time: Option<Duration>) -> usize {
     read_until(s, buf, || time.and_then(|t| Instant::now().checked_add(t))).await
 }
 
-/// Reads what comes into the end of buf before the deadline, as read_into does.
-/// While there is nothing to read, a buffer without memory is not given any.
 pub async fn read_until<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, deadline: impl Fn() -> Option<Instant>) -> usize {
     let read = std::future::poll_fn(|cx| {
         let lent = buf.capacity() == 0;
@@ -146,42 +119,32 @@ pub async fn read_until<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>, dead
     until(deadline, read).await.and_then(Result::ok).unwrap_or(0)
 }
 
-/// What a future gives now; None when it has to wait, and is dropped.
 pub async fn at_once<F: Future>(f: F) -> Option<F::Output> {
     let mut f = std::pin::pin!(f);
     std::future::poll_fn(|cx| Poll::Ready(match f.as_mut().poll(cx) { Poll::Ready(out) => Some(out), Poll::Pending => None })).await
 }
 
-/// Reads what there is to read now; None when there is nothing.
 pub async fn read_ready<S: AsyncRead + Unpin>(s: &mut S, buf: &mut [u8]) -> Option<std::io::Result<usize>> {
     at_once(s.read(buf)).await
 }
 
 thread_local! {
-    /// Buffers used before, to use again: a worker, which serves its connections
-    /// on one thread, needs few at a time.
     static SPARE: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) }
 }
 
-/// An empty buffer, which may have memory.
 pub fn buffer() -> Vec<u8> {
     SPARE.with_borrow_mut(Vec::pop).unwrap_or_default()
 }
 
-/// Keeps the memory of a buffer for the next that needs one, if it is not large.
 pub fn recycle(mut buf: Vec<u8>) {
     buf.clear();
     SPARE.with_borrow_mut(|spare| if (1..=16384).contains(&buf.capacity()) && spare.len() < 16 { spare.push(buf) });
 }
 
-/// Writes data and flushes it (a TLS record may wait in the connection otherwise),
-/// each write waiting at most the time.
 pub async fn write_all<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8], time: Option<Duration>) -> bool {
     write_vectored(s, &mut [IoSlice::new(data)], time).await
 }
 
-/// Writes the slices one after another, as writev does, and flushes them;
-/// each write waits at most the time.
 pub async fn write_vectored<S: AsyncWrite + Unpin>(s: &mut S, mut bufs: &mut [IoSlice<'_>], time: Option<Duration>) -> bool {
     loop {
         // Empty slices are left out: a write of nothing would look like a closed connection.
@@ -193,8 +156,6 @@ pub async fn write_vectored<S: AsyncWrite + Unpin>(s: &mut S, mut bufs: &mut [Io
     matches!(within(time, s.flush()).await, Some(Ok(())))
 }
 
-/// Writes what one write takes of the slices, waiting at most the time for it: how much,
-/// which is nothing when it was interrupted, or None when it fails.
 pub async fn write_once<S: AsyncWrite + Unpin>(s: &mut S, bufs: &[IoSlice<'_>], time: Option<Duration>) -> Option<usize> {
     match within(time, s.write_vectored(bufs)).await {
         Some(Ok(0)) | None => None,
@@ -203,8 +164,6 @@ pub async fn write_once<S: AsyncWrite + Unpin>(s: &mut S, bufs: &[IoSlice<'_>], 
     }
 }
 
-/// Sends so much of a file from there on (sendfile), if it need not wait: how much was
-/// sent, which is nothing at the end of the file.
 pub fn sendfile(tcp: &TcpStream, file: &std::fs::File, at: u64, n: usize) -> std::io::Result<usize> {
     use std::os::fd::AsRawFd;
     let mut at = at as libc::off_t;
@@ -217,7 +176,6 @@ pub fn sendfile(tcp: &TcpStream, file: &std::fs::File, at: u64, n: usize) -> std
     })
 }
 
-/// A connection that is written to while it is watched.
 pub struct Writing<'a, 'b>(pub &'a RefCell<&'b mut Stream>);
 
 impl AsyncWrite for Writing<'_, '_> {
@@ -243,7 +201,6 @@ impl AsyncWrite for Writing<'_, '_> {
 }
 
 impl Writing<'_, '_> {
-    /// Waits until the client has gone, as gone() does, between writes to it.
     pub async fn gone(&self) {
         use std::os::fd::AsRawFd;
         let reader = match &**self.0.borrow() { Stream::Pipe(pipe) => pipe.reader.clone(), _ => None };
@@ -258,17 +215,12 @@ impl Writing<'_, '_> {
     }
 }
 
-/// Whether the peer has closed its side of a connection, or it failed.
 fn hung_up(fd: std::os::fd::RawFd) -> bool {
     let mut fd = libc::pollfd { fd, events: libc::POLLRDHUP, revents: 0 };
     // SAFETY: fd is one pollfd that lives through the call.
     unsafe { libc::poll(&mut fd, 1, 0) != 0 }
 }
 
-/// Waits until the client closes its side of the connection (or it fails),
-/// as nginx's check of a broken connection finds it with EPOLLRDHUP. While
-/// what the client sent is waiting to be read, which keeps the connection
-/// readable, it looks again every 100 ms.
 pub async fn closed(tcp: &TcpStream) {
     use std::os::fd::AsRawFd;
     loop {
@@ -281,8 +233,6 @@ pub async fn closed(tcp: &TcpStream) {
     }
 }
 
-/// Waits until a client has gone: it has closed its side of the connection, or the
-/// stream of its HTTP/2 connection has ended before its answer.
 pub async fn gone(client: &Stream) {
     match client {
         Stream::Pipe(pipe) => match pipe.reader.clone() {
@@ -293,7 +243,6 @@ pub async fn gone(client: &Stream) {
     }
 }
 
-/// What a future gives, None when the client goes away before.
 pub async fn unless_closed<F: Future>(client: &Stream, f: F) -> Option<F::Output> {
     tokio::select! { biased; out = f => Some(out), () = gone(client) => None }
 }
@@ -308,7 +257,6 @@ pub fn block_on<F: Future>(f: F) -> F::Output {
 mod tests {
     use super::*;
 
-    /// A connected pair: what was accepted, and the other end.
     async fn pair() -> (TcpStream, TcpStream) {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let other = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
@@ -353,7 +301,6 @@ mod tests {
             let mut got = [0; 5];
             other.read_exact(&mut got).await.unwrap();
             assert_eq!(&got, b"cdegh");
-            // Until it would have to wait.
             std::fs::write(&path, vec![b'x'; 1 << 24]).unwrap();
             while sendfile(&s, &file, 0, 1 << 24).is_ok() {}
             assert_eq!(sendfile(&s, &file, 0, 1).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
@@ -369,7 +316,6 @@ mod tests {
         block_on(async {
             let (s, mut other) = pair().await;
             let (mut s, mut buf) = (Stream::Tcp(s), Vec::new());
-            // A read that gives up keeps no memory, which the next buffer has.
             assert_eq!(read_into(&mut s, &mut buf, Some(Duration::from_millis(10))).await, 0);
             assert_eq!(buf.capacity(), 0);
             let lent = buffer();
@@ -378,7 +324,6 @@ mod tests {
             other.write_all(b"x").await.unwrap();
             assert_eq!(read_into(&mut s, &mut buf, None).await, 1);
             assert_eq!((buf.as_slice(), buffer().capacity()), (&b"x"[..], 0));
-            // A large buffer is not kept.
             recycle(Vec::with_capacity(1 << 20));
             assert_eq!(buffer().capacity(), 0);
         });
@@ -393,12 +338,9 @@ mod tests {
             other.write_all(b"xy").await.unwrap();
             s.tcp().unwrap().readable().await.unwrap();
             assert!(s.waiting());
-            // A read that fills its buffer leaves the connection readable, to
-            // the event loop, until a peek finds nothing.
             assert_eq!(s.read(&mut [0; 2]).await.unwrap(), 2);
             assert!(!s.waiting());
             assert!(within(Some(Duration::from_millis(50)), s.tcp().unwrap().readable()).await.is_none());
-            // What comes before the end is waiting; the end is not.
             other.write_all(b"z").await.unwrap();
             other.shutdown().await.unwrap();
             s.tcp().unwrap().readable().await.unwrap();
@@ -412,7 +354,6 @@ mod tests {
     fn finds_the_client_closing() {
         block_on(async {
             let (s, mut other) = pair().await;
-            // Data waiting to be read is no close.
             other.write_all(b"pipelined").await.unwrap();
             assert!(within(Some(Duration::from_millis(300)), closed(&s)).await.is_none());
             other.shutdown().await.unwrap();
