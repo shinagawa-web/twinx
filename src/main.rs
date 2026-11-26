@@ -23,7 +23,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use libc::{SIGCHLD, SIGHUP, SIGINT, SIGQUIT, SIGTERM, c_int, pid_t, sigset_t};
+use libc::{SIGCHLD, SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, c_int, pid_t, sigset_t};
 
 const CONFIGURE: &str = "--with-http_ssl_module --with-http_v2_module --without-http_fastcgi_module --without-http_uwsgi_module \
 --with-http_gunzip_module --with-http_gzip_static_module --without-http_scgi_module --without-http_grpc_module --without-http_memcached_module";
@@ -38,19 +38,36 @@ struct Args {
     error_log: PathBuf,
     globals: String,
     version: bool,
+    test: bool,
+    dump: bool,
+    quiet: bool,
+    signal: Option<c_int>,
 }
+
+const SIGNALS: [(&str, c_int); 4] = [("stop", SIGTERM), ("quit", SIGQUIT), ("reopen", SIGUSR1), ("reload", SIGHUP)];
 
 fn args(list: &[String]) -> Result<Args, String> {
     let mut values = [("-p", "/usr/local/twinx/"), ("-c", "conf/nginx.conf"), ("-e", "logs/error.log"), ("-g", "")].map(|(o, v)| (o, v.to_string()));
-    let mut version = false;
+    let (mut version, mut test, mut dump, mut quiet, mut signal) = (false, false, false, false, None);
     let mut it = list.iter();
     while let Some(arg) = it.next() {
-        if arg == "-V" || arg == "-v" { version = true; continue; }
-        let slot = values.iter_mut().find(|(o, _)| o == arg).ok_or_else(|| format!("invalid option: \"{arg}\""))?;
-        slot.1 = it.next().cloned().ok_or_else(|| format!("option \"{arg}\" requires an argument"))?;
+        match arg.as_str() {
+            "-V" | "-v" => version = true,
+            "-t" => test = true,
+            "-T" => (test, dump) = (true, true),
+            "-q" => quiet = true,
+            "-s" => {
+                let name = it.next().ok_or("option \"-s\" requires parameter")?;
+                signal = Some(SIGNALS.iter().find(|(n, _)| n == name).ok_or_else(|| format!("invalid option: \"-s {name}\""))?.1);
+            }
+            _ => {
+                let slot = values.iter_mut().find(|(o, _)| o == arg).ok_or_else(|| format!("invalid option: \"{arg}\""))?;
+                slot.1 = it.next().cloned().ok_or_else(|| format!("option \"{arg}\" requires an argument"))?;
+            }
+        }
     }
     let [p, c, e, g] = values.map(|(_, v)| v);
-    Ok(Args { prefix: p.into(), conf: c.into(), error_log: e.into(), globals: g, version })
+    Ok(Args { prefix: p.into(), conf: c.into(), error_log: e.into(), globals: g, version, test, dump, quiet, signal })
 }
 
 fn load(a: &Args) -> Result<conf::Config, String> {
@@ -232,12 +249,62 @@ async fn next_signal(fd: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>) -> c_i
 
 fn main() {
     let list: Vec<String> = std::env::args().skip(1).collect();
-    let a = args(&list).unwrap_or_else(|e| fail(&e, None));
+    let a = args(&list).unwrap_or_else(|e| { eprintln!("twinx: {e}"); std::process::exit(1) });
     if a.version {
         eprintln!("twinx version: {}\n{TLS_LIBRARY}\nconfigure arguments: {CONFIGURE}", http::NAME);
-        return;
+        if !a.test { return }
     }
+    if a.test { std::process::exit(test(&a)) }
+    if let Some(sig) = a.signal { std::process::exit(signal(&a, sig)) }
     if let Err(e) = run(&a) { fail(&e, Some(&a.prefix.join(&a.error_log))) }
+}
+
+fn test(a: &Args) -> i32 {
+    let file = a.prefix.join(&a.conf);
+    if a.dump { config::DUMP.set(Some(Vec::new())) }
+    let checked = load(a).and_then(|config| {
+        if !a.quiet { eprintln!("twinx: the configuration file {} syntax is ok", file.display()) }
+        OpenOptions::new().create(true).write(true).open(&config.pid).map_err(|e| spool::failed("open()", &config.pid, &e))
+    });
+    if let Err(e) = checked {
+        emerg(&e, Some(&a.prefix.join(&a.error_log)));
+        eprintln!("twinx: configuration file {} test failed", file.display());
+        return 1
+    }
+    if !a.quiet { eprintln!("twinx: configuration file {} test is successful", file.display()) }
+    if a.dump {
+        let mut files = vec![(file.clone(), std::fs::read_to_string(&file).unwrap_or_default())];
+        files.extend(config::DUMP.take().unwrap_or_default());
+        let mut out = std::io::stdout().lock();
+        let mut seen = std::collections::HashSet::new();
+        for (name, text) in files.iter().filter(|(name, _)| seen.insert(name.clone())) {
+            let _ = write!(out, "# configuration file {}:\n{text}\n", name.display());
+        }
+        let _ = out.flush();
+    }
+    0
+}
+
+fn signal(a: &Args, sig: c_int) -> i32 {
+    let log = a.prefix.join(&a.error_log);
+    let config = load(a).unwrap_or_else(|e| fail(&e, Some(&log)));
+    let pid = &config.pid;
+    let text = match std::fs::read(pid) {
+        Ok(text) => text,
+        Err(e) => { report("error", &spool::failed("open()", pid, &e), Some(&log)); return 1 }
+    };
+    let text = String::from_utf8_lossy(&text);
+    let text = text.trim_end_matches(['\r', '\n']);
+    let Some(n) = text.bytes().all(|b| b.is_ascii_digit()).then(|| text.parse::<pid_t>().ok()).flatten() else {
+        report("error", &format!("invalid PID number \"{text}\" in \"{}\"", pid.display()), Some(&log));
+        return 1
+    };
+    // SAFETY: kill() takes plain numbers.
+    if unsafe { libc::kill(n, sig) } == 0 { return 0 }
+    let e = std::io::Error::last_os_error();
+    let reason = e.to_string().split(" (os error").next().unwrap_or_default().to_string();
+    report("alert", &format!("kill({n}, {sig}) failed ({}: {reason})", e.raw_os_error().unwrap_or(0)), Some(&log));
+    1
 }
 
 fn fail(msg: &str, log: Option<&Path>) -> ! {
@@ -280,6 +347,10 @@ mod tests {
         let a = args(&strings(&["-p", "/t/", "-c", "nginx.conf", "-e", "error.log", "-g", "pid x;"])).unwrap();
         assert_eq!((a.prefix.to_str(), a.conf.to_str(), a.globals.as_str()), (Some("/t/"), Some("nginx.conf"), "pid x;"));
         assert!(args(&strings(&["-V"])).unwrap().version);
+        let a = args(&strings(&["-T", "-q", "-s", "reopen"])).unwrap();
+        assert_eq!((a.test, a.dump, a.quiet, a.signal), (true, true, true, Some(SIGUSR1)));
+        assert_eq!(args(&strings(&["-s", "x"])).unwrap_err(), "invalid option: \"-s x\"");
+        assert_eq!(args(&strings(&["-s"])).unwrap_err(), "option \"-s\" requires parameter");
         assert_eq!(args(&strings(&["-x"])).unwrap_err(), "invalid option: \"-x\"");
         assert_eq!(args(&strings(&["-p"])).unwrap_err(), "option \"-p\" requires an argument");
     }

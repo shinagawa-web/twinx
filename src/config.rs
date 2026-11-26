@@ -121,6 +121,10 @@ pub fn parse_in(text: &str, file: &Path, dir: &Path) -> Result<Vec<Directive>, S
     Ok(stack.pop().unwrap())
 }
 
+thread_local! {
+    pub static DUMP: std::cell::RefCell<Option<Vec<(PathBuf, String)>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn include(name: &str, dir: &Path, at: &str) -> Result<Vec<Directive>, String> {
     let path = dir.join(name);
     let files = if path.to_string_lossy().contains(['*', '?', '[']) { glob(&path).ok_or_else(|| format!("glob() \"{}\" failed in {at}", path.display()))? } else { vec![path] };
@@ -130,6 +134,7 @@ fn include(name: &str, dir: &Path, at: &str) -> Result<Vec<Directive>, String> {
         let mut f = File::open(&file).map_err(|e| format!("{} in {at}", crate::spool::failed("open()", &file, &e)))?;
         let mut text = String::new();
         f.read_to_string(&mut text).map_err(|e| format!("{} in {at}", crate::spool::failed("read()", &file, &e)))?;
+        DUMP.with_borrow_mut(|d| if let Some(d) = d { d.push((file.clone(), text.clone())) });
         out.extend(parse_in(&text, &file, dir)?);
     }
     Ok(out)
