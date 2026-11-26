@@ -1,4 +1,8 @@
-use std::path::Path;
+use std::ffi::{CStr, CString, OsStr};
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
@@ -74,6 +78,10 @@ fn unescape(raw: &[u8]) -> String {
 }
 
 pub fn parse(text: &str, file: &Path) -> Result<Vec<Directive>, String> {
+    parse_in(text, file, file.parent().unwrap_or(Path::new("")))
+}
+
+pub fn parse_in(text: &str, file: &Path, dir: &Path) -> Result<Vec<Directive>, String> {
     let at = |line: usize| format!("{}:{}", file.display(), line);
     let toks = tokenize(text).map_err(|(msg, line)| format!("{msg} in {}", at(line)))?;
     let mut stack: Vec<Vec<Directive>> = vec![Vec::new()];
@@ -85,6 +93,13 @@ pub fn parse(text: &str, file: &Path) -> Result<Vec<Directive>, String> {
                 let c = if tok == Tok::Semi { ';' } else { '{' };
                 if words.is_empty() { return Err(format!("unexpected \"{c}\" in {}", at(line))); }
                 let first = words.remove(0);
+                if first.0 == "include" {
+                    if tok == Tok::Open { return Err(format!("directive \"include\" is not terminated by \";\" in {}", at(first.1))); }
+                    if words.len() != 1 { return Err(format!("invalid number of arguments in \"include\" directive in {}", at(first.1))); }
+                    let included = include(&words.pop().unwrap().0, dir, &at(first.1))?;
+                    stack.last_mut().unwrap().extend(included);
+                    continue;
+                }
                 let d = Directive {
                     name: first.0,
                     args: words.drain(..).map(|w| w.0).collect(),
@@ -104,6 +119,32 @@ pub fn parse(text: &str, file: &Path) -> Result<Vec<Directive>, String> {
     let line = text.lines().count().max(1);
     if !words.is_empty() || stack.len() > 1 { return Err(format!("unexpected end of file, expecting \";\" or \"}}\" in {}", at(line))); }
     Ok(stack.pop().unwrap())
+}
+
+fn include(name: &str, dir: &Path, at: &str) -> Result<Vec<Directive>, String> {
+    let path = dir.join(name);
+    let files = if path.to_string_lossy().contains(['*', '?', '[']) { glob(&path).ok_or_else(|| format!("glob() \"{}\" failed in {at}", path.display()))? } else { vec![path] };
+    let mut out = Vec::new();
+    for file in files {
+        // Kept open while its own includes are read, so that a loop of includes ends when descriptors run out.
+        let mut f = File::open(&file).map_err(|e| format!("{} in {at}", crate::spool::failed("open()", &file, &e)))?;
+        let mut text = String::new();
+        f.read_to_string(&mut text).map_err(|e| format!("{} in {at}", crate::spool::failed("read()", &file, &e)))?;
+        out.extend(parse_in(&text, &file, dir)?);
+    }
+    Ok(out)
+}
+
+fn glob(pattern: &Path) -> Option<Vec<PathBuf>> {
+    let c = CString::new(pattern.as_os_str().as_bytes()).ok()?;
+    // SAFETY: glob fills the zeroed glob_t; its paths are copied out before globfree releases them.
+    unsafe {
+        let mut g: libc::glob_t = std::mem::zeroed();
+        let n = libc::glob(c.as_ptr(), 0, None, &mut g);
+        let paths = (0..g.gl_pathc).map(|i| PathBuf::from(OsStr::from_bytes(CStr::from_ptr(*g.gl_pathv.add(i)).to_bytes()))).collect();
+        libc::globfree(&mut g);
+        (n == 0 || n == libc::GLOB_NOMATCH).then_some(paths)
+    }
 }
 
 #[cfg(test)]

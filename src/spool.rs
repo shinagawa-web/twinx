@@ -20,7 +20,7 @@ fn numbered(dir: &Path, levels: &[usize], n: u32) -> PathBuf {
     path.join(name)
 }
 
-fn failed(call: &str, path: &Path, e: &Error) -> String {
+pub fn failed(call: &str, path: &Path, e: &Error) -> String {
     let text = e.to_string();
     format!("{call} \"{}\" failed ({}: {})", path.display(), e.raw_os_error().unwrap_or(0), text.split(" (os error").next().unwrap_or_default())
 }
