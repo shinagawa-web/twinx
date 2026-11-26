@@ -3,9 +3,10 @@ name: release
 # For a version tag (v*): builds twinx from that tag the way the judge does, for
 # x86_64 and aarch64 Linux on runners of each, runs nginx-tests against it and
 # against nginx there, and publishes a GitHub release with the binaries and the
-# results. Run by hand with a tag to add what an existing release lacks.
-# twinx's code runs only in containers; the token that publishes stays on the
-# runner, in the last job, which runs none of twinx's code.
+# results, and pushes the container image (packaging/docker) to ghcr.io after
+# it has answered on each architecture. Run by hand with a tag to add what an
+# existing release lacks. twinx's code runs only in containers; the tokens that
+# publish stay on the runner, in the last jobs, which run none of twinx's code.
 
 on:
   push:
@@ -121,3 +122,71 @@ jobs:
           else
             gh release create "$TAG" dist/* --title "twinx $TAG" --notes-file notes.md --verify-tag
           fi
+
+  image-check:
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist
+
+      - name: Build the image for this runner and request the default page
+        run: |
+          docker build -f packaging/docker/Dockerfile -t twinx-image-check .
+          packaging/docker/check.sh twinx-image-check
+
+  image:
+    needs: image-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      # The arm64 image's RUN steps run Debian's programs under QEMU.
+      - name: Set up QEMU and buildx
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 --install arm64
+          docker buildx create --use --name twinx
+
+      # latest moves only to the highest version tag, so publishing an older tag again leaves it.
+      - name: Build and push the image for amd64 and arm64
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY,,}
+          tags=(-t "$image:$TAG")
+          newest=$(git ls-remote --tags --refs origin 'v*' | sed 's,.*refs/tags/,,' | sort -V | tail -n 1)
+          if [ "$TAG" = "$newest" ]; then tags+=(-t "$image:latest"); fi
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx build --platform linux/amd64,linux/arm64 -f packaging/docker/Dockerfile "${tags[@]}" --push .
