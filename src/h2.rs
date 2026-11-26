@@ -745,31 +745,30 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
         if pipe.read_buf(&mut buf).await.unwrap_or(0) == 0 { return }
     };
     // The head is bytes: what is not UTF-8 in a header goes as it came.
-    let head = buf[..end].to_vec();
+    let head = &buf[..end];
     let mut lines = head.split(|&c| c == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let mut line = lines.next().unwrap_or_default().split(|&c| c == b' ');
     let (method, path) = (std::str::from_utf8(line.next().unwrap_or_default()).unwrap_or_default(), line.next().unwrap_or_default());
-    let mut fields = vec![(b":method".to_vec(), method.as_bytes().to_vec()), (b":scheme".to_vec(), scheme.as_bytes().to_vec()), (b":path".to_vec(), path.to_vec())];
+    let mut fields = Vec::with_capacity(3 + head.iter().filter(|&&c| c == b'\n').count());
+    fields.extend([(&b":method"[..], method.as_bytes()), (&b":scheme"[..], scheme.as_bytes()), (&b":path"[..], path)]);
     let mut body = if framing.chunked { Body::Chunked(0, false) } else { Body::Length(framing.length) };
-    for (name, value) in lines.filter_map(|l| l.iter().position(|&c| c == b':').map(|at| (l[..at].to_ascii_lowercase(), l[at + 1..].trim_ascii()))) {
-        match &name[..] {
-            b"host" if framing.authority => fields.insert(2, (b":authority".to_vec(), value.to_vec())),
-            _ => fields.push((name, value.to_vec())),
-        }
+    for (name, value) in lines.filter_map(|l| l.iter().position(|&c| c == b':').map(|at| (&l[..at], l[at + 1..].trim_ascii()))) {
+        if framing.authority && name.eq_ignore_ascii_case(b"host") { fields.insert(2, (b":authority", value)) } else { fields.push((name, value)) }
     }
+    let mut block = Vec::with_capacity(end + 64);
+    literals(&mut block, fields.iter());
+    let head_method = method == "HEAD";
     buf.drain(..end + 4);
     if kept.is_none() {
         frame(&mut out, SETTINGS, 0, 0, &[0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 4, 0x7f, 0xff, 0xff, 0xff]);
         frame(&mut out, WINDOW_UPDATE, 0, 0, &((MAX_WINDOW - 65535) as u32).to_be_bytes());
     }
-    let mut block = Vec::new();
-    literals(&mut block, fields.iter());
     let mut ended = body == Body::Length(0);
     header_frames(&mut out, id, &block, 16384, ended);
     let (mut stream_window, mut stream_recv, mut pending, mut finished) = (initial, MAX_WINDOW, Vec::new(), ended);
     let (mut table, mut answer) = (Table { entries: VecDeque::new(), size: 0, used: 0, limit: 0 }, None::<(u8, Vec<u8>)>);
     let (mut headed, mut size, mut deaf) = (false, 0, false);
-    let (mut no_body, mut bodiless, mut keep, mut rest) = (method == "HEAD", false, true, None);
+    let (mut no_body, mut bodiless, mut keep, mut rest) = (head_method, false, true, None);
     let mut left = None::<u64>;
     loop {
         if finished { buf.clear(); }
@@ -852,15 +851,16 @@ pub async fn upstream(mut conn: Conn, mut pipe: tokio::io::DuplexStream, scheme:
                     } else {
                         let Some(status) = status(&fields).filter(|s| *s != 103 || !done) else { failed = true; break };
                         (headed, size) = (status != 103, 0);
-                        let length = fields.iter().find(|f| f.0 == b"content-length" && method != "HEAD" && ![103, 204, 304].contains(&status));
+                        let length = fields.iter().find(|f| f.0 == b"content-length" && !head_method && ![103, 204, 304].contains(&status));
                         left = length.and_then(|f| std::str::from_utf8(&f.1).ok()?.parse().ok());
                         no_body |= matches!(status, 204 | 304);
                         if headed && no_body && !(done && got.is_empty()) { keep = false; }
                         (bodiless, slot.lock().unwrap().bodiless) = (headed && done, headed && done);
-                        let mut head = format!("HTTP/1.1 {status} \r\n").into_bytes();
-                        fields.iter().filter(|f| !f.0.starts_with(b":")).for_each(|(n, v)| head.extend([&n[..], b": ", v, b"\r\n"].concat()));
-                        head.extend_from_slice(b"\r\n");
-                        to_pipe.extend_from_slice(&head);
+                        let headers = fields.iter().filter(|f| !f.0.starts_with(b":"));
+                        to_pipe.reserve(17 + headers.clone().map(|(n, v)| n.len() + v.len() + 4).sum::<usize>());
+                        let _ = std::io::Write::write_fmt(&mut to_pipe, format_args!("HTTP/1.1 {status} \r\n"));
+                        headers.for_each(|(n, v)| [&n[..], b": ", v, b"\r\n"].iter().for_each(|part| to_pipe.extend_from_slice(part)));
+                        to_pipe.extend_from_slice(b"\r\n");
                         head_end = to_pipe.len();
                     }
                 }
