@@ -20,7 +20,7 @@ use crate::expires;
 use crate::upstream::{Addr, Conn, Held, Peer, Upstream};
 use crate::vars::{Request, Sent};
 use crate::spool::{Spool, temp_path};
-use crate::stream::{Stream, Writing, at_once, buffer, read_into, read_more, read_until, recycle, unless_closed, within, write_all};
+use crate::stream::{Flush, Stream, Writing, at_once, buffer, read_into, read_more, read_until, recycle, unless_closed, within, write_all};
 
 pub const NAME: &str = concat!("twinx/", env!("CARGO_PKG_VERSION"));
 
@@ -207,6 +207,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
     let mut buf = Vec::new();
     let ((connected, mut requests), mut idle) = (origin.as_ref().map_or((Instant::now(), 0), |o| (o.connected, o.number - 1)), None);
     let (mut piped, mut nodelay) = (false, false);
+    let mut timer = None;
     let to_https = ssl.is_none() && !matches!(stream, Stream::Pipe(_)) && config.servers.iter().any(|s| s.ssl.contains(&listen));
     if ssl.as_ref().is_some_and(|s| s.alpn == "h2") && !matches!(stream, Stream::Pipe(_)) {
         return Box::pin(crate::h2::serve(config.clone(), stream, buf, (listen, local, peer, ssl), fresh.take())).await;
@@ -231,7 +232,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             }
             let first = buf.is_empty();
             let wait = idle.filter(|_| first);
-            if read_until(&mut stream, &mut buf, || wait.and_then(|t| crate::clock::coarse().checked_add(t))).await == 0 { return; }
+            if read_until(&mut stream, &mut buf, &mut timer, || wait.and_then(|t| crate::clock::coarse().checked_add(t))).await == 0 { return; }
             if first { started = Instant::now(); }
         };
         if requests == 1 && ssl.is_none() && !to_https && http2(config, listen, default) && buf.starts_with(b"PRI * HTTP/2.0\r\n") && !matches!(stream, Stream::Pipe(_)) {
@@ -1651,7 +1652,7 @@ async fn send<const N: usize>(stream: &mut Stream, parts: &[&[u8]; N], pace: &mu
     send_from(stream, parts, 0, pace, time).await
 }
 
-async fn send_from<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts: &[&[u8]; N], mut from: usize, pace: &mut Pace, time: Option<Duration>) -> bool {
+async fn send_from<S: AsyncWrite + Unpin + Flush, const N: usize>(stream: &mut S, parts: &[&[u8]; N], mut from: usize, pace: &mut Pace, time: Option<Duration>) -> bool {
     let total: usize = parts.iter().map(|p| p.len()).sum();
     loop {
         let before = pace.sent;
@@ -1661,7 +1662,7 @@ async fn send_from<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts:
     }
 }
 
-async fn write_some<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts: &[&[u8]; N], from: usize, pace: &mut Pace, time: Option<Duration>) -> bool {
+async fn write_some<S: AsyncWrite + Unpin + Flush, const N: usize>(stream: &mut S, parts: &[&[u8]; N], from: usize, pace: &mut Pace, time: Option<Duration>) -> bool {
     let total = parts.iter().map(|p| p.len()).sum::<usize>();
     let to = if from < total || total == 0 { from + pace.allowed(total - from).await } else { total };
     if from < to {
@@ -1678,7 +1679,7 @@ async fn write_some<S: AsyncWrite + Unpin, const N: usize>(stream: &mut S, parts
         pace.wrote(n);
         if from + n < total && pace.rate == 0 { return true }
     }
-    matches!(within(time, tokio::io::AsyncWriteExt::flush(stream)).await, Some(Ok(())))
+    !stream.needs_flush() || matches!(within(time, tokio::io::AsyncWriteExt::flush(stream)).await, Some(Ok(())))
 }
 
 async fn send_watched<const N: usize>(stream: &mut Stream, parts: &[&[u8]; N], pace: &mut Pace, time: Option<Duration>) -> bool {
