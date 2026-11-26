@@ -300,7 +300,7 @@ impl Rotated {
     }
 }
 
-/// Servers with other certificates keep their sessions apart in a zone they share.
+/// Servers with other certificates keep their sessions apart in a zone or ticket keys they share.
 fn context(keys: &[Arc<rustls::sign::CertifiedKey>]) -> [u8; 32] {
     let mut c = ring::digest::Context::new(&ring::digest::SHA256);
     keys.iter().flat_map(|k| &k.cert).for_each(|d| c.update(d));
@@ -351,7 +351,7 @@ impl TicketKey {
 }
 
 #[derive(Debug)]
-struct Timed<T>(T, u64);
+struct Timed<T>(T, u64, [u8; 32]);
 
 impl<T> Timed<T> {
     fn stamp(data: &[u8]) -> Vec<u8> {
@@ -374,11 +374,11 @@ impl rustls::server::ProducesTickets for Timed<Rotated> {
     }
 
     fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
-        self.0.encrypt(&Self::stamp(plain))
+        self.0.encrypt(&[&self.2[..], &Self::stamp(plain)].concat())
     }
 
     fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
-        self.fresh(self.0.decrypt(cipher)?)
+        self.fresh(self.0.decrypt(cipher)?.strip_prefix(&self.2[..])?.to_vec())
     }
 }
 
@@ -595,7 +595,7 @@ pub fn server((files, passwords): (&[(&Path, &Path)], Option<&Path>), named: Opt
     };
     let file = options.ticket_keys.iter().map(|f| TicketKey::load(f)).collect::<Result<Vec<_>, _>>()?;
     let keys = Rotated::new(sessions.zone.map(|z| (z, sessions.timeout)), file)?;
-    if sessions.tickets { config.ticketer = Arc::new(Timed(keys, sessions.timeout)); }
+    if sessions.tickets { config.ticketer = Arc::new(Timed(keys, sessions.timeout, context)); }
     Ok(ServerTls { config: Arc::new(config), trusted, crls: options.crl.as_deref().map(crls).transpose()?, depth: options.depth, named, ocsp: options.ocsp })
 }
 
@@ -1448,15 +1448,19 @@ cANBAI+4pL55PDAZuSVQBnX+wbeY2bLsGvIt8cw+b8Ugbunb6nN+nFiEuOXlpGgT
 
     #[test]
     fn sessions_last_for_the_timeout() {
-        let timed = Timed((), 10);
+        let timed = Timed((), 10, [0; 32]);
         let stamped = Timed::<()>::stamp(b"data");
         assert_eq!(timed.fresh(stamped.clone()), Some(b"data".to_vec()));
         let old = [(now() - 11).to_be_bytes().as_slice(), b"data"].concat();
         assert_eq!((timed.fresh(old), timed.fresh(b"short".to_vec())), (None, None));
-        let tickets = Timed(Rotated::new(None, Vec::new()).unwrap(), 10);
+        let tickets = Timed(Rotated::new(None, Vec::new()).unwrap(), 10, [0; 32]);
         use rustls::server::ProducesTickets;
         assert!(tickets.enabled() && tickets.lifetime() == 10);
         assert_eq!(tickets.decrypt(&tickets.encrypt(b"t").unwrap()), Some(b"t".to_vec()));
+        let keyed = |context| Timed(Rotated { file: vec![TicketKey::raw(&[1; 48]).unwrap()], ..Rotated::new(None, Vec::new()).unwrap() }, 10, context);
+        let (one, same, other) = (keyed([1; 32]), keyed([1; 32]), keyed([2; 32]));
+        let ticket = one.encrypt(b"t").unwrap();
+        assert_eq!((same.decrypt(&ticket), other.decrypt(&ticket)), (Some(b"t".to_vec()), None));
     }
 
     async fn listener() -> (tokio::net::TcpListener, SocketAddr) {
