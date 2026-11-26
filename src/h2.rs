@@ -1921,6 +1921,10 @@ mod tests {
         }
 
         async fn all(&mut self, sid: u32) -> Vec<(u128, String)> {
+            self.all_telling(sid, || ()).await
+        }
+
+        async fn all_telling(&mut self, sid: u32, mut seen: impl FnMut()) -> Vec<(u128, String)> {
             let (started, mut all) = (Instant::now(), Vec::new());
             loop {
                 let frames = self.next().await;
@@ -1935,6 +1939,7 @@ mod tests {
                     };
                     let end = kind == RST_STREAM || flags & END_STREAM != 0;
                     all.push((started.elapsed().as_millis(), format!("{text}{}", if end && kind != RST_STREAM { "|" } else { "" })));
+                    seen();
                     if end { return all }
                 }
             }
@@ -1975,25 +1980,45 @@ mod tests {
     fn parts_of_answers_arrive_as_they_come() {
         let _busy = serving_on();
         let length = LENGTH.replace("30000", "4");
+        let chunks = ["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"];
         at_once([
-            (length.as_str(), &["ab", "c", "d"][..], false, "proxy_buffering off;", vec![OK4, "ab", "c", "d|"]),
-            (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], false, "", vec![OK, "ab", "cd", "|"]),
-            (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], false, "chunked_transfer_encoding off;", vec![OK, "ab", "cd", "|"]),
-            (DELIMITED, &["ab", "cd", ""], true, "proxy_buffering off;", vec![OK, "ab", "cd", "|"]),
-            (&length, &["ab", "c", "d"], false, "proxy_buffering off; add_trailer X $upstream_response_length;", vec![OK4, "ab", "c", "d", "x: 4;|"]),
-            (CHUNKED, &["2\r\nab\r\n", "2\r\ncd\r\n", "0\r\n\r\n"], false, "add_trailer X 1;", vec![OK, "ab", "cd", "x: 1;|"]),
-        ], |(head, parts, closes, directives, want)| {
-            let all = got(&after_head(head, parts, 200), closes, directives, "GET");
+            (length.as_str(), &["ab", "c", "d"][..], [2, 3], false, "proxy_buffering off;", vec![OK4, "ab", "c", "d|"]),
+            (CHUNKED, &chunks, [2, 3], false, "", vec![OK, "ab", "cd", "|"]),
+            (CHUNKED, &chunks, [2, 3], false, "chunked_transfer_encoding off;", vec![OK, "ab", "cd", "|"]),
+            (DELIMITED, &["ab", "cd", ""], [2, 3], true, "proxy_buffering off;", vec![OK, "ab", "cd", "|"]),
+            (&length, &["ab", "c", "d"], [2, 3], false, "proxy_buffering off; add_trailer X $upstream_response_length;", vec![OK4, "ab", "c", "d", "x: 4;|"]),
+            (CHUNKED, &chunks, [2, 3], false, "add_trailer X 1;", vec![OK, "ab", "cd", "x: 1;|"]),
+            (&length, &["ab", "c", "d"], [1, 1], false, "", vec![OK4, "abcd|"]),
+            (DELIMITED, &["ab", "cd", ""], [1, 1], true, "", vec![OK, "abcd|"]),
+            (&length, &["", "ab", "cd"], [1, 2], false, "proxy_buffering off;", vec![OK4, "ab", "cd|"]),
+        ], |(head, parts, waits, closes, directives, want)| {
+            let seen = Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
+            let pieces: Vec<_> = after_head(head, parts, 0).into_iter().map(|p| p.1).zip([0].into_iter().chain(waits)).collect();
+            let upstream_seen = seen.clone();
+            let (addr, _told) = listening::<()>(move |_, mut s, _| {
+                let (pieces, seen) = (pieces.clone(), upstream_seen.clone());
+                std::thread::spawn(move || {
+                    let mut got = Vec::new();
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let mut part = [0; 1024];
+                        match std::io::Read::read(&mut s, &mut part) { Ok(n @ 1..) => got.extend_from_slice(&part[..n]), _ => return }
+                    }
+                    for (piece, wait) in pieces {
+                        let (count, ready) = &*seen;
+                        let held = ready.wait_timeout_while(count.lock().unwrap(), Duration::from_secs(30), |n| *n < wait).unwrap().1.timed_out();
+                        if held || std::io::Write::write_all(&mut s, &piece).is_err() { return }
+                    }
+                    if !closes { let _ = std::io::Read::read(&mut s, &mut [0; 1]); }
+                });
+            });
+            let all = crate::stream::block_on(async {
+                let mut c = Client::new(&passing(addr, directives), 1 << 20).await;
+                c.get(1, "GET").await;
+                let all = c.all_telling(1, || { *seen.0.lock().unwrap() += 1; seen.1.notify_all(); }).await;
+                c.close().await;
+                all
+            });
             assert_eq!(texts(&all), want, "{directives}");
-            let start = all[0].0;
-            for (i, part) in all.iter().enumerate().skip(1) {
-                let due = start + 200 * (i as u128 - 1).min(2);
-                assert!(part.0 + 20 >= due && part.0 < due + 150, "{i} {all:?}");
-            }
-        });
-        at_once([(length.as_str(), &["ab", "c", "d"][..], false, "", vec![OK4, "abcd|"]), (DELIMITED, &["ab", "cd", ""], true, "", vec![OK, "abcd|"]), (&length, &["", "ab", "cd"], false, "proxy_buffering off;", vec![OK4, "ab", "cd|"])], |(head, parts, closes, directives, want)| {
-            let all = got(&after_head(head, parts, 200), closes, directives, "GET");
-            assert!(texts(&all) == want && all[0].0 < 150 && all[1].0 >= 180, "{all:?}");
         });
     }
 
