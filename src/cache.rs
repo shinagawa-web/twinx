@@ -1,40 +1,24 @@
-//! proxy_cache: answers of proxied servers kept by the key of their request in a
-//! zone that proxy_cache_path names (keys_zone=), and given again while they are valid
-//! for as long as the headers of the answer (X-Accel-Expires, Cache-Control, Expires)
-//! or else proxy_cache_valid say for their status.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// A cached answer: its status, Content-Type, headers and body, until when (in seconds
-/// since the epoch) it is valid, and for how long after that it may be given while it
-/// is being updated (stale-while-revalidate).
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub status: u16,
     pub ctype: Option<String>,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
-    /// The length its server gave (Content-Length), also of an answer to HEAD; without one
-    /// its length is not known when it is sent again.
     pub length: Option<usize>,
-    /// Its server's status line from the code on, sent again as it was.
     pub line: Option<String>,
-    /// The headers its server sent, which $upstream_http_* give when it is sent again.
     pub upstream: Vec<(String, String)>,
     until: i64,
     updating: i64,
-    /// For how long after that it may be given when its server fails (stale-if-error).
     error: i64,
-    /// The request headers its Vary names, lowercase, and their values in the request it answered.
     vary: Vec<String>,
     variant: String,
 }
 
 impl Entry {
-    /// The conditions it is revalidated with (proxy_cache_revalidate): If-Modified-Since its
-    /// Last-Modified and If-None-Match its ETag, which only a 200 or a 206 keeps.
     pub fn conditions(&self) -> Vec<(&'static str, String)> {
         if !matches!(self.status, 200 | 206) { return Vec::new(); }
         let header = |name: &str| self.headers.iter().rev().find(|h| h.0.eq_ignore_ascii_case(name)).map(|h| h.1.clone());
@@ -42,21 +26,15 @@ impl Entry {
         modified.into_iter().chain(header("etag").filter(|e| !e.is_empty()).map(|e| ("If-None-Match", e))).collect()
     }
 
-    /// Whether it may still be given when its server fails (c->stale_error).
     pub fn erring(&self) -> bool {
         self.until.saturating_add(self.error) >= crate::clock::seconds()
     }
 
-    /// Whether it may still be given while it is being updated (c->stale_updating).
     pub fn updating(&self) -> bool {
         self.until.saturating_add(self.updating) >= crate::clock::seconds()
     }
 }
 
-/// What the headers of an answer say about caching it, as nginx reads them in turn
-/// (ngx_http_upstream_process_cache_control() and those of Expires, X-Accel-Expires
-/// and Set-Cookie): until when it is valid, if they say, and for how long after that
-/// it may be given while it is being updated; None when it is not cached at all.
 pub fn said(headers: &[(String, String)], ignored: &[String], now: i64) -> Option<(Option<i64>, i64)> {
     let (mut valid, mut updating, mut accel, mut no_cache, mut expired) = (None, 0, false, false, false);
     for (name, value) in headers {
@@ -65,10 +43,8 @@ pub fn said(headers: &[(String, String)], ignored: &[String], now: i64) -> Optio
         let lower = value.to_ascii_lowercase();
         match name.as_str() {
             "set-cookie" => return None,
-            // Only the first one counts; "0" caches nothing, "@" gives the time it ends.
             "x-accel-expires" if !accel => {
                 accel = true;
-                // As ngx_atoi() reads them: digits only.
                 let number = |v: &str| v.bytes().all(|c| c.is_ascii_digit()).then(|| v.parse::<i64>().ok()).flatten();
                 let n = match value.strip_prefix('@') {
                     Some(at) => number(at),
@@ -77,11 +53,9 @@ pub fn said(headers: &[(String, String)], ignored: &[String], now: i64) -> Optio
                 if let Some(n) = n { (valid, no_cache, expired) = (Some(n), false, false); }
             }
             "cache-control" => {
-                // A time X-Accel-Expires gave ("@0" gives none) comes first.
                 if !(valid.is_some_and(|v| v != 0) && accel) {
                     if ["no-cache", "no-store", "private"].iter().any(|d| lower.contains(d)) { no_cache = true; continue; }
                     let age = lower.find("s-maxage=").map(|i| i + 9).or_else(|| lower.find("max-age=").map(|i| i + 8));
-                    // Other than digits caches nothing at all, nor does "0".
                     match age.map(|age| seconds(&lower[age..])) { Some(None) => return None, Some(Some(0)) => { no_cache = true; continue } Some(Some(n)) => (valid, expired) = (Some(now.saturating_add(n)), false), None => {} }
                 }
                 match lower.find("stale-while-revalidate=").map(|i| seconds(&lower[i + 23..])) { Some(None) => return None, Some(Some(n)) => updating = n, None => {} }
@@ -97,24 +71,16 @@ pub fn said(headers: &[(String, String)], ignored: &[String], now: i64) -> Optio
     (!no_cache && !expired).then_some((valid.filter(|&v| v != 0), updating))
 }
 
-/// For how long after an answer is no longer valid it may be given when its server fails, as
-/// the stale-if-error of its Cache-Control says, unless proxy_ignore_headers has Cache-Control.
 pub fn stale_if_error(headers: &[(String, String)], ignored: &[String]) -> i64 {
     let controls = headers.iter().filter(|h| h.0.eq_ignore_ascii_case("cache-control") && !ignored.iter().any(|i| i == "cache-control"));
     controls.filter_map(|h| { let lower = h.1.to_ascii_lowercase(); lower.find("stale-if-error=").and_then(|i| seconds(&lower[i + 15..])) }).last().unwrap_or(0)
 }
 
-/// The seconds a directive of Cache-Control gives, up to ",", ";" or " " (as many as
-/// may be when they are more); None when something else comes first.
 fn seconds(s: &str) -> Option<i64> {
     let digits = s.find([',', ';', ' ']).map_or(s, |end| &s[..end]);
     digits.bytes().try_fold(0i64, |n, c| c.is_ascii_digit().then(|| n.saturating_mul(10).saturating_add((c - b'0') as i64)))
 }
 
-/// The request headers a Vary names, lowercase (none without one), as nginx reads its
-/// lines joined by ", ": names apart by spaces and commas. None for a line that is "*",
-/// which no other request matches, or for more than NGX_HTTP_CACHE_VARY_LEN (128) bytes,
-/// so that the answer is not cached.
 pub fn vary(headers: &[(String, String)]) -> Option<Vec<String>> {
     let lines: Vec<&str> = headers.iter().filter(|h| h.0.eq_ignore_ascii_case("vary")).map(|h| h.1.as_str()).collect();
     let all = lines.join(", ");
@@ -122,14 +88,10 @@ pub fn vary(headers: &[(String, String)]) -> Option<Vec<String>> {
     Some(words(&all).map(str::to_ascii_lowercase).collect())
 }
 
-/// What is between spaces and commas.
 fn words(s: &str) -> impl Iterator<Item = &str> {
     s.split([' ', ',']).filter(|w| !w.is_empty())
 }
 
-/// The values of the headers a Vary names in a request, which tell its variant, as
-/// ngx_http_file_cache_vary_header() takes them: those of a header joined by ",", and
-/// for Accept-Charset, Accept-Encoding and Accept-Language, the words of them.
 pub fn variant(names: &[String], request: &[(String, String)]) -> String {
     names.iter().map(|n| {
         let values = request.iter().filter(|h| h.0.eq_ignore_ascii_case(n)).map(|h| h.1.as_str());
@@ -138,25 +100,17 @@ pub fn variant(names: &[String], request: &[(String, String)]) -> String {
     }).collect()
 }
 
-/// A zone of keys (keys_zone=name:size of proxy_cache_path), with what it keeps, also
-/// in files of its path, so that what it keeps outlives the process.
 #[derive(Debug, Default)]
 pub struct Zone {
     dir: Option<std::path::PathBuf>,
-    /// The lengths of the subdirectories its files are in (levels=).
     levels: Vec<usize>,
     entries: Mutex<HashMap<String, Entry>>,
-    /// proxy_cache_lock: what a request that asks the server for a key holds meanwhile.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// When the request that asks the server for each key last began to (proxy_cache_lock_age).
     since: Mutex<HashMap<String, Instant>>,
-    /// How many requests asked for each key (proxy_cache_min_uses).
     uses: Mutex<HashMap<String, u64>>,
-    /// The keys whose kept answer, no longer valid, a request asks the server to update.
     refreshing: Mutex<std::collections::HashSet<String>>,
 }
 
-/// A request asking the server to update what a zone keeps for a key, until it is dropped.
 pub struct Refresh<'a>(&'a Zone, String);
 
 impl Drop for Refresh<'_> {
@@ -166,18 +120,14 @@ impl Drop for Refresh<'_> {
 }
 
 impl Refresh<'_> {
-    /// Leaves the key noted as being updated until release() is called for it.
     pub fn hand_over(self) {
         std::mem::forget(self);
     }
 }
 
-/// How long a request waits for another that asks for the same key (proxy_cache_lock_timeout's default).
 pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Zone {
-    /// A zone that keeps its answers in files under a path, in subdirectories of these levels,
-    /// with those already there.
     pub fn at(dir: std::path::PathBuf, levels: &[usize]) -> Zone {
         fn files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
             for f in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -190,8 +140,6 @@ impl Zone {
         Zone { dir: Some(dir), levels: levels.to_vec(), entries: Mutex::new(entries), ..Zone::default() }
     }
 
-    /// The file of a key: the MD5 of the key in hex, in subdirectories named by the levels,
-    /// each taken from the end of the name (levels=1:2: c/29/b7f54b2df7773722d382f4809d65029c).
     fn file(&self, dir: &std::path::Path, key: &str) -> std::path::PathBuf {
         use md5::Digest;
         let name = md5::Md5::digest(key.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -200,16 +148,12 @@ impl Zone {
         path.join(name)
     }
 
-    /// What is kept for a key, as long as its file still holds it: one whose file was removed,
-    /// or holds something else, is no longer kept, as nginx no longer finds it.
     fn kept<'a>(&self, entries: &'a mut HashMap<String, Entry>, key: &str) -> Option<&'a Entry> {
         let Some(dir) = &self.dir else { return entries.get(key) };
         if entries.contains_key(key) && std::fs::read(self.file(dir, key)).ok().and_then(|b| decode(&b)).is_none_or(|(k, _)| k != key) { entries.remove(key); }
         entries.get(key)
     }
 
-    /// The key an answer to a request is kept by: that of the variant of the request when
-    /// what the key keeps has a Vary its headers do not match.
     pub fn resolve(&self, key: &str, request: &[(String, String)]) -> String {
         match self.kept(&mut self.entries.lock().unwrap(), key).map(|e| (variant(&e.vary, request), e)) {
             Some((v, e)) if !e.vary.is_empty() && v != e.variant => format!("{key}\n{v}"),
@@ -217,7 +161,6 @@ impl Zone {
         }
     }
 
-    /// Writes what is kept for a key to its file.
     fn save(&self, key: &str, e: &Entry) {
         let Some(dir) = &self.dir else { return };
         let file = self.file(dir, key);
@@ -225,28 +168,22 @@ impl Zone {
         let _ = std::fs::create_dir_all(file.parent().unwrap_or(dir)).and_then(|()| std::fs::write(&temp, encode(key, e))).and_then(|()| std::fs::rename(&temp, &file));
     }
 
-    /// The answer kept for a key, while it is valid.
     pub fn get(&self, key: &str) -> Option<Entry> {
         self.kept(&mut self.entries.lock().unwrap(), key).filter(|e| e.until >= crate::clock::seconds()).cloned()
     }
 
-    /// The answer kept for a key, also once it is no longer valid (proxy_cache_use_stale).
     pub fn stale(&self, key: &str) -> Option<Entry> {
         self.kept(&mut self.entries.lock().unwrap(), key).cloned()
     }
 
-    /// Notes that a request asks the server to update what is kept for a key, unless another
-    /// already does (the node's updating flag of nginx): None then.
     pub fn refresh(&self, key: &str) -> Option<Refresh<'_>> {
         self.refreshing.lock().unwrap().insert(key.to_string()).then(|| Refresh(self, key.to_string()))
     }
 
-    /// Notes that no request asks the server to update what is kept for a key any longer.
     pub fn release(&self, key: &str) {
         self.refreshing.lock().unwrap().remove(key);
     }
 
-    /// Counts one more request for a key, and gives how many asked for it so far.
     pub fn used(&self, key: &str) -> u64 {
         let mut uses = self.uses.lock().unwrap();
         let n = uses.entry(key.to_string()).or_default();
@@ -254,9 +191,6 @@ impl Zone {
         *n
     }
 
-    /// Makes what is kept for a key valid again, until then and given while it is updated
-    /// for so long after (a 304 of proxy_cache_revalidate). The Vary of the 304, if it has
-    /// one, replaces what was kept, with the variant of the request it answered.
     pub fn renew(&self, key: &str, (until, updating): (i64, i64), vary: Option<(Vec<String>, &[(String, String)])>) {
         let mut entries = self.entries.lock().unwrap();
         let Some(e) = entries.get_mut(key) else { return };
@@ -265,9 +199,6 @@ impl Zone {
         self.save(key, e);
     }
 
-    /// Keeps an answer for a key, valid until then, and given while it is updated for so long after.
-    /// One looked up by the key of a variant is kept by it when its Vary gives the same variant,
-    /// and else by the key itself, as nginx does (ngx_http_file_cache_update_variant()).
     pub fn put(&self, (key, at): (&str, &str), (status, ctype, headers, body): (u16, Option<String>, Vec<(String, String)>, Vec<u8>), (length, line, upstream): (Option<usize>, Option<String>, Vec<(String, String)>), (until, updating, error): (i64, i64, i64), (vary, request): (Vec<String>, &[(String, String)])) {
         let variant = variant(&vary, request);
         let key = if at == key || (!vary.is_empty() && at == format!("{key}\n{variant}")) { at } else { key };
@@ -276,10 +207,6 @@ impl Zone {
         self.entries.lock().unwrap().insert(key.to_string(), e);
     }
 
-    /// Waits, for so long at most (proxy_cache_lock_timeout), until no other request asks the
-    /// server for the key, and holds that until what it gives is dropped; None when the time ran
-    /// out. Once the request that asks has been at it for so long (proxy_cache_lock_age), this one
-    /// asks in its place without holding anything: Some(None).
     pub async fn lock(&self, key: &str, wait: Duration, age: Duration) -> Option<Option<tokio::sync::OwnedMutexGuard<()>>> {
         let lock = self.locks.lock().unwrap().entry(key.to_string()).or_default().clone();
         let deadline = Instant::now() + wait;
@@ -296,7 +223,6 @@ impl Zone {
     }
 }
 
-/// What the file of a kept answer holds: its key and fields, each after its length.
 fn encode(key: &str, e: &Entry) -> Vec<u8> {
     let mut fields = vec![key.to_string(), e.status.to_string(), e.until.to_string(), e.updating.to_string(), e.error.to_string(), e.vary.join(","), e.variant.clone(), e.ctype.is_some().to_string(), e.ctype.clone().unwrap_or_default(), e.length.map_or_else(String::new, |n| n.to_string()), e.line.is_some().to_string(), e.line.clone().unwrap_or_default(), e.headers.len().to_string()];
     fields.extend(e.headers.iter().chain(&e.upstream).flat_map(|(n, v)| [n.clone(), v.clone()]));
@@ -308,7 +234,6 @@ fn encode(key: &str, e: &Entry) -> Vec<u8> {
     out
 }
 
-/// The key and the answer the file of a kept answer holds; None when it holds no such thing.
 fn decode(b: &[u8]) -> Option<(String, Entry)> {
     let count = u64::from_le_bytes(b.get(..8)?.try_into().ok()?) as usize;
     let mut at = 8;
@@ -322,8 +247,6 @@ fn decode(b: &[u8]) -> Option<(String, Entry)> {
     Some((key, Entry { status: status.parse().ok()?, ctype: (typed == "true").then_some(ctype), headers, body, length: length.parse().ok(), line: (lined == "true").then_some(line), upstream, until: until.parse().ok()?, updating: updating.parse().ok()?, error: error.parse().ok()?, vary, variant }))
 }
 
-/// proxy_cache_valid: the statuses an answer is cached with (none: 200, 301 and 302;
-/// "any": all of them), and for how long.
 pub fn valid(args: &[String], time: Duration) -> Result<Vec<(Option<u16>, Duration)>, String> {
     if args.is_empty() { return Ok([200, 301, 302].map(|s| (Some(s), time)).to_vec()); }
     args.iter().map(|a| match a.as_str() {
@@ -332,8 +255,6 @@ pub fn valid(args: &[String], time: Duration) -> Result<Vec<(Option<u16>, Durati
     }).collect()
 }
 
-/// For how long an answer of a status is valid, if it is cached at all: as the first of
-/// the statuses that is its own or "any" says (ngx_http_file_cache_valid()).
 pub fn validity(valid: &[(Option<u16>, Duration)], status: u16) -> Option<Duration> {
     valid.iter().find(|v| v.0.is_none_or(|s| s == status)).map(|v| v.1).filter(|t| !t.is_zero())
 }
@@ -355,7 +276,6 @@ mod tests {
         assert_eq!(validity(&v, 404), None);
         let any = valid(&strings(&["404", "any"]), m).unwrap();
         assert_eq!(validity(&any, 500), Some(m));
-        // The first that is the status or "any" says.
         let zero = Duration::ZERO;
         assert_eq!(validity(&[(None, m), (Some(404), zero)], 404), Some(m));
         assert_eq!(validity(&[(Some(404), zero), (None, m)], 404), None);
@@ -378,11 +298,8 @@ mod tests {
         crate::stream::block_on(async {
             let (ms, long) = (Duration::from_millis, LOCK_TIMEOUT);
             let held = z.lock("k", long, long).await.unwrap().unwrap();
-            // Another key is not held; the same one is, until the time runs out.
             assert!(z.lock("other", ms(50), long).await.unwrap().is_some());
             assert!(z.lock("k", ms(50), long).await.is_none());
-            // Once the one that holds it has asked for so long, the next asks in its place, and
-            // then the one after that waits for as long again.
             assert!(z.lock("k", long, ms(100)).await.unwrap().is_none());
             let start = Instant::now();
             assert!(z.lock("k", long, ms(100)).await.unwrap().is_none());
@@ -405,12 +322,10 @@ mod tests {
         assert_eq!(said(&[("Cache-Control", "max-age=60")]), Some((Some(1060), 0)));
         assert_eq!(said(&[("Cache-Control", "s-maxage=5, max-age=60")]), Some((Some(1005), 0)));
         assert_eq!(said(&[("Cache-Control", "max-age=9223372036854775808")]), Some((Some(i64::MAX), 0)));
-        // Other than digits caches nothing, also in its extensions.
         assert_eq!(said(&[("Cache-Control", "max-age=6x")]), None);
         assert_eq!(said(&[("Cache-Control", "max-age=60, stale-while-revalidate=x")]), None);
         assert_eq!(said(&[("Cache-Control", "max-age=60, stale-if-error=x")]), None);
         assert_eq!(said(&[("Cache-Control", "max-age=60, stale-if-error=1")]), Some((Some(1060), 0)));
-        // "@0" gives no time.
         assert_eq!(said(&[("X-Accel-Expires", "@0"), ("Cache-Control", "max-age=60")]), Some((Some(1060), 0)));
         assert_eq!(said(&[("Cache-Control", "max-age=60"), ("X-Accel-Expires", "@0")]), Some((None, 0)));
         assert_eq!(said(&[("X-Accel-Expires", "@0"), ("Cache-Control", "no-cache")]), None);
@@ -450,7 +365,6 @@ mod tests {
         z.renew("k", (crate::clock::seconds() + 60, 0), None);
         z.renew("other", (0, 0), None);
         assert!(z.get("k").is_some() && z.stale("other").is_none());
-        // The Vary of a 304 replaces the one kept, with the variant of its request.
         z.renew("k", (crate::clock::seconds() + 60, 0), Some((vec!["foo".into()], &h(&[("Foo", "a")]))));
         assert_eq!((z.resolve("k", &h(&[("Foo", "a")])), z.resolve("k", &[])), ("k".to_string(), "k\nfoo:\n".to_string()));
     }
@@ -458,16 +372,12 @@ mod tests {
     #[test]
     fn variants_by_vary() {
         assert_eq!(vary(&h(&[("Vary", ",, Accept-encoding , ,"), ("vary", "Foo")])), Some(vec!["accept-encoding".to_string(), "foo".to_string()]));
-        // Only a line that is "*" is no name: in a list, it is one.
         assert_eq!(vary(&h(&[("Vary", "Foo, *")])), Some(vec!["foo".to_string(), "*".to_string()]));
         assert_eq!(vary(&h(&[("Vary", "*"), ("Vary", "Foo")])), None);
-        // Spaces part names too, and tabs are in them.
         assert_eq!(vary(&h(&[("Vary", "Foo Bar\t,\tBaz")])), Some(vec!["foo".to_string(), "bar\t".to_string(), "\tbaz".to_string()]));
-        // Up to 128 bytes, its lines joined by ", ".
         assert!(vary(&h(&[("Vary", "Foo"), ("Vary", &"a".repeat(123))])).is_some());
         assert_eq!(vary(&h(&[("Vary", "Foo"), ("Vary", &"a".repeat(124))])), None);
         assert_eq!(vary(&[]), Some(Vec::new()));
-        // The values of other headers are taken as they are.
         let foo = vec!["foo".to_string()];
         assert_ne!(variant(&foo, &h(&[("Foo", "a, b")])), variant(&foo, &h(&[("Foo", "a,b")])));
         assert_eq!(variant(&foo, &h(&[("Foo", "a"), ("Foo", "b")])), variant(&foo, &h(&[("Foo", "a,b")])));
@@ -486,7 +396,6 @@ mod tests {
         assert_eq!(z.resolve("k", &gzip), "k");
         let other = z.resolve("k", &deflate);
         assert_ne!(other, "k");
-        // A variant is kept by its own key; an answer without Vary replaces them by the key itself.
         z.put(("k", &other), answer("d"), (None, None, Vec::new()), valid, (names.clone(), &deflate));
         assert_eq!((z.get("k").unwrap().body, z.get(&other).unwrap().body), (b"g".to_vec(), b"d".to_vec()));
         z.put(("k", &other), answer("n"), (None, None, Vec::new()), valid, (Vec::new(), &deflate));
@@ -512,8 +421,6 @@ mod tests {
         assert_eq!(again.get("n").map(|e| (e.line, e.upstream)), Some((Some("404 Gone".into()), h(&[("X-A", "a"), ("X-A", "b")]))));
         assert_eq!(e.length, None);
         assert!(decode(&encode("k", &e)[..20]).is_none());
-        // Named by the MD5 of the key, under its levels; one whose file is gone or holds
-        // something else is no longer kept.
         let file = dir.join("1/3a/7b8b965ad4bca0e41ab51de7b31363a1");
         assert!(file.is_file() && again.file(&dir, "n") == file);
         std::fs::write(&file, b"garbage").unwrap();
