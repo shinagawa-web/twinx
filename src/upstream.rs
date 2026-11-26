@@ -85,11 +85,12 @@ pub struct Conn {
     opened: Instant,
     requests: u64,
     pub slot: Option<crate::h2::Slot>,
+    pub seat: Option<crate::http::Seat>,
 }
 
 impl Conn {
     pub fn new(stream: Stream, opened: Instant) -> Conn {
-        Conn { stream, h2: None, opened, requests: 1, slot: None }
+        Conn { stream, h2: None, opened, requests: 1, slot: None, seat: None }
     }
 
     /// The socket itself is peeked, as tokio may not have seen yet what came.

@@ -37,6 +37,7 @@ const DIRECTIVES: &[(&str, u16, usize, usize, bool)] = &[
     ("log_not_found", HSL, 1, 1, false),
     ("index", HSL, 1, usize::MAX, false),
     ("events", MAIN, 0, 0, true),
+    ("worker_connections", EVENTS, 1, 1, false),
     ("http", MAIN, 0, 0, true),
     ("server", HTTP, 0, 0, true),
     ("upstream", HTTP, 1, 1, true),
@@ -530,6 +531,8 @@ pub struct Config {
     pub emerg_logs: Vec<Arc<File>>,
     pub alert_logs: Vec<Arc<File>>,
     pub notice_logs: Vec<Arc<File>>,
+    pub warn_logs: Vec<Arc<File>>,
+    pub connections: usize,
     pub temp_paths: Vec<PathBuf>,
     pub servers: Vec<Server>,
 }
@@ -560,7 +563,7 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
     let combined = Arc::new(Format { line: Template::parse(COMBINED)?, escape: Escape::Default });
     let formats = HashMap::from([("combined".to_string(), combined)]);
     let mut b = Builder { prefix, formats, logs: HashMap::new(), upstreams: HashMap::new(), zones: HashMap::new(), implicit: Implicit::default(), errors: Vec::new(), temp_paths: Vec::new(), location: String::new(), location_no_uri: false, listens: HashMap::new(), ssl_zones: HashMap::new() };
-    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, user: None, warnings: Vec::new(), emerg_logs: Vec::new(), alert_logs: Vec::new(), notice_logs: Vec::new(), temp_paths: Vec::new(), servers: Vec::new() };
+    let mut config = Config { pid: prefix.join("logs/nginx.pid"), rlimit_nofile: None, shutdown_timeout: None, working_directory: None, user: None, warnings: Vec::new(), emerg_logs: Vec::new(), alert_logs: Vec::new(), notice_logs: Vec::new(), warn_logs: Vec::new(), connections: 512, temp_paths: Vec::new(), servers: Vec::new() };
     // Read first: the http block loads its certificates as it says.
     let inheritable = main.iter().find(|d| d.name == "ssl_object_cache_inheritable").map_or(Ok(true), |d| flag(d).map_err(|e| format!("{e} in {}", d.at)))?;
     crate::tls::new_configuration(inheritable);
@@ -592,15 +595,27 @@ pub fn build(main: &[Directive], prefix: &Path) -> Result<Config, String> {
                 let level = d.args.get(1).map(|l| LEVELS.iter().position(|v| v == l));
                 config.emerg_logs.push(file.clone());
                 if level.is_none_or(|l| l <= Some(6)) { config.alert_logs.push(file.clone()) }
+                if level.is_some_and(|l| l <= Some(3)) { config.warn_logs.push(file.clone()) }
                 if level.is_none_or(|l| l <= Some(2)) { config.notice_logs.push(file) }
             }
-            "events" => d.block.iter().flatten().try_for_each(|e| b.check(e, EVENTS))?,
+            "events" => for (j, e) in d.block.iter().flatten().enumerate() {
+                b.check(e, EVENTS)?;
+                once(&d.block.as_deref().unwrap_or_default()[..j], e)?;
+                if e.name == "worker_connections" {
+                    let n = Some(&e.args[0]).filter(|v| v.bytes().all(|c| c.is_ascii_digit())).and_then(|v| v.parse().ok());
+                    config.connections = n.filter(|&n| n <= isize::MAX as usize).ok_or_else(|| format!("invalid number \"{}\" in {}", e.args[0], e.at))?;
+                }
+            },
             "http" => config.servers = b.http(d.block.as_deref().unwrap_or_default())?,
             _ => {}
         }
     }
     if !main.iter().any(|d| d.name == "events") { return Err("no \"events\" section in configuration".into()); }
     if root && config.user.is_none() { config.user = Some(default_user()?) }
+    let mut listening: Vec<&SocketAddr> = config.servers.iter().flat_map(|s| &s.listen).collect();
+    listening.sort();
+    listening.dedup();
+    if config.connections < listening.len() + 1 { return Err(format!("{} worker_connections are not enough for {} listening sockets", config.connections, listening.len())); }
     config.temp_paths = b.temp_paths.into_iter().map(|t| t.0).collect();
     Ok(config)
 }
@@ -1987,6 +2002,16 @@ mod tests {
     fn worker_processes() {
         assert!(build_text("worker_processes 2; http { }").is_ok() && build_text("worker_processes auto; http { }").is_ok());
         assert_eq!(build_text("worker_processes x;").unwrap_err(), "invalid value \"x\" in \"worker_processes\" directive in t.conf:1");
+    }
+
+    #[test]
+    fn worker_connections() {
+        assert_eq!(build_text("events { worker_connections 3; } http { server { listen 127.0.0.1:1; } server { listen 127.0.0.1:2; } }").unwrap().connections, 3);
+        assert_eq!(build_text("events { worker_connections 2; } http { server { listen 127.0.0.1:1; } server { listen 127.0.0.1:2; } }").unwrap_err(), "2 worker_connections are not enough for 2 listening sockets");
+        assert_eq!(build_text("events { worker_connections 0; }").unwrap_err(), "0 worker_connections are not enough for 0 listening sockets");
+        assert_eq!(build_text("events { worker_connections -1; }").unwrap_err(), "invalid number \"-1\" in t.conf:1");
+        assert_eq!(build_text("events { worker_connections 1; worker_connections 1; }").unwrap_err(), "\"worker_connections\" directive is duplicate in t.conf:1");
+        assert_eq!(build_text("http { }").unwrap().connections, 512);
     }
 
     #[test]
