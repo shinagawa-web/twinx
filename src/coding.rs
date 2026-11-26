@@ -1,29 +1,17 @@
-//! The bodies of proxied answers compressed (gzip) or decompressed (gunzip) piece by
-//! piece as they come, and what of that goes on to the client when.
-
 use flate2::{Compress, Compression, Crc, Decompress, FlushCompress, FlushDecompress, Status};
 
-/// The size of the buffers of gzip_buffers and gunzip_buffers, and of all of them.
 const BUFFER: usize = 4096;
 const ALL: usize = 32 * BUFFER;
 
-/// What codes a body: what it has made of it and how much of that goes on, how much of
-/// the data given it has taken, and whether it has begun with that and is to flush it.
-/// What it holds is bounded, however large the body is or becomes.
 #[derive(Debug)]
 pub struct Coder { coding: Coding, out: Vec<u8>, ready: usize, taken: usize, begun: bool, flush: bool, to: Option<std::sync::Arc<crate::vars::Shared>> }
 
 #[derive(Debug)]
 enum Coding { Gzip(Gzip), Gunzip(Gunzip) }
 
-/// Compresses, counting what it takes. Whether anything came since it last flushed, or it
-/// never did, and whether there was room left after the last write.
 #[derive(Debug)]
 struct Gzip { deflate: Compress, crc: Crc, held: bool, filled: bool }
 
-/// Decompresses the members of the body: where one is, how many bytes of that have come,
-/// its flags, the length of its extra field, the last four bytes that came of what is
-/// around the data, and the sums of the header and of the data.
 #[derive(Debug)]
 struct Gunzip { inflate: Decompress, at: At, came: u32, flags: u8, extra: u32, last: u32, head: Crc, crc: Crc }
 
@@ -31,15 +19,11 @@ struct Gunzip { inflate: Decompress, at: At, came: u32, flags: u8, extra: u32, l
 enum At { Head, ExtraLength, Extra, Name, Comment, HeadSum, Data, Trailer, End }
 
 impl Coder {
-    /// Compresses the body, as ngx_http_gzip_body_filter() does, and tells the request
-    /// what it took and made once it ends ($gzip_ratio).
     pub fn gzip(to: Option<std::sync::Arc<crate::vars::Shared>>) -> Coder {
-        // The header of zlib at its lowest level: no name, no time, the fastest, Unix.
         let out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 4, 3];
         Coder { to, ..Coder::new(Coding::Gzip(Gzip { deflate: Compress::new(Compression::new(1), false), crc: Crc::new(), held: true, filled: false }), out) }
     }
 
-    /// Decompresses the body, as ngx_http_gunzip_body_filter() does.
     pub fn gunzip() -> Coder {
         let gunzip = Gunzip { inflate: Decompress::new(false), at: At::Head, came: 0, flags: 0, extra: 0, last: 0, head: Crc::new(), crc: Crc::new() };
         Coder::new(Coding::Gunzip(gunzip), Vec::new())
@@ -49,11 +33,6 @@ impl Coder {
         Coder { coding, out, ready: 0, taken: 0, begun: false, flush: false, to: None }
     }
 
-    /// Codes the data that came, which is flushed, or cut off after that. What is compressed
-    /// goes on in buffers, when they are full, or all of it then; what is decompressed at
-    /// once, with a flush what one member gives before the next is begun. Tells whether that
-    /// is all: if not, it is to be called with the same again once what goes on is written.
-    /// Malformed data is an error, and what was made in that call does not go on.
     pub fn code(&mut self, data: &[u8], flush: bool, cut: bool) -> Result<bool, String> {
         if !self.begun { (self.begun, self.flush) = (true, flush); }
         let all = match &mut self.coding {
@@ -74,15 +53,12 @@ impl Coder {
         Ok(all)
     }
 
-    /// Ends the body after all that came: the rest of what is compressed goes on with what
-    /// does already. It is an error if what is decompressed does not end there.
     pub fn end(&mut self) -> Result<(), String> {
         match &mut self.coding {
             Coding::Gzip(gzip) => {
                 gzip.code(&mut self.out, &[], &mut 0, FlushCompress::Finish)?;
                 self.out.extend(gzip.crc.sum().to_le_bytes());
                 self.out.extend(gzip.crc.amount().to_le_bytes());
-                // With the header and the trailer of gzip, as nginx counts them.
                 if let Some(to) = &self.to { *to.gzip.lock().unwrap() = Some((gzip.deflate.total_in(), 10 + gzip.deflate.total_out() + 8)); }
             }
             Coding::Gunzip(gunzip) => if gunzip.at != At::End { return Err("inflate() returned -5 on response end".to_string()) },
@@ -91,25 +67,21 @@ impl Coder {
         Ok(())
     }
 
-    /// What goes on.
     pub fn ready(&self) -> &[u8] {
         &self.out[..self.ready]
     }
 
-    /// What went on has been written.
     pub fn written(&mut self) {
         self.out.drain(..self.ready);
         self.ready = 0;
     }
 }
 
-/// Room to write to: as much as there is, so that all of it is at most all buffers.
 fn grow(out: &mut Vec<u8>) {
     if out.len() == out.capacity() { out.reserve_exact(out.len().next_power_of_two().max(BUFFER / 2) * 2 - out.len()); }
 }
 
 impl Gzip {
-    /// Compresses the data not taken, unless all buffers are full before.
     fn code(&mut self, out: &mut Vec<u8>, data: &[u8], taken: &mut usize, flush: FlushCompress) -> Result<bool, String> {
         let end = flush == FlushCompress::Finish;
         loop {
@@ -131,10 +103,7 @@ impl Gzip {
 }
 
 impl Gunzip {
-    /// Decompresses the data not taken, unless all buffers are full before, or a member is
-    /// flushed before the next.
     fn code(&mut self, out: &mut Vec<u8>, data: &[u8], taken: &mut usize, flush: &mut bool) -> Result<bool, String> {
-        // What nginx logs: the flush asked of inflate(), and what it returned.
         let malformed = |flush: bool| format!("inflate() failed: {}, -3", if flush { 2 } else { 0 });
         loop {
             if out.len() >= ALL { return Ok(false) }
@@ -161,8 +130,6 @@ impl Gunzip {
         }
     }
 
-    /// Takes a byte of what is around the data, as inflate() does; tells whether what it
-    /// then looks at is as it should be.
     fn byte(&mut self, c: u8) -> bool {
         use At::*;
         if ![HeadSum, Trailer].contains(&self.at) { self.head.update(&[c]); }
@@ -185,12 +152,10 @@ impl Gunzip {
             (HeadSum, 2) => self.last >> 16 == self.head.sum() & 0xffff && self.next(Data),
             (Trailer, 4) => self.last == self.crc.sum(),
             (Trailer, 8) => self.last == self.crc.amount() && self.next(End),
-            // A name may be of any length.
             _ => true,
         }
     }
 
-    /// Goes to that, or to what is after it if the header's flags do not have it.
     fn next(&mut self, at: At) -> bool {
         let (flag, after) = match at { At::ExtraLength => (4, At::Name), At::Name => (8, At::Comment), At::Comment => (16, At::HeadSum), At::HeadSum => (2, At::Data), _ => (0, at) };
         if flag > 0 && self.flags & flag == 0 { return self.next(after) }
@@ -204,7 +169,6 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    /// Bytes that do not compress (xorshift64), the same each time.
     fn noise(n: usize) -> Vec<u8> {
         let mut x = 0x2545_f491_4f6c_dd1d_u64;
         (0..n).map(|_| {
@@ -215,7 +179,6 @@ mod tests {
         }).collect()
     }
 
-    /// Lines that do.
     fn text(n: usize) -> Vec<u8> {
         let mut text = Vec::new();
         for c in noise(n / 8 + 1) { let _ = writeln!(text, "line {:>3}", c); }
@@ -229,7 +192,6 @@ mod tests {
         gz.finish().unwrap()
     }
 
-    /// The parts that go on of the data, each of which is at most all buffers.
     fn coded(coder: &mut Coder, data: &[u8], flush: bool) -> Result<Vec<Vec<u8>>, String> {
         let mut parts = Vec::new();
         loop {
@@ -241,13 +203,11 @@ mod tests {
         }
     }
 
-    /// What goes on then at the end.
     fn ended(coder: &mut Coder) -> Vec<u8> {
         coder.end().unwrap();
         coder.ready().to_vec()
     }
 
-    /// What can be decompressed of a member that has come so far.
     fn so_far(gz: &[u8]) -> Vec<u8> {
         let (mut plain, mut inflate) = (Vec::with_capacity(1 << 20), Decompress::new(false));
         inflate.decompress_vec(&gz[10..], &mut plain, FlushDecompress::None).unwrap();
@@ -256,7 +216,6 @@ mod tests {
 
     #[test]
     fn gzip_goes_on_when_a_buffer_is_full_or_flushed() {
-        // Nothing but what is flushed, even of nothing: the header and an empty block.
         let mut coder = Coder::gzip(None);
         let mut all = coded(&mut coder, b"", true).unwrap().concat();
         assert_eq!(all, [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0xff, 0xff]);
@@ -275,7 +234,6 @@ mod tests {
         flate2::read::GzDecoder::new(&all[..]).read_to_end(&mut got).unwrap();
         assert_eq!(got, plain);
 
-        // In whole buffers without it, and the rest at the end.
         for data in [Vec::new(), text(90), text(400_000), noise(400_000)] {
             for size in [1000, 20000, 400_000] {
                 let (mut coder, mut all) = (Coder::gzip(None), Vec::new());
@@ -293,7 +251,6 @@ mod tests {
             }
         }
         assert_eq!(ended(&mut Coder::gzip(None)), [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 4, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        // Cut off: what is held is flushed, but there is no end.
         let mut coder = Coder::gzip(None);
         assert!(coded(&mut coder, &text(90), false).unwrap().is_empty());
         assert_eq!(coder.code(&text(90), false, true), Ok(true));
@@ -308,18 +265,15 @@ mod tests {
         for c in &one[..40] { got.extend(coded(&mut coder, &[*c], false).unwrap().concat()); }
         assert!(!got.is_empty() && text(90).starts_with(&got));
         assert_eq!(coder.end().unwrap_err(), "inflate() returned -5 on response end");
-        // The next member, and one of nothing.
         got.extend(coded(&mut coder, &[&one[40..], &two, &gzipped(b"")].concat(), false).unwrap().concat());
         assert!(got == [text(90), noise(20000)].concat());
         assert!(ended(&mut coder).is_empty());
-        // Each member is flushed before the next, once.
         let mut coder = Coder::gunzip();
         let parts = coded(&mut coder, &[&one[..], &one, &one].concat(), true).unwrap();
         assert_eq!(parts, [text(90), [text(90), text(90)].concat()]);
         let mut coder = Coder::gunzip();
         assert_eq!((coder.code(&[&one[..], &one].concat(), false, true), coder.ready().len()), (Ok(true), 180));
         assert_eq!(Coder::gunzip().code(b"no", false, true).unwrap_err(), "inflate() failed: 0, -3");
-        // All buffers at a time, however much it becomes.
         for flush in [false, true] {
             let mut coder = Coder::gunzip();
             let parts = coded(&mut coder, &gzipped(&vec![0; 10 << 20]), flush).unwrap();
@@ -331,7 +285,6 @@ mod tests {
     #[test]
     fn gunzip_takes_any_pieces() {
         let plain = [text(70000), noise(70000), vec![7; 70000]].concat();
-        // A header with everything there can be in it.
         let gz = gzipped(&plain);
         let mut head = [&gz[..3], &[0x1f], &gz[4..10], b"\x03\0abc", b"name\0", b"comment\0"].concat();
         let mut sum = Crc::new();
@@ -353,7 +306,6 @@ mod tests {
                 assert!(coder.end().is_err(), "{n}");
             }
         }
-        // The header's sum.
         let mut wrong = long.clone();
         wrong[head.len() - 1] ^= 1;
         assert_eq!(coded(&mut Coder::gunzip(), &wrong, false).unwrap_err(), "inflate() failed: 0, -3");
@@ -364,7 +316,6 @@ mod tests {
         let gz = gzipped(&text(90));
         let n = gz.len();
         let changed = |at: usize| { let mut gz = gz.clone(); gz[at] ^= 0xe0; gz };
-        // How much is taken, byte by byte, before it is found.
         for (data, at) in [
             (b"this is not".to_vec(), 2), (changed(0), 2), (changed(1), 2), (changed(2), 4), (changed(3), 4),
             (changed(n - 8), n - 4), (changed(n - 5), n - 4), (changed(n - 4), n), (changed(n - 1), n),
@@ -373,7 +324,6 @@ mod tests {
             let mut coder = Coder::gunzip();
             let taken = data.iter().take_while(|c| coded(&mut coder, &[**c], false).is_ok()).count();
             assert_eq!(taken + 1, at, "{data:?}");
-            // At once, nothing goes on of what came before it, unless that is flushed.
             let mut coder = Coder::gunzip();
             assert_eq!(coder.code(&data, false, false).unwrap_err(), "inflate() failed: 0, -3");
             assert!(coder.ready().is_empty());
@@ -386,11 +336,9 @@ mod tests {
                 assert_eq!(coder.code(&data, true, false).unwrap_err(), "inflate() failed: 0, -3");
             }
         }
-        // A byte after a member may begin another, which has to end.
         let mut coder = Coder::gunzip();
         assert_eq!(coded(&mut coder, &[&gz[..], b"\0"].concat(), false).unwrap(), [text(90)]);
         assert!(coder.end().is_err());
-        // Full buffers have gone on before.
         let mut coder = Coder::gunzip();
         let bomb = [gzipped(&vec![0; 300_000]), b"junk".to_vec()].concat();
         for _ in 0..2 {
