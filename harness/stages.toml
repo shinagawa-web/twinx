@@ -124,14 +124,14 @@ files = [
 # (harness/nginx-tests/extra).
 [stage6]
 files = [
-  "twinx_alias_rewrite.t", "twinx_answers_left.t", "twinx_cache_answers.t",
-  "twinx_cache_buffering.t", "twinx_cache_control.t", "twinx_cache_fields.t",
-  "twinx_cache_h2.t", "twinx_cache_hit.t", "twinx_cache_key.t",
-  "twinx_cache_methods_conditions.t", "twinx_cache_path.t", "twinx_cache_shared.t",
-  "twinx_cache_stale.t", "twinx_cache_updating.t", "twinx_cache_vary.t",
-  "twinx_conf_refused_left.t", "twinx_h2_refused_streams.t", "twinx_h2_streams.t",
-  "twinx_h2_upstream_body.t", "twinx_header_inherit.t", "twinx_keepalive_options.t",
-  "twinx_proxy_early_answer.t", "twinx_proxy_pass_request.t",
-  "twinx_proxy_send_timeout.t", "twinx_proxy_status.t", "twinx_proxy_xar_escape.t",
-  "twinx_range_values.t", "twinx_variables_left.t",
+  "twinx_alias_rewrite.t",
+  "twinx_answers_left.t", "twinx_cache_answers.t", "twinx_cache_buffering.t",
+  "twinx_cache_control.t", "twinx_cache_fields.t", "twinx_cache_h2.t",
+  "twinx_cache_hit.t", "twinx_cache_key.t", "twinx_cache_methods_conditions.t",
+  "twinx_cache_path.t", "twinx_cache_shared.t", "twinx_cache_stale.t",
+  "twinx_cache_updating.t", "twinx_cache_vary.t", "twinx_conf_refused_left.t",
+  "twinx_h2_refused_streams.t", "twinx_h2_streams.t", "twinx_h2_upstream_body.t",
+  "twinx_header_inherit.t", "twinx_keepalive_options.t", "twinx_proxy_early_answer.t",
+  "twinx_proxy_pass_request.t", "twinx_proxy_send_timeout.t", "twinx_proxy_status.t",
+  "twinx_proxy_xar_escape.t", "twinx_range_values.t", "twinx_variables_left.t",
 ]
