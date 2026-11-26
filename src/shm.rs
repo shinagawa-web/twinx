@@ -9,14 +9,19 @@ struct Counters {
 static COUNTERS: OnceLock<&'static Counters> = OnceLock::new();
 
 pub fn shared<T: Sync>(value: T) -> Result<&'static T, String> {
-    let size = size_of::<T>();
-    // SAFETY: a new anonymous mapping, page aligned and as large as T, is written before it is read.
+    let p = zeroed(size_of::<T>())?.cast::<T>();
+    // SAFETY: a new mapping, page aligned and as large as T, is written before it is read.
     unsafe {
-        let p = libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0);
-        if p == libc::MAP_FAILED { return Err(format!("mmap(MAP_ANON|MAP_SHARED, {size}) failed ({})", std::io::Error::last_os_error())) }
-        p.cast::<T>().write(value);
-        Ok(&*p.cast::<T>())
+        p.write(value);
+        Ok(&*p)
     }
+}
+
+pub fn zeroed(size: usize) -> Result<*mut libc::c_void, String> {
+    // SAFETY: an anonymous mapping touches no memory that is in use.
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), size.max(1), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0) };
+    if p == libc::MAP_FAILED { return Err(format!("mmap(MAP_ANON|MAP_SHARED, {size}) failed ({})", std::io::Error::last_os_error())) }
+    Ok(p)
 }
 
 fn fresh() -> Counters {
