@@ -299,3 +299,4 @@ Kinds:
 | 2026-11-26 | After stage 6 | correction | worker_processes was accepted and ignored: one worker whatever the number | #471, #472, #481; what workers share, #475 to #479 |
 | 2026-11-26 | After stage 6 | decision | twinx-perf measures twinx against nginx only, with scenarios named when a run is started; nginx only with tags; no load tests in the VM | twinx-perf #11 to #16; one pull request's run is about 5 minutes |
 | 2026-11-26 | After stage 6 | decision | No performance runs for the rest of the day; tomorrow nginx's baseline, then a v0.6.0 tag, then what to improve from the numbers | #397 closed |
+| 2026-11-26 | Stage 6 | decision | The schedule is paused again | 256 of 256 files, 4274 of 4274 subtests after #508; the Fixer had fixed the five files added that day (#501, #503, #506, #507, #508) |
