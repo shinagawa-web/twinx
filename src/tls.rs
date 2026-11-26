@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime};
-use x509_parser::prelude::{ASN1Time, CertificateRevocationList, FromDer, GeneralName, X509Certificate, X509Version};
+use x509_parser::asn1_rs::{Any, BitString};
+use x509_parser::prelude::{ASN1Time, AlgorithmIdentifier, CertificateRevocationList, FromDer, GeneralName, SubjectPublicKeyInfo, X509Certificate, X509Version};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{ClientConfig, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
 
@@ -157,10 +159,35 @@ fn trusted(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     certs.ok_or_else(|| format!("cannot load certificate \"{}\": PEM_read_bio_X509_AUX() failed", path.display()))
 }
 
-fn crls(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+fn crls(path: &Path) -> Result<Arc<[Crl]>, String> {
     let pem = read(path, true).map_err(|_| format!("cannot load CRL \"{}\": BIO_new_file() failed", path.display()))?;
-    let crls: Option<Vec<Vec<u8>>> = CertificateRevocationListDer::pem_slice_iter(&pem).map(|c| c.ok().filter(|c| CertificateRevocationList::from_der(c).is_ok()).map(|c| c.to_vec())).collect();
-    crls.filter(|c| !c.is_empty()).ok_or_else(|| format!("cannot load CRL \"{}\": PEM_read_bio_X509_CRL() failed", path.display()))
+    let crls: Option<Vec<Crl>> = CertificateRevocationListDer::pem_slice_iter(&pem).map(|c| c.ok().and_then(|c| Crl::load(&c))).collect();
+    crls.filter(|c| !c.is_empty()).map(Arc::from).ok_or_else(|| format!("cannot load CRL \"{}\": PEM_read_bio_X509_CRL() failed", path.display()))
+}
+
+#[derive(Debug)]
+struct Crl {
+    der: Vec<u8>,
+    issuer: Vec<u8>,
+    next_update: Option<ASN1Time>,
+    revoked: HashSet<Vec<u8>>,
+}
+
+impl Crl {
+    fn load(der: &[u8]) -> Option<Crl> {
+        let (_, crl) = CertificateRevocationList::from_der(der).ok()?;
+        let revoked = crl.iter_revoked_certificates().map(|r| r.raw_serial().to_vec()).collect();
+        Some(Crl { der: der.to_vec(), issuer: crl.issuer().as_raw().to_vec(), next_update: crl.next_update(), revoked })
+    }
+
+    fn signed_by(&self, key: &SubjectPublicKeyInfo) -> bool {
+        let Ok((_, outer)) = Any::from_der(&self.der) else { return false };
+        let Ok((rest, _)) = Any::from_der(outer.data) else { return false };
+        let tbs = &outer.data[..outer.data.len() - rest.len()];
+        let Ok((rest, algorithm)) = AlgorithmIdentifier::from_der(rest) else { return false };
+        let Ok((_, signature)) = BitString::from_der(rest) else { return false };
+        x509_parser::verify::verify_signature(key, &algorithm, &signature, tbs).is_ok()
+    }
 }
 
 /// Keeps a session a TLS 1.3 client resumes, as OpenSSL does; rustls's cache would drop it.
@@ -193,7 +220,7 @@ fn provider() -> Arc<CryptoProvider> {
 pub struct ServerTls {
     config: Arc<ServerConfig>,
     trusted: Vec<CertificateDer<'static>>,
-    crls: Option<Vec<Vec<u8>>>,
+    crls: Option<Arc<[Crl]>>,
     depth: usize,
     named: Option<Named>,
     ocsp: Option<crate::ocsp::Ocsp>,
@@ -786,7 +813,7 @@ impl ClientCertVerifier for AnyClient {
     }
 }
 
-fn verified(chain: &[CertificateDer<'static>], (trusted, crls, depth): (&[CertificateDer<'static>], Option<&[Vec<u8>]>, usize), ocsp: Option<&crate::ocsp::Ocsp>) -> String {
+fn verified(chain: &[CertificateDer<'static>], (trusted, crls, depth): (&[CertificateDer<'static>], Option<&[Crl]>, usize), ocsp: Option<&crate::ocsp::Ocsp>) -> String {
     let Some(leaf) = chain.first() else { return "NONE".to_string() };
     let checked = verify_chain(leaf, &chain[1..], trusted, crls, depth, true).and_then(|certs| ocsp.map_or(Ok(()), |o| o.check(&certs)));
     checked.map_or_else(|e| format!("FAILED:{e}"), |()| "SUCCESS".to_string())
@@ -819,7 +846,7 @@ impl ServerCertVerifier for Proxied {
 #[derive(Debug)]
 pub struct Verify {
     trusted: Vec<CertificateDer<'static>>,
-    crls: Option<Vec<Vec<u8>>>,
+    crls: Option<Arc<[Crl]>>,
     depth: usize,
 }
 
@@ -835,7 +862,7 @@ impl Verify {
     }
 }
 
-fn verify_chain<'a>(end: &'a [u8], sent: &'a [CertificateDer], trusted: &'a [CertificateDer], crls: Option<&'a [Vec<u8>]>, depth: usize, last: bool) -> Result<Vec<X509Certificate<'a>>, &'static str> {
+fn verify_chain<'a>(end: &'a [u8], sent: &'a [CertificateDer], trusted: &'a [CertificateDer], crls: Option<&'a [Crl]>, depth: usize, last: bool) -> Result<Vec<X509Certificate<'a>>, &'static str> {
     let parse = |d: &'a [u8]| X509Certificate::from_der(d).ok().map(|(_, c)| c);
     let (anchors, sent): (Vec<_>, Vec<_>) = (trusted.iter().filter_map(|d| parse(d)).collect(), sent.iter().filter_map(|d| parse(d)).collect());
     let mut chain = vec![parse(end).ok_or("unable to decode certificate")?];
@@ -857,12 +884,11 @@ fn verify_chain<'a>(end: &'a [u8], sent: &'a [CertificateDer], trusted: &'a [Cer
     let purpose = |c: &&X509Certificate| c.extended_key_usage().ok().flatten().is_some_and(|u| !if last { u.value.client_auth } else { u.value.server_auth });
     if chain.iter().filter(|c| !is_trusted(c)).any(|c| purpose(&c)) { errors.push("unsuitable certificate purpose") }
     if chain[1..].iter().any(|c| !c.is_ca() && c.version() != X509Version::V1) { errors.push("invalid CA certificate") }
-    let crls: Option<Vec<_>> = crls.map(|crls| crls.iter().filter_map(|d| CertificateRevocationList::from_der(d).ok().map(|(_, c)| c)).collect());
     for (i, c) in chain.iter().enumerate().filter(|_| crls.is_some()) {
         let issuer = chain.get(i + 1).unwrap_or(c);
-        let Some(crl) = crls.iter().flatten().find(|l| l.issuer().as_raw() == c.issuer().as_raw() && l.verify_signature(issuer.public_key()).is_ok()) else { errors.push("unable to get certificate CRL"); continue };
-        if crl.next_update().is_some_and(|t| t < ASN1Time::now()) { errors.push("CRL has expired") }
-        if crl.iter_revoked_certificates().any(|r| r.raw_serial() == c.raw_serial()) { errors.push("certificate revoked") }
+        let Some(crl) = crls.into_iter().flatten().find(|l| l.issuer == c.issuer().as_raw() && l.signed_by(issuer.public_key())) else { errors.push("unable to get certificate CRL"); continue };
+        if crl.next_update.is_some_and(|t| t < ASN1Time::now()) { errors.push("CRL has expired") }
+        if crl.revoked.contains(c.raw_serial()) { errors.push("certificate revoked") }
     }
     errors.extend(chain.iter().rev().filter(|c| !c.validity().is_valid()).map(|c| if c.validity().not_before > ASN1Time::now() { "certificate is not yet valid" } else { "certificate has expired" }));
     match if last { errors.last() } else { errors.first() } { Some(e) => Err(e), None => Ok(chain) }
@@ -1017,14 +1043,14 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         CertificateDer::from_pem_slice(pem.as_bytes()).unwrap()
     }
 
-    fn crl(pem: &str) -> Vec<u8> {
-        CertificateRevocationListDer::from_pem_slice(pem.as_bytes()).unwrap().to_vec()
+    fn crl(pem: &str) -> Crl {
+        Crl::load(&CertificateRevocationListDer::from_pem_slice(pem.as_bytes()).unwrap()).unwrap()
     }
 
     #[test]
     fn verifies_chains_as_openssl() {
         let (root, int, end) = (der(ROOT), der(INT), der(END));
-        let ok = |sent: &[CertificateDer<'static>], trusted: &[CertificateDer<'static>], crls: Option<&[Vec<u8>]>, depth| verify_chain(&end, sent, trusted, crls, depth, false).map(|_| ());
+        let ok = |sent: &[CertificateDer<'static>], trusted: &[CertificateDer<'static>], crls: Option<&[Crl]>, depth| verify_chain(&end, sent, trusted, crls, depth, false).map(|_| ());
         assert_eq!(ok(&[int.clone()], &[root.clone()], None, 2), Ok(()));
         assert_eq!(ok(&[int.clone()], &[root.clone()], None, 1), Ok(()));
         assert_eq!(ok(&[int.clone()], &[root.clone()], None, 0), Err("unable to get local issuer certificate"));
@@ -1037,7 +1063,7 @@ zj0EAwIDSQAwRgIhAKrH2gSMjnYnNwAuqh5X34wyu2L1YI9k8XkzT+cGx1t6AiEA
         assert_eq!(ok(&[int.clone()], &[root.clone()], Some(&[crl(ROOT_CRL)]), 2), Err("unable to get certificate CRL"));
         assert_eq!(ok(&[int.clone()], &[root.clone()], Some(&[crl(ROOT_CRL), crl(INT_CRL)]), 2), Ok(()));
         assert_eq!(ok(&[int.clone()], &[root.clone()], Some(&[crl(REVOKED_CRL), crl(INT_CRL)]), 2), Err("certificate revoked"));
-        let last = |crls: &[Vec<u8>]| verified(&[end.clone(), int.clone()], (std::slice::from_ref(&root), Some(crls), 2), None);
+        let last = |crls: &[Crl]| verified(&[end.clone(), int.clone()], (std::slice::from_ref(&root), Some(crls), 2), None);
         assert_eq!(last(&[crl(REVOKED_CRL)]), "FAILED:certificate revoked");
         assert_eq!(last(&[crl(ROOT_CRL)]), "FAILED:unable to get certificate CRL");
         assert_eq!(last(&[crl(ROOT_CRL), crl(INT_CRL)]), "SUCCESS");
