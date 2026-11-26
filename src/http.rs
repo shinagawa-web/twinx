@@ -2126,9 +2126,10 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let sent = Sent { proxy_host: Some(host.clone()), ..Sent::default() };
     let set_body = level.proxy_set_body.as_ref().map(|b| b.render(r, &sent).into_bytes());
     let pass_body = level.proxy_pass_request_body && set_body.is_none();
+    let file = r.body_file.as_ref().filter(|_| pass_body).and_then(|f| std::fs::File::open(f).ok()).and_then(|f| Some((f.metadata().ok()?.len(), f)));
     let body = match &set_body {
         Some(b) => b.clone(),
-        None if pass_body => r.body_file.as_ref().map_or_else(|| r.body.clone(), |f| std::fs::read(f).unwrap_or_default()),
+        None if pass_body && r.body_file.is_none() => r.body.clone(),
         None => Vec::new(),
     };
     let set: Vec<(&String, String)> = level.proxy_set_header.iter().map(|(n, v)| (n, v.render(r, &sent))).collect();
@@ -2146,7 +2147,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     let length = match &set_body {
         Some(b) => Some(b.len() as u64),
         None => {
-            let had = if pass_body { body.len() as u64 } else { r.body_file.as_ref().map_or(r.body.len() as u64, |f| std::fs::metadata(f).map_or(0, |m| m.len())) };
+            let had = if pass_body { body.len() as u64 + file.as_ref().map_or(0, |f| f.0) } else { r.body_file.as_ref().map_or(r.body.len() as u64, |f| std::fs::metadata(f).map_or(0, |m| m.len())) };
             (!chunked && (pass_body || !level.proxy_h2) && (framing(r) != Ok(Some(0)) || header(r, "content-length").is_some())).then(|| had + unread.as_ref().map_or(0, |u| u.left))
         }
     };
@@ -2163,6 +2164,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
     req.push_str("\r\n");
     let mut req = if crate::vars::plain(req.as_bytes()) { req.into_bytes() } else { crate::vars::bytes(&req) };
     req.extend_from_slice(&body);
+    if let Some((n, _)) = file.as_ref().filter(|f| chunked && f.0 > 0) { req.extend_from_slice(format!("{n:x}\r\n").as_bytes()); }
     let bind = level.proxy_bind.as_ref().map(|(a, t)| (a.render(r, &Sent::default()), *t)).filter(|(a, _)| !a.is_empty());
     let Some(bind) = bind.map(|(a, t)| crate::conf::local_addr(&a).map(|a| (a, t))).map_or(Some(None), |b| b.map(Some)) else { return special(500) };
     let rate = |resp: &Response| crate::conf::size(&level.proxy_limit_rate.fixed().map_or_else(|| Cow::Owned(level.proxy_limit_rate.render(r, &Sent { upstream: resp.upstream.clone(), ..Sent::default() })), Cow::Borrowed)).unwrap_or(0);
@@ -2217,7 +2219,7 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let mut fetched = match conn {
             Ok(conn) => {
                 time[0] = Some(connecting.elapsed().as_millis());
-                fetch(conn, connecting, &req, level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints, !cacheable && !level.proxy_ignore_client_abort)).await
+                fetch(conn, connecting, (&req, file.as_ref().map(|(n, f)| (f, *n, chunked))), level, client.as_deref_mut(), (&mut time, &mut counted), &rate, unread.as_mut().filter(|_| pass_body), level.max_body, (upgrade, hints, !cacheable && !level.proxy_ignore_client_abort)).await
             }
             Err(e) => Err(e),
         };
@@ -2540,15 +2542,14 @@ fn invalid_length(headers: &[(String, String)]) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn fetch(mut conn: Conn, start: Instant, req: &[u8], level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, (upgrade, hints, watch): (bool, bool, bool)) -> Result<(Response, Option<Conn>), NoAnswer> {
+async fn fetch(mut conn: Conn, start: Instant, (req, file): (&[u8], Option<(&std::fs::File, u64, bool)>), level: &Level, mut client: Option<&mut Stream>, (time, bytes): (&mut [Option<u128>; 3], &mut [u64; 3]), rate: &dyn Fn(&Response) -> u64, unread: Option<&mut Unread>, max: u64, (upgrade, hints, watch): (bool, bool, bool)) -> Result<(Response, Option<Conn>), NoAnswer> {
     use NoAnswer::{Closed, Gone, Other, TimedOut};
     let invalid = |msg: &str| Other(format!("{msg} while {READING_HEAD}"));
     let s = &mut conn.stream;
     let (wait, send) = (Some(level.proxy_read_timeout).filter(|t| !t.is_zero()), Some(level.proxy_send_timeout).filter(|t| !t.is_zero()));
     let unsent = || conn.slot.as_ref().and_then(|slot| { let e = slot.lock().unwrap(); (!e.sent).then(|| e.moved.unwrap_or(start)) });
     let mut answer = Vec::new();
-    send_up(s, req, send).await?;
-    bytes[2] = req.len() as u64;
+    bytes[2] = send_with(s, req, file, send).await?;
     let mut cut = false;
     if let Some(u) = unread {
         let answered = match s { Stream::Tcp(tcp) => std::os::fd::AsFd::as_fd(tcp).try_clone_to_owned().ok().and_then(|fd| TcpStream::from_std(fd.into()).ok()), _ => None };
@@ -2739,6 +2740,24 @@ pub struct Unread { left: u64, chunked: Option<(Vec<u8>, usize)>, rest: Vec<u8>,
 
 fn chunk(data: &[u8]) -> Vec<u8> {
     [format!("{:x}\r\n", data.len()).as_bytes(), data, b"\r\n"].concat()
+}
+
+async fn send_with<W: AsyncWrite + Unpin>(to: &mut W, head: &[u8], file: Option<(&std::fs::File, u64, bool)>, send: Option<Duration>) -> Result<u64, NoAnswer> {
+    const PIECE: usize = 65536;
+    let Some((file, len, chunked)) = file.filter(|f| f.1 > 0) else { send_up(to, head, send).await?; return Ok(head.len() as u64) };
+    let (mut buf, mut at, mut sent) = (Vec::with_capacity(head.len() + PIECE + 2), 0, 0);
+    buf.extend_from_slice(head);
+    while at < len {
+        let from = buf.len();
+        buf.resize(from + PIECE.min((len - at) as usize), 0);
+        file.read_exact_at(&mut buf[from..], at).map_err(|_| NoAnswer::Other(String::new()))?;
+        at += (buf.len() - from) as u64;
+        if chunked && at == len { buf.extend_from_slice(b"\r\n"); }
+        send_up(to, &buf, send).await?;
+        sent += buf.len() as u64;
+        buf.clear();
+    }
+    Ok(sent)
 }
 
 async fn send_up<W: AsyncWrite + Unpin>(to: &mut W, mut data: &[u8], send: Option<Duration>) -> Result<(), NoAnswer> {
@@ -3602,7 +3621,7 @@ pub(crate) mod tests {
         let start = Instant::now();
         let s = connect(&(*addr).into(), socket, level).await.ok()?;
         time[0] = Some(start.elapsed().as_millis());
-        fetch(Conn::new(Stream::Tcp(s), start), start, b"GET / HTTP/1.0\r\n\r\n", level, None, (time, bytes), rate, None, 0, (false, false, true)).await.ok().map(|(resp, _)| resp)
+        fetch(Conn::new(Stream::Tcp(s), start), start, (b"GET / HTTP/1.0\r\n\r\n", None), level, None, (time, bytes), rate, None, 0, (false, false, true)).await.ok().map(|(resp, _)| resp)
     }
 
     #[test]
@@ -5381,7 +5400,7 @@ pub(crate) mod tests {
             let req = format!("{method} / HTTP/1.1\r\n\r\n");
             let back = block_on(async {
                 let s = connect(&addr.into(), None, &level).await.ok()?;
-                let (mut resp, conn) = fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), req.as_bytes(), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, (false, false, true)).await.ok()?;
+                let (mut resp, conn) = fetch(Conn::new(Stream::Tcp(s), Instant::now()), Instant::now(), (req.as_bytes(), None), &level, None, (&mut [None; 3], &mut [0; 3]), &|_| 0, None, 0, (false, false, true)).await.ok()?;
                 let mut up = Upstream::new(vec![crate::upstream::Peer::new(addr)]);
                 up.keepalive = Some(Default::default());
                 let up = Arc::new(up);
