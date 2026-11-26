@@ -59,7 +59,8 @@ fn load(a: &Args) -> Result<conf::Config, String> {
     main.extend(config::parse(&text, &file)?);
     if !main.iter().any(|d| d.name == "error_log") { main.extend(config::parse(&format!("error_log \"{}\" error;", a.error_log.display()), &file)?); }
     let config = conf::build(&main, &a.prefix)?;
-    spool::make_dirs(&config.temp_paths)?;
+    config.warnings.iter().for_each(|w| report("warn", w, Some(&a.prefix.join(&a.error_log))));
+    spool::make_dirs(&config.temp_paths, config.user.as_ref().map(|u| u.uid))?;
     Ok(config)
 }
 
@@ -123,6 +124,7 @@ fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], s
     let limit = config.rlimit_nofile.map(|n| libc::rlimit { rlim_cur: n, rlim_max: n });
     // SAFETY: setrlimit() only reads the structure it is given.
     if let Some(l) = limit { unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &l) }; }
+    if let Some(u) = &config.user { switch_user(config, u) }
     if let Some((dir, Err(e))) = config.working_directory.as_ref().map(|d| (d, std::env::set_current_dir(d))) {
         let reason = e.to_string().split(" (os error").next().unwrap_or_default().to_string();
         alert(config, &format!("chdir(\"{}\") failed ({}: {reason})", dir.display(), e.raw_os_error().unwrap_or(0)));
@@ -137,6 +139,18 @@ fn worker(config: &Arc<conf::Config>, listeners: &[(TcpListener, SocketAddr)], s
         if sig == SIGQUIT { http::shut_down(accepting, config.shutdown_timeout).await }
     });
     std::process::exit(0)
+}
+
+fn switch_user(config: &conf::Config, u: &conf::User) {
+    let failed = |call: String| {
+        let e = std::io::Error::last_os_error();
+        let text = e.to_string();
+        log(&config.emerg_logs, "emerg", &format!("{call} failed ({}: {})", e.raw_os_error().unwrap_or(0), text.split(" (os error").next().unwrap_or_default()));
+    };
+    // SAFETY: plain system calls with ids, and a name ended by a zero byte, that the configuration holds.
+    if unsafe { libc::setgid(u.gid) } == -1 { failed(format!("setgid({})", u.gid)); std::process::exit(2) }
+    if unsafe { libc::initgroups(u.name.as_ptr(), u.gid) } == -1 { failed(format!("initgroups({}, {})", u.name.to_string_lossy(), u.gid)) }
+    if unsafe { libc::setuid(u.uid) } == -1 { failed(format!("setuid({})", u.uid)); std::process::exit(2) }
 }
 
 fn signal_fd(set: &sigset_t) -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
@@ -186,9 +200,13 @@ fn log(logs: &[Arc<std::fs::File>], level: &str, msg: &str) {
 }
 
 fn emerg(msg: &str, log: Option<&Path>) {
-    eprintln!("twinx: [emerg] {msg}");
+    report("emerg", msg, log)
+}
+
+fn report(level: &str, msg: &str, log: Option<&Path>) {
+    eprintln!("twinx: [{level}] {msg}");
     let time = chrono::Local::now().format("%Y/%m/%d %H:%M:%S");
-    let line = format!("{time} [emerg] {}#0: {msg}\n", std::process::id());
+    let line = format!("{time} [{level}] {}#0: {msg}\n", std::process::id());
     let file = log.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
     let _ = file.map(|mut f| f.write_all(line.as_bytes()));
 }
