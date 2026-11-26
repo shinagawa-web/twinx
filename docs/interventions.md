@@ -288,3 +288,9 @@ Kinds:
 | 2026-11-26 | After stage 6 | decision | Some HTTP/2 tests are put on hold | The human could not follow the agent's explanation of them |
 | 2026-11-26 | After stage 6 | decision | Performance starts from three issues: regex built with its perf feature (#365), headers over 1 KB (#366), what made v0.5.0 cost more than v0.4.1 (#367) | Measured again after them; the human then decides what to look into further |
 | 2026-11-26 | After stage 6 | correction | The agent opened the three performance issues and then waited to be told to start | Work is started when an issue is opened; the agent does not stop during the day |
+| 2026-11-26 | After stage 6 | correction | Issues left open were not worked on | #321, #325 and #326 were started; #325 is done one file per pull request (17) |
+| 2026-11-26 | After stage 6 | decision | The performance measurements move into twinx (#379) | Low priority, when agents have nothing else |
+| 2026-11-26 | After stage 6 | approval | Auto-merge for the agent's pull requests all of 2026-11-26 | "Push them in with auto-merge" |
+| 2026-11-26 | After stage 6 | correction | An investigation was given 90 minutes and had nothing after 40 | Investigations stop at 30 minutes and report what they have (#367) |
+| 2026-11-26 | After stage 6 | decision | No scenario of twinx-perf above nginx in CPU per request, by the end of the day | Plan #397; each cause found by profiling against nginx gets an issue of its own |
+| 2026-11-26 | After stage 6 | finding | A 1 MB HIT of proxy_cache cost 2.7 times what it did in v0.5.0 | Since #344 a HIT read its whole file to check its key; #416 |
