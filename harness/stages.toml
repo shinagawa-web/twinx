@@ -149,4 +149,5 @@ files = [
   "twinx_ssl_client_sigalg.t",
   "twinx_worker_processes.t",
   "twinx_worker_restart.t",
+  "twinx_daemon.t",
 ]
