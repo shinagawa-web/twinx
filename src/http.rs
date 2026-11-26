@@ -88,6 +88,70 @@ impl Drop for Busy {
     }
 }
 
+struct Places {
+    total: usize,
+    free: usize,
+    waiting: std::collections::VecDeque<std::rc::Rc<Place>>,
+    warned: i64,
+    logs: Vec<Arc<std::fs::File>>,
+}
+
+#[derive(Debug, Default)]
+struct Place {
+    freed: std::cell::Cell<bool>,
+    close: tokio::sync::Notify,
+}
+
+#[derive(Debug)]
+pub(crate) struct Seat(std::rc::Rc<Place>);
+
+thread_local! {
+    static PLACES: RefCell<Places> = RefCell::new(Places { total: 512, free: usize::MAX, waiting: Default::default(), warned: 0, logs: Vec::new() });
+}
+
+tokio::task_local! {
+    static SEAT: Seat;
+}
+
+/// A place among worker_connections, or their number when there is none.
+pub(crate) fn seat() -> Result<Seat, usize> {
+    PLACES.with_borrow_mut(|p| {
+        if p.free <= p.total / 16 && !p.waiting.is_empty() {
+            let now = chrono::Local::now();
+            if p.warned != now.timestamp() {
+                p.warned = now.timestamp();
+                let line = format!("{} [warn] {}#0: {} worker_connections are not enough, reusing connections\n", now.format("%Y/%m/%d %H:%M:%S"), std::process::id(), p.total);
+                p.logs.iter().for_each(|f| { let _ = (&**f).write_all(line.as_bytes()); });
+            }
+            for _ in 0..(p.waiting.len() / 8).clamp(1, 32) {
+                let Some(place) = p.waiting.pop_front() else { break };
+                place.freed.set(true);
+                place.close.notify_one();
+                p.free += 1;
+            }
+        }
+        if p.free == 0 { return Err(p.total) }
+        p.free -= 1;
+        Ok(Seat(Default::default()))
+    })
+}
+
+impl Seat {
+    fn waiting(place: &std::rc::Rc<Place>, waiting: bool) {
+        PLACES.with_borrow_mut(|p| {
+            p.waiting.retain(|w| !std::rc::Rc::ptr_eq(w, place));
+            if waiting && !place.freed.get() { p.waiting.push_back(place.clone()) }
+        })
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        Seat::waiting(&self.0, false);
+        if !self.0.freed.replace(true) { PLACES.with_borrow_mut(|p| p.free += 1) }
+    }
+}
+
 pub async fn shut_down(accepting: Vec<JoinHandle<()>>, timeout: Option<Duration>) {
     let start = Instant::now();
     SHUTTING.store(true, Ordering::SeqCst);
@@ -113,6 +177,8 @@ fn number() -> u64 {
 
 pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> Result<Vec<JoinHandle<()>>, String> {
     let mut tasks = Vec::new();
+    // Each listening socket and the channel to the master take a place in nginx.
+    PLACES.with_borrow_mut(|p| (p.total, p.free, p.logs) = (config.connections, config.connections.saturating_sub(listeners.len() + 1), config.warn_logs.clone()));
     for (listener, addr) in listeners {
         // The socket keeps the options it was opened with; the event loop needs it non-blocking.
         let listener = listener.try_clone().and_then(|l| l.set_nonblocking(true).and_then(|()| tokio::net::TcpListener::from_std(l))).map_err(|e| e.to_string())?;
@@ -122,13 +188,24 @@ pub fn accept(config: Arc<Config>, listeners: &[(TcpListener, SocketAddr)]) -> R
             loop {
                 // Out of descriptors, say: accept() is tried again a little later.
                 let Ok((stream, peer)) = listener.accept().await else { tokio::time::sleep(Duration::from_millis(10)).await; continue };
+                let seat = match seat() {
+                    Ok(seat) => seat,
+                    Err(n) => { drop(stream); refused(&config, addr, n); continue }
+                };
                 let (config, fresh) = (config.clone(), Busy::new());
                 let local = if addr.ip().is_unspecified() { stream.local_addr().unwrap_or(addr) } else { addr };
-                tokio::task::spawn_local(Box::pin(serving(config, stream, tls, (addr, local, (peer, number())), fresh)));
+                tokio::task::spawn_local(SEAT.scope(seat, Box::pin(serving(config, stream, tls, (addr, local, (peer, number())), fresh))));
             }
         }));
     }
     Ok(tasks)
+}
+
+fn refused(config: &Config, addr: SocketAddr, n: usize) {
+    let Some(server) = config.servers.iter().find(|s| s.listen.contains(&addr)) else { return };
+    let line = format!("{} [alert] {}#0: {n} worker_connections are not enough\n", chrono::Local::now().format("%Y/%m/%d %H:%M:%S"), std::process::id());
+    let alert = crate::conf::LEVELS.iter().position(|l| *l == "alert");
+    server.level.error_log.iter().filter(|l| alert >= Some(l.1)).for_each(|l| { let _ = (&*l.0).write_all(line.as_bytes()); });
 }
 
 /// Kept small, as it is copied when made, spawned and done: what few connections use is boxed where it is awaited.
@@ -234,7 +311,12 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             }
             let first = buf.is_empty();
             let wait = idle.filter(|_| first);
-            if read_until(&mut stream, &mut buf, &mut timer, || wait.and_then(|t| crate::clock::coarse().checked_add(t))).await == 0 { return; }
+            let place = SEAT.try_with(|s| s.0.clone()).ok().filter(|_| first && !matches!(stream, Stream::Pipe(_)));
+            place.iter().for_each(|p| Seat::waiting(p, true));
+            let read = read_until(&mut stream, &mut buf, &mut timer, || wait.and_then(|t| crate::clock::coarse().checked_add(t)));
+            let got = match &place { Some(p) => tokio::select! { n = read => n, () = p.close.notified() => 0 }, None => read.await };
+            place.iter().for_each(|p| Seat::waiting(p, false));
+            if got == 0 { return; }
             if first { started = Instant::now(); }
         };
         if requests == 1 && ssl.is_none() && !to_https && http2(config, listen, default) && buf.starts_with(b"PRI * HTTP/2.0\r\n") && !matches!(stream, Stream::Pipe(_)) {
@@ -2111,7 +2193,13 @@ async fn proxy(p: &Proxy, level: &Level, r: &Request, prefix: &str, mut client: 
         let connecting = Instant::now();
         let conn = match taken {
             Some(conn) => Ok(conn),
-            None => connect(&addr, socket.flatten(), level).await.map(|s| Conn::new(Stream::Tcp(s), connecting)),
+            None => {
+                let seat = match seat() {
+                    Ok(seat) => seat,
+                    Err(n) => { log_at(level, r, "alert", &format!("{n} worker_connections are not enough while {CONNECTING}"), &url(&addr, &uri)); return special(500) }
+                };
+                connect(&addr, socket.flatten(), level).await.map(|s| { let mut c = Conn::new(Stream::Tcp(s), connecting); c.seat = Some(seat); c })
+            }
         };
         let conn = match (conn, &tls) {
             (Ok(conn), Some(tls)) if level.proxy_h2 => secure(conn, &addr, (&crate::tls::h2(tls), name.as_deref()), level).await,
