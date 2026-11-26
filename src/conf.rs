@@ -910,14 +910,16 @@ impl Builder<'_> {
                 "ssl_conf_command" => commands.get_or_insert_default().push((d.args[0].clone(), if ["Certificate", "PrivateKey"].contains(&d.args[0].as_str()) { self.path(&d.args[1]).to_string_lossy().into_owned() } else { d.args[1].clone() })),
                 "ssl_session_cache" => {
                     if let Some(a) = d.args.iter().find(|a| !(["off", "none", "builtin"].contains(&a.as_str()) || a.starts_with("builtin:") || a.starts_with("shared:") && a.matches(':').count() == 2)) { return Err(at(format!("invalid session cache \"{a}\""))); }
+                    let mut zone = None;
                     for (a, (name, n)) in d.args.iter().filter_map(|a| Some((a, a.strip_prefix("shared:")?.split_once(':')?))) {
                         let n = size(n).map_err(|_| at(format!("invalid session cache \"{a}\"")))?;
                         if n < 8 * page_size() { return Err(at(format!("session cache \"{a}\" is too small"))); }
                         let declared = *self.ssl_zones.entry(name.to_string()).or_insert(n);
                         if declared != n { return Err(at(format!("the size {n} of shared memory zone \"{name}\" conflicts with already declared size {declared}"))); }
+                        zone = Some(crate::shm::zone(name, n).map_err(at)?);
                     }
                     level.ssl_sessions.cache = d.args.iter().all(|a| a != "off" && a != "none");
-                    level.ssl_sessions.shared = level.ssl_sessions.cache && d.args.iter().any(|a| a.starts_with("shared:"));
+                    level.ssl_sessions.zone = zone.filter(|_| level.ssl_sessions.cache);
                 }
                 "ssl_session_ticket_key" => ticket_keys.get_or_insert_default().push(self.path(&d.args[0])),
                 "ssl_session_tickets" => level.ssl_sessions.tickets = flag(d).map_err(at)?,
@@ -2020,7 +2022,7 @@ mod tests {
     #[test]
     fn shared_session_caches() {
         let c = build_text("http { server { ssl_session_cache builtin shared:SSL:1m; } server { ssl_session_cache builtin; } server { ssl_session_cache none; } }").unwrap();
-        assert_eq!(c.servers.iter().map(|s| s.level.ssl_sessions.shared).collect::<Vec<_>>(), [true, false, false]);
+        assert_eq!(c.servers.iter().map(|s| s.level.ssl_sessions.zone.is_some()).collect::<Vec<_>>(), [true, false, false]);
     }
 
     #[test]
