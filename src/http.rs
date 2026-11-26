@@ -206,7 +206,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
     let mut fresh = Some(fresh);
     let mut buf = Vec::new();
     let ((connected, mut requests), mut idle) = (origin.as_ref().map_or((Instant::now(), 0), |o| (o.connected, o.number - 1)), None);
-    let mut piped = false;
+    let (mut piped, mut nodelay) = (false, false);
     let to_https = ssl.is_none() && !matches!(stream, Stream::Pipe(_)) && config.servers.iter().any(|s| s.ssl.contains(&listen));
     if ssl.as_ref().is_some_and(|s| s.alpn == "h2") && !matches!(stream, Stream::Pipe(_)) {
         return Box::pin(crate::h2::serve(config.clone(), stream, buf, (listen, local, peer, ssl), fresh.take())).await;
@@ -258,7 +258,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
             upstream_status: None,
             upstream: Vec::new(),
             captures: Vec::new(),
-            shared: Arc::new(crate::vars::Shared { number: peer.1, fd: stream.tcp().map(std::os::fd::AsRawFd::as_raw_fd), ..Default::default() }),
+            shared: Arc::new(crate::vars::Shared { number: peer.1, fd: stream.tcp().map(std::os::fd::AsRawFd::as_raw_fd), nodelay: AtomicBool::new(nodelay), ..Default::default() }),
             ssl: ssl.clone(),
         };
         let parsed = parse(&mut r, &buf[..end], &default.level, matches!(stream, Stream::Pipe(_)));
@@ -330,6 +330,7 @@ pub(crate) async fn connection(config: &Arc<Config>, mut stream: Stream, (listen
         let busy = Busy::new();
         drop(fresh.take());
         idle = exchange(&mut stream, server, &r, parsed, found, local, &buf).await;
+        nodelay = r.shared.nodelay.load(Ordering::Relaxed);
         drop(busy);
         let background = r.shared.background.lock().unwrap().take();
         if let Some(update) = background { let _ = update.await; }
@@ -612,7 +613,7 @@ async fn send_file<E: FnOnce(&Response, &mut Vec<u8>) -> Vec<(String, String)>>(
                 in_chunk(chunked, part.len(), &mut size, &mut tail);
                 if let Some(ending) = ending.take_if(|_| chunked && last) { trailers = ending(resp, &mut tail); }
                 if last || !part.is_empty() {
-                    if let Some(tcp) = stream.tcp().filter(|_| last && asked.1.tcp_nodelay) { let _ = tcp.set_nodelay(true); }
+                    if let Some(tcp) = stream.tcp().filter(|_| last && asked.1.tcp_nodelay) { set_nodelay(tcp, asked.0); }
                     let (before, sent) = (pace.sent, send_watched(stream, &[head, &size, part, &tail], &mut pace, time).await);
                     passed += (pace.sent - before).saturating_sub(head.len() + size.len()).min(part.len());
                     if !sent || last { return sent }
@@ -677,8 +678,12 @@ async fn send_direct(stream: &Stream, (before, after): (&[&[u8]; 2], &[u8]), fil
     if level.tcp_nopush { let _ = socket.set_tcp_cork(true); }
     let sent = tokio::select! { biased; sent = sent => sent, () = crate::stream::closed(tcp) => false };
     if level.tcp_nopush { let _ = socket.set_tcp_cork(false); }
-    if level.tcp_nodelay { let _ = tcp.set_nodelay(true); }
+    if level.tcp_nodelay { set_nodelay(tcp, r); }
     sent
+}
+
+fn set_nodelay(tcp: &TcpStream, r: &Request) {
+    if !r.shared.nodelay.load(Ordering::Relaxed) && tcp.set_nodelay(true).is_ok() { r.shared.nodelay.store(true, Ordering::Relaxed); }
 }
 
 #[derive(Debug)]
@@ -1497,7 +1502,7 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
                 if !send(stream, &[head, &size, part, &tail], pace, time).await { return Some(false) }
                 *passed += part.len();
                 if let Some(c) = &mut coder { c.written(); }
-                if let Some(tcp) = stream.tcp().filter(|_| level.tcp_nodelay) { let _ = tcp.set_nodelay(true); }
+                if let Some(tcp) = stream.tcp().filter(|_| level.tcp_nodelay) { set_nodelay(tcp, of.1); }
                 head = &[];
             }
             unless_aborted(level, stream, incoming.next(true)).await?;
@@ -1563,7 +1568,7 @@ async fn pass_pieces(stream: &mut Stream, (rest, read, passed): (&mut Option<Box
                 };
                 *passed += (pace.sent - before).saturating_sub(lead).min(length);
                 if let Err(written) = written { return written }
-                if let Some(tcp) = stream.tcp().filter(|_| level.tcp_nodelay && !head.is_empty() && !last) { let _ = tcp.set_nodelay(true); }
+                if let Some(tcp) = stream.tcp().filter(|_| level.tcp_nodelay && !head.is_empty() && !last) { set_nodelay(tcp, of.1); }
                 head = &[];
             }
             match &mut coder { Some(c) => c.written(), None => release(&mut incoming.buffers, &mut lent, owned, end) }

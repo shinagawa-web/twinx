@@ -23,6 +23,7 @@ pub struct Shared {
     pub fd: Option<i32>,
     pub completion: std::sync::OnceLock<bool>,
     pub gzip: std::sync::Mutex<Option<(u64, u64)>>,
+    pub nodelay: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Default)]
