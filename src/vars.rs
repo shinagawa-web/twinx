@@ -392,7 +392,7 @@ impl Var {
             Var::Http2 => (if !r.line.ends_with(" HTTP/2.0") { "" } else if r.ssl.is_some() { "h2" } else { "h2c" }).to_string(),
             Var::ServerProtocol => r.line.split(' ').filter(|w| !w.is_empty()).nth(2).unwrap_or_default().to_string(),
             Var::SslProtocol => r.ssl.as_ref()?.protocol.clone(),
-            Var::SslServerName => r.ssl.as_ref()?.server_name.clone(),
+            Var::SslServerName => r.ssl.as_ref().map(|s| s.resumed_name.clone().unwrap_or_else(|| s.server_name.clone()))?,
             Var::SslSessionReused => (if r.ssl.as_ref()?.reused { "r" } else { "." }).to_string(),
             Var::SslClientVerify => r.ssl.as_ref()?.verify.clone(),
             Var::SslClientSDn => r.ssl.as_ref()?.subject.clone()?,
