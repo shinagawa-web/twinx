@@ -81,6 +81,10 @@ The human includes the Claude Code session the human instructs; the loop is the 
 
 Every intervention adds one row to `docs/interventions.md`. Decisions made before the experiment starts are recorded there too, as human decisions.
 
+## Installing
+
+Each release publishes a container image used as the official `nginx` image is (`docs/container.md`).
+
 ## Out of scope
 
 - nginx's C modules and Lua (lua-nginx-module)
