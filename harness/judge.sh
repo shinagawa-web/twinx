@@ -38,7 +38,7 @@ cargo_in() {
   fi
   docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
     --network "$([ "$network" = net ] && echo bridge || echo none)" \
-    -e HOME=/tmp -e CARGO_HOME=/cargo -e RUSTFLAGS="$rustflags" --tmpfs /tmp:rw,exec "${profiles[@]}" \
+    -e HOME=/tmp -e CARGO_HOME=/cargo -e CARGO_PROFILE_RELEASE_LTO=false -e RUSTFLAGS="$rustflags" --tmpfs /tmp:rw,exec "${profiles[@]}" \
     -v "$JUDGE_DIR/cargo:/cargo" -v "$tree:$tree" -w "$tree" "$IMAGE" cargo "$@"
 }
 
