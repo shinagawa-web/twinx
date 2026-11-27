@@ -1,0 +1,3817 @@
+{
+ "tag": "v0.6.0",
+ "date": "2026-11-26",
+ "nginx": "nginx version: nginx/1.30.6",
+ "machine": {
+  "cache": {
+   "arch": "aarch64",
+   "cpu": "implementer 0x41 part 0xd49",
+   "server_cpus": [
+    0
+   ],
+   "load_cpus": [
+    1,
+    2,
+    3
+   ]
+  },
+  "config": {
+   "arch": "aarch64",
+   "cpu": "implementer 0x41 part 0xd49",
+   "server_cpus": [
+    0
+   ],
+   "load_cpus": [
+    1,
+    2,
+    3
+   ]
+  },
+  "files": {
+   "arch": "aarch64",
+   "cpu": "implementer 0x41 part 0xd49",
+   "server_cpus": [
+    0
+   ],
+   "load_cpus": [
+    1,
+    2,
+    3
+   ]
+  },
+  "http": {
+   "arch": "aarch64",
+   "cpu": "implementer 0x41 part 0xd49",
+   "server_cpus": [
+    0
+   ],
+   "load_cpus": [
+    1,
+    2,
+    3
+   ]
+  },
+  "http2": {
+   "arch": "aarch64",
+   "cpu": "implementer 0x41 part 0xd49",
+   "server_cpus": [
+    0
+   ],
+   "load_cpus": [
+    1,
+    2,
+    3
+   ]
+  },
+  "latency": {
+   "arch": "aarch64",
+   "cpu": "implementer 0x41 part 0xd49",
+   "server_cpus": [
+    0
+   ],
+   "load_cpus": [
+    1,
+    2,
+    3
+   ]
+  },
+  "memory": {
+   "arch": "aarch64",
+   "cpu": "implementer 0x41 part 0xd49",
+   "server_cpus": [
+    0
+   ],
+   "load_cpus": [
+    1,
+    2,
+    3
+   ]
+  },
+  "proxy": {
+   "arch": "aarch64",
+   "cpu": "implementer 0x41 part 0xd49",
+   "server_cpus": [
+    0
+   ],
+   "load_cpus": [
+    1,
+    2,
+    3
+   ]
+  },
+  "tls": {
+   "arch": "aarch64",
+   "cpu": "implementer 0x41 part 0xd49",
+   "server_cpus": [
+    0
+   ],
+   "load_cpus": [
+    1,
+    2,
+    3
+   ]
+  },
+  "upstreams": {
+   "arch": "aarch64",
+   "cpu": "implementer 0x41 part 0xd49",
+   "server_cpus": [
+    0
+   ],
+   "load_cpus": [
+    1,
+    2,
+    3
+   ]
+  }
+ },
+ "scenarios": {
+  "return, 64 connections": {
+   "definition": "b8df180d3aaf7d73",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 452860,
+     "rps": 146109.0,
+     "mb_per_s": 21.92,
+     "p50_ms": 0.426,
+     "p90_ms": 0.454,
+     "p99_ms": 0.5,
+     "max_ms": 9.861,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 62,
+     "peak_send_q_kb": 3.4,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.57,
+     "system_seconds": 2.52,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 6.845,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.052
+    }
+   }
+  },
+  "return, 1000 connections": {
+   "definition": "1084cd02b144f2bf",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 404402,
+     "rps": 132840.3,
+     "mb_per_s": 19.93,
+     "p50_ms": 7.315,
+     "p90_ms": 7.711,
+     "p99_ms": 8.809,
+     "max_ms": 126.07,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 15.2,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 44.8,
+     "peak_connections_unread": 997,
+     "peak_send_q_kb": 2.3,
+     "cpu_seconds": 3.01,
+     "user_seconds": 0.57,
+     "system_seconds": 2.44,
+     "cpu_percent": 98.6,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 7.443,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.129
+    }
+   }
+  },
+  "return, a new connection per request, 64 connections": {
+   "definition": "0ccc6853fcd4ff5b",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "close"
+    },
+    "median": {
+     "requests": 196895,
+     "rps": 64978.4,
+     "mb_per_s": 9.42,
+     "p50_ms": 0.857,
+     "p90_ms": 1.008,
+     "p99_ms": 3.252,
+     "max_ms": 9.217,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 50,
+     "peak_recv_q_kb": 1.8,
+     "peak_connections_unread": 28,
+     "peak_send_q_kb": 0.1,
+     "cpu_seconds": 2.97,
+     "user_seconds": 0.4,
+     "system_seconds": 2.58,
+     "cpu_percent": 98.1,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 15.103,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.041
+    }
+   }
+  },
+  "return, 64 connections, beside 1000 slow clients": {
+   "definition": "d6047d8bedbedb29",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 440098,
+     "rps": 141979.6,
+     "mb_per_s": 21.3,
+     "p50_ms": 0.44,
+     "p90_ms": 0.465,
+     "p99_ms": 0.543,
+     "max_ms": 11.656,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "slow_connected": 1000,
+     "slow_kept_open": 1000,
+     "peak_rss_mb": 24.1,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 1.9,
+     "cpu_seconds": 3.12,
+     "user_seconds": 0.61,
+     "system_seconds": 2.51,
+     "cpu_percent": 67.2,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "regex location, rewrite and variables": {
+   "definition": "25f2c7ed9b7fed0e",
+   "nginx": {
+    "idle_rss_mb": 14.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 19,
+     "x-a": "127.0.0.1-12-12"
+    },
+    "median": {
+     "requests": 381731,
+     "rps": 123170.7,
+     "mb_per_s": 23.28,
+     "p50_ms": 0.509,
+     "p90_ms": 0.537,
+     "p99_ms": 0.585,
+     "max_ms": 12.052,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 15.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 3.0,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 1.7,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.81,
+     "system_seconds": 2.28,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 8.121,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.077
+    }
+   }
+  },
+  "one of 200 locations": {
+   "definition": "945da651263010b4",
+   "nginx": {
+    "idle_rss_mb": 17.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 7
+    },
+    "median": {
+     "requests": 433622,
+     "rps": 139905.7,
+     "mb_per_s": 21.54,
+     "p50_ms": 0.448,
+     "p90_ms": 0.477,
+     "p99_ms": 0.525,
+     "max_ms": 11.11,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 17.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 2.9,
+     "peak_connections_unread": 62,
+     "peak_send_q_kb": 2.4,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.58,
+     "system_seconds": 2.52,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 7.149,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.056
+    }
+   }
+  },
+  "one of 200 server names": {
+   "definition": "38641363242d66b5",
+   "nginx": {
+    "idle_rss_mb": 19.8,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 7
+    },
+    "median": {
+     "requests": 442770,
+     "rps": 143325.2,
+     "mb_per_s": 22.07,
+     "p50_ms": 0.44,
+     "p90_ms": 0.461,
+     "p99_ms": 0.481,
+     "max_ms": 4.117,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 20.1,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2.1,
+     "peak_connections_unread": 62,
+     "peak_send_q_kb": 2.3,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.56,
+     "system_seconds": 2.54,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 6.962,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.009
+    }
+   }
+  },
+  "return, access_log on": {
+   "definition": "7d997a20dba8c9ed",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 381514,
+     "rps": 123075.5,
+     "mb_per_s": 18.46,
+     "p50_ms": 0.509,
+     "p90_ms": 0.536,
+     "p99_ms": 0.58,
+     "max_ms": 13.327,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 62,
+     "peak_send_q_kb": 2.5,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.6,
+     "system_seconds": 2.49,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 8.126,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.018
+    }
+   }
+  },
+  "one of 50 regex locations": {
+   "definition": "33f8b4954a8b5ebe",
+   "nginx": {
+    "idle_rss_mb": 15.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 6
+    },
+    "median": {
+     "requests": 276658,
+     "rps": 90508.2,
+     "mb_per_s": 13.85,
+     "p50_ms": 0.691,
+     "p90_ms": 0.731,
+     "p99_ms": 0.781,
+     "max_ms": 19.105,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 16.5,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 3.0,
+     "cpu_seconds": 3.1,
+     "user_seconds": 1.32,
+     "system_seconds": 1.79,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 11.077,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.041
+    }
+   }
+  },
+  "one of 50 wildcard and 50 regex server names": {
+   "definition": "05dd36a09e9c65cd",
+   "nginx": {
+    "idle_rss_mb": 17.3,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 5
+    },
+    "median": {
+     "requests": 288903,
+     "rps": 93201.8,
+     "mb_per_s": 14.17,
+     "p50_ms": 0.674,
+     "p90_ms": 0.695,
+     "p99_ms": 0.719,
+     "max_ms": 7.274,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 18.5,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2.2,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 0.9,
+     "cpu_seconds": 3.1,
+     "user_seconds": 1.31,
+     "system_seconds": 1.79,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 10.765,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.03
+    }
+   }
+  },
+  "error_page, to an internal redirect": {
+   "definition": "6c1c4462b37194d3",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 419447,
+     "rps": 135330.5,
+     "mb_per_s": 20.3,
+     "p50_ms": 0.462,
+     "p90_ms": 0.495,
+     "p99_ms": 0.534,
+     "max_ms": 12.351,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 2.7,
+     "peak_connections_unread": 62,
+     "peak_send_q_kb": 3.2,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.57,
+     "system_seconds": 2.53,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 7.391,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.019
+    }
+   }
+  },
+  "return, 18 headers and a 1 KB cookie": {
+   "definition": "93736c89b7c01949",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 264538,
+     "rps": 85456.7,
+     "mb_per_s": 12.82,
+     "p50_ms": 0.73,
+     "p90_ms": 0.767,
+     "p99_ms": 0.835,
+     "max_ms": 18.434,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 19.9,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 109.6,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 0.9,
+     "cpu_seconds": 3.1,
+     "user_seconds": 1.18,
+     "system_seconds": 1.92,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 11.681,
+     "rss_growth_mb": 0.6,
+     "cpu_spread": 0.023
+    }
+   }
+  },
+  "return, access_log to a path with a variable": {
+   "definition": "b8d4e44a8209eb67",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 230552,
+     "rps": 75564.5,
+     "mb_per_s": 11.33,
+     "p50_ms": 0.83,
+     "p90_ms": 0.857,
+     "p99_ms": 0.898,
+     "max_ms": 21.065,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 32,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 1.2,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.49,
+     "system_seconds": 2.59,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 13.192,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.064
+    }
+   }
+  },
+  "return, access_log with a log_format of 12 variables": {
+   "definition": "e09e870560946c9f",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 369591,
+     "rps": 119233.1,
+     "mb_per_s": 17.88,
+     "p50_ms": 0.524,
+     "p90_ms": 0.558,
+     "p99_ms": 0.602,
+     "max_ms": 13.193,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 2.1,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.64,
+     "system_seconds": 2.47,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 8.415,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.06
+    }
+   }
+  },
+  "index, alias, if and expires": {
+   "definition": "50f360e5032db6d3",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 4096,
+     "connection": "keep-alive",
+     "cache-control": "max-age=3600"
+    },
+    "median": {
+     "requests": 163337,
+     "rps": 52700.9,
+     "mb_per_s": 232.15,
+     "p50_ms": 1.182,
+     "p90_ms": 1.262,
+     "p99_ms": 1.341,
+     "max_ms": 28.942,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 2.7,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 12.9,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.51,
+     "system_seconds": 2.57,
+     "cpu_percent": 99.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 18.918,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.103
+    }
+   }
+  },
+  "static 1m with sendfile": {
+   "definition": "8a83e6bb0f17e9ee",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 1048576,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 32895,
+     "rps": 10860.9,
+     "mb_per_s": 11391.34,
+     "p50_ms": 3.629,
+     "p90_ms": 5.314,
+     "p99_ms": 7.666,
+     "max_ms": 13.259,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.4,
+     "peak_connections_unread": 8,
+     "peak_send_q_kb": 42960.7,
+     "cpu_seconds": 2.36,
+     "user_seconds": 0.09,
+     "system_seconds": 2.27,
+     "cpu_percent": 77.9,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 3732,
+     "cpu_ms_per_1k_requests": 71.84,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.01
+    }
+   }
+  },
+  "return, add_header of the server and the location, add_header_inherit merge": {
+   "definition": "17538f47931d1d00",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive",
+     "x-s": "s",
+     "x-l": "l"
+    },
+    "median": {
+     "requests": 431576,
+     "rps": 139218.1,
+     "mb_per_s": 23.11,
+     "p50_ms": 0.45,
+     "p90_ms": 0.474,
+     "p99_ms": 0.52,
+     "max_ms": 11.388,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 62,
+     "peak_send_q_kb": 4.1,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.56,
+     "system_seconds": 2.54,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 7.206,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.054
+    }
+   }
+  },
+  "static 1m, 64 connections": {
+   "definition": "bcbda17b2bfb1424",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 1048576,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 9719,
+     "rps": 3139.1,
+     "mb_per_s": 3292.32,
+     "p50_ms": 19.944,
+     "p90_ms": 20.311,
+     "p99_ms": 20.772,
+     "max_ms": 233.401,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 3.3,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 128.0,
+     "cpu_seconds": 3.02,
+     "user_seconds": 0.19,
+     "system_seconds": 2.83,
+     "cpu_percent": 100.0,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 5,
+     "cpu_ms_per_1k_requests": 318.032,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.072
+    }
+   }
+  },
+  "static 4k": {
+   "definition": "ef964b9897e6c366",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 4096,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 250453,
+     "rps": 81243.1,
+     "mb_per_s": 352.35,
+     "p50_ms": 0.774,
+     "p90_ms": 0.811,
+     "p99_ms": 0.879,
+     "max_ms": 19.071,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 3.3,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 55.1,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.56,
+     "system_seconds": 2.53,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 12.313,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.089
+    }
+   }
+  },
+  "try_files, to a 4k file": {
+   "definition": "a34843ed5a5724eb",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 4096,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 193620,
+     "rps": 62476.8,
+     "mb_per_s": 270.96,
+     "p50_ms": 1.0,
+     "p90_ms": 1.052,
+     "p99_ms": 1.153,
+     "max_ms": 25.69,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 13,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 16.9,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.5,
+     "system_seconds": 2.59,
+     "cpu_percent": 99.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 15.959,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.108
+    }
+   }
+  },
+  "range, 4k of 1m": {
+   "definition": "12119c906b5cdd74",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 206,
+     "length": 4096,
+     "content-range": "bytes 1000-5095/1048576"
+    },
+    "median": {
+     "requests": 240267,
+     "rps": 78442.1,
+     "mb_per_s": 342.79,
+     "p50_ms": 0.8,
+     "p90_ms": 0.826,
+     "p99_ms": 0.902,
+     "max_ms": 20.45,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 10,
+     "peak_recv_q_kb": 4.7,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 76.8,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.58,
+     "system_seconds": 2.5,
+     "cpu_percent": 99.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 12.707,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.041
+    }
+   }
+  },
+  "304": {
+   "definition": "8b228f4f8ffa808f",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 304,
+     "length": 0,
+     "last-modified": "Thu, 01 Jan 2026 00:00:00 GMT"
+    },
+    "median": {
+     "requests": 302081,
+     "rps": 97463.6,
+     "mb_per_s": 17.64,
+     "p50_ms": 0.643,
+     "p90_ms": 0.674,
+     "p99_ms": 0.729,
+     "max_ms": 16.438,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 6.3,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 2.5,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.57,
+     "system_seconds": 2.53,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 10.262,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.069
+    }
+   }
+  },
+  "gzip, 64k of text": {
+   "definition": "dcf22a8b31b96f5d",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "content-encoding": "gzip"
+    },
+    "median": {
+     "requests": 10948,
+     "rps": 3624.3,
+     "mb_per_s": 53.0,
+     "p50_ms": 17.278,
+     "p90_ms": 17.489,
+     "p99_ms": 208.669,
+     "max_ms": 443.274,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 15.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 16,
+     "peak_recv_q_kb": 4.7,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 14.3,
+     "cpu_seconds": 3.02,
+     "user_seconds": 2.69,
+     "system_seconds": 0.32,
+     "cpu_percent": 99.7,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 276.582,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.025
+    }
+   }
+  },
+  "gunzip, 64k of text": {
+   "definition": "56e77f17f7ded692",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 65536,
+     "content-encoding": null
+    },
+    "median": {
+     "requests": 22281,
+     "rps": 7412.4,
+     "mb_per_s": 487.57,
+     "p50_ms": 8.479,
+     "p90_ms": 8.612,
+     "p99_ms": 9.433,
+     "max_ms": 139.395,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 15.5,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 3.3,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 92.7,
+     "cpu_seconds": 3.02,
+     "user_seconds": 2.19,
+     "system_seconds": 0.83,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 25,
+     "cpu_ms_per_1k_requests": 134.644,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.039
+    }
+   }
+  },
+  "gzip_static, 64k of text": {
+   "definition": "f25f622383d3a1f6",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 12503,
+     "content-encoding": "gzip"
+    },
+    "median": {
+     "requests": 217600,
+     "rps": 70204.5,
+     "mb_per_s": 896.44,
+     "p50_ms": 0.893,
+     "p90_ms": 0.93,
+     "p99_ms": 1.012,
+     "max_ms": 23.156,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 4.7,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 212.0,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.52,
+     "system_seconds": 2.57,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 14.239,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.054
+    }
+   }
+  },
+  "proxy, 64 connections": {
+   "definition": "3196f5ea4fe80099",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 179514,
+     "rps": 57911.5,
+     "mb_per_s": 14.42,
+     "p50_ms": 1.046,
+     "p90_ms": 1.223,
+     "p99_ms": 1.748,
+     "max_ms": 9.776,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.046,
+     "peak_rss_mb": 15.4,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.5,
+     "peak_connections_unread": 33,
+     "peak_send_q_kb": 1.7,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.66,
+     "system_seconds": 2.44,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 17.325,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.098
+    }
+   }
+  },
+  "proxy to an upstream answering after 100 ms, 1000 connections": {
+   "definition": "45115f172fd82cf4",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 28833,
+     "rps": 9440.1,
+     "mb_per_s": 2.11,
+     "p50_ms": 100.962,
+     "p90_ms": 102.493,
+     "p99_ms": 136.971,
+     "max_ms": 141.534,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.076,
+     "peak_rss_mb": 24.2,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.5,
+     "peak_connections_unread": 10,
+     "peak_send_q_kb": 0.4,
+     "cpu_seconds": 0.66,
+     "user_seconds": 0.16,
+     "system_seconds": 0.5,
+     "cpu_percent": 21.4,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 22.89,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.057
+    }
+   }
+  },
+  "proxy, 1m answer": {
+   "definition": "facf3001d5f8e3e3",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 1048576,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 3495,
+     "rps": 1160.7,
+     "mb_per_s": 1223.96,
+     "p50_ms": 56.013,
+     "p90_ms": 68.953,
+     "p99_ms": 81.287,
+     "max_ms": 204.342,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.008,
+     "peak_rss_mb": 17.0,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.9,
+     "peak_connections_unread": 21,
+     "peak_send_q_kb": 384.0,
+     "cpu_seconds": 3.02,
+     "user_seconds": 0.23,
+     "system_seconds": 2.78,
+     "cpu_percent": 99.7,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 3434,
+     "cpu_ms_per_1k_requests": 861.23,
+     "rss_growth_mb": -0.1,
+     "cpu_spread": 0.046
+    }
+   }
+  },
+  "proxy, 64k POST": {
+   "definition": "60cfcc7529c88337",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 30919,
+     "rps": 10016.7,
+     "mb_per_s": 2.49,
+     "p50_ms": 6.115,
+     "p90_ms": 6.444,
+     "p99_ms": 9.907,
+     "max_ms": 81.557,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.01,
+     "peak_rss_mb": 15.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2498.6,
+     "peak_connections_unread": 39,
+     "peak_send_q_kb": 0.5,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.4,
+     "system_seconds": 2.69,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 37,
+     "cpu_ms_per_1k_requests": 99.845,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.083
+    }
+   }
+  },
+  "proxy, next_upstream": {
+   "definition": "6e6a615f51b42ff8",
+   "nginx": {
+    "idle_rss_mb": 14.6,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 108670,
+     "rps": 35056.8,
+     "mb_per_s": 8.73,
+     "p50_ms": 1.535,
+     "p90_ms": 2.185,
+     "p99_ms": 2.294,
+     "max_ms": 15.129,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.001,
+     "peak_rss_mb": 15.5,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.3,
+     "peak_connections_unread": 30,
+     "peak_send_q_kb": 4.1,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.6,
+     "system_seconds": 2.5,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 28.527,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.06
+    }
+   }
+  },
+  "WebSocket, 125 bytes there and back": {
+   "definition": "817d744320b6a717",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 101,
+     "echoed": 125
+    },
+    "median": {
+     "requests": 248030,
+     "rps": 82638.8,
+     "p50_ms": 0.657,
+     "p90_ms": 1.477,
+     "p99_ms": 1.607,
+     "max_ms": 2.673,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 15.9,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.6,
+     "peak_connections_unread": 5,
+     "peak_send_q_kb": 7.4,
+     "cpu_seconds": 2.39,
+     "user_seconds": 0.22,
+     "system_seconds": 2.17,
+     "cpu_percent": 77.3,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 9.636,
+     "rss_growth_mb": -0.5,
+     "cpu_spread": 0.034
+    }
+   }
+  },
+  "proxy, 18 request headers, 4 set, 15 in the answer": {
+   "definition": "93092f1dd3d6489c",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive",
+     "x-h15": "fifteen"
+    },
+    "median": {
+     "requests": 125007,
+     "rps": 40325.2,
+     "mb_per_s": 19.36,
+     "p50_ms": 1.494,
+     "p90_ms": 1.699,
+     "p99_ms": 2.493,
+     "max_ms": 17.396,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.051,
+     "peak_rss_mb": 23.4,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 63.4,
+     "peak_connections_unread": 37,
+     "peak_send_q_kb": 1.9,
+     "cpu_seconds": 3.11,
+     "user_seconds": 1.11,
+     "system_seconds": 2.0,
+     "cpu_percent": 100.1,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 24.754,
+     "rss_growth_mb": 2.5,
+     "cpu_spread": 0.021
+    }
+   }
+  },
+  "proxy to an address in a variable": {
+   "definition": "4cc152ad28e339fe",
+   "nginx": {
+    "idle_rss_mb": 15.1,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 73724,
+     "rps": 24009.8,
+     "mb_per_s": 5.98,
+     "p50_ms": 2.614,
+     "p90_ms": 2.707,
+     "p99_ms": 2.832,
+     "max_ms": 23.585,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 1.001,
+     "peak_rss_mb": 16.0,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.4,
+     "peak_connections_unread": 32,
+     "peak_send_q_kb": 0.7,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.42,
+     "system_seconds": 2.63,
+     "cpu_percent": 99.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 41.631,
+     "rss_growth_mb": -0.0,
+     "cpu_spread": 0.025
+    }
+   }
+  },
+  "proxy, cookies, redirects and headers rewritten": {
+   "definition": "64bd7dc0c5758438",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive",
+     "x-hidden": null,
+     "location": "http://outer/x",
+     "set-cookie": "a=1; Domain=outer.test; Path=/out/x; Secure; HttpOnly"
+    },
+    "median": {
+     "requests": 171778,
+     "rps": 55531.4,
+     "mb_per_s": 18.99,
+     "p50_ms": 1.102,
+     "p90_ms": 1.256,
+     "p99_ms": 1.829,
+     "max_ms": 10.745,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.042,
+     "peak_rss_mb": 15.4,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.6,
+     "peak_connections_unread": 34,
+     "peak_send_q_kb": 2.0,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.77,
+     "system_seconds": 2.32,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 17.941,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.042
+    }
+   }
+  },
+  "proxy, errors answered by error_page": {
+   "definition": "fa135cf4e14d70ff",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 74731,
+     "rps": 24669.2,
+     "mb_per_s": 3.7,
+     "p50_ms": 2.552,
+     "p90_ms": 2.637,
+     "p99_ms": 2.761,
+     "max_ms": 21.152,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 1.001,
+     "peak_rss_mb": 15.4,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.6,
+     "peak_connections_unread": 34,
+     "peak_send_q_kb": 0.3,
+     "cpu_seconds": 3.0,
+     "user_seconds": 0.39,
+     "system_seconds": 2.62,
+     "cpu_percent": 99.3,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 40.411,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.042
+    }
+   }
+  },
+  "proxy, 1m answer, proxy_buffering off": {
+   "definition": "7ed647d7bd51e922",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 1048576,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 2091,
+     "rps": 680.4,
+     "mb_per_s": 722.19,
+     "p50_ms": 93.578,
+     "p90_ms": 95.248,
+     "p99_ms": 100.108,
+     "max_ms": 208.167,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.021,
+     "peak_rss_mb": 15.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.6,
+     "peak_connections_unread": 13,
+     "peak_send_q_kb": 57.2,
+     "cpu_seconds": 3.11,
+     "user_seconds": 0.21,
+     "system_seconds": 2.89,
+     "cpu_percent": 100.1,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 218,
+     "cpu_ms_per_1k_requests": 1474.633,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.014
+    }
+   }
+  },
+  "proxy to a name looked up": {
+   "definition": "1c0ed553e7f015be",
+   "nginx": {
+    "idle_rss_mb": 15.1,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 73280,
+     "rps": 23891.1,
+     "mb_per_s": 5.95,
+     "p50_ms": 2.63,
+     "p90_ms": 2.714,
+     "p99_ms": 2.852,
+     "max_ms": 24.354,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 1.001,
+     "peak_rss_mb": 16.0,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.4,
+     "peak_connections_unread": 31,
+     "peak_send_q_kb": 0.5,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.43,
+     "system_seconds": 2.63,
+     "cpu_percent": 99.6,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 41.727,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.038
+    }
+   }
+  },
+  "proxy, not kept alive": {
+   "definition": "f843ccdf48b38619",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 73347,
+     "rps": 24364.5,
+     "mb_per_s": 6.07,
+     "p50_ms": 2.575,
+     "p90_ms": 2.676,
+     "p99_ms": 3.018,
+     "max_ms": 22.104,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 1.001,
+     "peak_rss_mb": 15.4,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.3,
+     "peak_connections_unread": 30,
+     "peak_send_q_kb": 0.5,
+     "cpu_seconds": 3.03,
+     "user_seconds": 0.4,
+     "system_seconds": 2.64,
+     "cpu_percent": 99.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 40.901,
+     "rss_growth_mb": -0.0,
+     "cpu_spread": 0.058
+    }
+   }
+  },
+  "proxy, 64k POST, its body and headers not passed on": {
+   "definition": "4bef6e6615d2fa43",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 42515,
+     "rps": 13718.0,
+     "mb_per_s": 3.42,
+     "p50_ms": 4.551,
+     "p90_ms": 4.723,
+     "p99_ms": 4.985,
+     "max_ms": 48.55,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.004,
+     "peak_rss_mb": 15.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2456.6,
+     "peak_connections_unread": 39,
+     "peak_send_q_kb": 0.5,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.41,
+     "system_seconds": 2.68,
+     "cpu_percent": 99.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 33,
+     "cpu_ms_per_1k_requests": 72.68,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.023
+    }
+   }
+  },
+  "proxy, a keepalive pool of 16, 1000 connections": {
+   "definition": "a92908ae98fc0b26",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 81164,
+     "rps": 26615.2,
+     "mb_per_s": 6.63,
+     "p50_ms": 32.706,
+     "p90_ms": 46.41,
+     "p99_ms": 62.6,
+     "max_ms": 739.006,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.434,
+     "peak_rss_mb": 24.2,
+     "peak_threads": 2,
+     "peak_accept_queue": 67,
+     "peak_recv_q_kb": 24.9,
+     "peak_connections_unread": 566,
+     "peak_send_q_kb": 1.2,
+     "cpu_seconds": 3.02,
+     "user_seconds": 0.57,
+     "system_seconds": 2.45,
+     "cpu_percent": 98.3,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 37.209,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.185
+    }
+   }
+  },
+  "proxy to TLS, kept alive": {
+   "definition": "7e18521a3b77d322",
+   "nginx": {
+    "idle_rss_mb": 15.2,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 19359,
+     "rps": 6246.7,
+     "mb_per_s": 1.56,
+     "p50_ms": 9.117,
+     "p90_ms": 17.919,
+     "p99_ms": 19.174,
+     "max_ms": 39.951,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.257,
+     "peak_rss_mb": 23.3,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.3,
+     "peak_connections_unread": 29,
+     "peak_send_q_kb": 0.5,
+     "cpu_seconds": 3.08,
+     "user_seconds": 2.26,
+     "system_seconds": 0.82,
+     "cpu_percent": 99.1,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 4080,
+     "cpu_ms_per_1k_requests": 160.649,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.483
+    }
+   }
+  },
+  "proxy to TLS, not kept alive": {
+   "definition": "9918611048505bb9",
+   "nginx": {
+    "idle_rss_mb": 15.2,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 5653,
+     "rps": 1880.4,
+     "mb_per_s": 0.47,
+     "p50_ms": 33.026,
+     "p90_ms": 35.285,
+     "p99_ms": 92.972,
+     "max_ms": 247.107,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 1.015,
+     "peak_rss_mb": 23.5,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.3,
+     "peak_connections_unread": 29,
+     "peak_send_q_kb": 0.2,
+     "cpu_seconds": 3.01,
+     "user_seconds": 2.37,
+     "system_seconds": 0.65,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 5687,
+     "cpu_ms_per_1k_requests": 532.461,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.103
+    }
+   }
+  },
+  "proxy to HTTP/2, 64 connections": {
+   "definition": "37444a9b77e0610c",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 157117,
+     "rps": 50694.2,
+     "mb_per_s": 12.62,
+     "p50_ms": 1.221,
+     "p90_ms": 2.111,
+     "p99_ms": 37.544,
+     "max_ms": 43.294,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.004,
+     "peak_rss_mb": 15.6,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 1.3,
+     "peak_connections_unread": 30,
+     "peak_send_q_kb": 2.2,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.63,
+     "system_seconds": 2.46,
+     "cpu_percent": 99.1,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 19.667,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.043
+    }
+   }
+  },
+  "proxy to TLS, verified, with a client certificate": {
+   "definition": "4c1b9bcef46bee2a",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive",
+     "x-verified": "SUCCESS"
+    },
+    "median": {
+     "requests": 1836,
+     "rps": 607.5,
+     "mb_per_s": 0.16,
+     "p50_ms": 100.931,
+     "p90_ms": 102.984,
+     "p99_ms": 123.095,
+     "max_ms": 198.127,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 1.042,
+     "peak_rss_mb": 23.6,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.9,
+     "peak_connections_unread": 20,
+     "peak_send_q_kb": 0.3,
+     "cpu_seconds": 3.04,
+     "user_seconds": 2.66,
+     "system_seconds": 0.34,
+     "cpu_percent": 99.0,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 1885,
+     "cpu_ms_per_1k_requests": 1640.998,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.029
+    }
+   }
+  },
+  "proxy to HTTP/2 over TLS, 64 connections": {
+   "definition": "9eec58e5d85411db",
+   "nginx": {
+    "idle_rss_mb": 15.2,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 38185,
+     "rps": 12320.4,
+     "mb_per_s": 3.07,
+     "p50_ms": 3.295,
+     "p90_ms": 12.279,
+     "p99_ms": 17.79,
+     "max_ms": 33.429,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.098,
+     "peak_rss_mb": 23.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.5,
+     "peak_connections_unread": 35,
+     "peak_send_q_kb": 0.7,
+     "cpu_seconds": 3.0,
+     "user_seconds": 1.99,
+     "system_seconds": 1.08,
+     "cpu_percent": 98.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 2183,
+     "cpu_ms_per_1k_requests": 80.66,
+     "rss_growth_mb": 0.1,
+     "cpu_spread": 0.673
+    }
+   }
+  },
+  "proxy to HTTP/2, 64k POST": {
+   "definition": "d49757e2b13dd97f",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 25429,
+     "rps": 8427.6,
+     "mb_per_s": 2.1,
+     "p50_ms": 7.398,
+     "p90_ms": 7.712,
+     "p99_ms": 12.152,
+     "max_ms": 89.541,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.008,
+     "peak_rss_mb": 16.0,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2562.7,
+     "peak_connections_unread": 40,
+     "peak_send_q_kb": 0.5,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.44,
+     "system_seconds": 2.65,
+     "cpu_percent": 99.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 150,
+     "cpu_ms_per_1k_requests": 118.37,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.107
+    }
+   }
+  },
+  "proxy, 64k chunked answer with a trailer": {
+   "definition": "a5d91102213576cd",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 65536
+    },
+    "median": {
+     "requests": 47187,
+     "rps": 15691.0,
+     "mb_per_s": 1031.71,
+     "p50_ms": 3.985,
+     "p90_ms": 4.141,
+     "p99_ms": 4.251,
+     "max_ms": 28.779,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.001,
+     "peak_rss_mb": 15.3,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.8,
+     "peak_connections_unread": 35,
+     "peak_send_q_kb": 437.3,
+     "cpu_seconds": 3.01,
+     "user_seconds": 0.47,
+     "system_seconds": 2.56,
+     "cpu_percent": 99.7,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 41,
+     "cpu_ms_per_1k_requests": 63.765,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.056
+    }
+   }
+  },
+  "proxy, 64k chunked answer": {
+   "definition": "b46cb5b61d18049c",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 65536
+    },
+    "median": {
+     "requests": 49418,
+     "rps": 15990.6,
+     "mb_per_s": 1051.28,
+     "p50_ms": 3.931,
+     "p90_ms": 4.02,
+     "p99_ms": 4.209,
+     "max_ms": 18.286,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.002,
+     "peak_rss_mb": 15.4,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.7,
+     "peak_connections_unread": 34,
+     "peak_send_q_kb": 1091.4,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.46,
+     "system_seconds": 2.62,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 42,
+     "cpu_ms_per_1k_requests": 62.542,
+     "rss_growth_mb": 0.1,
+     "cpu_spread": 0.057
+    }
+   }
+  },
+  "proxy, 64k chunked answer, gzip": {
+   "definition": "7bc460a577b2e7a9",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "content-encoding": "gzip"
+    },
+    "median": {
+     "requests": 10385,
+     "rps": 3350.0,
+     "mb_per_s": 48.74,
+     "p50_ms": 18.674,
+     "p90_ms": 18.905,
+     "p99_ms": 19.203,
+     "max_ms": 158.603,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.001,
+     "peak_rss_mb": 16.1,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 3.1,
+     "peak_connections_unread": 42,
+     "peak_send_q_kb": 397.9,
+     "cpu_seconds": 3.1,
+     "user_seconds": 2.7,
+     "system_seconds": 0.4,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 49,
+     "cpu_ms_per_1k_requests": 298.507,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.031
+    }
+   }
+  },
+  "proxy, 1m chunked POST": {
+   "definition": "50210433e3275b66",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 2234,
+     "rps": 720.7,
+     "mb_per_s": 0.18,
+     "p50_ms": 76.706,
+     "p90_ms": 119.48,
+     "p99_ms": 293.201,
+     "max_ms": 500.745,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.012,
+     "peak_rss_mb": 15.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 9,
+     "peak_recv_q_kb": 18686.9,
+     "peak_connections_unread": 54,
+     "peak_send_q_kb": 2.2,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.19,
+     "system_seconds": 2.91,
+     "cpu_percent": 99.3,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 2488,
+     "cpu_ms_per_1k_requests": 1387.645,
+     "rss_growth_mb": -0.0,
+     "cpu_spread": 0.054
+    }
+   }
+  },
+  "TLS, proxied to plain HTTP": {
+   "definition": "06fc5913a221fc0e",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 114370,
+     "rps": 36909.7,
+     "mb_per_s": 9.19,
+     "p50_ms": 1.631,
+     "p90_ms": 1.841,
+     "p99_ms": 4.18,
+     "max_ms": 49.733,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.015,
+     "peak_rss_mb": 22.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 13.8,
+     "peak_connections_unread": 39,
+     "peak_send_q_kb": 5.8,
+     "cpu_seconds": 3.09,
+     "user_seconds": 1.14,
+     "system_seconds": 1.96,
+     "cpu_percent": 99.6,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 39,
+     "cpu_ms_per_1k_requests": 27.105,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.124
+    }
+   }
+  },
+  "proxy_cache, HIT": {
+   "definition": "df735ff982528793",
+   "nginx": {
+    "idle_rss_mb": 20.3,
+    "idle_threads": 4,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive",
+     "x-cache-status": "HIT"
+    },
+    "median": {
+     "requests": 230311,
+     "rps": 74653.9,
+     "mb_per_s": 20.16,
+     "p50_ms": 0.832,
+     "p90_ms": 0.885,
+     "p99_ms": 1.022,
+     "max_ms": 22.473,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 20.8,
+     "peak_threads": 4,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 6.1,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.68,
+     "system_seconds": 2.42,
+     "cpu_percent": 100.0,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 13.438,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.071
+    }
+   }
+  },
+  "proxy_cache, HIT of 1m": {
+   "definition": "48eb9877ae48dfa0",
+   "nginx": {
+    "idle_rss_mb": 20.3,
+    "idle_threads": 4,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 1048576,
+     "connection": "keep-alive",
+     "x-cache-status": "HIT"
+    },
+    "median": {
+     "requests": 9019,
+     "rps": 2909.4,
+     "mb_per_s": 3051.86,
+     "p50_ms": 21.487,
+     "p90_ms": 21.719,
+     "p99_ms": 209.843,
+     "max_ms": 469.646,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 20.8,
+     "peak_threads": 4,
+     "peak_accept_queue": 14,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 13216.7,
+     "cpu_seconds": 3.11,
+     "user_seconds": 0.19,
+     "system_seconds": 2.91,
+     "cpu_percent": 99.9,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 42,
+     "cpu_ms_per_1k_requests": 344.828,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.025
+    }
+   }
+  },
+  "proxy_cache, MISS stored, a key per request": {
+   "definition": "a483eb7780a0a99d",
+   "nginx": {
+    "idle_rss_mb": 20.4,
+    "idle_threads": 4,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive",
+     "x-cache-status": "MISS"
+    },
+    "median": {
+     "requests": 50906,
+     "rps": 16424.0,
+     "mb_per_s": 4.45,
+     "p50_ms": 3.691,
+     "p90_ms": 4.978,
+     "p99_ms": 5.775,
+     "max_ms": 19.071,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.104,
+     "peak_rss_mb": 30.6,
+     "peak_threads": 4,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.7,
+     "peak_connections_unread": 39,
+     "peak_send_q_kb": 0.3,
+     "cpu_seconds": 3.09,
+     "user_seconds": 0.68,
+     "system_seconds": 2.41,
+     "cpu_percent": 99.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 60.7,
+     "rss_growth_mb": 4.5,
+     "cpu_spread": 0.167
+    }
+   }
+  },
+  "proxy_cache, HIT, a key of 5 variables": {
+   "definition": "68127e6bf59247fd",
+   "nginx": {
+    "idle_rss_mb": 20.3,
+    "idle_threads": 4,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive",
+     "x-cache-status": "HIT"
+    },
+    "median": {
+     "requests": 227386,
+     "rps": 73365.6,
+     "mb_per_s": 19.81,
+     "p50_ms": 0.855,
+     "p90_ms": 0.877,
+     "p99_ms": 0.916,
+     "max_ms": 21.485,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 20.8,
+     "peak_threads": 4,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 6.9,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 3.2,
+     "cpu_seconds": 3.11,
+     "user_seconds": 0.8,
+     "system_seconds": 2.31,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 13.633,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.057
+    }
+   }
+  },
+  "proxy_cache, 304 from a HIT": {
+   "definition": "c1cc91774e830f3e",
+   "nginx": {
+    "idle_rss_mb": 20.3,
+    "idle_threads": 4,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 304,
+     "length": 0,
+     "x-cache-status": "HIT"
+    },
+    "median": {
+     "requests": 239803,
+     "rps": 77374.8,
+     "mb_per_s": 15.63,
+     "p50_ms": 0.811,
+     "p90_ms": 0.835,
+     "p99_ms": 0.883,
+     "max_ms": 20.053,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 20.8,
+     "peak_threads": 4,
+     "peak_accept_queue": 23,
+     "peak_recv_q_kb": 5.9,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 1.0,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.74,
+     "system_seconds": 2.37,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 12.927,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.044
+    }
+   }
+  },
+  "proxy_cache, range, 4k of a HIT of 1m": {
+   "definition": "2c4d34fc1c9cbc64",
+   "nginx": {
+    "idle_rss_mb": 20.3,
+    "idle_threads": 4,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 206,
+     "length": 4096,
+     "content-range": "bytes 1000-5095/1048576",
+     "x-cache-status": "HIT"
+    },
+    "median": {
+     "requests": 202418,
+     "rps": 65299.8,
+     "mb_per_s": 286.73,
+     "p50_ms": 0.962,
+     "p90_ms": 0.994,
+     "p99_ms": 1.041,
+     "max_ms": 25.475,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 20.8,
+     "peak_threads": 4,
+     "peak_accept_queue": 2,
+     "peak_recv_q_kb": 4.3,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 12.9,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.73,
+     "system_seconds": 2.38,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 15.315,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.05
+    }
+   }
+  },
+  "proxy_cache, HIT of an answer with Vary": {
+   "definition": "18b01bcc01582df8",
+   "nginx": {
+    "idle_rss_mb": 20.3,
+    "idle_threads": 4,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive",
+     "x-cache-status": "HIT",
+     "vary": "Accept-Language"
+    },
+    "median": {
+     "requests": 220107,
+     "rps": 71016.4,
+     "mb_per_s": 20.81,
+     "p50_ms": 0.882,
+     "p90_ms": 0.914,
+     "p99_ms": 0.968,
+     "max_ms": 21.933,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 20.8,
+     "peak_threads": 4,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 4.0,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 0.9,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.73,
+     "system_seconds": 2.36,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 14.084,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.109
+    }
+   }
+  },
+  "proxy_cache, bypassed and not stored": {
+   "definition": "6cdfaaa5add399ff",
+   "nginx": {
+    "idle_rss_mb": 20.4,
+    "idle_threads": 4,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive",
+     "x-cache-status": "BYPASS"
+    },
+    "median": {
+     "requests": 153629,
+     "rps": 49561.5,
+     "mb_per_s": 13.53,
+     "p50_ms": 1.208,
+     "p90_ms": 1.52,
+     "p99_ms": 2.086,
+     "max_ms": 9.055,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.063,
+     "peak_rss_mb": 21.2,
+     "peak_threads": 4,
+     "peak_accept_queue": 3,
+     "peak_recv_q_kb": 2.0,
+     "peak_connections_unread": 36,
+     "peak_send_q_kb": 4.3,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.7,
+     "system_seconds": 2.4,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 20.178,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.052
+    }
+   }
+  },
+  "proxy_cache_use_stale updating, background update, upstream answering after 100 ms": {
+   "definition": "7c504d5a57eee0bf",
+   "nginx": {
+    "idle_rss_mb": 20.3,
+    "idle_threads": 4,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 237510,
+     "rps": 76637.8,
+     "mb_per_s": 18.72,
+     "p50_ms": 0.818,
+     "p90_ms": 0.839,
+     "p99_ms": 0.899,
+     "max_ms": 102.251,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.0,
+     "peak_rss_mb": 20.8,
+     "peak_threads": 4,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 64,
+     "peak_send_q_kb": 0.5,
+     "cpu_seconds": 3.1,
+     "user_seconds": 0.65,
+     "system_seconds": 2.44,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 13.01,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.039
+    }
+   }
+  },
+  "proxy_cache_lock, a new key each second, upstream answering after 100 ms": {
+   "definition": "e072c699a347431d",
+   "nginx": {
+    "idle_rss_mb": 20.7,
+    "idle_threads": 4,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 141929,
+     "rps": 47215.0,
+     "mb_per_s": 11.52,
+     "p50_ms": 0.881,
+     "p90_ms": 347.268,
+     "p99_ms": 485.74,
+     "max_ms": 500.909,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "upstream_connections_per_request": 0.0,
+     "peak_rss_mb": 22.5,
+     "peak_threads": 4,
+     "peak_accept_queue": 27,
+     "peak_recv_q_kb": 2.7,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 0.7,
+     "cpu_seconds": 2.18,
+     "user_seconds": 0.49,
+     "system_seconds": 1.65,
+     "cpu_percent": 72.1,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 15.402,
+     "rss_growth_mb": -0.0,
+     "cpu_spread": 0.181
+    }
+   }
+  },
+  "TLS, return, 64 connections": {
+   "definition": "19fa8daf413bb64f",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 263991,
+     "rps": 87686.8,
+     "mb_per_s": 13.15,
+     "p50_ms": 0.678,
+     "p90_ms": 0.729,
+     "p99_ms": 2.738,
+     "max_ms": 52.923,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 22.6,
+     "peak_threads": 2,
+     "peak_accept_queue": 2,
+     "peak_recv_q_kb": 8.6,
+     "peak_connections_unread": 62,
+     "peak_send_q_kb": 3.9,
+     "cpu_seconds": 3.01,
+     "user_seconds": 1.25,
+     "system_seconds": 1.76,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 44,
+     "cpu_ms_per_1k_requests": 11.402,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.043
+    }
+   }
+  },
+  "TLS, full handshakes": {
+   "definition": "87695adc7aa98648",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 3081,
+     "rps": 770.2,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 19.6,
+     "peak_threads": 2,
+     "peak_accept_queue": 2,
+     "peak_recv_q_kb": 3.0,
+     "peak_connections_unread": 2,
+     "peak_send_q_kb": 0.3,
+     "cpu_seconds": 3.94,
+     "user_seconds": 3.59,
+     "system_seconds": 0.36,
+     "cpu_percent": 98.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 1278.806,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.012
+    }
+   }
+  },
+  "TLS, resumed handshakes": {
+   "definition": "9c701e46d5eae83e",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 9089,
+     "rps": 2272.2,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 19.6,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 3.6,
+     "peak_connections_unread": 2,
+     "peak_send_q_kb": 0.3,
+     "cpu_seconds": 3.8,
+     "user_seconds": 3.02,
+     "system_seconds": 0.79,
+     "cpu_percent": 95.0,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 421.169,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.022
+    }
+   }
+  },
+  "TLS, full handshakes with a client certificate": {
+   "definition": "c70ac67a2594acfc",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive",
+     "x-verify": "SUCCESS"
+    },
+    "median": {
+     "requests": 2569,
+     "rps": 642.2,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 19.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 2.7,
+     "peak_connections_unread": 2,
+     "peak_send_q_kb": 1.0,
+     "cpu_seconds": 3.99,
+     "user_seconds": 3.55,
+     "system_seconds": 0.43,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 1553.134,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.02
+    }
+   }
+  },
+  "TLS, static 1m": {
+   "definition": "f3bfc41c2d472938",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 1048576,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 2973,
+     "rps": 980.6,
+     "mb_per_s": 1028.81,
+     "p50_ms": 62.297,
+     "p90_ms": 63.392,
+     "p99_ms": 65.715,
+     "max_ms": 67.543,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 22.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 7.5,
+     "peak_connections_unread": 63,
+     "peak_send_q_kb": 32.0,
+     "cpu_seconds": 3.01,
+     "user_seconds": 1.35,
+     "system_seconds": 1.67,
+     "cpu_percent": 99.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 37,
+     "cpu_ms_per_1k_requests": 1019.737,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.09
+    }
+   }
+  },
+  "TLS, full handshakes, ECDSA": {
+   "definition": "090d8fb6550789cb",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 7497,
+     "rps": 1874.2,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 19.9,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 1.5,
+     "peak_connections_unread": 2,
+     "peak_send_q_kb": 1.0,
+     "cpu_seconds": 3.79,
+     "user_seconds": 2.92,
+     "system_seconds": 0.88,
+     "cpu_percent": 94.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 506.869,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.043
+    }
+   }
+  },
+  "TLS, full handshakes with a client certificate, its chain and a CRL": {
+   "definition": "110b129a04aa36b6",
+   "nginx": {
+    "idle_rss_mb": 20.1,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive",
+     "x-verify": "SUCCESS"
+    },
+    "median": {
+     "requests": 2147,
+     "rps": 536.8,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 24.1,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 2.7,
+     "peak_connections_unread": 2,
+     "peak_send_q_kb": 1.0,
+     "cpu_seconds": 3.98,
+     "user_seconds": 3.6,
+     "system_seconds": 0.38,
+     "cpu_percent": 99.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 1858.407,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.015
+    }
+   }
+  },
+  "TLS 1.2, resumed handshakes by session": {
+   "definition": "22dd0146357d3b86",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 19791,
+     "rps": 4947.8,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 19.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 1.5,
+     "peak_connections_unread": 1,
+     "peak_send_q_kb": 0.2,
+     "cpu_seconds": 3.12,
+     "user_seconds": 1.88,
+     "system_seconds": 1.28,
+     "cpu_percent": 78.0,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 156.132,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.096
+    }
+   }
+  },
+  "TLS, full handshakes, the certificate named by a variable": {
+   "definition": "65479f66f01bbb77",
+   "nginx": {
+    "idle_rss_mb": 15.2,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "close"
+    },
+    "median": {
+     "requests": 2471,
+     "rps": 798.5,
+     "mb_per_s": 0.12,
+     "p50_ms": 2.504,
+     "p90_ms": 2.603,
+     "p99_ms": 38.568,
+     "max_ms": 76.913,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 22.5,
+     "peak_threads": 2,
+     "peak_accept_queue": 59,
+     "peak_recv_q_kb": 96.8,
+     "peak_connections_unread": 62,
+     "peak_send_q_kb": 0.1,
+     "cpu_seconds": 3.08,
+     "user_seconds": 2.86,
+     "system_seconds": 0.22,
+     "cpu_percent": 99.0,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 23,
+     "cpu_ms_per_1k_requests": 1247.981,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.018
+    }
+   }
+  },
+  "HTTP/2, one stream on each of 64 connections": {
+   "definition": "03da8872743271e9",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "version": "2"
+    },
+    "median": {
+     "requests": 258623,
+     "rps": 86207.67,
+     "mb_per_s": 6.04,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "max_ms": 50.01,
+     "peak_rss_mb": 22.2,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2.4,
+     "peak_connections_unread": 59,
+     "peak_send_q_kb": 2.5,
+     "cpu_seconds": 3.01,
+     "user_seconds": 1.33,
+     "system_seconds": 1.68,
+     "cpu_percent": 99.6,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 43,
+     "cpu_ms_per_1k_requests": 11.628,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.016
+    }
+   }
+  },
+  "HTTP/2, 32 streams on each of 8 connections": {
+   "definition": "f58270b51e6864a7",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "version": "2"
+    },
+    "median": {
+     "requests": 527764,
+     "rps": 175921.33,
+     "mb_per_s": 12.31,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "max_ms": 4.66,
+     "peak_rss_mb": 20.0,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 5.4,
+     "peak_connections_unread": 8,
+     "peak_send_q_kb": 1.3,
+     "cpu_seconds": 3.0,
+     "user_seconds": 1.35,
+     "system_seconds": 1.65,
+     "cpu_percent": 99.4,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 2,
+     "cpu_ms_per_1k_requests": 5.684,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.016
+    }
+   }
+  },
+  "HTTP/2, static 1m, 8 streams on each of 8 connections": {
+   "definition": "167121f6f22cb6a3",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 1048576,
+     "version": "2"
+    },
+    "median": {
+     "requests": 3009,
+     "rps": 1003.0,
+     "mb_per_s": 1053.13,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "max_ms": 74.04,
+     "peak_rss_mb": 20.0,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2.9,
+     "peak_connections_unread": 8,
+     "peak_send_q_kb": 30.2,
+     "cpu_seconds": 3.01,
+     "user_seconds": 1.24,
+     "system_seconds": 1.77,
+     "cpu_percent": 100.0,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 7,
+     "cpu_ms_per_1k_requests": 1000.332,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.028
+    }
+   }
+  },
+  "HTTP/2, 64k POST proxied, 8 streams on each of 8 connections": {
+   "definition": "b4c44de726c72799",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "version": "2"
+    },
+    "median": {
+     "requests": 24166,
+     "rps": 8055.33,
+     "mb_per_s": 1.47,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "max_ms": 16.36,
+     "upstream_connections_per_request": 0.052,
+     "peak_rss_mb": 21.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 2117.3,
+     "peak_connections_unread": 5,
+     "peak_send_q_kb": 2.2,
+     "cpu_seconds": 3.0,
+     "user_seconds": 0.96,
+     "system_seconds": 2.04,
+     "cpu_percent": 99.7,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 1,
+     "cpu_ms_per_1k_requests": 124.555,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.028
+    }
+   }
+  },
+  "HTTP/2, proxied, 32 streams on each of 8 connections": {
+   "definition": "ccc321fd71da78a6",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "version": "2"
+    },
+    "median": {
+     "requests": 102227,
+     "rps": 34075.67,
+     "mb_per_s": 5.76,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "max_ms": 12.69,
+     "upstream_connections_per_request": 0.48,
+     "peak_rss_mb": 22.5,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 4.5,
+     "peak_connections_unread": 6,
+     "peak_send_q_kb": 3.2,
+     "cpu_seconds": 3.0,
+     "user_seconds": 0.8,
+     "system_seconds": 2.19,
+     "cpu_percent": 99.3,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 30,
+     "cpu_ms_per_1k_requests": 29.346,
+     "rss_growth_mb": -0.0,
+     "cpu_spread": 0.087
+    }
+   }
+  },
+  "HTTP/2, 18 headers in full, 32 streams on each of 8 connections": {
+   "definition": "a84a1511e09c88cb",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "version": "2"
+    },
+    "median": {
+     "requests": 223337,
+     "rps": 74445.67,
+     "mb_per_s": 5.21,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "max_ms": 4.65,
+     "peak_rss_mb": 20.0,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 314.5,
+     "peak_connections_unread": 8,
+     "peak_send_q_kb": 0.4,
+     "cpu_seconds": 3.0,
+     "user_seconds": 2.22,
+     "system_seconds": 0.78,
+     "cpu_percent": 99.6,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 666,
+     "cpu_ms_per_1k_requests": 13.433,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.011
+    }
+   }
+  },
+  "return, 64 connections, reloading": {
+   "definition": "7cb2e583a7014524",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 451208,
+     "rps": 146341.3,
+     "mb_per_s": 21.95,
+     "p50_ms": 0.424,
+     "p90_ms": 0.454,
+     "p99_ms": 1.531,
+     "max_ms": 15.461,
+     "socket_errors": 252,
+     "bad_status": 0,
+     "reloads": 4,
+     "reload_ms": 5.7,
+     "peak_rss_mb": 21.3,
+     "peak_threads": 3,
+     "peak_accept_queue": 11,
+     "peak_recv_q_kb": 2.8,
+     "peak_connections_unread": 62,
+     "peak_send_q_kb": 3.5,
+     "cpu_seconds": 3.08,
+     "user_seconds": 0.59,
+     "system_seconds": 2.48,
+     "cpu_percent": 75.0,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 6.79,
+     "rss_growth_mb": 0.0,
+     "cpu_spread": 0.031
+    }
+   }
+  },
+  "TLS, return, reloading 200 servers with certificates": {
+   "definition": "b8d3759dada2176d",
+   "nginx": {
+    "idle_rss_mb": 28.9,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 239935,
+     "rps": 78650.5,
+     "mb_per_s": 11.8,
+     "p50_ms": 0.66,
+     "p90_ms": 1.256,
+     "p99_ms": 3.814,
+     "max_ms": 46.372,
+     "socket_errors": 156,
+     "bad_status": 0,
+     "reloads": 4,
+     "reload_ms": 74.9,
+     "peak_rss_mb": 71.0,
+     "peak_threads": 3,
+     "peak_accept_queue": 44,
+     "peak_recv_q_kb": 77.4,
+     "peak_connections_unread": 62,
+     "peak_send_q_kb": 3.2,
+     "cpu_seconds": 3.09,
+     "user_seconds": 1.42,
+     "system_seconds": 1.63,
+     "cpu_percent": 75.2,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 67,
+     "cpu_ms_per_1k_requests": 12.718,
+     "rss_growth_mb": -4.2,
+     "cpu_spread": 0.045
+    }
+   }
+  },
+  "return, 16 connections, beside gzip of 5m": {
+   "definition": "b31c7ccadd3e23df",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 553,
+     "rps": 184.1,
+     "mb_per_s": 0.03,
+     "p50_ms": 67.236,
+     "p90_ms": 243.715,
+     "p99_ms": 802.665,
+     "max_ms": 981.701,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "beside_requests": 179,
+     "peak_rss_mb": 15.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 15,
+     "peak_recv_q_kb": 0.8,
+     "peak_connections_unread": 17,
+     "peak_send_q_kb": 32.0,
+     "cpu_seconds": 4.01,
+     "user_seconds": 3.69,
+     "system_seconds": 0.32,
+     "cpu_percent": 99.9,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "TLS, return, 16 connections, beside full handshakes": {
+   "definition": "23eb4d4222592ef5",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 39577,
+     "rps": 12845.7,
+     "mb_per_s": 1.93,
+     "p50_ms": 1.277,
+     "p90_ms": 2.167,
+     "p99_ms": 2.625,
+     "max_ms": 3.859,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "beside_requests": 3162,
+     "peak_rss_mb": 20.3,
+     "peak_threads": 2,
+     "peak_accept_queue": 2,
+     "peak_recv_q_kb": 4.0,
+     "peak_connections_unread": 17,
+     "peak_send_q_kb": 2.4,
+     "cpu_seconds": 4.57,
+     "user_seconds": 3.92,
+     "system_seconds": 0.65,
+     "cpu_percent": 99.3,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "first byte, return": {
+   "definition": "7aedeadf6e01aded",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 40,
+     "bad_status": 0,
+     "socket_errors": 0,
+     "p50_ms": 0.169,
+     "p99_ms": 0.231,
+     "max_ms": 0.231,
+     "peak_rss_mb": 14.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 0.0,
+     "cpu_seconds": 0.0,
+     "user_seconds": 0.0,
+     "system_seconds": 0.0,
+     "cpu_percent": 0.0,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0
+    }
+   }
+  },
+  "first byte, TLS": {
+   "definition": "507b0a1f0a8606fe",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "requests": 40,
+     "bad_status": 0,
+     "socket_errors": 0,
+     "p50_ms": 3.761,
+     "p99_ms": 4.147,
+     "max_ms": 4.147,
+     "peak_rss_mb": 19.5,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 0.0,
+     "cpu_seconds": 0.05,
+     "user_seconds": 0.05,
+     "system_seconds": 0.0,
+     "cpu_percent": 11.9,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0
+    }
+   }
+  },
+  "first byte, HTTP/2": {
+   "definition": "284670530f91e4bb",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "version": "2"
+    },
+    "median": {
+     "requests": 40,
+     "bad_status": 0,
+     "socket_errors": 0,
+     "p50_ms": 3.86,
+     "p99_ms": 4.2,
+     "max_ms": 4.2,
+     "peak_rss_mb": 19.6,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 0.0,
+     "cpu_seconds": 0.05,
+     "user_seconds": 0.05,
+     "system_seconds": 0.0,
+     "cpu_percent": 11.6,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0
+    }
+   }
+  },
+  "first byte, proxied as it comes": {
+   "definition": "9381d9d26b533ca2",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100
+    },
+    "median": {
+     "requests": 40,
+     "bad_status": 0,
+     "socket_errors": 0,
+     "p50_ms": 0.532,
+     "p99_ms": 0.695,
+     "max_ms": 0.695,
+     "peak_rss_mb": 14.8,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 0.0,
+     "cpu_seconds": 0.01,
+     "user_seconds": 0.0,
+     "system_seconds": 0.01,
+     "cpu_percent": 0.1,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "return, a new connection per request, for 40 s": {
+   "definition": "feee98116856171d",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "close"
+    },
+    "median": {
+     "requests": 2662507,
+     "rps": 66418.2,
+     "mb_per_s": 9.63,
+     "p50_ms": 0.887,
+     "p90_ms": 1.015,
+     "p99_ms": 3.237,
+     "max_ms": 7.73,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "peak_rss_mb": 14.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 58,
+     "peak_recv_q_kb": 2.9,
+     "peak_connections_unread": 46,
+     "peak_send_q_kb": 0.3,
+     "cpu_seconds": 39.86,
+     "user_seconds": 5.39,
+     "system_seconds": 34.47,
+     "cpu_percent": 99.2,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "cpu_ms_per_1k_requests": 14.971,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "HTTP/2, 32 streams on each of 8 connections, for 40 s": {
+   "definition": "8a7f87d0b0782fc6",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "version": "2"
+    },
+    "median": {
+     "requests": 7120013,
+     "rps": 178000.33,
+     "mb_per_s": 12.37,
+     "socket_errors": 0,
+     "bad_status": 0,
+     "max_ms": 10.01,
+     "peak_rss_mb": 19.9,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 5.6,
+     "peak_connections_unread": 8,
+     "peak_send_q_kb": 2.0,
+     "cpu_seconds": 40.0,
+     "user_seconds": 18.31,
+     "system_seconds": 21.69,
+     "cpu_percent": 99.9,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 8,
+     "cpu_ms_per_1k_requests": 5.618,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "static 10m, 50 slow readers": {
+   "definition": "41e7d8197754aaf8",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 10485760,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "clients": 50,
+     "clients_ok": 50,
+     "read_mb": 23.8,
+     "peak_rss_mb": 18.3,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 124271.2,
+     "cpu_seconds": 0.03,
+     "user_seconds": 0.0,
+     "system_seconds": 0.03,
+     "cpu_percent": 1.0,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 250,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "proxied 10m, 50 slow readers": {
+   "definition": "3c28b3929eb235fb",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 10485760,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "clients": 50,
+     "clients_ok": 50,
+     "read_mb": 25.6,
+     "peak_rss_mb": 20.3,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 127114.7,
+     "cpu_seconds": 0.29,
+     "user_seconds": 0.01,
+     "system_seconds": 0.27,
+     "cpu_percent": 9.5,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 282,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "TLS, static 10m, 50 slow readers": {
+   "definition": "99ca184168e4b53d",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 10485760,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "clients": 50,
+     "clients_ok": 50,
+     "read_mb": 8.2,
+     "peak_rss_mb": 26.1,
+     "peak_threads": 2,
+     "peak_accept_queue": 1,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 202476.4,
+     "cpu_seconds": 0.22,
+     "user_seconds": 0.15,
+     "system_seconds": 0.07,
+     "cpu_percent": 6.3,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 49,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "HTTP/2, static 10m, 50 slow readers": {
+   "definition": "e5d995ef1d5e55c6",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 10485760,
+     "version": "2"
+    },
+    "median": {
+     "clients": 50,
+     "clients_ok": 50,
+     "read_mb": 4.9,
+     "peak_rss_mb": 25.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 29158.8,
+     "cpu_seconds": 0.12,
+     "user_seconds": 0.09,
+     "system_seconds": 0.03,
+     "cpu_percent": 3.4,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 99,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "10m uploads, 50 slow senders": {
+   "definition": "47a6fbb34a33612c",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "clients": 50,
+     "clients_ok": 50,
+     "sent_mb": 196.6,
+     "peak_rss_mb": 15.6,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 0.0,
+     "cpu_seconds": 0.1,
+     "user_seconds": 0.0,
+     "system_seconds": 0.1,
+     "cpu_percent": 3.3,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "10m uploads, 50 slow senders, proxy_request_buffering off": {
+   "definition": "5ee03f7ff520159c",
+   "nginx": {
+    "idle_rss_mb": 14.5,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 100,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "clients": 50,
+     "clients_ok": 50,
+     "sent_mb": 196.6,
+     "peak_rss_mb": 15.6,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 0.0,
+     "cpu_seconds": 0.13,
+     "user_seconds": 0.01,
+     "system_seconds": 0.12,
+     "cpu_percent": 4.2,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 9,
+     "rss_growth_mb": 0.0
+    }
+   }
+  },
+  "1000 idle connections": {
+   "definition": "1cdb9515d1183fdc",
+   "nginx": {
+    "idle_rss_mb": 14.4,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "clients": 1000,
+     "clients_ok": 1000,
+     "peak_rss_mb": 15.2,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 0.0,
+     "cpu_seconds": 0.02,
+     "user_seconds": 0.0,
+     "system_seconds": 0.02,
+     "cpu_percent": 1.8,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0
+    }
+   }
+  },
+  "TLS, 1000 idle connections": {
+   "definition": "c7a338e8f168ec21",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "connection": "keep-alive"
+    },
+    "median": {
+     "clients": 1000,
+     "clients_ok": 1000,
+     "peak_rss_mb": 48.2,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 0.2,
+     "cpu_seconds": 1.42,
+     "user_seconds": 1.23,
+     "system_seconds": 0.19,
+     "cpu_percent": 14.4,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 0,
+     "rss_growth_mb": 20.2
+    }
+   }
+  },
+  "HTTP/2, 1000 idle connections": {
+   "definition": "ce7dfc8acb3e865f",
+   "nginx": {
+    "idle_rss_mb": 15.7,
+    "idle_threads": 2,
+    "listen_backlog": 511,
+    "answer": {
+     "status": 200,
+     "length": 3,
+     "version": "2"
+    },
+    "median": {
+     "clients": 1000,
+     "clients_ok": 1000,
+     "peak_rss_mb": 48.7,
+     "peak_threads": 2,
+     "peak_accept_queue": 0,
+     "peak_recv_q_kb": 0.0,
+     "peak_connections_unread": 0,
+     "peak_send_q_kb": 0.5,
+     "cpu_seconds": 1.4,
+     "user_seconds": 1.22,
+     "system_seconds": 0.17,
+     "cpu_percent": 14.4,
+     "listen_overflows": 0,
+     "listen_drops": 0,
+     "retransmitted_segments": 646,
+     "rss_growth_mb": 20.3
+    }
+   }
+  }
+ }
+}
