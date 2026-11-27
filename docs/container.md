@@ -1,6 +1,6 @@
 # The container image
 
-`ghcr.io/shinagawa-web/twinx:<tag>` is laid out as the official `nginx` image is, with twinx in place of nginx. Each release tag publishes it (`.github/workflows/release.yml`, from `packaging/docker/Dockerfile`), and `latest` is the highest version tag. It is built for `linux/amd64` and `linux/arm64`, on Debian trixie-slim.
+`ghcr.io/shinagawa-web/twinx:<tag>` runs twinx. Its files are where the official `nginx` image has them, so the same mounts and environment variables work. Each release tag publishes it (`.github/workflows/release.yml`, from `packaging/docker/Dockerfile`), and `latest` is the highest version tag. It is built for `linux/amd64` and `linux/arm64`, on Debian trixie-slim.
 
 ## What is in it
 

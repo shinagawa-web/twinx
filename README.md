@@ -2,6 +2,34 @@
 
 An experiment to find out how far an agent loop can take an HTTP server that behaves like nginx.
 
+## What twinx is
+
+twinx is a reverse proxy written in Rust. Its configuration is written as nginx's is, and it does what nginx does as a reverse proxy, without the rest of nginx. What it does is what the nginx-tests files of stages 1 to 5 check.
+
+It has:
+
+- Proxying to HTTP/1.1 and HTTP/2 servers, over TLS too, and WebSocket upgrades
+- Load balancing by round robin, ip_hash or least_conn, with weights, max_fails and backup servers; kept connections to servers; retries on the next server
+- TLS termination: SNI, client certificates, OCSP stapling, session reuse
+- HTTP/2 with clients
+- proxy_cache
+- gzip
+- Static files
+
+Of a reverse proxy, it does not have yet:
+
+- The other load-balancing methods (hash, random, sticky), and zone in upstream blocks
+- limit_req and limit_conn
+- realip and proxy_protocol
+- auth_request
+- map, geo and split_clients
+- grpc_pass
+- HTTP/3
+
+It does not have what is not a reverse proxy: mail, stream (TCP and UDP), fastcgi, uwsgi, scgi and memcached, SSI, WebDAV.
+
+A configuration with a directive twinx does not know does not start: twinx stops with "unknown directive".
+
 ## Questions
 
 | Question | Records that answer it |
