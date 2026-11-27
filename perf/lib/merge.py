@@ -1,6 +1,6 @@
 """Puts the measurements of the groups of scenarios, made in jobs of their own, in one file.
 
-    python3 perf/merge.py <out.json> <group.json>...
+    python3 perf/lib/merge.py <out.json> <group.json>...
 """
 
 import json

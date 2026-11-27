@@ -85,6 +85,10 @@ Every intervention adds one row to `docs/interventions.md`. Decisions made befor
 
 Each release publishes a container image used as the official `nginx` image is (`docs/container.md`).
 
+## Performance
+
+`perf/` measures twinx against nginx under the same load, by hand and outside the judge (`docs/performance.md`).
+
 ## Out of scope
 
 - nginx's C modules and Lua (lua-nginx-module)

@@ -1,10 +1,10 @@
 """Summarizes one run's measurements in Markdown.
 
-    python3 perf/compare.py results/aarch64/v0.4.0.json [--nginx results/aarch64/nginx.json]
+    python3 perf/lib/compare.py perf/results/aarch64/v0.4.0.json [--nginx perf/results/aarch64/nginx.json]
 
 It starts with the scenarios where twinx takes more CPU time per request than nginx,
 the most first. Each cell holds nginx / twinx: from the same run, or, where the run
-measured twinx alone, nginx's from --nginx (perf/keep.py). Results recorded with the
+measured twinx alone, nginx's from --nginx (perf/lib/keep.py). Results recorded with the
 twinx before beside them have it too; it is left out.
 """
 

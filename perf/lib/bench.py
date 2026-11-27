@@ -571,7 +571,7 @@ def reloading(server, q, seconds, load_cpu):
 
 
 def held(port, q, seconds, load_cpu):
-    """What perf/clients.py does with connections held open."""
+    """What perf/lib/clients.py does with connections held open."""
     spec = {k: q[k] for k in ("client", "count", "path", "tls", "h2") if k in q}
     cmd = ["taskset", "-c", cpu_list(load_cpu), "python3", "/perf/clients.py", str(port), json.dumps(spec), str(seconds)]
     try:
@@ -699,7 +699,7 @@ def main():
     parser.add_argument("--only", help="only the scenarios whose name this regular expression is found in")
     parser.add_argument("--scenario", action="append", help="only the scenario of this exact name; can be given more than once")
     parser.add_argument("--quick", action="store_true", help="one short round, to try things out")
-    parser.add_argument("--kept-nginx", help="nginx's measurements kept from a tag (perf/keep.py): nginx is "
+    parser.add_argument("--kept-nginx", help="nginx's measurements kept from a tag (perf/lib/keep.py): nginx is "
                         "measured only in the scenarios not there")
     args = parser.parse_args()
     unknown = sorted(set(args.scenario or []) - {q["name"] for q in SCENARIOS})

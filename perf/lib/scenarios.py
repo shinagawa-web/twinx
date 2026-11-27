@@ -1,5 +1,5 @@
 """What is measured: a scenario for each feature, level with nginx or not, so that a
-regression in it shows. See README.md.
+regression in it shows. See docs/performance.md.
 
 Each scenario has:
 
@@ -14,7 +14,7 @@ kind      "load": requests are made as fast as they are answered, with tool:
             "s_time", openssl's, a process on each load CPU that makes connections one
               after another, and a request on each: resumed or not, with a client's cert
               (its name in /work) or not.
-            "websocket" (perf/websocket.py): connections that send 125 bytes and wait
+            "websocket" (perf/lib/websocket.py): connections that send 125 bytes and wait
               for them to come back.
             reload: the server is told to reload every 0.7 s meanwhile.
             seconds and rounds, when not the usual.
@@ -22,7 +22,7 @@ kind      "load": requests are made as fast as they are answered, with tool:
             header line a second.
           "beside": a load whose latency is measured beside another (beside) on the server.
           "first": the time to the first byte of one request on a connection of its own.
-          "memory": a client of perf/clients.py (readers, uploaders or idle), count of it.
+          "memory": a client of perf/lib/clients.py (readers, uploaders or idle), count of it.
 before, http, server, listen
           what its configuration has in those places (before: ahead of the servers); @prefix@ is the server's directory.
 files     what is in that directory: a size, or text; gzipped has a .gz of it beside.

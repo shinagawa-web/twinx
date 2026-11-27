@@ -1,35 +1,36 @@
 #!/usr/bin/env bash
-# Measures twinx against nginx: a tag,  ./run.sh v0.4.0 [--quick]
-# a twinx pull request,                ./run.sh --pr 123 [--quick]
-# or a twinx commit or branch          ./run.sh --ref main [--quick]
+# Measures twinx against nginx: a tag,  perf/run.sh v0.4.0 [--quick]
+# a twinx pull request,                perf/run.sh --pr 123 [--quick]
+# or a twinx commit or branch          perf/run.sh --ref main [--quick]
 #
-# With --group tls, only the scenarios of that group (perf/scenarios.py) are measured;
+# With --group tls, only the scenarios of that group (perf/lib/scenarios.py) are measured;
 # with --scenario <name>, given once for each, only the scenarios of those exact names.
 #
 # A tag: fetches its binary for this architecture from its release or, when the
 # release has none, builds it from the tag's source in twinx's pinned Rust image.
 # A pull request: builds its head the same way; a ref, its commit.
-# Then runs nginx, twinx and perf/bench.py in one container with no network.
-# On macOS everything runs in the Lima VM named by $VM (default twinx).
-# Writes results/<arch>/<tag>.json, and nginx's of it to results/<arch>/nginx.json. With
-# --pr, --ref, --group or --scenario, only work/<what>/<arch>/<group, or scenarios, or
-# what>.json, which is not committed, and nginx is measured only in the scenarios that
-# results/<arch>/nginx.json does not have, unless --measure-nginx is given (a group of
+# Then runs nginx, twinx and perf/lib/bench.py in one container with no network.
+# On macOS everything runs in the Lima VM named by $VM (default twinx), in the directory
+# $VM_DIR of its home (default perf-run).
+# Writes perf/results/<arch>/<tag>.json, and nginx's of it to perf/results/<arch>/nginx.json.
+# With --pr, --ref, --group or --scenario, only perf/work/<what>/<arch>/<group, or scenarios,
+# or what>.json, which is not committed, and nginx is measured only in the scenarios that
+# perf/results/<arch>/nginx.json does not have, unless --measure-nginx is given (a group of
 # a tag's run of all the scenarios in CI).
 set -euo pipefail
 pr= ref=
 if [ "${1:-}" = --pr ]; then
-  pr=${2:?usage: ./run.sh --pr <number> [bench arguments]}
+  pr=${2:?usage: perf/run.sh --pr <number> [bench arguments]}
   [[ "$pr" =~ ^[0-9]+$ ]] || { echo "not a pull request number: $pr" >&2; exit 2; }
   name=pr-$pr
   shift 2
 elif [ "${1:-}" = --ref ]; then
-  ref=${2:?usage: ./run.sh --ref <commit or branch> [bench arguments]}
+  ref=${2:?usage: perf/run.sh --ref <commit or branch> [bench arguments]}
   [[ "$ref" =~ ^[A-Za-z0-9._/-]+$ && "$ref" != *..* ]] || { echo "not a commit or branch: $ref" >&2; exit 2; }
   name=ref-${ref//\//-}
   shift 2
 else
-  name=${1:?usage: ./run.sh <tag> [--group <group>] [bench arguments], or ./run.sh --pr <number>, or ./run.sh --ref <commit or branch>}
+  name=${1:?usage: perf/run.sh <tag> [--group <group>] [bench arguments], or perf/run.sh --pr <number>, or perf/run.sh --ref <commit or branch>}
   shift
 fi
 tag=$name group= named= measure_nginx= rest=()
@@ -47,7 +48,8 @@ repo=shinagawa-web/twinx
 rust_image=rust@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37
 
 if [ "$(uname -s)" = Darwin ]; then
-  vm=${VM:-twinx}
+  vm=${VM:-twinx} vm_dir=${VM_DIR:-perf-run}
+  [[ "$vm_dir" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "not a directory name: $vm_dir" >&2; exit 2; }
   arch=$(limactl shell "$vm" uname -m)
 else
   arch=$(uname -m)
@@ -67,7 +69,7 @@ if [ "$results" = "$work" ] && [ -z "$measure_nginx" ]; then
     cp "$root/results/$arch/nginx.json" "$work/kept/nginx.json"
     set -- "$@" --kept-nginx /kept/nginx.json
   else
-    echo "no results/$arch/nginx.json: nginx is measured too" >&2
+    echo "no perf/results/$arch/nginx.json: nginx is measured too" >&2
   fi
 fi
 
@@ -111,7 +113,7 @@ set -euo pipefail
 cd "$1"; name=$2; kind=$3; at=$4; rust_image=$5; shift 5
 work=work/$name/$(uname -m)
 # Builds the source in tarball $1 into binary $2, unless $2 was already built from it ($3, a commit).
-# The registry and target/ are kept in work/build, between runs and, by perf.yml, between
+# The registry and target/ are kept in perf/work/build, between runs and, by perf.yml, between
 # jobs: only twinx itself is compiled again.
 build() {
   [ -f "$2" ] && [ "$(cat "$2.built" 2>/dev/null)" = "$3" ] && return
@@ -133,11 +135,11 @@ build() {
 binary=$work/twinx
 [ "$kind" = binary ] || { build "$work/twinx.tar.gz" "$work/twinx-built" "$at"; binary=$work/twinx-built; }
 rm -rf "$work/out" && mkdir -p "$work/out" "$work/kept"
-# Pushed by .github/workflows/image.yml from main. Built here when it cannot be pulled:
-# with no way to ghcr.io, or when perf/Dockerfile or what it copies is not on main yet.
-image=ghcr.io/shinagawa-web/twinx-perf:$(bash perf/image-tag.sh)
+# Pushed by .github/workflows/perf-image.yml from main. Built here when it cannot be pulled:
+# with no way to ghcr.io, or when perf/lib/Dockerfile or what it copies is not on main yet.
+image=ghcr.io/shinagawa-web/twinx/perf:$(bash lib/image-tag.sh)
 docker image inspect "$image" >/dev/null 2>&1 || docker pull -q "$image" >/dev/null 2>&1 ||
-  docker build -q -t "$image" perf >/dev/null
+  docker build -q -t "$image" lib >/dev/null
 # Loopback only. 1000 clients and their proxied connections need file
 # descriptors, local ports and, up to v0.3.0, a thread per connection.
 exec docker run --rm --network none --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
@@ -150,17 +152,17 @@ exec docker run --rm --network none --user "$(id -u):$(id -g)" --cap-drop ALL --
 '
 
 if [ "$(uname -s)" = Darwin ]; then
-  limactl shell "$vm" -- bash -c 'rm -rf ~/perf-run/perf && mkdir -p ~/perf-run'
+  limactl shell "$vm" -- bash -c 'rm -rf ~/"$0"/lib && mkdir -p ~/"$0"' "$vm_dir"
   (cd "$root" && { git ls-files -z -co --exclude-standard -- . ':!results' | while IFS= read -r -d '' f; do [ -e "$f" ] && printf '%s\0' "$f"; done
                    for f in "work/$name/$arch/"{twinx,twinx.tar.gz,kept/nginx.json}; do
                      [ -f "$f" ] && printf '%s\0' "$f"; done; true; } |
      COPYFILE_DISABLE=1 tar --no-xattrs --null -T - -cf - 2>/dev/null) |
-    limactl shell "$vm" -- bash -c 'tar -C ~/perf-run -xf -'
+    limactl shell "$vm" -- bash -c 'tar -C ~/"$0" -xf -' "$vm_dir"
   set +e
-  limactl shell "$vm" -- bash -c 'cd ~/perf-run && bash -c "$0" bash "$PWD" "$@"' "$inside" "$name" "$kind" "$at" "$rust_image" ${labels[@]+"${labels[@]}"} "$@"
+  limactl shell "$vm" -- bash -c 'cd ~/"$1" && s=$0 && shift && bash -c "$s" bash "$PWD" "$@"' "$inside" "$vm_dir" "$name" "$kind" "$at" "$rust_image" ${labels[@]+"${labels[@]}"} "$@"
   rc=$?
   set -e
-  limactl shell "$vm" -- bash -c 'cat ~/perf-run/work/"$0"/"$1"/out/"$0".json' "$name" "$arch" > "$results/$out"
+  limactl shell "$vm" -- bash -c 'cat ~/"$2"/work/"$0"/"$1"/out/"$0".json' "$name" "$arch" "$vm_dir" > "$results/$out"
 else
   set +e
   bash -c "$inside" bash "$root" "$name" "$kind" "$at" "$rust_image" ${labels[@]+"${labels[@]}"} "$@"
@@ -171,6 +173,6 @@ fi
 if [ "$results" = "$work" ]; then
   echo "wrote $results/$out"
 elif [ "$rc" = 0 ]; then
-  python3 "$root/perf/keep.py" "$results/$out" "$results/nginx.json"
+  python3 "$root/lib/keep.py" "$results/$out" "$results/nginx.json"
 fi
 exit "$rc"

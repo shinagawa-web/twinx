@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Puts one tag's measurements on the open pull request from a branch, in one
-# comment that each later run replaces:   perf/comment.sh <tag> <branch> [run URL]
+# Puts one run's measurements on the open pull request from a branch, or on the
+# pull request $PR when given, in one comment that each later run replaces:
+#   perf/lib/comment.sh <tag, or pr-<number> or ref-<ref>> <branch> [run URL]
 #
-# Reads results/<arch>/<tag>.json for every architecture there. Does nothing
+# Reads perf/results/<arch>/<tag>.json for every architecture there. Does nothing
 # when the branch has no open pull request.
 set -euo pipefail
-tag=${1:?usage: perf/comment.sh <tag> <branch> [run URL]}
-branch=${2:?usage: perf/comment.sh <tag> <branch> [run URL]}
+tag=${1:?usage: perf/lib/comment.sh <tag> <branch> [run URL]}
+branch=${2:?usage: perf/lib/comment.sh <tag> <branch> [run URL]}
 run=${3:-}
 root=$(cd "$(dirname "$0")/.." && pwd)
-marker='<!-- twinx-perf -->'
+marker='<!-- perf measurements -->'
 # The commit measured: $COMMIT when given (a pull request's head), else this checkout's.
 commit=$(git -C "$root" rev-parse --short "${COMMIT:-HEAD}" 2>/dev/null || echo "${COMMIT:0:7}")
 
-pr=$(gh pr list --head "$branch" --state open --json number -q '.[0].number')
+pr=${PR:-$(gh pr list --head "$branch" --state open --json number -q '.[0].number')}
 [ -n "$pr" ] || { echo "no open pull request from $branch"; exit 0; }
 
 body=$(mktemp)
@@ -29,7 +30,7 @@ trap 'rm -f "$body"' EXIT
     found=1
     echo
     kept=(); [ ! -f "$(dirname "$f")/nginx.json" ] || kept=(--nginx "$(dirname "$f")/nginx.json")
-    python3 "$root/perf/compare.py" "$f" ${kept[@]+"${kept[@]}"}
+    python3 "$root/lib/compare.py" "$f" ${kept[@]+"${kept[@]}"}
   done
   [ -n "$found" ] || { echo; echo "No measurements were recorded for $tag."; }
 } > "$body"

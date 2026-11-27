@@ -1,12 +1,13 @@
 name: perf
 
 # Started by hand: measures a twinx tag, a twinx pull request, or a twinx commit
-# or branch against nginx (run.sh, perf/bench.py).
+# or branch against nginx (perf/run.sh, perf/lib/bench.py). It is not part of the
+# judge and decides nothing.
 #
-# A pull request or a commit measures the scenarios named (perf/scenarios.py) in one
+# A pull request or a commit measures the scenarios named (perf/lib/scenarios.py) in one
 # job; a tag, those or all of them ("all"), then a job for each group. Only a tag's
 # run of all of them measures nginx, and keeps its measurements in
-# results/aarch64/nginx.json; the others measure twinx alone and are compared with
+# perf/results/aarch64/nginx.json; the others measure twinx alone and are compared with
 # those, but in the scenarios not there yet. Each job is on
 # an aarch64 runner of its own: servers are only ever compared within one. The
 # questions do not depend on the architecture, and aarch64 runners have given
@@ -14,14 +15,17 @@ name: perf
 # request or a commit adds a build to each job.
 #
 # Started by hand, a tag's results of all the scenarios are committed to
-# results/aarch64/<tag>.json on the branch it runs on, and, when that branch has an
-# open pull request, put in one comment there that each later run replaces. A twinx
-# pull request's, or a commit's or branch's, are only shown in the run's summary and
-# kept as an artifact.
+# perf/results/aarch64/<tag>.json on the branch it runs on, which cannot be main (main
+# takes changes only through pull requests), and, when that branch has an open pull
+# request, put in one comment there that each later run replaces. A pull request's
+# are put in one comment on it, replaced by each later run, and a commit's or
+# branch's are only shown in the run's summary; all are kept as an artifact, and
+# nothing of them is committed.
 #
-# A pull request here that changes how the measurements are made runs it too,
-# on one scenario of twinx's latest release in one short round, and puts the
-# results in one comment on it, replaced by each later push; nothing is committed.
+# A pull request that changes how the measurements are made (perf/ or these
+# workflows) runs it too, on one scenario of twinx's latest release in one short
+# round, and puts the results in one comment on it, replaced by each later push;
+# nothing is committed. Other pull requests do not run it.
 
 on:
   workflow_dispatch:
@@ -36,14 +40,14 @@ on:
         description: Or a twinx commit or branch, such as main
         required: false
       scenarios:
-        description: Names of scenarios of perf/scenarios.py, separated by commas, or all (a tag only, and the default for one)
+        description: Names of scenarios of perf/lib/scenarios.py, separated by commas, or all (a tag only, and the default for one)
         required: false
 
   pull_request:
     paths:
       - perf/**
-      - run.sh
       - .github/workflows/perf.yml
+      - .github/workflows/perf-image.yml
 
 permissions:
   contents: read
@@ -100,7 +104,7 @@ jobs:
           else
             names=$(python3 - <<'EOF'
           import json, os, sys
-          sys.path.insert(0, "perf")
+          sys.path.insert(0, "perf/lib")
           from scenarios import SCENARIOS
           # The names have commas in them too, so the list is read as the longest names
           # it starts with, one after another, which holds while no name is two others
@@ -147,21 +151,21 @@ jobs:
         with:
           persist-credentials: false
 
-      # The registry and target/ of the last build of a pull request or a commit (run.sh,
-      # work/build): only twinx itself is compiled. A tag's binary is fetched, not built.
+      # The registry and target/ of the last build of a pull request or a commit (perf/run.sh,
+      # perf/work/build): only twinx itself is compiled. A tag's binary is fetched, not built.
       # Saved under the Cargo.lock built, and taken back from the latest of the same Rust.
       - name: Take the Rust image of the build
         id: rust
         if: env.PR != '' || env.REF != ''
-        run: echo "digest=$(sed -n 's/^rust_image=rust@sha256://p' run.sh)" >> "$GITHUB_OUTPUT"
+        run: echo "digest=$(sed -n 's/^rust_image=rust@sha256://p' perf/run.sh)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache/restore@v4
         id: build
         if: steps.rust.outputs.digest != ''
         with:
-          path: work/build
-          key: build-${{ runner.arch }}-${{ steps.rust.outputs.digest }}-
-          restore-keys: build-${{ runner.arch }}-${{ steps.rust.outputs.digest }}-
+          path: perf/work/build
+          key: perf-build-${{ runner.arch }}-${{ steps.rust.outputs.digest }}-
+          restore-keys: perf-build-${{ runner.arch }}-${{ steps.rust.outputs.digest }}-
 
       - name: Measure
         env:
@@ -172,16 +176,16 @@ jobs:
           if [ -n "$NAMES" ]; then
             pick=(); while IFS= read -r n; do pick+=(--scenario "$n"); done < <(jq -r '.[]' <<<"$NAMES")
           fi
-          ./run.sh "${what[@]}" "${pick[@]}" ${ONLY:+--only "$ONLY" --quick} ${ALL:+--measure-nginx}
-          mkdir -p part && cp work/*/aarch64/"$GROUP".json part/
+          perf/run.sh "${what[@]}" "${pick[@]}" ${ONLY:+--only "$ONLY" --quick} ${ALL:+--measure-nginx}
+          mkdir -p part && cp perf/work/*/aarch64/"$GROUP".json part/
 
       - uses: actions/cache/save@v4
         if: >-
-          steps.rust.outputs.digest != '' && hashFiles('work/*/*/src-twinx-built/Cargo.lock') != '' &&
-          steps.build.outputs.cache-matched-key != format('build-{0}-{1}-{2}', runner.arch, steps.rust.outputs.digest, hashFiles('work/*/*/src-twinx-built/Cargo.lock'))
+          steps.rust.outputs.digest != '' && hashFiles('perf/work/*/*/src-twinx-built/Cargo.lock') != '' &&
+          steps.build.outputs.cache-matched-key != format('perf-build-{0}-{1}-{2}', runner.arch, steps.rust.outputs.digest, hashFiles('perf/work/*/*/src-twinx-built/Cargo.lock'))
         with:
-          path: work/build
-          key: build-${{ runner.arch }}-${{ steps.rust.outputs.digest }}-${{ hashFiles('work/*/*/src-twinx-built/Cargo.lock') }}
+          path: perf/work/build
+          key: perf-build-${{ runner.arch }}-${{ steps.rust.outputs.digest }}-${{ hashFiles('perf/work/*/*/src-twinx-built/Cargo.lock') }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -211,9 +215,9 @@ jobs:
         run: |
           name=${TAG:-pr-$PR}; [ -z "$REF" ] || name=ref-${REF//\//-}
           mkdir -p merged/aarch64
-          python3 perf/merge.py "merged/aarch64/$name.json" parts/*.json
-          [ -z "$ALL" ] || python3 perf/keep.py "merged/aarch64/$name.json" merged/aarch64/nginx.json
-          python3 perf/compare.py "merged/aarch64/$name.json" --nginx results/aarch64/nginx.json >> "$GITHUB_STEP_SUMMARY"
+          python3 perf/lib/merge.py "merged/aarch64/$name.json" parts/*.json
+          [ -z "$ALL" ] || python3 perf/lib/keep.py "merged/aarch64/$name.json" merged/aarch64/nginx.json
+          python3 perf/lib/compare.py "merged/aarch64/$name.json" --nginx perf/results/aarch64/nginx.json >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -242,10 +246,10 @@ jobs:
 
       - name: Commit the results
         run: |
-          cp -r "$RUNNER_TEMP/results/." results/
+          cp -r "$RUNNER_TEMP/results/." perf/results/
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add results
+          git add perf/results
           git diff --cached --quiet && { echo "nothing changed"; exit 0; }
           git commit -m "Record the measurements for $TAG"
           git pull --rebase -q
@@ -256,11 +260,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: perf/comment.sh "$TAG" "$BRANCH" "$RUN_URL"
+        run: perf/lib/comment.sh "$TAG" "$BRANCH" "$RUN_URL"
 
   comment:
     needs: [what, merge]
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || inputs.pr != ''
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -273,13 +277,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: perf
-          path: results
+          path: perf/results
 
-      - name: Comment the measurements on this pull request
+      # On a pull request that changes the measurements, its own; started by hand with
+      # a pull request, the one measured.
+      - name: Comment the measurements on the pull request
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.what.outputs.tag }}
-          BRANCH: ${{ github.head_ref }}
+          PR: ${{ inputs.pr }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
           COMMIT: ${{ github.event.pull_request.head.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: perf/comment.sh "$TAG" "$BRANCH" "$RUN_URL"
+        run: perf/lib/comment.sh "${TAG:-pr-$PR}" "$BRANCH" "$RUN_URL"

@@ -1,7 +1,7 @@
 """Keeps nginx's measurements from a tag's run of all the scenarios, so that the other runs
 measure twinx alone and are compared with them (bench.py --kept-nginx, compare.py --nginx).
 
-    python3 perf/keep.py results/aarch64/v0.4.0.json results/aarch64/nginx.json
+    python3 perf/lib/keep.py perf/results/aarch64/v0.4.0.json perf/results/aarch64/nginx.json
 
 nginx is the same nginx in every run; what moves between runners is ignored, as only the
 scenarios far above nginx are worked on.
