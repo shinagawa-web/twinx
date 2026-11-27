@@ -304,3 +304,4 @@ Kinds:
 | 2026-11-27 | After v0.6.0 | approval | Auto-merge for #511 once its checks pass | Only this pull request |
 | 2026-11-27 | After v0.6.0 | decision | twinx-perf is deleted rather than archived | Its code and results are in perf/, its open issue moved to #512, and no document links to it |
 | 2026-11-27 | After v0.6.0 | decision | twinx is described as a reverse proxy written in Rust, with what it has and does not have yet, not as a replacement for nginx | Apache gave way to nginx with fewer features, as nginx did the job; README and docs/container.md |
+| 2026-11-27 | After v0.6.0 | approval | The agent proposed an issue for the default Actions event policy that GitHub enforces on public repositories on 2026-12-02, which blocks `pull_request_target` and so the judge | Opened as #515 |
