@@ -301,3 +301,4 @@ Kinds:
 | 2026-11-26 | After stage 6 | decision | No performance runs for the rest of the day; tomorrow nginx's baseline, then a v0.6.0 tag, then what to improve from the numbers | #397 closed |
 | 2026-11-26 | Stage 6 | decision | The schedule is paused again | 256 of 256 files, 4274 of 4274 subtests after #508; the Fixer had fixed the five files added that day (#501, #503, #506, #507, #508) |
 | 2026-11-27 | After v0.6.0 | decision | The performance measurements move into twinx (perf/, #379), and twinx-perf is deleted after | A tag's full run is started on a branch, as main takes pull requests only |
+| 2026-11-27 | After v0.6.0 | approval | Auto-merge for #511 once its checks pass | Only this pull request |
